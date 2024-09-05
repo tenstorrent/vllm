@@ -368,7 +368,7 @@ def get_vllm_version() -> str:
     if _no_device():
         version += "+empty"
     elif _is_tt():
-        version += "+empty"
+        version += "+tt"
     elif _is_cuda():
         cuda_version = str(get_nvcc_cuda_version())
         if cuda_version != MAIN_CUDA_VERSION:

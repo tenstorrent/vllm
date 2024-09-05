@@ -18,7 +18,7 @@ from vllm.transformers_utils.config import (get_config,
                                             get_hf_text_config)
 from vllm.utils import (STR_NOT_IMPL_ENC_DEC_CUDAGRAPH, GiB_bytes,
                         cuda_device_count_stateless, get_cpu_memory, is_cpu,
-                        is_hip, is_neuron, is_openvino, is_xpu,
+                        is_hip, is_neuron, is_openvino, is_xpu, is_tt,
                         print_warning_once)
 
 if TYPE_CHECKING:
@@ -1049,6 +1049,8 @@ class DeviceConfig:
                 self.device_type = "cpu"
             elif is_xpu():
                 self.device_type = "xpu"
+            elif is_tt():
+                self.device_type = "tt"
             else:
                 # We don't call torch.cuda.is_available() here to
                 # avoid initializing CUDA before workers are forked
@@ -1060,7 +1062,7 @@ class DeviceConfig:
         # Some device types require processing inputs on CPU
         if self.device_type in ["neuron", "openvino"]:
             self.device = torch.device("cpu")
-        elif self.device_type in ["tpu"]:
+        elif self.device_type in ["tpu"] or self.device_type in ["tt"]:
             self.device = None
         else:
             # Set device with device type
