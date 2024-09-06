@@ -205,7 +205,7 @@ class ModelConfig:
             # so no logging message needed.
             self.enforce_eager = False
 
-        if (not self.disable_sliding_window
+        if (not self.disable_sliding_window and hasattr(self.hf_text_config, "model_type")
                 and self.hf_text_config.model_type == "gemma2"
                 and self.hf_text_config.sliding_window is not None):
             print_warning_once(
@@ -1604,7 +1604,7 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type == "gemma2":
+                if hasattr(config, "model_type") and config.model_type == "gemma2":
                     logger.info(
                         "For Gemma 2, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "

@@ -10,7 +10,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase,
@@ -87,14 +87,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.attn_backend = None
 
     def load_model(self) -> None:
-        self.model = get_model(
-            model_config=self.model_config,
-            load_config=self.load_config,
+        # Note: using custom TT loader instead of selecting from default vllm loaders
+        loader = TTModelLoader(self.load_config)
+        self.model = loader.load_model(model_config=self.model_config,
             device_config=self.device_config,
+            lora_config=None,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
-            cache_config=self.cache_config,
-            lora_config=None,
+            cache_config=self.cache_config
         )
 
     def make_model_input_from_broadcasted_tensor_dict(
