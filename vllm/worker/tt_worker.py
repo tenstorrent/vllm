@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -10,6 +11,8 @@ from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.worker.tt_model_runner import TTModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
                                      LoraNotSupportedWorkerBase, WorkerInput)
+
+import ttnn
 
 logger = init_logger(__name__)
 
@@ -47,6 +50,8 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             load_config
         )
         
+        self.mesh_device = None  # initialized by init_device
+        
     @property
     def do_metadata_broadcast(self) -> bool:
         return False  # TTWorker only supports single-worker execution
@@ -56,10 +61,14 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         return self.tt_cache
 
     def init_device(self) -> None:
-        """Initialize device state, such as loading the model or other on-device
-        memory allocations.
-        """
-        raise NotImplementedError
+        # TODO: Add support for devices other than T3K
+        self.mesh_device = self._open_t3k_mesh_device()
+        
+        # TODO: Add flag for enabling program cache
+        self._enable_program_cache()
+        
+        # TODO: Add flag for enabling async mode
+        self._enable_async_mode()
 
     def load_model(self):
         self.model_runner.load_model()
@@ -109,3 +118,75 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         Process an execution request.
         """
         raise NotImplementedError
+    
+    # TT-NN utilities
+    
+    def _get_devices(self):
+        if self.mesh_device:
+            devices = self.mesh_device.get_devices()
+        else:
+            devices = []
+            logger.warning("No devices exist")
+        return devices
+    
+    def _get_dispatch_core_type(self):
+        dispatch_core_type = ttnn.device.DispatchCoreType.WORKER
+        if ("WH_ARCH_YAML" in os.environ) and os.environ["WH_ARCH_YAML"] == "wormhole_b0_80_arch_eth_dispatch.yaml":
+            dispatch_core_type = ttnn.device.DispatchCoreType.ETH
+        return dispatch_core_type
+    
+    def _open_t3k_mesh_device(self):
+        device_ids = [0, 4, 5, 1, 2, 6, 7, 3]
+        num_devices_requested = len(device_ids)
+        device_params = {}
+        
+        self.pci_ids = [ttnn.GetPCIeDeviceID(i) for i in device_ids[:num_devices_requested]]
+
+        mesh_device = ttnn.open_mesh_device(
+            ttnn.MeshShape(1, num_devices_requested),
+            device_ids[:num_devices_requested],
+            dispatch_core_type=self._get_dispatch_core_type(),
+            **device_params,
+        )
+
+        logger.debug(f"multidevice with {mesh_device.get_num_devices()} devices is created")
+        return mesh_device
+    
+    def _enable_program_cache(self):
+        devices = self._get_devices()
+        if not devices or len(devices) == 0:
+            logger.warning("No devices found to apply program cache to: PROGRAM CACHE DISABLED")
+        for dev in devices:
+            dev.enable_program_cache()
+            
+    def _enable_async_mode(self):
+        devices = self._get_devices()
+        if not devices or len(devices) == 0:
+            logger.warning("No devices found to apply async mode to: ASYNC MODE DISABLED")
+        for dev in devices:
+            dev.enable_async(True)
+        
+    ## Destructor (used to close devices)
+    
+    def __del__(self):
+        if self.mesh_device:
+            devices = self.mesh_device.get_devices()
+            
+            # Disable program cache
+            for dev in devices:
+                dev.disable_and_clear_program_cache()
+            
+            # Disable async mode
+            for dev in devices:
+                dev.enable_async(False)
+            
+            # Dump device profiler
+            for device in devices:
+                ttnn.DumpDeviceProfiler(device)
+
+            # Close devices
+            ttnn.close_mesh_device(self.mesh_device)
+            del self.mesh_device
+        
+        if hasattr(super(TTWorker, self), '__del__'):
+            super().__del__()
