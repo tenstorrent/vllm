@@ -1,4 +1,11 @@
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from tt_metal.models.demos.t3000.llama2_70b.tt.llama_generation import TtLlamaModelForGeneration
+
 from vllm import LLM, SamplingParams
+from vllm import ModelRegistry
+ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaModelForGeneration)
 
 # Sample prompts.
 prompts = [
