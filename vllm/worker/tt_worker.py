@@ -26,6 +26,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         device_config: DeviceConfig,
         cache_config: CacheConfig,
         load_config: LoadConfig,
+        is_driver_worker: bool,
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -33,6 +34,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.device_config = device_config
         self.cache_config = cache_config
         self.load_config = load_config
+        self.is_driver_worker = is_driver_worker
 
         assert self.device_config.device_type == "tt"
         if self.cache_config.cache_dtype == "auto":
@@ -85,7 +87,11 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         num_cpu_blocks refers to "swapped" blocks in CPU memory and cannot be
         appended to.
         """
-        raise NotImplementedError
+        # TODO: Add proper implementation, ignoring block allocation for now
+        # Note: can use --max-num-batched-tokens to set max number of batched tokens per iteration in EngineArgs
+        num_tt_blocks = int(self.scheduler_config.max_model_len / self.cache_config.block_size)
+        num_cpu_blocks = 0
+        return num_tt_blocks, num_cpu_blocks
 
     def initialize_cache(
         self,
@@ -94,7 +100,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     ) -> None:
         """Initialize the KV cache with the given size in blocks.
         """
-        raise NotImplementedError
+        pass  # TODO: Add proper implementation, ignoring block allocation for now
     
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
@@ -111,13 +117,30 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         request. This method may move data to the worker's local device. It is
         not allowed to communicate with other workers or devices.
         """
-        raise NotImplementedError
+        virtual_engine = execute_model_req.virtual_engine
+        num_steps = execute_model_req.num_steps
+        num_seq_groups = len(execute_model_req.seq_group_metadata_list)
+        
+        # TODO: Add proper implementation, ignoring block allocation for now
+        blocks_to_swap_in = 0
+        blocks_to_swap_out = 0
+        blocks_to_copy = 0
+
+        return WorkerInput(
+            num_seq_groups=num_seq_groups,
+            blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_swap_out=blocks_to_swap_out,
+            blocks_to_copy=blocks_to_copy,
+            virtual_engine=virtual_engine,
+            num_steps=num_steps,
+        )
 
     def execute_worker(self, worker_input: WorkerInput) -> None:
         """
         Process an execution request.
         """
-        raise NotImplementedError
+        # TODO: Add proper implementation, ignoring block allocation for now
+        pass
     
     # TT-NN utilities
     

@@ -35,6 +35,7 @@ class TTExecutor(ExecutorBase):
             device_config=self.device_config,
             cache_config=self.cache_config,
             load_config=self.load_config,
+            is_driver_worker=True,
         )
 
     def _create_worker(
