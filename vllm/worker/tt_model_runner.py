@@ -32,31 +32,24 @@ class TTModelInput(ModelRunnerInputBase):
     """
     input_tokens: Optional[torch.Tensor] = None
     input_positions: Optional[torch.Tensor] = None
-    attn_metadata: Optional["AttentionMetadata"] = None
-    sampling_metadata: Optional["SamplingMetadata"] = None
-    virtual_engine: Optional[int] = None
+    prompt_lens: Optional[torch.Tensor] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
         tensor_dict = {
             "input_tokens": self.input_tokens,
             "input_positions": self.input_positions,
+            "prompt_lens": self.prompt_lens,
         }
-        _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
-        _add_sampling_metadata_broadcastable_dict(tensor_dict,
-                                                  self.sampling_metadata)
+        
         return tensor_dict
 
     @classmethod
     def from_broadcasted_tensor_dict(
             cls: Type["TTModelInput"],
             tensor_dict: Dict[str, Any],
-            attn_backend: Optional["AttentionBackend"] = None
     ) -> "TTModelInput":
         tensor_dict = _init_sampling_metadata_from_tensor_dict(tensor_dict)
-        if attn_backend is not None:
-            tensor_dict = _init_attn_metadata_from_tensor_dict(
-                attn_backend, tensor_dict)
         return cls(**tensor_dict)
 
 
@@ -84,7 +77,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         self.sliding_window = model_config.get_sliding_window()
         self.block_size = cache_config.block_size
-        self.attn_backend = None
 
     def load_model(self) -> None:
         # Note: using custom TT loader instead of selecting from default vllm loaders
@@ -103,7 +95,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     ) -> TTModelInput:
         return TTModelInput.from_broadcasted_tensor_dict(
             tensor_dict,
-            attn_backend=self.attn_backend,
         )
 
     def prepare_model_input(
@@ -112,12 +103,55 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             virtual_engine: int = 0,
             finished_requests_ids: Optional[List[str]] = None
     ) -> TTModelInput:
-        """
-        Prepare the inputs to ModelRunnerBase.execute_model from an execution
-        request. This method may move data to the worker's local device. It is
-        not allowed to communicate with other workers or devices.
-        """
-        raise NotImplementedError
+        
+        # NOTE: We assume that all sequences in the group are all prompts or
+        # all decodes.
+        is_prompt = seq_group_metadata_list[0].is_prompt  # prefill if True, otherwise decode
+        
+        batch_size = len(seq_group_metadata_list)
+        assert batch_size > 0
+        
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        prompt_lens: List[int] = []
+
+        for seq_group_metadata in seq_group_metadata_list:
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(seq_ids) == 1   # Only support one sequence per request group
+            seq_id = seq_ids[0]
+
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            
+            if is_prompt:
+                # tokens
+                prompt_tokens = seq_data.get_token_ids()
+                input_tokens.extend(prompt_tokens)
+                
+                # positions
+                prompt_len = len(prompt_tokens)
+                prompt_lens.append(prompt_len)
+                input_positions.extend(list(range(prompt_len)))
+            else:
+                # tokens
+                generation_token = seq_data.get_last_token_id()
+                input_tokens.append(generation_token)
+                
+                # positions
+                position = seq_data.get_len() - 1
+                input_positions.append(position)
+                
+            # TODO: Get block table using seq_group_metadata.block_tables[seq_id]
+                
+        input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device="cpu")
+        input_positions = torch.tensor(input_positions, dtype=torch.int32, device="cpu")
+        if is_prompt:
+            prompt_lens = torch.tensor(prompt_lens,
+                                    dtype=torch.int32,
+                                    device="cpu")
+        else:
+            prompt_lens = None
+        
+        return TTModelInput(input_tokens, input_positions, prompt_lens)
 
     @torch.no_grad()
     def execute_model(
