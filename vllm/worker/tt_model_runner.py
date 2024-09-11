@@ -83,7 +83,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(model_config=self.model_config,
             device_config=self.device_config,
-            lora_config=None,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
             cache_config=self.cache_config
@@ -107,6 +106,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = seq_group_metadata_list[0].is_prompt  # prefill if True, otherwise decode
+        assert all(x.is_prompt == is_prompt for x in seq_group_metadata_list), "Currently only supporting all prefills or all decodes in seq group"
         
         batch_size = len(seq_group_metadata_list)
         assert batch_size > 0
@@ -165,19 +165,30 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             raise ValueError(
                 "TT worker does not support multi-step execution.")
 
-        model_executable = self.model
+        if model_input.prompt_lens is not None:  # prefill
+            input_position = 0
+            # Currently only support same prompt length
+            assert torch.all(model_input.prompt_lens == model_input.prompt_lens[0]), "Currently only supporting same prompt lengths for prefill"
+            batch_size = model_input.prompt_lens.shape[0]
+        else:  # decode
+            # Currently only support same decode positions
+            input_position = model_input.input_positions[0]
+            assert torch.all(model_input.input_positions == input_position), "Currently only supporting same input positions for decode"
+            batch_size = model_input.input_tokens.shape[0]
+        
+        input_tokens = model_input.input_tokens.view(batch_size, -1)
+        
         execute_model_kwargs = {
-            "input_ids":
-            model_input.input_tokens,
-            "positions":
-            model_input.input_positions,
-            "kv_caches":
-            kv_caches,
-            "attn_metadata":
-            model_input.attn_metadata,
+            "tokens": input_tokens,
+            "start_pos": input_position,
+            # TODO: Add block table and maybe kv cache
         }
+        
+        breakpoint()
 
-        hidden_states = model_executable(**execute_model_kwargs)
+        hidden_states = self.model(**execute_model_kwargs)
+        
+        breakpoint()
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states,

@@ -25,5 +25,5 @@ ln -s <path/to/tt-metal>/models ./models
 
 ## Running the offline inference example
 ```python
-python examples/offline_inference_tt.py
+WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py
 ```

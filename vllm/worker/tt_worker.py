@@ -68,6 +68,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def init_device(self) -> None:
         # TODO: Add support for devices other than T3K
         self.mesh_device = self._open_t3k_mesh_device()
+        self.device_config.device = self.mesh_device
         
         # TODO: Add flag for enabling program cache
         self._enable_program_cache()

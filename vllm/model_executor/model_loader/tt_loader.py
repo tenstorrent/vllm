@@ -11,7 +11,6 @@ from vllm.config import (CacheConfig, DeviceConfig, LoRAConfig, ModelConfig,
 class TTModelLoader(BaseModelLoader):
     def load_model(self, *, model_config: ModelConfig,
                    device_config: DeviceConfig,
-                   lora_config: Optional[LoRAConfig],
                    parallel_config: ParallelConfig,
                    scheduler_config: SchedulerConfig,
                    cache_config: CacheConfig) -> nn.Module:
@@ -23,3 +22,5 @@ class TTModelLoader(BaseModelLoader):
         arch_names[0] = "TT" + arch_names[0]
         
         model_class, _ = get_model_architecture(model_config)
+        model = model_class.initialize_vllm_model(model_config.hf_config, device_config.device)
+        return model
