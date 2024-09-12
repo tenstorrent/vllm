@@ -3,21 +3,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
 import torch
 
-from vllm.attention import AttentionMetadata
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
                          ModelConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.logger import init_logger
-from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
-from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
-from vllm.worker.model_runner_base import (
-    ModelRunnerBase, ModelRunnerInputBase,
-    _add_attn_metadata_broadcastable_dict,
-    _add_sampling_metadata_broadcastable_dict,
-    _init_attn_metadata_from_tensor_dict,
-    _init_sampling_metadata_from_tensor_dict)
+from vllm.sequence import IntermediateTensors, SequenceGroupMetadata, Logprob, SequenceOutput, CompletionSequenceGroupOutput
+from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
@@ -33,6 +26,7 @@ class TTModelInput(ModelRunnerInputBase):
     input_tokens: Optional[torch.Tensor] = None
     input_positions: Optional[torch.Tensor] = None
     prompt_lens: Optional[torch.Tensor] = None
+    seq_groups: Optional[List[List[int]]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -40,6 +34,7 @@ class TTModelInput(ModelRunnerInputBase):
             "input_tokens": self.input_tokens,
             "input_positions": self.input_positions,
             "prompt_lens": self.prompt_lens,
+            "seq_groups": self.seq_groups,
         }
         
         return tensor_dict
@@ -49,7 +44,6 @@ class TTModelInput(ModelRunnerInputBase):
             cls: Type["TTModelInput"],
             tensor_dict: Dict[str, Any],
     ) -> "TTModelInput":
-        tensor_dict = _init_sampling_metadata_from_tensor_dict(tensor_dict)
         return cls(**tensor_dict)
 
 
@@ -150,8 +144,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
         else:
             prompt_lens = None
+            
+        seq_groups = [
+            list(metadata.seq_data.keys())
+            for metadata in seq_group_metadata_list
+        ]
         
-        return TTModelInput(input_tokens, input_positions, prompt_lens)
+        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups)
 
     @torch.no_grad()
     def execute_model(
@@ -164,15 +163,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if num_steps > 1:
             raise ValueError(
                 "TT worker does not support multi-step execution.")
+            
+        is_prompt = model_input.prompt_lens is not None  # prefill if True, otherwise decode
 
-        if model_input.prompt_lens is not None:  # prefill
+        if is_prompt:
             input_position = 0
             # Currently only support same prompt length
             assert torch.all(model_input.prompt_lens == model_input.prompt_lens[0]), "Currently only supporting same prompt lengths for prefill"
             batch_size = model_input.prompt_lens.shape[0]
-        else:  # decode
+        else:
             # Currently only support same decode positions
-            input_position = model_input.input_positions[0]
+            input_position = model_input.input_positions[0].item()
             assert torch.all(model_input.input_positions == input_position), "Currently only supporting same input positions for decode"
             batch_size = model_input.input_tokens.shape[0]
         
@@ -184,19 +185,27 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # TODO: Add block table and maybe kv cache
         }
         
-        breakpoint()
+        logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
 
-        hidden_states = self.model(**execute_model_kwargs)
-        
-        breakpoint()
+        # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
+        # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
+        next_logits = logits[:, -1, :]  # batch, vocab of last token
+        next_token_ids = self._sample_tokens(next_logits)
 
-        # Compute the logits.
-        logits = self.model.compute_logits(hidden_states,
-                                           model_input.sampling_metadata)
+        # Minimal code to construct the sampler outputs, based on tpu_model_runner.py
+        # TT backend does not support the advanced sampling parameters such as logprobs.
+        zero_logprob = Logprob(0.0)
+        sampler_outputs = []
+        for batch_idx, seq_ids in enumerate(model_input.seq_groups):
+            assert len(seq_ids) == 1   # Only support one sequence per request group
+            next_token_id = next_token_ids[batch_idx]
+            seq_outputs = [SequenceOutput(seq_ids[0], next_token_id,
+                                {next_token_id: zero_logprob})]
+            sampler_outputs.append(
+                CompletionSequenceGroupOutput(seq_outputs, None))
+        return [SamplerOutput(sampler_outputs)]
 
-        # Sample the next token.
-        output = self.model.sample(
-            logits=logits,
-            sampling_metadata=model_input.sampling_metadata,
-        )
-        return [output]
+
+    def _sample_tokens(self, logits):
+        # TODO: Add other sampling methods, currently only using greedy sampling
+        return torch.argmax(logits, dim=-1)
