@@ -1542,7 +1542,7 @@ class DeviceConfig:
         # Some device types require processing inputs on CPU
         if self.device_type in ["neuron", "openvino"]:
             self.device = torch.device("cpu")
-        elif self.device_type in ["tpu"]:
+        elif self.device_type in ["tpu"] or self.device_type in ["tt"]:
             self.device = None
         else:
             # Set device with device type
@@ -2236,7 +2236,7 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type == "gemma2":
+                if hasattr(config, "model_type") and config.model_type == "gemma2":
                     logger.info(
                         "For Gemma 2, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
