@@ -30,7 +30,7 @@ def main():
 
     # Create an LLM.
     ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaModelForGeneration)
-    llm = LLM(model="meta-llama/Meta-Llama-3.1-70B")
+    llm = LLM(model="meta-llama/Meta-Llama-3.1-70B", block_size=64)
 
     # TODO: Double check how many different seq lengths need to be compiled for decode
     print("Starting compile run")
