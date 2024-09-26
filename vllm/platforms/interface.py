@@ -53,6 +53,7 @@ class PlatformEnum(enum.Enum):
     NEURON = enum.auto()
     OPENVINO = enum.auto()
     OOT = enum.auto()
+    TT = enum.auto()
     UNSPECIFIED = enum.auto()
 
 
@@ -119,6 +120,9 @@ class Platform:
 
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
+    
+    def is_tt(self) -> bool:
+        return self._enum == PlatformEnum.TT
 
     def is_hpu(self) -> bool:
         return self._enum == PlatformEnum.HPU
