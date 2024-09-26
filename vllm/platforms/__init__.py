@@ -42,6 +42,13 @@ try:
 except Exception:
     pass
 
+is_tt = False
+try:
+    import ttnn  # assume ttnn is installed if and only if machine has TT devices
+    is_tt = True
+except Exception:
+    pass
+
 if is_tpu:
     # people might install pytorch built with cuda but run on tpu
     # so we need to check tpu first
@@ -53,6 +60,9 @@ elif is_cuda:
 elif is_rocm:
     from .rocm import RocmPlatform
     current_platform = RocmPlatform()
+elif is_tt:
+    from .tt import TTPlatform
+    current_platform = TTPlatform()
 else:
     current_platform = UnspecifiedPlatform()
 
