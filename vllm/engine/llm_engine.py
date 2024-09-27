@@ -370,7 +370,8 @@ class LLMEngine:
                 # before prometheus_client is imported.
                 # See https://prometheus.github.io/client_python/multiprocess/
                 from vllm.engine.metrics import (LoggingStatLogger,
-                                                 PrometheusStatLogger)
+                                                 PrometheusStatLogger,
+                                                 GlobalStatLogger)
 
                 self.stat_loggers = {
                     "logging":
@@ -383,6 +384,7 @@ class LLMEngine:
                         labels=dict(
                             model_name=self.model_config.served_model_name),
                         vllm_config=vllm_config),
+                    "global": GlobalStatLogger(),
                 }
                 self.stat_loggers["prometheus"].info("cache_config",
                                                      self.cache_config)
