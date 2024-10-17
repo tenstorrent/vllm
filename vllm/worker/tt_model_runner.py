@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+import time
+
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -292,16 +294,29 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Remove kv_cache from execute_model_kwargs since it doesn't need to be copied to device for trace execution
             execute_model_kwargs.pop("kv_cache")
             
+            fwd_trace_start = time.time()
+            
             logits = self.model.decode_forward_trace(
                 **execute_model_kwargs, **self.execute_trace_kwargs
             )
+            
+            fwd_trace_end = time.time()
+            fwd_trace_time = fwd_trace_end - fwd_trace_start
         else:
             logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
+            fwd_trace_time = None
+            
+        sample_start = time.time()
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
         next_logits = logits[:model_input.unpadded_batch_size, -1, :]  # unpadded batch, vocab of last token
         next_token_ids = self._sample_tokens(next_logits, model_input.tt_sampling_params)
+        
+        sample_end = time.time()
+        sample_time = sample_end - sample_start
+        
+        output_collect_start = time.time()
 
         # Minimal code to construct the sampler outputs, based on tpu_model_runner.py
         # TT backend does not support the advanced sampling parameters such as logprobs.
@@ -313,7 +328,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                 {next_token_id: zero_logprob})]
             sampler_outputs.append(
                 CompletionSequenceGroupOutput(seq_outputs, None))
-        return [SamplerOutput(sampler_outputs)]
+        output_collect_end = time.time()
+        output_collect_time = output_collect_end - output_collect_start
+        return [SamplerOutput(sampler_outputs)], fwd_trace_time, sample_time, output_collect_time
 
     def _sample_tokens(self, logits, tt_sampling_params : TTSamplingParams):
         if tt_sampling_params.temperature == 0:  # greedy decoding

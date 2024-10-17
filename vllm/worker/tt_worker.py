@@ -80,6 +80,7 @@ class TTCacheEngine:
         kv_cache_shape = (num_blocks, self.num_kv_heads, self.block_size, self.head_size)
         kv_cache: List[torch.Tensor] = []
         num_layers = self.num_attention_layers
+        # num_layers = 1
         if device == "cpu":
             for _ in range(num_layers):
                 # null block in CpuGpuBlockAllocator requires at least that
@@ -323,10 +324,14 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         """Executes at least one model step on the given sequences, unless no
         sequences are provided."""
         start_time = time.perf_counter()
+        
+        input_start = time.time()
 
         inputs = self.prepare_input(execute_model_req)
         if inputs is None:
             return None
+        
+        input_end = time.time()
 
         model_input, worker_input, kwargs = inputs
         num_steps = worker_input.num_steps
@@ -340,7 +345,9 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         intermediate_tensors = None
         orig_model_execute_time = 0.0
         
-        output = self.model_runner.execute_model(
+        exec_start = time.time()
+        
+        output, fwd_trace_time, sample_time, output_collect_time = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache
             if self.kv_cache is not None else None,
@@ -348,6 +355,15 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             num_steps=num_steps,
             **kwargs,
         )
+        
+        exec_end = time.time()
+        
+        if model_input.prompt_lens is None:
+            print(f"Input preparation time: {input_end - input_start}")
+            print(f"Model execution time: {exec_end - exec_start}")
+            print(f"Forward trace time: {fwd_trace_time}")
+            print(f"Sample time: {sample_time}")
+            print(f"Output collection time: {output_collect_time}")
 
         model_execute_time = time.perf_counter() - start_time
         

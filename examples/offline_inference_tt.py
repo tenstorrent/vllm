@@ -80,7 +80,7 @@ def run_inference_perf(
     # Inference runs
     print("Starting inference runs")
     N_warmup = 1
-    N_inference = 5
+    N_inference = 2
     for i in tqdm(range(N_inference), desc="Inference runs"):
         if i == N_warmup:  # Reset stats after warmup
             llm.llm_engine.stat_loggers['global'].reset()
