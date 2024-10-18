@@ -11,6 +11,8 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
+from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalInputs,
+                             MultiModalRegistry)
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata, Logprob, SequenceOutput, CompletionSequenceGroupOutput
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
 from vllm.utils import make_tensor_with_pad
@@ -18,6 +20,36 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
 logger = init_logger(__name__)
+
+def create_vision_mask(
+    tokens: List[int],
+    vision_token: int,
+) -> List[List[int]]:
+    vision_token_locations = [
+        i for i, token in enumerate(tokens) if token == vision_token
+    ]
+    if len(vision_token_locations) == 0:
+        return []
+
+    if len(vision_token_locations) == 1:
+        # only one image present, unmask until end of sequence
+        return [[vision_token_locations[0], -1]]
+    vision_masks = [
+        [loc1, loc2]
+        for loc1, loc2 in zip(vision_token_locations[:-1], vision_token_locations[1:])
+    ]
+    # last image will attend to all subsequent text
+    vision_masks.append([vision_token_locations[-1], len(tokens)])
+
+    # if there are two or more consecutive vision tokens,
+    # they should all attend to all subsequent
+    # text present
+    last_mask_end = vision_masks[-1][1]
+    for vision_mask in vision_masks[::-1]:
+        if vision_mask[0] == vision_mask[1] - 1:
+            vision_mask[1] = last_mask_end
+        last_mask_end = vision_mask[1]
+    return vision_masks
 
 
 @dataclass(frozen=True)
@@ -42,6 +74,7 @@ class TTModelInput(ModelRunnerInputBase):
     block_tables: Optional[torch.Tensor] = None
     unpadded_batch_size: Optional[int] = None
     tt_sampling_params: Optional[TTSamplingParams] = None
+    multi_modal_kwargs: Optional[Dict[str, Any]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -53,6 +86,7 @@ class TTModelInput(ModelRunnerInputBase):
             "block_tables": self.block_tables,
             "unpadded_batch_size": self.unpadded_batch_size,
             "tt_sampling_params": self.tt_sampling_params,
+            "multi_modal_kwargs": self.multi_modal_kwargs,
         }
         
         return tensor_dict
@@ -148,6 +182,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         block_tables: List[List[int]] = []
         seq_groups: List[int] = []
         top_pk_sampling_params = {}
+        multi_modal_kwargs = {}
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -173,7 +208,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # positions
                 position = seq_data.get_len() - 1
                 input_positions.append(position)
-                
+
+            # multi-modal inputs
+            multi_modal_data = seq_group_metadata.multi_modal_data
+            if multi_modal_data:
+                image = multi_modal_data.image # this is of type PIL.Image.Image
+                maks = create_vision_mask(input_tokens, self.model.tokenizer.special_tokens["<|image|>"])
+                xattn_caches, cross_attention_masks, full_text_row_masked_out_mask = (
+                self.model.compute_vision_tokens_masks(
+                    batch_images=[[image]],
+                    batch_masks=[mask],
+                    total_len=total_len,
+                )
+                )
+                multi_modal_kwargs["image"] = image
+                multi_modal_kwargs["xattn_caches"] = xattn_caches
+                multi_modal_kwargs["cross_attention_masks"] = cross_attention_masks
+                multi_modal_kwargs["full_text_row_masked_out_mask"] = full_text_row_masked_out_mask
+
             block_table = seq_group_metadata.block_tables[seq_id]
             block_tables.append(block_table)
             
@@ -246,7 +298,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     torch.zeros(block_tables.shape[0], self.cache_config.num_gpu_blocks - block_tables.shape[1], dtype=torch.int32, device="cpu")
                 ], dim=1)
         
-        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params)
+        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs)
 
     @torch.no_grad()
     def execute_model(
@@ -266,6 +318,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             "page_table": model_input.block_tables,
             "kv_cache": kv_caches,
             "prompt_lens": model_input.prompt_lens,
+            "multi_modal_kwargs" : model_input.multi_modal_kwargs or {}
         }
         
         is_decode = model_input.prompt_lens is None
