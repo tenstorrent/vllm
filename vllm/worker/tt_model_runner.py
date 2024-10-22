@@ -11,8 +11,6 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
-from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalInputs,
-                             MultiModalRegistry)
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata, Logprob, SequenceOutput, CompletionSequenceGroupOutput
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
 from vllm.utils import make_tensor_with_pad
@@ -51,6 +49,25 @@ def create_vision_mask(
         last_mask_end = vision_mask[1]
     return vision_masks
 
+def encode_message(message, tokenizer):
+    tokens = []
+    tokens.append(tokenizer.special_tokens["<|begin_of_text|>"])
+    
+    tokens.append(tokenizer.special_tokens["<|start_header_id|>"])
+    tokens.extend(tokenizer.encode("user", bos=False, eos=False))
+    tokens.append(tokenizer.special_tokens["<|end_header_id|>"])
+    tokens.extend(tokenizer.encode("\n\n", bos=False, eos=False))
+    
+    tokens.extend(tokenizer.encode(message, bos=False, eos=False))
+    tokens.extend(tokenizer.encode("\n\n", bos=False, eos=False))
+    tokens.append(tokenizer.special_tokens["<|eom_id|>" if eom else "<|eot_id|>"])
+    
+    # Add the start of an assistant message for the model to complete.
+    tokens.append(tokenizer.special_tokens["<|start_header_id|>"])
+    tokens.extend(tokenizer.encode("assistant", bos=False, eos=False))
+    tokens.append(tokenizer.special_tokens["<|end_header_id|>"])
+    tokens.extend(tokenizer.encode("\n\n", bos=False, eos=False))
+    return tokens
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -213,9 +230,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             multi_modal_data = seq_group_metadata.multi_modal_data
             if multi_modal_data:
                 image = multi_modal_data.image # this is of type PIL.Image.Image
-                maks = create_vision_mask(input_tokens, self.model.tokenizer.special_tokens["<|image|>"])
+                mask = create_vision_mask(input_tokens, self.model.tokenizer.special_tokens["<|image|>"])
                 xattn_caches, cross_attention_masks, full_text_row_masked_out_mask = (
-                self.model.compute_vision_tokens_masks(
+                self.model.tt_model.compute_vision_tokens_masks(
                     batch_images=[[image]],
                     batch_masks=[mask],
                     total_len=total_len,
