@@ -1,0 +1,132 @@
+from typing import List
+import os
+import sys
+import json
+import argparse
+from tqdm import tqdm
+from PIL import Image
+
+from vllm import LLM, SamplingParams
+from vllm import ModelRegistry
+from vllm.multimodal import MultiModalDataBuiltins
+from vllm.inputs import TextPrompt
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from tt_metal.models.demos.t3000.llama.tt.multimodal.llama_generation import TTMllamaForConditionalGeneration
+
+
+def run_inference(
+    prompts_json,
+    images_dir,
+    default_max_tokens=128,
+    max_seqs_in_batch=32,
+    num_repeat_prompts=2,
+    measure_perf=False,
+    perf_prompt_len=None,
+    greedy_sampling=False,  # Option to use greedy decoding instead of top-k/p
+):
+    # Generation args
+    ignore_eos = True if measure_perf else False
+    
+    if greedy_sampling:
+        sampling_params = SamplingParams(max_tokens=default_max_tokens, ignore_eos=ignore_eos, temperature=0.0)
+    else:
+        sampling_params = SamplingParams(max_tokens=default_max_tokens, ignore_eos=ignore_eos, top_k=10, top_p=0.9, temperature=1.0)
+
+    # Create an LLM.
+    ModelRegistry.register_model("TTMllamaForConditionalGeneration", TTMllamaForConditionalGeneration)
+    llm = LLM(model="meta-llama/Meta-Llama-3.2-11B-Vision-Instruct", block_size=64, max_num_seqs=max_seqs_in_batch, max_model_len=131072, disable_log_stats=False, max_num_batched_tokens=131072)
+
+    if not measure_perf:
+        # Load prompts from a JSON file
+        prompts = []
+        with open(prompts_json, 'r') as file:
+            txt_prompts = json.load(file)
+            for i, txt in enumerate(txt_prompts):
+                prompts.append(TextPrompt(prompt = txt, multi_modal_data = MultiModalDataBuiltins(image=MultiModalData([Image.open(f'{images_dir}/{i}.jpg')]))))
+        if num_repeat_prompts is not None:
+            prompts = prompts * num_repeat_prompts
+        print("Number of prompts:", len(prompts))
+        
+        generate_tokens(llm, prompts, sampling_params, print_output=True)
+    else:
+        print("Note: Ignoring prompts for performance measurement")
+        run_inference_perf(llm, sampling_params, max_seqs_in_batch, input_prompt_len=perf_prompt_len)
+
+
+def run_inference_perf(
+    llm : LLM,
+    sampling_params,
+    max_seqs_in_batch,
+    prompts=None,
+    input_prompt_len=None  # Used to generate dummy prompts if prompts is None
+):
+    assert llm.llm_engine.log_stats, "disable_log_stats=False is required for llm to use stat loggers"
+    if prompts is not None:
+        print("Measuring performance with given prompts")
+        prompts = prompts[:max_seqs_in_batch]  # Only run a single batch for performance measurement
+    else:
+        assert input_prompt_len is not None, "input_prompt_len is required to generate dummy prompts"
+        print("Measuring performance with dummy prompts of length", input_prompt_len)
+        prompt_token_ids = [[0]*input_prompt_len]*max_seqs_in_batch  # dummy prompts
+    sampling_params = sampling_params[:max_seqs_in_batch] if isinstance(sampling_params, list) else sampling_params
+    
+    # Set an arbitrary max_tokens to simulate generating multiple tokens consecutively
+    sampling_params.max_tokens = 33  # 1 prefill output token + 32 decode output tokens
+    
+    assert_str = f"prompt length ({input_prompt_len}) + num generated tokens ({sampling_params.max_tokens}) will exceed max_model_len ({llm.llm_engine.model_config.max_model_len})"
+    assert input_prompt_len + sampling_params.max_tokens <= llm.llm_engine.model_config.max_model_len, assert_str
+
+    # Compile run
+    print("Starting compile run")
+    generate_tokens(llm, prompts, sampling_params, prompt_token_ids, print_output=False)
+    print("Finished compile run")
+    llm.llm_engine.stat_loggers['global'].reset()  # Reset stats before inference run
+
+    # Inference runs
+    print("Starting inference runs")
+    N_warmup = 1
+    N_inference = 5
+    for i in tqdm(range(N_inference), desc="Inference runs"):
+        if i == N_warmup:  # Reset stats after warmup
+            llm.llm_engine.stat_loggers['global'].reset()
+        generate_tokens(llm, prompts, sampling_params, prompt_token_ids, print_output=False)
+    print("Finished inference runs")
+
+    # Collect stats
+    ttft = llm.llm_engine.stat_loggers['global'].time_to_first_token.avg
+    tpot = llm.llm_engine.stat_loggers['global'].time_per_output_token.avg
+    print(f"Average time to first token (batch): {ttft} s")
+    print(f"Average decode throughput: {1/tpot} t/s/u")
+    
+
+def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, print_output=True):
+    # Generate texts from the prompts. The output is a list of RequestOutput objects
+    # that contain the prompt, generated text, and other information.
+    outputs = llm.generate(prompts, sampling_params, prompt_token_ids)
+    # Print the outputs.
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        if print_output:
+            print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+            
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prompts_json", type=str, default="tt_metal/prompts.json", help="Path to JSON file containing prompts")
+    parser.add_argument("--images_dir", type=str, default="tt_metal/images", help="Path to directory containing images")
+    parser.add_argument("--measure_perf", action="store_true", help="Measure performance")
+    parser.add_argument("--perf_prompt_len", type=int, default=128, help="Length of dummy prompts for performance measurement")
+    parser.add_argument("--greedy_sampling", action="store_true", help="Use greedy decoding instead of top-k/p")
+    parser.add_argument("--max_seqs_in_batch", type=int, default=32, help="Maximum batch size for inference")
+    args = parser.parse_args()
+
+    run_inference(
+        args.prompts_json,
+        args.images_dir,
+        measure_perf=args.measure_perf,
+        perf_prompt_len=args.perf_prompt_len,
+        greedy_sampling=args.greedy_sampling,
+        max_seqs_in_batch=args.max_seqs_in_batch
+    )
