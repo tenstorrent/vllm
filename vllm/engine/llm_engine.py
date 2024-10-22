@@ -1336,6 +1336,8 @@ class LLMEngine:
 
         # Clear outputs for each new scheduler iteration
         ctx.request_outputs.clear()
+        
+        scheduler_start = time.time()
 
         # Skip the scheduler if there are any remaining steps in the seq groups.
         # This ensures that the scheduler is only called again when the current
@@ -1360,9 +1362,14 @@ class LLMEngine:
                 self._cache_scheduler_outputs_for_multi_step(
                     virtual_engine, seq_group_metadata_list, scheduler_outputs,
                     allow_async_output_proc)
+                
+        schedule_end = time.time()
+        print("Scheduler time: ", schedule_end - scheduler_start)
 
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
+        
+        exec_start = time.time()
 
         if not scheduler_outputs.is_empty():
             finished_requests_ids = self.scheduler[
@@ -1386,6 +1393,8 @@ class LLMEngine:
                 # We use ExecuteModelRequest to pass the last sampled_token_ids
                 # to each of the non-last PP stages for in-place prepare_input.
                 last_sampled_token_ids=last_sampled_token_ids)
+            
+            print("Current step: ", execute_model_req.current_step)
 
             if allow_async_output_proc:
                 execute_model_req.async_callback = self.async_callbacks[
@@ -1410,6 +1419,11 @@ class LLMEngine:
         if self.scheduler_config.is_multi_step:
             for seq_group in seq_group_metadata_list:
                 seq_group.finish_step()
+        
+        exec_end = time.time()
+        print("Execution time: ", exec_end - exec_start)
+        
+        process_out_start = time.time()
 
         if not self._has_remaining_steps(seq_group_metadata_list):
             # clear the cache if we have finished all the steps.
@@ -1450,6 +1464,9 @@ class LLMEngine:
         else:
             # Multi-step case
             return ctx.request_outputs
+        
+        process_out_end = time.time()
+        print("Process output time: ", process_out_end - process_out_start)
 
         if not self.has_unfinished_requests():
             # Drain async postprocessor (if exists)
