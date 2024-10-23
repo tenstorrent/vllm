@@ -376,7 +376,7 @@ class ModelConfig:
 
         # Reminder: Please update docs/source/serving/compatibility_matrix.rst
         # If the feature combo become valid
-        if device_config.device_type not in ("cuda", "tpu", "xpu"):
+        if device_config.device_type not in ("cuda", "tpu", "xpu", "tt"):
             logger.warning(
                 "Async output processing is only supported for CUDA, TPU, XPU. "
                 "Disabling it for other platforms.")
