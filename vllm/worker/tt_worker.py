@@ -81,6 +81,7 @@ class TTCacheEngine:
         kv_cache_shape = (num_blocks, self.num_kv_heads, self.block_size, self.head_size)
         kv_cache: List[torch.Tensor] = []
         num_layers = self.num_attention_layers
+        # num_layers = 1
         if device == "cpu":
             for _ in range(num_layers):
                 # null block in CpuGpuBlockAllocator requires at least that

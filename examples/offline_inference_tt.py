@@ -13,6 +13,7 @@ from vllm.entrypoints.openai.api_server import build_async_engine_client_from_en
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils import merge_async_iterators
 from vllm.inputs.data import TokensPrompt
+from vllm.engine.multiprocessing.client import MQLLMEngineClient
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from tt_metal.models.demos.t3000.llama2_70b.tt.llama_generation import TtLlamaModelForGeneration
@@ -53,7 +54,7 @@ def run_inference(
                 await generate_tokens_async(llm, prompts, sampling_params, print_output=True)
         else:
             print("Note: Ignoring prompts for performance measurement")
-            run_inference_perf(llm, sampling_params, max_seqs_in_batch, max_tokens, input_prompt_len=perf_prompt_len, async_engine=async_engine)
+            await run_inference_perf(llm, sampling_params, max_seqs_in_batch, max_tokens, input_prompt_len=perf_prompt_len, async_engine=async_engine)
 
     # Create an LLM.
     engine_kw_args = {
@@ -63,6 +64,7 @@ def run_inference(
         "max_model_len": 131072,
         "disable_log_stats": False,
         "max_num_batched_tokens": 131072,
+        "log_global_stats": True if measure_perf else False,
         "num_scheduler_steps": 10,
     }
     if not async_engine:
@@ -77,7 +79,7 @@ def run_inference(
         uvloop.run(_run_inference_async())
 
 
-def run_inference_perf(
+async def run_inference_perf(
     llm : LLM,
     sampling_params,
     max_seqs_in_batch,
@@ -122,7 +124,7 @@ def run_inference_perf(
         if not async_engine:
             generate_tokens(llm, prompts, sampling_params, prompt_token_ids, print_output=False)
         else:
-            generate_tokens_async(llm, prompts, sampling_params, prompt_token_ids, print_output=False)
+            await generate_tokens_async(llm, prompts, sampling_params, prompt_token_ids, print_output=False)
     print("Finished inference runs")
 
     # Collect stats
@@ -145,7 +147,7 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
             print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-async def generate_tokens_async(llm, prompts, sampling_params, prompt_token_ids=None, print_output=True):
+async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_params, prompt_token_ids=None, print_output=True):
     # async def _generate_tokens_async(llm, prompts, sampling_params, prompt_token_ids, print_output):
     # Use tokenized prompts if provided
     if prompt_token_ids is not None:
@@ -162,7 +164,6 @@ async def generate_tokens_async(llm, prompts, sampling_params, prompt_token_ids=
         generators.append(generator)
     all_gens = merge_async_iterators(*generators)
     async for i, res in all_gens:
-        print(res)
         prompt = res.prompt
         generated_text = res.outputs[0].text
         if print_output:
