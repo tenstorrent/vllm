@@ -349,9 +349,13 @@ class GlobalStatLogger(StatLoggerBase):
             self.time_per_output_token.update(avg_list(stats.time_per_output_tokens_iter))
     
     def log_out(self):
-        decode_throughput = 1 / self.time_per_output_token.avg if self.time_per_output_token.avg != 0 else 0
-        logger.info(f"Average time to first token (batch): {self.time_to_first_token.avg} s")
-        logger.info(f"Average decode throughput: {decode_throughput} t/s/u")
+        ttft = self.time_to_first_token
+        tpot = self.time_per_output_token
+        if not ttft.count == 0:
+            logger.info(f"Average time to first token (batch): {ttft.avg} s")
+        if not tpot.count == 0:
+            decode_throughput = 1 / tpot.avg if tpot.avg != 0 else 0
+            logger.info(f"Average decode throughput: {decode_throughput} t/s/u")
             
     def reset(self) -> None:
         self.time_to_first_token = AvgTracker()

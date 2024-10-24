@@ -5,7 +5,7 @@ import json
 import argparse
 from tqdm import tqdm
 import uvloop
-import asyncio
+import time
 
 from vllm import LLM, SamplingParams
 from vllm import ModelRegistry
@@ -96,20 +96,30 @@ def run_inference_perf(
     llm : LLM,
     prompt_token_ids,
     sampling_params,
+    N_warmup=1,
     N_inference=2,
 ):
     for i in tqdm(range(N_inference), desc="Inference runs"):
+        if i == N_warmup:
+            start_time = time.perf_counter()
         generate_tokens(llm, None, sampling_params, prompt_token_ids, print_output=False)
+    avg_time = (time.perf_counter()-start_time) / (N_inference-N_warmup)
+    print(f"Average time taken per inference run: {avg_time:.2f} s")
 
 
 async def run_inference_perf_async(
     llm : LLM,
     prompt_token_ids,
     sampling_params,
+    N_warmup=1,
     N_inference=2,
 ):
     for i in tqdm(range(N_inference), desc="Inference runs"):
+        if i == N_warmup:
+            start_time = time.perf_counter()
         await generate_tokens_async(llm, None, sampling_params, prompt_token_ids, print_output=False)
+    avg_time = (time.perf_counter()-start_time) / (N_inference-N_warmup)
+    print(f"Average time taken per inference run: {avg_time:.2f} s")
 
 
 def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, print_output=True):
