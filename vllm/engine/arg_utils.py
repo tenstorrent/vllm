@@ -13,6 +13,7 @@ from vllm.config import (CacheConfig, ConfigFormat, DecodingConfig,
                          LoRAConfig, ModelConfig, ObservabilityConfig,
                          ParallelConfig, PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig, TokenizerPoolConfig)
+from vllm.engine.metrics_types import StatLoggerBase
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -115,6 +116,7 @@ class EngineArgs:
     max_num_seqs: int = 256
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
     disable_log_stats: bool = False
+    log_global_stats: bool = False
     revision: Optional[str] = None
     code_revision: Optional[str] = None
     rope_scaling: Optional[dict] = None
