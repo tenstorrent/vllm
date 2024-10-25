@@ -266,6 +266,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         num_steps: int = 1,
     ) -> Optional[List[SamplerOutput]]:
         is_decode = model_input.prompt_lens is None
+        use_async_out_proc = model_input.async_callback is not None
         if not is_decode:
             assert num_steps == 1, "Num steps must be 1 for prefill"
 
@@ -273,24 +274,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.cached_step_outputs = []
             for i in range(num_steps):
                 next_token_ids = self._execute_model_single_step(model_input, kv_caches, is_decode)
-                
-                sampler_output = self._make_sampler_output(
-                    next_token_ids,
-                    model_input.seq_groups
-                )
-                if i < num_steps - 1 and model_input.async_callback is not None:
-                    ctx = model_input.async_callback.keywords[  # type: ignore
-                        "ctx"]
-                    ctx.append_output(
-                        outputs=[sampler_output],
-                        seq_group_metadata_list=ctx.seq_group_metadata_list,
-                        scheduler_outputs=ctx.scheduler_outputs,
-                        is_async=False,
-                        is_last_step=False,
-                        is_first_step_output=i == 0)
-                    model_input.async_callback()  # trigger output processor
-                else:
-                    self.cached_step_outputs.append(sampler_output)
+                self.cached_step_outputs.append(next_token_ids)
                 
                 if i < num_steps - 1:
                     # Prepare the inputs for the next step
@@ -315,15 +299,34 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         input_tokens=new_input_tokens,
                         input_positions=new_input_positions
                     )
-        
-        if model_input.is_last_step:  # always true if not using multi-step
-            if model_input.async_callback is not None:
+                    
+            if use_async_out_proc:
                 model_input.async_callback()  # trigger output processor
-                return [self.cached_step_outputs[-1]]  # only return the last output
-            else:
-                return self.cached_step_outputs
+
+        sampler_outputs = []  # no outputs unless last step
+        if model_input.is_last_step:  # always true if not using multi-step
+            num_outputs = len(self.cached_step_outputs)
+            for i in range(num_outputs):
+                next_token_ids = self.cached_step_outputs.pop(0)
+                sampler_output = self._make_sampler_output(
+                    next_token_ids,
+                    model_input.seq_groups
+                )
+                sampler_outputs.append(sampler_output)
+                if i < num_outputs - 1 and use_async_out_proc:
+                    ctx = model_input.async_callback.keywords["ctx"]
+                    ctx.append_output(
+                        outputs=[sampler_output],
+                        seq_group_metadata_list=ctx.seq_group_metadata_list,
+                        scheduler_outputs=ctx.scheduler_outputs,
+                        is_async=False,
+                        is_last_step=False,
+                        is_first_step_output=i == 0)
+                    model_input.async_callback()
+            if use_async_out_proc:
+                return [sampler_outputs[-1]]  # only return the last output for async output processor
         
-        return []  # no outputs if not last step
+        return sampler_outputs
     
     def _make_sampler_output(
         self,
