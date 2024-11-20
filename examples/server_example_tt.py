@@ -10,6 +10,7 @@ ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
 
 
 def main():
+    os.environ["MESH_DEVICE"] = "T3K_RING"
     sys.argv.extend([
         "--model", "meta-llama/Meta-Llama-3.1-70B",
         "--block_size", "64",

@@ -1,5 +1,4 @@
 import dataclasses
-import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
@@ -42,6 +41,7 @@ class TTModelInput(ModelRunnerInputBase):
     block_tables: Optional[torch.Tensor] = None
     unpadded_batch_size: Optional[int] = None
     tt_sampling_params: Optional[TTSamplingParams] = None
+    multi_modal_kwargs: Optional[List[Dict[str, Any]]] = None
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
@@ -56,6 +56,7 @@ class TTModelInput(ModelRunnerInputBase):
             "block_tables": self.block_tables,
             "unpadded_batch_size": self.unpadded_batch_size,
             "tt_sampling_params": self.tt_sampling_params,
+            "multi_modal_kwargs": self.multi_modal_kwargs,
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
         }
@@ -115,6 +116,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.execute_trace_kwargs = None  # kw args for trace execution (populated during first decode execution)
 
         self.cached_step_outputs: List[torch.Tensor] = []  # Only used for multi-step execution
+        
+        self.cached_multi_modal_data: Optional[Dict[int, Dict[str, Any]]] = None  # seq_id -> multi_modal_data
 
     def load_model(self) -> None:
         # Note: using custom TT loader instead of selecting from default vllm loaders
@@ -175,6 +178,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         block_tables: List[List[int]] = []
         seq_groups: List[int] = []
         top_pk_sampling_params = {}
+        multi_modal_kwargs: Dict[str, Any] = {}
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -182,7 +186,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             seq_id = seq_ids[0]
             seq_groups.append(seq_id)
 
-            seq_data = seq_group_metadata.seq_data[seq_id]
+            multi_modal_data = seq_group_metadata.multi_modal_data
+            
+            # Use encoder_seq_data for encoder-decoder (e.g. multi-modal) prompts
+            if is_prompt and multi_modal_data:
+                seq_data = seq_group_metadata.encoder_seq_data
+            else:
+                seq_data = seq_group_metadata.seq_data[seq_id]
             
             if is_prompt:
                 # tokens
@@ -190,8 +200,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 input_tokens.append(prompt_tokens)
                 
                 # prompt lengths
-                prompt_len = len(prompt_tokens)
-                prompt_lens.append(prompt_len)
+                prompt_lens.append(len(prompt_tokens))
             else:
                 # tokens
                 generation_token = seq_data.get_last_token_id()
@@ -199,10 +208,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 
                 # positions
                 position = seq_data.get_len() - 1
+                if seq_group_metadata.encoder_seq_data:  # Add prompt length for encoder-decoder (e.g. multi-modal) prompts
+                    position += seq_group_metadata.encoder_seq_data.get_len() - 1  # TODO: check why TT model needs -1
                 input_positions.append(position)
                 
             block_table = seq_group_metadata.block_tables[seq_id]
             block_tables.append(block_table)
+            
+            if multi_modal_data:
+                image = multi_modal_data["image"]  # this is of type PIL.Image.Image
+                if "images" not in multi_modal_kwargs:
+                    multi_modal_kwargs["images"] = [image]
+                else:
+                    multi_modal_kwargs["images"].append(image)
             
             # Sampling params
             # TODO: Add support for different sampling params in the same batch
@@ -224,6 +242,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             top_k=top_pk_sampling_params["top_k"],
             top_p=top_pk_sampling_params["top_p"]
         )
+        
+        # Remove cached multi-modal data for any seq ids that are not in the current batch (assume they were either finished or preempted)
+        if not is_prompt and self.cached_multi_modal_data:
+            for seq_id in self.cached_multi_modal_data:
+                if seq_id not in seq_groups:
+                    del self.cached_multi_modal_data[seq_id]
         
         # Convert lists to tensors and add padding
         
@@ -275,7 +299,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     torch.zeros(block_tables.shape[0], self.cache_config.num_gpu_blocks - block_tables.shape[1], dtype=torch.int32, device="cpu")
                 ], dim=1)
         
-        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params)
+        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs)
 
     @torch.no_grad()
     def execute_model(
@@ -385,6 +409,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             "page_table": model_input.block_tables,
             "kv_cache": kv_caches,
             "prompt_lens": model_input.prompt_lens,
+            **(model_input.multi_modal_kwargs or {}),
         }
         
         if self.trace_mode and is_decode:  # Trace mode for decode
@@ -424,7 +449,32 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self._send_async_out(sampler_output, model_input.async_callback, is_first_step_output=(step_idx == 1))
             logits = self.model.read_forward_trace(tt_logits, model_input.unpadded_batch_size)
         else:
-            logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
+            if model_input.multi_modal_kwargs or self.cached_multi_modal_data:
+                # TODO: remove different forward calls once TT models can manage intermediate outputs internally
+                if not is_decode:
+                    logits, xattn_caches, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
+                    
+                    # Save multi-modal data for use in subsequent decode steps
+                    if self.cached_multi_modal_data is None:
+                        self.cached_multi_modal_data = {}
+                    for i, seq_id in enumerate(model_input.seq_groups):
+                        multi_modal_data = {"xattn_caches": xattn_caches[i], 
+                                            "cross_attention_masks": cross_attention_masks[i], 
+                                            "full_text_row_masked_out_mask": full_text_row_masked_out_mask[i]}
+                        self.cached_multi_modal_data[seq_id] = multi_modal_data
+                else:
+                    # Use multi-modal data from prefill step
+                    xattn_caches = [self.cached_multi_modal_data[seq_id]["xattn_caches"] for seq_id in model_input.seq_groups]
+                    cross_attention_masks = [self.cached_multi_modal_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
+                    full_text_row_masked_out_mask = [self.cached_multi_modal_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
+                    
+                    multi_modal_kwargs = {"xattn_caches": xattn_caches,
+                                          "cross_attention_masks": cross_attention_masks,
+                                          "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
+                    
+                    logits = self.model.decode_forward(**execute_model_kwargs, **multi_modal_kwargs)
+            else:
+                logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this

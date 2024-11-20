@@ -30,15 +30,17 @@ Git-checkout the following branches in each repo separately:
     source $vllm_dir/tt_metal/setup-metal.sh && source $PYTHON_ENV_DIR/bin/activate
     ```
 
-## Accessing the Meta-Llama-3.1 Hugging Face Model
+## Accessing the Meta-Llama Hugging Face Models
 
-To run Meta-Llama-3.1, it is required to have access to the model on Hugging Face. To gain access:
-1. Request access on [https://huggingface.co/meta-llama/Meta-Llama-3.1-70B](https://huggingface.co/meta-llama/Meta-Llama-3.1-70B).
+To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging Face. To gain access:
+1. Request access on Hugging Face:
+    - Llama-3.1: [https://huggingface.co/meta-llama/Meta-Llama-3.1-70B](https://huggingface.co/meta-llama/Meta-Llama-3.1-70B)
+    - Llama-3.2: [https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
 2. Once you have received access, create and copy your access token from the settings tab on Hugging Face.
 3. Run this code in python and paste your access token:
     ```python
-    from huggingface_hub import notebook_login
-    notebook_login()
+    from huggingface_hub import login
+    login()
     ```
 
 ## Preparing the tt-metal models

@@ -1,11 +1,12 @@
-from typing import List
 import os
-import sys
 import json
 import argparse
 from tqdm import tqdm
 import uvloop
 import time
+from pathlib import Path
+from pkg_resources import resource_filename
+from PIL import Image as PIL_Image
 
 from vllm import LLM, SamplingParams
 from vllm import ModelRegistry
@@ -15,9 +16,30 @@ from vllm.utils import merge_async_iterators
 from vllm.inputs.data import TokensPrompt
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 
-# Import and register model from tt-metal
+# Import and register models from tt-metal
 from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
+from models.demos.llama3.tt.generator import LlamaGenerator
 ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
+ModelRegistry.register_model("TTMllamaForConditionalGeneration", LlamaGenerator)
+
+
+def get_sample_multi_modal_llama_inputs():
+    IMG_PATH = Path(resource_filename("llama_models", "scripts/resources/"))
+    relative_img_paths = ["dog.jpg", "pasta.jpeg", "ocr_image.jpeg", "clutter.jpeg"]
+    questions = [
+        "Write a haiku for this image.",
+        "What is for dinner?",
+        "What is the full text of this image? Do OCR",
+        "What objects are in this image?"
+    ]
+    inputs = []
+    for relative_img_path, question in zip(relative_img_paths, questions):
+        with open(IMG_PATH / relative_img_path, "rb") as f:
+            img = PIL_Image.open(f).convert("RGB")
+        prompt = f"<|image|>{question}"
+        inputs.append({"prompt": prompt, "multi_modal_data": {"image": img}})
+    inputs = inputs[0:1]  # TODO: Remove once model supports batch > 1
+    return inputs
 
 
 def run_inference(
@@ -29,18 +51,32 @@ def run_inference(
     perf_prompt_len=None,
     greedy_sampling=False,  # Option to use greedy decoding instead of top-k/p
     async_engine=False,
+    num_scheduler_steps=10,
+    disable_async_output_proc=False,
+    multi_modal=False,
 ):
+    if multi_modal:
+        model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        os.environ["MESH_DEVICE"] = "N300"
+        assert not measure_perf, "measure_perf is not yet supported for multi-modal inference"
+        assert not async_engine, "async_engine is not yet supported for multi-modal inference"
+        assert disable_async_output_proc, "async output processing is not yet supported for multi-modal inference"
+        assert num_scheduler_steps == 1, "multi-step scheduling is not yet supported for multi-modal inference"
+    else:
+        model = "meta-llama/Meta-Llama-3.1-70B"
+        os.environ["MESH_DEVICE"] = "T3K_RING"
+    
     # LLM args
     engine_kw_args = {
-        "model": "meta-llama/Meta-Llama-3.1-70B",
+        "model": model,
         "block_size": 64,
         "max_num_seqs": max_seqs_in_batch,
         "max_model_len": 131072,
         "disable_log_stats": False,
         "max_num_batched_tokens": 131072,
         "log_global_stats": True if measure_perf else False,
-        "num_scheduler_steps": 10,
-        "disable_async_output_proc": False,
+        "num_scheduler_steps": num_scheduler_steps,
+        "disable_async_output_proc": disable_async_output_proc,
     }
     
     # Generation args
@@ -53,12 +89,16 @@ def run_inference(
 
     # Prepare inputs
     if not measure_perf:
-        # Load prompts from a JSON file
-        with open(prompts_json, 'r') as file:
-            prompts = json.load(file)
-        assert isinstance(prompts, list), "Prompts must be a list of strings"
-        if num_repeat_prompts is not None:
-            prompts = prompts * num_repeat_prompts
+        if not multi_modal:
+            # Load prompts from a JSON file
+            with open(prompts_json, 'r') as file:
+                prompts = json.load(file)
+            assert isinstance(prompts, list), "Prompts must be a list of strings"
+            if num_repeat_prompts is not None:
+                prompts = prompts * num_repeat_prompts
+        else:
+            print("Ignoring prompts json for multi-modal inference")
+            prompts = get_sample_multi_modal_llama_inputs() 
         print("Number of prompts:", len(prompts))
     else:
         assert perf_prompt_len is not None, "perf_prompt_len is required to generate dummy prompts"
@@ -129,7 +169,7 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
     outputs = llm.generate(prompts, sampling_params, prompt_token_ids)
     # Print the outputs.
     for output in outputs:
-        prompt = output.prompt
+        prompt = output.prompt or output.encoder_prompt
         generated_text = output.outputs[0].text
         if print_output:
             print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
@@ -167,6 +207,9 @@ if __name__ == "__main__":
     parser.add_argument("--greedy_sampling", action="store_true", help="Use greedy decoding instead of top-k/p")
     parser.add_argument("--max_seqs_in_batch", type=int, default=32, help="Maximum batch size for inference")
     parser.add_argument("--async_engine", action="store_true", help="Use async engine")
+    parser.add_argument("--disable_async_output_proc", action="store_true", help="Disable async output processing")
+    parser.add_argument("--num_scheduler_steps", type=int, default=10, help="Number of scheduler steps")
+    parser.add_argument("--multi_modal", action="store_true", help="Run multi-modal inference")
     args = parser.parse_args()
 
     run_inference(
@@ -177,4 +220,7 @@ if __name__ == "__main__":
         greedy_sampling=args.greedy_sampling,
         max_seqs_in_batch=args.max_seqs_in_batch,
         async_engine=args.async_engine,
+        num_scheduler_steps=args.num_scheduler_steps,
+        disable_async_output_proc=args.disable_async_output_proc,
+        multi_modal=args.multi_modal,
     )
