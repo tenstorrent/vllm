@@ -38,7 +38,6 @@ def get_sample_multi_modal_llama_inputs():
             img = PIL_Image.open(f).convert("RGB")
         prompt = f"<|image|>{question}"
         inputs.append({"prompt": prompt, "multi_modal_data": {"image": img}})
-    inputs = inputs[0:1]  # TODO: Remove once model supports batch > 1
     return inputs
 
 

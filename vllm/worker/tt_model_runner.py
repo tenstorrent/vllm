@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from transformers import TopPLogitsWarper
 
+import ttnn
+
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
                          ModelConfig, ParallelConfig,
                          SchedulerConfig)
@@ -452,7 +454,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if model_input.multi_modal_kwargs or self.cached_multi_modal_data:
                 # TODO: remove different forward calls once TT models can manage intermediate outputs internally
                 if not is_decode:
-                    logits, xattn_caches, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
+                    
+                    # TODO: remove once using cross block tables
+                    xattn_caches = self.model.model.setup_cache(max_batch_size=model_input.unpadded_batch_size)  # allocate xattn_caches for each user
+                    execute_model_kwargs["xattn_caches"] = xattn_caches
+                    
+                    logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward_vllm(**execute_model_kwargs)
+                    
+                    dim0, dim1 = len(xattn_caches), len(xattn_caches[0])
+                    xattn_caches = [[[xattn_caches[d0][d1][i:i+1] for d1 in range(dim1)] for d0 in range(dim0)] for i in range(model_input.unpadded_batch_size)]  # Move batch to outer dim
                     
                     # Save multi-modal data for use in subsequent decode steps
                     if self.cached_multi_modal_data is None:
@@ -465,6 +475,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 else:
                     # Use multi-modal data from prefill step
                     xattn_caches = [self.cached_multi_modal_data[seq_id]["xattn_caches"] for seq_id in model_input.seq_groups]
+                    dim0, dim1, dim2 = len(xattn_caches), len(xattn_caches[0]), len(xattn_caches[0][0])
+                    xattn_caches = [[ttnn.concat([xattn_caches[d0][d1][d2] for d0 in range(dim0)], dim=0) for d2 in range(dim2)] for d1 in range(dim1)]  # Move dim 0 to dim 2 and concat
+                    
                     cross_attention_masks = [self.cached_multi_modal_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
                     full_text_row_masked_out_mask = [self.cached_multi_modal_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
                     
