@@ -189,12 +189,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             seq_groups.append(seq_id)
 
             multi_modal_data = seq_group_metadata.multi_modal_data
-            
-            # Use encoder_seq_data for encoder-decoder (e.g. multi-modal) prompts
-            if is_prompt and multi_modal_data:
-                seq_data = seq_group_metadata.encoder_seq_data
-            else:
-                seq_data = seq_group_metadata.seq_data[seq_id]
+            seq_data = seq_group_metadata.seq_data[seq_id]
             
             if is_prompt:
                 # tokens
@@ -210,8 +205,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 
                 # positions
                 position = seq_data.get_len() - 1
-                if seq_group_metadata.encoder_seq_data:  # Add prompt length for encoder-decoder (e.g. multi-modal) prompts
-                    position += seq_group_metadata.encoder_seq_data.get_len() - 1  # TODO: check why TT model needs -1
                 input_positions.append(position)
                 
             block_table = seq_group_metadata.block_tables[seq_id]
@@ -459,7 +452,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     xattn_caches = self.model.model.setup_cache(max_batch_size=model_input.unpadded_batch_size)  # allocate xattn_caches for each user
                     execute_model_kwargs["xattn_caches"] = xattn_caches
                     
-                    logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward_vllm(**execute_model_kwargs)
+                    logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
                     
                     dim0, dim1 = len(xattn_caches), len(xattn_caches[0])
                     xattn_caches = [[[xattn_caches[d0][d1][i:i+1] for d1 in range(dim1)] for d0 in range(dim0)] for i in range(model_input.unpadded_batch_size)]  # Move batch to outer dim

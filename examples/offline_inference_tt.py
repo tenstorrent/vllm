@@ -18,9 +18,9 @@ from vllm.engine.multiprocessing.client import MQLLMEngineClient
 
 # Import and register models from tt-metal
 from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
-from models.demos.llama3.tt.generator import LlamaGenerator
+from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
 ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
-ModelRegistry.register_model("TTMllamaForConditionalGeneration", LlamaGenerator)
+ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
 
 
 def get_sample_multi_modal_llama_inputs():
