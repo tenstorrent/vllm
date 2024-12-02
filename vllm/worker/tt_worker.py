@@ -399,8 +399,8 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             dispatch_core_type = ttnn.device.DispatchCoreType.ETH
         return dispatch_core_type
 
-    def get_dispatch_core_config(self, device_params):
-        dispatch_core_type = self.get_dispatch_core_type()
+    def _get_dispatch_core_config(self, device_params):
+        dispatch_core_type = self._get_dispatch_core_type()
         dispatch_core_axis = device_params.pop(
             "dispatch_core_axis",
             ttnn.DispatchCoreAxis.COL if os.environ["ARCH_NAME"] == "blackhole" else ttnn.DispatchCoreAxis.ROW,
