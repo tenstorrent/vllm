@@ -48,7 +48,6 @@ class TTCacheEngine:
         # Models like Jamba, have mixed typed layers, E.g Mamba
         self.num_attention_layers = model_config.get_num_attention_layers(
             parallel_config)
-        # TODO: exclude cross attention layers from num_attention_layers if not using paged attention
 
         self.num_kv_heads = TTCacheEngine.get_num_kv_heads(
             model_config, parallel_config, device_config

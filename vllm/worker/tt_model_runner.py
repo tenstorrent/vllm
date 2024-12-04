@@ -14,8 +14,10 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata, Logprob, SequenceOutput, CompletionSequenceGroupOutput, SequenceGroup
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
+from vllm.transformers_utils.config import uses_mrope
 from vllm.utils import make_tensor_with_pad
 
 logger = init_logger(__name__)
@@ -44,6 +46,7 @@ class TTModelInput(ModelRunnerInputBase):
     unpadded_batch_size: Optional[int] = None
     tt_sampling_params: Optional[TTSamplingParams] = None
     multi_modal_kwargs: Optional[List[Dict[str, Any]]] = None
+    cross_block_tables: Optional[torch.Tensor] = None
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
@@ -59,6 +62,7 @@ class TTModelInput(ModelRunnerInputBase):
             "unpadded_batch_size": self.unpadded_batch_size,
             "tt_sampling_params": self.tt_sampling_params,
             "multi_modal_kwargs": self.multi_modal_kwargs,
+            "cross_block_tables": self.cross_block_tables,
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
         }
@@ -121,6 +125,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         
         self.cached_multi_modal_data: Optional[Dict[int, Dict[str, Any]]] = None  # seq_id -> multi_modal_data
 
+        # Multi-modal data support - add once TT models no longer require raw PIL images
+        # self.mm_registry = MULTIMODAL_REGISTRY
+        # self.multi_modal_input_mapper = self.mm_registry \
+        #     .create_input_mapper(self.model_config)
+        # self.mm_registry.init_mm_limits_per_prompt(self.model_config)
+
+        if self.model_is_mrope:
+            assert "TTModelRunner does not currently support models with mrope rope_scaling"
+        
+    @property
+    def model_is_mrope(self) -> bool:
+        """Detect if the model has "mrope" rope_scaling type.
+        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        return uses_mrope(self.model_config.hf_config)
+
     def load_model(self) -> None:
         # Note: using custom TT loader instead of selecting from default vllm loaders
         loader = TTModelLoader(self.load_config)
@@ -181,6 +200,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         seq_groups: List[int] = []
         top_pk_sampling_params = {}
         multi_modal_kwargs: Dict[str, Any] = {}
+        cross_block_tables: List[List[int]] = []
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -210,12 +230,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             block_table = seq_group_metadata.block_tables[seq_id]
             block_tables.append(block_table)
             
-            if multi_modal_data:
+            # Multi-modal data
+            # TODO: Replace with multi_modal_input_mapper (used by CPU/GPU model runners) once TT models no longer require raw PIL images
+            if (multi_modal_data := seq_group_metadata.multi_modal_data):
+                assert "image" in multi_modal_data, "Currently only supporting image multi-modal inputs"
                 image = multi_modal_data["image"]  # this is of type PIL.Image.Image
                 if "images" not in multi_modal_kwargs:
                     multi_modal_kwargs["images"] = [image]
                 else:
                     multi_modal_kwargs["images"].append(image)
+            
+            # Encoder-decoder data (currently only supporting cross attention metadata and not additional encoder data)
+            if self.model_config.is_encoder_decoder_model:
+                cross_block_table = seq_group_metadata.cross_block_table
+                cross_block_tables.append(cross_block_table)
             
             # Sampling params
             # TODO: Add support for different sampling params in the same batch
@@ -252,6 +280,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             device="cpu",
             pad=0
         )
+        if self.model_config.is_encoder_decoder_model:
+            cross_block_tables = make_tensor_with_pad(
+                cross_block_tables,
+                dtype=torch.int32,
+                device="cpu",
+                pad=0
+            )
+        else:
+            cross_block_tables = None
         if is_prompt:
             input_tokens = make_tensor_with_pad(
                 input_tokens, 
@@ -294,7 +331,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     torch.zeros(block_tables.shape[0], self.cache_config.num_gpu_blocks - block_tables.shape[1], dtype=torch.int32, device="cpu")
                 ], dim=1)
         
-        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs)
+        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs, cross_block_tables)
 
     @torch.no_grad()
     def execute_model(
@@ -406,6 +443,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             "prompt_lens": model_input.prompt_lens,
             **(model_input.multi_modal_kwargs or {}),
         }
+        if model_input.cross_block_tables is not None:
+            execute_model_kwargs["cross_page_table"] = model_input.cross_block_tables
         
         if self.trace_mode and is_decode:  # Trace mode for decode
             # Remove prompt_lens from execute_model_kwargs since it's not used for decode
@@ -447,35 +486,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if model_input.multi_modal_kwargs or self.cached_multi_modal_data:
                 # TODO: remove different forward calls once TT models can manage intermediate outputs internally
                 if not is_decode:
-                    
-                    # TODO: remove once using cross block tables
-                    xattn_caches = self.model.model.setup_cache(max_batch_size=model_input.unpadded_batch_size)  # allocate xattn_caches for each user
-                    execute_model_kwargs["xattn_caches"] = xattn_caches
-                    
                     logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
-                    
-                    dim0, dim1 = len(xattn_caches), len(xattn_caches[0])
-                    xattn_caches = [[[xattn_caches[d0][d1][i:i+1] for d1 in range(dim1)] for d0 in range(dim0)] for i in range(model_input.unpadded_batch_size)]  # Move batch to outer dim
                     
                     # Save multi-modal data for use in subsequent decode steps
                     if self.cached_multi_modal_data is None:
                         self.cached_multi_modal_data = {}
                     for i, seq_id in enumerate(model_input.seq_groups):
-                        multi_modal_data = {"xattn_caches": xattn_caches[i], 
-                                            "cross_attention_masks": cross_attention_masks[i], 
+                        multi_modal_data = {"cross_attention_masks": cross_attention_masks[i], 
                                             "full_text_row_masked_out_mask": full_text_row_masked_out_mask[i]}
                         self.cached_multi_modal_data[seq_id] = multi_modal_data
                 else:
                     # Use multi-modal data from prefill step
-                    xattn_caches = [self.cached_multi_modal_data[seq_id]["xattn_caches"] for seq_id in model_input.seq_groups]
-                    dim0, dim1, dim2 = len(xattn_caches), len(xattn_caches[0]), len(xattn_caches[0][0])
-                    xattn_caches = [[ttnn.concat([xattn_caches[d0][d1][d2] for d0 in range(dim0)], dim=0) for d2 in range(dim2)] for d1 in range(dim1)]  # Move dim 0 to dim 2 and concat
-                    
                     cross_attention_masks = [self.cached_multi_modal_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
                     full_text_row_masked_out_mask = [self.cached_multi_modal_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
                     
-                    multi_modal_kwargs = {"xattn_caches": xattn_caches,
-                                          "cross_attention_masks": cross_attention_masks,
+                    multi_modal_kwargs = {"cross_attention_masks": cross_attention_masks,
                                           "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
                     
                     logits = self.model.decode_forward(**execute_model_kwargs, **multi_modal_kwargs)
