@@ -434,6 +434,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
     
+    def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
+        if step_idx > 0:
+            next_token_ids = self.cached_step_outputs.pop(0)
+            sampler_output = self._make_sampler_output(
+                next_token_ids,
+                model_input.seq_groups
+            )
+            self._send_async_out(sampler_output, model_input.async_callback, is_first_step_output=(step_idx == 1))
+    
     def _execute_model_single_step(self, model_input: TTModelInput, kv_caches: List[torch.Tensor], is_decode, async_out_proc_per_trace=False, step_idx=0):
         execute_model_kwargs = {
             "tokens": model_input.input_tokens,
@@ -475,13 +484,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 )
                 if async_out_proc_per_trace:
                     # trigger output processor on host while device is executing next step
-                    if step_idx > 0:
-                        next_token_ids = self.cached_step_outputs.pop(0)
-                        sampler_output = self._make_sampler_output(
-                            next_token_ids,
-                            model_input.seq_groups
-                        )
-                        self._send_async_out(sampler_output, model_input.async_callback, is_first_step_output=(step_idx == 1))
+                    self._send_prev_step_async_out(model_input, step_idx)
                 logits = self.model.read_forward_trace(tt_logits, model_input.unpadded_batch_size)
             else:  # prefill or non-traced decode
                 logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
@@ -511,9 +514,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {"cross_attention_masks": cross_attention_masks,
                                         "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
                 
-                logits = self.model.decode_forward(
-                    **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode
+                tt_logits = self.model.decode_forward(
+                    **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=False
                 )
+                if async_out_proc_per_trace:
+                    # trigger output processor on host while device is executing next step
+                    self._send_prev_step_async_out(model_input, step_idx)
+                logits = self.model.read_decode_output(tt_logits, model_input.unpadded_batch_size)
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this

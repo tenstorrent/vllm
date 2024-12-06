@@ -59,8 +59,6 @@ def run_inference(
         os.environ["MESH_DEVICE"] = "N300"
         assert not measure_perf, "measure_perf is not yet supported for multi-modal inference"
         assert not async_engine, "async_engine is not yet supported for multi-modal inference"
-        assert disable_async_output_proc, "async output processing is not yet supported for multi-modal inference"
-        assert num_scheduler_steps == 1, "multi-step scheduling is not yet supported for multi-modal inference"
     else:
         model = "meta-llama/Meta-Llama-3.1-70B"
         os.environ["MESH_DEVICE"] = "T3K_RING"
