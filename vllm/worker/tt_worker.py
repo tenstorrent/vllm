@@ -183,11 +183,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
-        if self.model_config.model == 'meta-llama/Llama-3.2-11B-Vision-Instruct':
-            self.trace_mode = False
-            logger.warning("trace_mode is not yet supported for Llama-3.2-11B-Vision-Instruct")
-        else:
-            self.trace_mode = True  # whether to use ttnn tracing for model execution, TODO: make this configurable
+        self.trace_mode = True  # whether to use ttnn tracing for model execution, TODO: make this configurable
 
         self.model_runner: TTModelRunner = TTModelRunner(
             model_config,

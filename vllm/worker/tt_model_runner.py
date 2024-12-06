@@ -123,7 +123,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         self.cached_step_outputs: List[torch.Tensor] = []  # Only used for multi-step execution
         
-        self.cached_multi_modal_data: Optional[Dict[int, Dict[str, Any]]] = None  # seq_id -> multi_modal_data
+        self.cached_enc_dec_data: Optional[Dict[int, Dict[str, Any]]] = None  # seq_id -> enc_dec_data
 
         # Multi-modal data support - add once TT models no longer require raw PIL images
         # self.mm_registry = MULTIMODAL_REGISTRY
@@ -266,11 +266,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             top_p=top_pk_sampling_params["top_p"]
         )
         
-        # Remove cached multi-modal data for any seq ids that are not in the current batch (assume they were either finished or preempted)
-        if not is_prompt and self.cached_multi_modal_data:
-            for seq_id in self.cached_multi_modal_data:
+        # Remove cached encoder-decoder data for any seq ids that are not in the current batch (assume they were either finished or preempted)
+        if not is_prompt and self.cached_enc_dec_data:
+            for seq_id in self.cached_enc_dec_data:
                 if seq_id not in seq_groups:
-                    del self.cached_multi_modal_data[seq_id]
+                    del self.cached_enc_dec_data[seq_id]
         
         # Convert lists to tensors and add padding
         
@@ -446,66 +446,74 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.cross_block_tables is not None:
             execute_model_kwargs["cross_page_table"] = model_input.cross_block_tables
         
-        if self.trace_mode and is_decode:  # Trace mode for decode
-            # Remove prompt_lens from execute_model_kwargs since it's not used for decode
-            execute_model_kwargs.pop("prompt_lens")
-            
-            # Capture trace for the first decode execution
-            if self.execute_trace_kwargs is None:
-                logger.info("Capturing trace for first decode execution")
-                trace_id, tt_inp, rot_idxs_tt, cache_idxs_tt, tt_logits, tt_page_table = self.model.capture_trace(
-                    **execute_model_kwargs
-                )
-                self.execute_trace_kwargs = {
-                    "trace_id": trace_id,
-                    "tt_inp": tt_inp,
-                    "rot_idxs_tt": rot_idxs_tt,
-                    "cache_idxs_tt": cache_idxs_tt,
-                    "tt_logits": tt_logits,
-                    "tt_page_table": tt_page_table,
-                    "read_from_device": False,
-                }
-            
-            # Remove kv_cache from execute_model_kwargs since it doesn't need to be copied to device for trace execution
-            execute_model_kwargs.pop("kv_cache")
-            
-            tt_logits = self.model.decode_forward_trace(
-                **execute_model_kwargs, **self.execute_trace_kwargs
-            )
-            if async_out_proc_per_trace:
-                # trigger output processor on host while device is executing next step
-                if step_idx > 0:
-                    next_token_ids = self.cached_step_outputs.pop(0)
-                    sampler_output = self._make_sampler_output(
-                        next_token_ids,
-                        model_input.seq_groups
+        if not self.model_config.is_encoder_decoder_model:  # Forward for decoder-only
+            if self.trace_mode and is_decode:  # Trace mode for decode
+                # Remove prompt_lens from execute_model_kwargs since it's not used for decode
+                execute_model_kwargs.pop("prompt_lens")
+                
+                # Capture trace for the first decode execution
+                if self.execute_trace_kwargs is None:
+                    logger.info("Capturing trace for first decode execution")
+                    trace_id, tt_inp, rot_idxs_tt, cache_idxs_tt, tt_logits, tt_page_table = self.model.capture_trace(
+                        **execute_model_kwargs
                     )
-                    self._send_async_out(sampler_output, model_input.async_callback, is_first_step_output=(step_idx == 1))
-            logits = self.model.read_forward_trace(tt_logits, model_input.unpadded_batch_size)
-        else:
-            if model_input.multi_modal_kwargs or self.cached_multi_modal_data:
-                # TODO: remove different forward calls once TT models can manage intermediate outputs internally
-                if not is_decode:
-                    logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
-                    
-                    # Save multi-modal data for use in subsequent decode steps
-                    if self.cached_multi_modal_data is None:
-                        self.cached_multi_modal_data = {}
-                    for i, seq_id in enumerate(model_input.seq_groups):
-                        multi_modal_data = {"cross_attention_masks": cross_attention_masks[i], 
-                                            "full_text_row_masked_out_mask": full_text_row_masked_out_mask[i]}
-                        self.cached_multi_modal_data[seq_id] = multi_modal_data
-                else:
-                    # Use multi-modal data from prefill step
-                    cross_attention_masks = [self.cached_multi_modal_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
-                    full_text_row_masked_out_mask = [self.cached_multi_modal_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
-                    
-                    multi_modal_kwargs = {"cross_attention_masks": cross_attention_masks,
-                                          "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
-                    
-                    logits = self.model.decode_forward(**execute_model_kwargs, **multi_modal_kwargs)
-            else:
+                    self.execute_trace_kwargs = {
+                        "trace_id": trace_id,
+                        "tt_inp": tt_inp,
+                        "rot_idxs_tt": rot_idxs_tt,
+                        "cache_idxs_tt": cache_idxs_tt,
+                        "tt_logits": tt_logits,
+                        "tt_page_table": tt_page_table,
+                        "read_from_device": False,
+                    }
+                
+                # Remove kv_cache from execute_model_kwargs since it doesn't need to be copied to device for trace execution
+                execute_model_kwargs.pop("kv_cache")
+                
+                tt_logits = self.model.decode_forward_trace(
+                    **execute_model_kwargs, **self.execute_trace_kwargs
+                )
+                if async_out_proc_per_trace:
+                    # trigger output processor on host while device is executing next step
+                    if step_idx > 0:
+                        next_token_ids = self.cached_step_outputs.pop(0)
+                        sampler_output = self._make_sampler_output(
+                            next_token_ids,
+                            model_input.seq_groups
+                        )
+                        self._send_async_out(sampler_output, model_input.async_callback, is_first_step_output=(step_idx == 1))
+                logits = self.model.read_forward_trace(tt_logits, model_input.unpadded_batch_size)
+            else:  # prefill or non-traced decode
                 logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
+        else: # Forward for encoder-decoder (may need to be updated for future models)
+            # TODO: remove different forward calls once TT models can manage intermediate outputs internally
+            if not is_decode:
+                # Remove start_pos from execute_model_kwargs since it's not used for prefill
+                execute_model_kwargs.pop("start_pos")
+                
+                logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
+                
+                # Save encoder-decoder data for use in subsequent decode steps
+                if self.cached_enc_dec_data is None:
+                    self.cached_enc_dec_data = {}
+                for i, seq_id in enumerate(model_input.seq_groups):
+                    enc_dec_data = {"cross_attention_masks": cross_attention_masks[i], 
+                                        "full_text_row_masked_out_mask": full_text_row_masked_out_mask[i]}
+                    self.cached_enc_dec_data[seq_id] = enc_dec_data
+            else:
+                # Remove prompt_lens from execute_model_kwargs since it's not used for decode
+                execute_model_kwargs.pop("prompt_lens")
+                
+                # Use encoder-decoder data from prefill step
+                cross_attention_masks = [self.cached_enc_dec_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
+                full_text_row_masked_out_mask = [self.cached_enc_dec_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
+                
+                enc_dec_kwargs = {"cross_attention_masks": cross_attention_masks,
+                                        "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
+                
+                logits = self.model.decode_forward(
+                    **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode
+                )
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
