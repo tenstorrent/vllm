@@ -268,9 +268,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         
         # Remove cached encoder-decoder data for any seq ids that are not in the current batch (assume they were either finished or preempted)
         if not is_prompt and self.cached_enc_dec_data:
+            seq_ids_to_del = []
             for seq_id in self.cached_enc_dec_data:
                 if seq_id not in seq_groups:
-                    del self.cached_enc_dec_data[seq_id]
+                    seq_ids_to_del.append(seq_id)
+            for seq_id in seq_ids_to_del:
+                del self.cached_enc_dec_data[seq_id]
         
         # Convert lists to tensors and add padding
         

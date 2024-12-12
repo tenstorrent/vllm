@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from pkg_resources import resource_filename
 from PIL import Image as PIL_Image
+import numpy as np
 
 from vllm import LLM, SamplingParams
 from vllm import ModelRegistry
@@ -15,6 +16,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils import merge_async_iterators
 from vllm.inputs.data import TokensPrompt
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
+from vllm.model_executor.models.mllama import MLLAMA_IMAGE_TOKEN, MLLAMA_IMAGE_TOKEN_ID
 
 # Import and register models from tt-metal
 from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
@@ -36,7 +38,7 @@ def get_sample_multi_modal_llama_inputs():
     for relative_img_path, question in zip(relative_img_paths, questions):
         with open(IMG_PATH / relative_img_path, "rb") as f:
             img = PIL_Image.open(f).convert("RGB")
-        prompt = f"<|image|>{question}"
+        prompt = f"{MLLAMA_IMAGE_TOKEN}{question}"
         inputs.append({"prompt": prompt, "multi_modal_data": {"image": img}})
     return inputs
 
@@ -57,8 +59,6 @@ def run_inference(
     if multi_modal:
         model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
         os.environ["MESH_DEVICE"] = "N300"
-        assert not measure_perf, "measure_perf is not yet supported for multi-modal inference"
-        assert not async_engine, "async_engine is not yet supported for multi-modal inference"
     else:
         model = "meta-llama/Meta-Llama-3.1-70B"
         os.environ["MESH_DEVICE"] = "T3K_RING"
@@ -100,11 +100,20 @@ def run_inference(
     else:
         assert perf_prompt_len is not None, "perf_prompt_len is required to generate dummy prompts"
         print("Measuring performance with dummy prompts of length", perf_prompt_len)
-        prompt_token_ids = [[0]*perf_prompt_len]*max_seqs_in_batch  # dummy prompts
-        sampling_params = sampling_params[:max_seqs_in_batch] if isinstance(sampling_params, list) else sampling_params
-
-        # Set an arbitrary max_tokens to simulate generating multiple tokens consecutively
         print("Generating prompts with output length", max_tokens)
+        
+        # Prompt token ids (dummy prompts)
+        prompt_token_ids_user = [0]*perf_prompt_len
+        if not multi_modal:
+            prompts = [{"prompt_token_ids": prompt_token_ids_user} for _ in range(max_seqs_in_batch)]
+        else:
+            prompt_token_ids_user.insert(0, MLLAMA_IMAGE_TOKEN_ID)
+            random_pixels = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
+            rand_img = PIL_Image.fromarray(random_pixels, 'RGB')  # Create a PIL Image from the random pixel data
+            prompts = [{"prompt_token_ids": prompt_token_ids_user, "multi_modal_data": {"image": rand_img}} for _ in range(max_seqs_in_batch)]
+        
+        # Sampling params
+        sampling_params = sampling_params[:max_seqs_in_batch] if isinstance(sampling_params, list) else sampling_params
         sampling_params.max_tokens = max_tokens
 
         max_model_len = engine_kw_args["max_model_len"]
@@ -117,7 +126,7 @@ def run_inference(
         if not measure_perf:
             generate_tokens(llm, prompts, sampling_params, print_output=True)
         else:
-            run_inference_perf(llm, prompt_token_ids, sampling_params)
+            run_inference_perf(llm, prompts, sampling_params)
     else:
         print("Using async engine")
         engine_args = AsyncEngineArgs(**engine_kw_args)
@@ -126,13 +135,13 @@ def run_inference(
                 if not measure_perf:
                     await generate_tokens_async(llm, prompts, sampling_params, print_output=True)
                 else:
-                    await run_inference_perf_async(llm, prompt_token_ids, sampling_params)
+                    await run_inference_perf_async(llm, prompts, sampling_params)
         uvloop.run(_run_inference_async())
 
 
 def run_inference_perf(
     llm : LLM,
-    prompt_token_ids,
+    prompts,
     sampling_params,
     N_warmup=1,
     N_inference=4,
@@ -140,14 +149,14 @@ def run_inference_perf(
     for i in tqdm(range(N_inference), desc="Inference runs"):
         if i == N_warmup:
             start_time = time.perf_counter()
-        generate_tokens(llm, None, sampling_params, prompt_token_ids, print_output=False)
+        generate_tokens(llm, prompts, sampling_params, print_output=False)
     avg_time = (time.perf_counter()-start_time) / (N_inference-N_warmup)
     print(f"Average time taken per inference run: {avg_time:.2f} s")
 
 
 async def run_inference_perf_async(
     llm : LLM,
-    prompt_token_ids,
+    prompts,
     sampling_params,
     N_warmup=1,
     N_inference=4,
@@ -155,7 +164,7 @@ async def run_inference_perf_async(
     for i in tqdm(range(N_inference), desc="Inference runs"):
         if i == N_warmup:
             start_time = time.perf_counter()
-        await generate_tokens_async(llm, None, sampling_params, prompt_token_ids, print_output=False)
+        await generate_tokens_async(llm, prompts, sampling_params, print_output=False)
     avg_time = (time.perf_counter()-start_time) / (N_inference-N_warmup)
     print(f"Average time taken per inference run: {avg_time:.2f} s")
 
@@ -166,14 +175,15 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
     outputs = llm.generate(prompts, sampling_params, prompt_token_ids)
     # Print the outputs.
     for output in outputs:
-        prompt = output.prompt or output.encoder_prompt
+        prompt = output.prompt
         generated_text = output.outputs[0].text
+        num_tokens_prompt = len(output.prompt_token_ids)
+        num_tokens_output = len(output.outputs[0].token_ids)
         if print_output:
-            print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+            print(f"Prompt ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_params, prompt_token_ids=None, print_output=True):
-    # async def _generate_tokens_async(llm, prompts, sampling_params, prompt_token_ids, print_output):
     # Use tokenized prompts if provided
     if prompt_token_ids is not None:
         prompts = []
@@ -191,8 +201,10 @@ async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_param
     async for i, res in all_gens:
         prompt = res.prompt
         generated_text = res.outputs[0].text
+        num_tokens_prompt = len(res.prompt_token_ids)
+        num_tokens_output = len(res.outputs[0].token_ids)
         if print_output and res.finished:
-            print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+            print(f"Prompt ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 if __name__ == "__main__":
