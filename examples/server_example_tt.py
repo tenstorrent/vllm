@@ -19,7 +19,10 @@ def main():
     
     if args.multi_modal:
         model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        os.environ["MESH_DEVICE"] = "N300"
+        if os.environ.get("MESH_DEVICE") is None:
+            os.environ["MESH_DEVICE"] = "N300"
+        else:
+            assert os.environ["MESH_DEVICE"] in ["N300", "T3K_LINE"], "Invalid MESH_DEVICE for multi-modal inference"
     else:
         model = "meta-llama/Meta-Llama-3.1-70B"
         os.environ["MESH_DEVICE"] = "T3K_RING"

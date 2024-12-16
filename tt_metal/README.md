@@ -49,6 +49,9 @@ To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging
 2. For the desired model, follow the setup instructions (if any) for the corresponding tt-metal demo. E.g. For Llama-3.1-70B, follow the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/t3000/llama3_70b) for preparing the weights and environment variables.
 
 ## Running the offline inference example
+
+### Llama-3.1-70B
+
 To generate tokens for sample prompts:
 ```python
 WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py
@@ -58,6 +61,20 @@ To measure performance for a single batch (with the default prompt length of 128
 ```python
 WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
 ```
+
+### Llama-3.2-11B-Vision-Instruct
+
+To generate tokens for sample prompts:
+```python
+WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 8
+```
+
+To measure performance for a single batch (with the default prompt length of 128 tokens):
+```python
+WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 8
+```
+
+**Note**: By default the multi-modal inference example will run with `MESH_DEVICE=N300`. To run on T3000, set `MESH_DEVICE=T3K_LINE` and `--max_seqs_in_batch 32 --num_repeat_prompts 16`
 
 ## Running the server example (experimental)
 ```python

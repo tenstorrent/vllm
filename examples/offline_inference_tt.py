@@ -26,6 +26,9 @@ ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForCond
 
 
 def get_sample_multi_modal_llama_inputs():
+    '''
+    Prepare 4 sample multi-modal prompts for Llama3.2-11B
+    '''
     IMG_PATH = Path(resource_filename("llama_models", "scripts/resources/"))
     relative_img_paths = ["dog.jpg", "pasta.jpeg", "ocr_image.jpeg", "clutter.jpeg"]
     questions = [
@@ -58,7 +61,10 @@ def run_inference(
 ):
     if multi_modal:
         model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        os.environ["MESH_DEVICE"] = "N300"
+        if os.environ.get("MESH_DEVICE") is None:
+            os.environ["MESH_DEVICE"] = "N300"
+        else:
+            assert os.environ["MESH_DEVICE"] in ["N300", "T3K_LINE"], "Invalid MESH_DEVICE for multi-modal inference"
     else:
         model = "meta-llama/Meta-Llama-3.1-70B"
         os.environ["MESH_DEVICE"] = "T3K_RING"
@@ -175,12 +181,13 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
     outputs = llm.generate(prompts, sampling_params, prompt_token_ids)
     # Print the outputs.
     for output in outputs:
+        request_id = int(output.request_id) + 1
         prompt = output.prompt
         generated_text = output.outputs[0].text
         num_tokens_prompt = len(output.prompt_token_ids)
         num_tokens_output = len(output.outputs[0].token_ids)
         if print_output:
-            print(f"Prompt #{output.request_id + 1} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
+            print(f"Prompt #{request_id} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_params, prompt_token_ids=None, print_output=True):
@@ -199,12 +206,13 @@ async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_param
         generators.append(generator)
     all_gens = merge_async_iterators(*generators)
     async for i, res in all_gens:
+        request_id = int(res.request_id) + 1
         prompt = res.prompt
         generated_text = res.outputs[0].text
         num_tokens_prompt = len(res.prompt_token_ids)
         num_tokens_output = len(res.outputs[0].token_ids)
         if print_output and res.finished:
-            print(f"Prompt #{res.request_id + 1} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
+            print(f"Prompt #{request_id} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 if __name__ == "__main__":
@@ -219,7 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--async_engine", action="store_true", help="Use async engine")
     parser.add_argument("--disable_async_output_proc", action="store_true", help="Disable async output processing")
     parser.add_argument("--num_scheduler_steps", type=int, default=10, help="Number of scheduler steps")
-    parser.add_argument("--multi_modal", action="store_true", help="Run multi-modal inference")
+    parser.add_argument("--multi_modal", action="store_true", help="Run multi-modal inference with Llama3.2-11b")
     args = parser.parse_args()
 
     run_inference(
