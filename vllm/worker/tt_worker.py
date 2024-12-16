@@ -237,10 +237,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         appended to.
         """
         # TODO: Add proper implementation which runs profiling on TT devices
-        if self.model_config.model == 'meta-llama/Llama-3.2-11B-Vision-Instruct':
-            max_tokens_all_users = 65536
-        else:
-            max_tokens_all_users = 131072
+        max_tokens_all_users = 131072  # Note: includes num vision tokens for multi-modal
         num_tt_blocks = math.ceil(max_tokens_all_users / self.cache_config.block_size)
         num_tt_blocks = int(num_tt_blocks * 1.01)  # Add 1% to account for vLLM's watermark_blocks
         num_cpu_blocks = 0

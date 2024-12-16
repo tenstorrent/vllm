@@ -1,18 +1,31 @@
+import argparse
 import os
 import sys
 import runpy
 
 from vllm import ModelRegistry
 
-# Import and register model from tt-metal
+# Import and register models from tt-metal
 from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
+from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
 ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
+ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
 
 
 def main():
-    os.environ["MESH_DEVICE"] = "T3K_RING"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--multi_modal", action="store_true", help="Run multi-modal inference with Llama3.2-11b")
+    args = parser.parse_args()
+    
+    if args.multi_modal:
+        model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        os.environ["MESH_DEVICE"] = "N300"
+    else:
+        model = "meta-llama/Meta-Llama-3.1-70B"
+        os.environ["MESH_DEVICE"] = "T3K_RING"
+    
     sys.argv.extend([
-        "--model", "meta-llama/Meta-Llama-3.1-70B",
+        "--model", model,
         "--block_size", "64",
         "--max_num_seqs", "32",
         "--max_model_len", "131072",

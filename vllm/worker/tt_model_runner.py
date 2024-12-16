@@ -326,6 +326,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     block_tables,
                     torch.zeros(batch_pad_len, block_tables.shape[1], dtype=torch.int32, device="cpu")
                 ])
+                if self.model_config.is_encoder_decoder_model:
+                    cross_block_tables = torch.cat([
+                        cross_block_tables,
+                        torch.zeros(batch_pad_len, cross_block_tables.shape[1], dtype=torch.int32, device="cpu")
+                    ])
             
             # Pad block_tables to max num blocks so ttnn tracing can work (requires constant shape)
             if self.trace_mode:

@@ -91,11 +91,11 @@ def run_inference(
             with open(prompts_json, 'r') as file:
                 prompts = json.load(file)
             assert isinstance(prompts, list), "Prompts must be a list of strings"
-            if num_repeat_prompts is not None:
-                prompts = prompts * num_repeat_prompts
         else:
             print("Ignoring prompts json for multi-modal inference")
             prompts = get_sample_multi_modal_llama_inputs() 
+        if num_repeat_prompts is not None:
+            prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))
     else:
         assert perf_prompt_len is not None, "perf_prompt_len is required to generate dummy prompts"
@@ -180,7 +180,7 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
         num_tokens_prompt = len(output.prompt_token_ids)
         num_tokens_output = len(output.outputs[0].token_ids)
         if print_output:
-            print(f"Prompt ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
+            print(f"Prompt #{output.request_id + 1} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_params, prompt_token_ids=None, print_output=True):
@@ -204,7 +204,7 @@ async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_param
         num_tokens_prompt = len(res.prompt_token_ids)
         num_tokens_output = len(res.outputs[0].token_ids)
         if print_output and res.finished:
-            print(f"Prompt ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
+            print(f"Prompt #{res.request_id + 1} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 if __name__ == "__main__":
@@ -215,6 +215,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_tokens", type=int, default=128, help="Length of outputs")
     parser.add_argument("--greedy_sampling", action="store_true", help="Use greedy decoding instead of top-k/p")
     parser.add_argument("--max_seqs_in_batch", type=int, default=32, help="Maximum batch size for inference")
+    parser.add_argument("--num_repeat_prompts", type=int, default=2, help="Number of times to repeat prompts")
     parser.add_argument("--async_engine", action="store_true", help="Use async engine")
     parser.add_argument("--disable_async_output_proc", action="store_true", help="Disable async output processing")
     parser.add_argument("--num_scheduler_steps", type=int, default=10, help="Number of scheduler steps")
@@ -228,6 +229,7 @@ if __name__ == "__main__":
         max_tokens=args.max_tokens,
         greedy_sampling=args.greedy_sampling,
         max_seqs_in_batch=args.max_seqs_in_batch,
+        num_repeat_prompts=args.num_repeat_prompts,
         async_engine=args.async_engine,
         num_scheduler_steps=args.num_scheduler_steps,
         disable_async_output_proc=args.disable_async_output_proc,
