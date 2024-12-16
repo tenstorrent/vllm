@@ -206,13 +206,12 @@ async def generate_tokens_async(llm : MQLLMEngineClient, prompts, sampling_param
         generators.append(generator)
     all_gens = merge_async_iterators(*generators)
     async for i, res in all_gens:
-        request_id = int(res.request_id) + 1
         prompt = res.prompt
         generated_text = res.outputs[0].text
         num_tokens_prompt = len(res.prompt_token_ids)
         num_tokens_output = len(res.outputs[0].token_ids)
         if print_output and res.finished:
-            print(f"Prompt #{request_id} ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
+            print(f"Prompt ({num_tokens_prompt} tokens): {prompt!r}, Generated text ({num_tokens_output} tokens): {generated_text!r}\n")
 
 
 if __name__ == "__main__":

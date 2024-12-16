@@ -23,6 +23,7 @@ def main():
             os.environ["MESH_DEVICE"] = "N300"
         else:
             assert os.environ["MESH_DEVICE"] in ["N300", "T3K_LINE"], "Invalid MESH_DEVICE for multi-modal inference"
+        sys.argv.remove("--multi_modal")  # remove the flag for the API server
     else:
         model = "meta-llama/Meta-Llama-3.1-70B"
         os.environ["MESH_DEVICE"] = "T3K_RING"

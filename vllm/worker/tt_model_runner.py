@@ -125,12 +125,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         
         self.cached_enc_dec_data: Optional[Dict[int, Dict[str, Any]]] = None  # seq_id -> enc_dec_data
 
-        # Multi-modal data support - add once TT models no longer require raw PIL images
-        # self.mm_registry = MULTIMODAL_REGISTRY
-        # self.multi_modal_input_mapper = self.mm_registry \
-        #     .create_input_mapper(self.model_config)
-        # self.mm_registry.init_mm_limits_per_prompt(self.model_config)
-
         if self.model_is_mrope:
             assert "TTModelRunner does not currently support models with mrope rope_scaling"
         
