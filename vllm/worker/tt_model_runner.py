@@ -499,8 +499,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if not is_decode:
                     logits = self.model.prefill_forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
                 else:
-                    breakpoint()  # add trace support
-                    logits = self.model.decode_forward(**execute_model_kwargs)
+                    tt_logits = self.model.decode_forward(
+                        **execute_model_kwargs, enable_trace=self.trace_mode, read_from_device=False
+                    )
+                    if async_out_proc_per_trace:
+                        # trigger output processor on host while device is executing next step
+                        self._send_prev_step_async_out(model_input, step_idx)
+                    logits = self.model.read_decode_output(tt_logits, model_input.unpadded_batch_size)
                 
         else: # Forward for encoder-decoder (may need to be updated for future models)
             # TODO: remove different forward calls once TT models can manage intermediate outputs internally

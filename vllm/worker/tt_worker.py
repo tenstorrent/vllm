@@ -425,7 +425,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             assert f"Requested mesh grid shape {mesh_grid} is larger than number of available devices {num_devices_available}"
         
         if self.trace_mode:
-            device_params = {"trace_region_size": 14227456}  # TODO: make this configurable
+            device_params = {"trace_region_size": 23887872}  # TODO: make this configurable
         else:
             device_params = {}
         mesh_device = ttnn.open_mesh_device(
