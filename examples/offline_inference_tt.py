@@ -19,7 +19,11 @@ from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.model_executor.models.mllama import MLLAMA_IMAGE_TOKEN, MLLAMA_IMAGE_TOKEN_ID
 
 # Import and register models from tt-metal
-from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
+old_llama_70b = False
+if old_llama_70b:
+    from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
+else:
+    from models.demos.llama3.tt.generator_vllm import TtLlamaForCausalLM
 from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
 ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
 ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
@@ -67,7 +71,10 @@ def run_inference(
             assert os.environ["MESH_DEVICE"] in ["N300", "T3K_LINE"], "Invalid MESH_DEVICE for multi-modal inference"
     else:
         model = "meta-llama/Meta-Llama-3.1-70B"
-        os.environ["MESH_DEVICE"] = "T3K_RING"
+        if old_llama_70b:
+            os.environ["MESH_DEVICE"] = "T3K_RING"
+        else:
+            os.environ["MESH_DEVICE"] = "T3K_LINE"
     
     # LLM args
     engine_kw_args = {
