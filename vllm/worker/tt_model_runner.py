@@ -453,6 +453,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             **(model_input.multi_modal_kwargs or {}),
         }
         old_llama_70b = False  # deprecated
+        old_llama_70b = old_llama_70b and 'meta-llama/Meta-Llama-3.1-70B' in self.model_config.model
         if not is_decode or old_llama_70b:
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         if is_decode or old_llama_70b:
@@ -461,71 +462,63 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.cross_block_tables is not None:
             execute_model_kwargs["cross_page_table"] = model_input.cross_block_tables
         
-        if not self.model_config.is_encoder_decoder_model:  # Forward for decoder-only
-            if old_llama_70b:  # deprecated
-                if self.trace_mode and is_decode:  # Trace mode for decode
-                    # Remove prompt_lens from execute_model_kwargs since it's not used for decode
-                    execute_model_kwargs.pop("prompt_lens")
-                    
-                    # Capture trace for the first decode execution
-                    if self.execute_trace_kwargs is None:
-                        logger.info("Capturing trace for first decode execution")
-                        trace_id, tt_inp, rot_idxs_tt, cache_idxs_tt, tt_logits, tt_page_table = self.model.capture_trace(
-                            **execute_model_kwargs
-                        )
-                        self.execute_trace_kwargs = {
-                            "trace_id": trace_id,
-                            "tt_inp": tt_inp,
-                            "rot_idxs_tt": rot_idxs_tt,
-                            "cache_idxs_tt": cache_idxs_tt,
-                            "tt_logits": tt_logits,
-                            "tt_page_table": tt_page_table,
-                            "read_from_device": False,
-                        }
-                    
-                    # Remove kv_cache from execute_model_kwargs since it doesn't need to be copied to device for trace execution
-                    execute_model_kwargs.pop("kv_cache")
-                    
-                    tt_logits = self.model.decode_forward_trace(
-                        **execute_model_kwargs, **self.execute_trace_kwargs
-                    )
-                    if async_out_proc_per_trace:
-                        # trigger output processor on host while device is executing next step
-                        self._send_prev_step_async_out(model_input, step_idx)
-                    logits = self.model.read_forward_trace(tt_logits, model_input.unpadded_batch_size)
-                else:  # prefill or non-traced decode
-                    logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
-            else:
-                if not is_decode:
-                    logits = self.model.prefill_forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
-                else:
-                    tt_logits = self.model.decode_forward(
-                        **execute_model_kwargs, enable_trace=self.trace_mode, read_from_device=False
-                    )
-                    if async_out_proc_per_trace:
-                        # trigger output processor on host while device is executing next step
-                        self._send_prev_step_async_out(model_input, step_idx)
-                    logits = self.model.read_decode_output(tt_logits, model_input.unpadded_batch_size)
+        if old_llama_70b:  # deprecated
+            if self.trace_mode and is_decode:  # Trace mode for decode
+                # Remove prompt_lens from execute_model_kwargs since it's not used for decode
+                execute_model_kwargs.pop("prompt_lens")
                 
-        else: # Forward for encoder-decoder (may need to be updated for future models)
-            # TODO: remove different forward calls once TT models can manage intermediate outputs internally
+                # Capture trace for the first decode execution
+                if self.execute_trace_kwargs is None:
+                    logger.info("Capturing trace for first decode execution")
+                    trace_id, tt_inp, rot_idxs_tt, cache_idxs_tt, tt_logits, tt_page_table = self.model.capture_trace(
+                        **execute_model_kwargs
+                    )
+                    self.execute_trace_kwargs = {
+                        "trace_id": trace_id,
+                        "tt_inp": tt_inp,
+                        "rot_idxs_tt": rot_idxs_tt,
+                        "cache_idxs_tt": cache_idxs_tt,
+                        "tt_logits": tt_logits,
+                        "tt_page_table": tt_page_table,
+                        "read_from_device": False,
+                    }
+                
+                # Remove kv_cache from execute_model_kwargs since it doesn't need to be copied to device for trace execution
+                execute_model_kwargs.pop("kv_cache")
+                
+                tt_logits = self.model.decode_forward_trace(
+                    **execute_model_kwargs, **self.execute_trace_kwargs
+                )
+                if async_out_proc_per_trace:
+                    # trigger output processor on host while device is executing next step
+                    self._send_prev_step_async_out(model_input, step_idx)
+                logits = self.model.read_forward_trace(tt_logits, model_input.unpadded_batch_size)
+            else:  # prefill or non-traced decode
+                logits = self.model.forward(**execute_model_kwargs)  # [batch_size, seq_len, vocab_size]
+        else:
             if not is_decode:
-                logits, cross_attention_masks, full_text_row_masked_out_mask = self.model.prefill_forward(**execute_model_kwargs)
+                outputs = self.model.prefill_forward(**execute_model_kwargs)
                 
-                # Save encoder-decoder data for use in subsequent decode steps
-                if self.cached_enc_dec_data is None:
-                    self.cached_enc_dec_data = {}
-                for i, seq_id in enumerate(model_input.seq_groups):
-                    enc_dec_data = {"cross_attention_masks": cross_attention_masks[i], 
-                                        "full_text_row_masked_out_mask": full_text_row_masked_out_mask[i]}
-                    self.cached_enc_dec_data[seq_id] = enc_dec_data
+                if self.model_config.is_encoder_decoder_model:
+                    # Save encoder-decoder data for use in subsequent decode steps (may need to be updated for future models)
+                    logits, cross_attention_masks, full_text_row_masked_out_mask = outputs
+                    if self.cached_enc_dec_data is None:
+                        self.cached_enc_dec_data = {}
+                    for i, seq_id in enumerate(model_input.seq_groups):
+                        enc_dec_data = {"cross_attention_masks": cross_attention_masks[i], 
+                                            "full_text_row_masked_out_mask": full_text_row_masked_out_mask[i]}
+                        self.cached_enc_dec_data[seq_id] = enc_dec_data
+                else:
+                    logits = outputs  # [batch_size, seq_len, vocab_size]
             else:
-                # Use encoder-decoder data from prefill step
-                cross_attention_masks = [self.cached_enc_dec_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
-                full_text_row_masked_out_mask = [self.cached_enc_dec_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
-                
-                enc_dec_kwargs = {"cross_attention_masks": cross_attention_masks,
-                                        "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
+                if self.model_config.is_encoder_decoder_model:
+                    # Use encoder-decoder data from prefill step
+                    cross_attention_masks = [self.cached_enc_dec_data[seq_id]["cross_attention_masks"] for seq_id in model_input.seq_groups]
+                    full_text_row_masked_out_mask = [self.cached_enc_dec_data[seq_id]["full_text_row_masked_out_mask"] for seq_id in model_input.seq_groups]
+                    enc_dec_kwargs = {"cross_attention_masks": cross_attention_masks,
+                                            "full_text_row_masked_out_mask": full_text_row_masked_out_mask}
+                else:
+                    enc_dec_kwargs = {}
                 
                 tt_logits = self.model.decode_forward(
                     **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=False

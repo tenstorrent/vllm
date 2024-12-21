@@ -54,32 +54,32 @@ To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging
 
 To generate tokens for sample prompts:
 ```python
-WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py
+MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py
 ```
 
 To measure performance for a single batch (with the default prompt length of 128 tokens):
 ```python
-WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
+MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
 ```
 
 ### Llama-3.2-11B-Vision-Instruct
 
 To generate tokens for sample prompts:
 ```python
-WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 8
+MESH_DEVICE=N300 WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --model "meta-llama/Llama-3.2-11B-Vision-Instruct" --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 8
 ```
 
 To measure performance for a single batch (with the default prompt length of 128 tokens):
 ```python
-WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 4
+MESH_DEVICE=N300 WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --model "meta-llama/Llama-3.2-11B-Vision-Instruct" --measure_perf --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 4
 ```
 
-**Note**: By default, the multi-modal inference example will run with `MESH_DEVICE=N300`. To run on T3000, set `MESH_DEVICE=T3K_LINE` and `--max_seqs_in_batch 32 --num_repeat_prompts 16`.
+**Note**: To run on T3000, set `MESH_DEVICE=T3K_LINE` and `--max_seqs_in_batch 32 --num_repeat_prompts 16`.
 
 ## Running the server example
 
 ```python
-VLLM_RPC_TIMEOUT=100000 WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/server_example_tt.py
+VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/server_example_tt.py
 ```
 
-**Note**: By default, the server will run with Llama-3.1-70B. To run with Llama-3.2-11B-Vision-Instruct instead, add `--multi_modal`.
+**Note**: By default, the server will run with Llama-3.1-70B. To run with Llama-3.2-11B-Vision-Instruct set `MESH_DEVICE=N300` and `--model "meta-llama/Llama-3.2-11B-Vision-Instruct"`.
