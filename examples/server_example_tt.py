@@ -1,20 +1,10 @@
 import argparse
-import os
 import sys
 import runpy
 
-from vllm import ModelRegistry
-from examples.offline_inference_tt import check_tt_model_supported
+from offline_inference_tt import register_tt_models, check_tt_model_supported
 
-# Import and register models from tt-metal
-old_llama_70b = False
-if old_llama_70b:
-    from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
-else:
-    from models.demos.llama3.tt.generator_vllm import TtLlamaForCausalLM
-from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
-ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
-ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
+register_tt_models()  # Import and register models from tt-metal
 
 
 def main():
@@ -25,6 +15,7 @@ def main():
     check_tt_model_supported(args.model)
     
     sys.argv.extend([
+        "--model", args.model,
         "--block_size", "64",
         "--max_num_seqs", "32",
         "--max_model_len", "131072",

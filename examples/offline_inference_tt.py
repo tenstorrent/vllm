@@ -18,15 +18,16 @@ from vllm.inputs.data import TokensPrompt
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.model_executor.models.mllama import MLLAMA_IMAGE_TOKEN, MLLAMA_IMAGE_TOKEN_ID
 
-# Import and register models from tt-metal
-old_llama_70b = False
-if old_llama_70b:
-    from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
-else:
+def register_tt_models():
     from models.demos.llama3.tt.generator_vllm import TtLlamaForCausalLM
-from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
-ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
-ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
+    # To use old version of llama70b tt-metal model, use the import below
+    # from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM
+    ModelRegistry.register_model("TTLlamaForCausalLM", TtLlamaForCausalLM)
+    
+    from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
+    ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
+
+register_tt_models()  # Import and register models from tt-metal
 
 
 def get_sample_multi_modal_llama_inputs():
