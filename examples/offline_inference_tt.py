@@ -57,6 +57,10 @@ def check_tt_model_supported(model):
         "meta-llama/Meta-Llama-3.1-70B-Instruct",
         "meta-llama/Meta-Llama-3.1-8B",
         "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.2-1B",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.2-3B",
+        "meta-llama/Llama-3.2-3B-Instruct",
         "meta-llama/Llama-3.2-11B-Vision-Instruct",
     ]
     assert model in supported_models, f"Invalid model: {model}"
