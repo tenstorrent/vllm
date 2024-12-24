@@ -415,7 +415,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def _open_mesh_device(self):
         num_devices_available = len(ttnn.get_device_ids())
         
-        mesh_grid_dict = {"N150": (1, 1), "N300": (1, 2), "T3K_LINE": (1, 8), "T3K_RING": (2, 4)}
+        mesh_grid_dict = {"N150": (1, 1), "N300": (1, 2), "T3K_LINE": (1, 8), "T3K_RING": (2, 4), "TG": (8, 4)}
         mesh_device = os.environ.get("MESH_DEVICE")
         if mesh_device is not None:
             assert mesh_device in mesh_grid_dict, f"Invalid MESH_DEVICE: {mesh_device}"

@@ -53,17 +53,19 @@ To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging
 
 ### Llama-3.1/3.2 Text Models (1B, 3B, 8B, 70B)
 
-To generate tokens for sample prompts:
+To generate tokens (Llama70B) for sample prompts:
 ```python
 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py
 ```
 
-To measure performance for a single batch (with the default prompt length of 128 tokens):
+To measure performance (Llama70B) for a single batch (with the default prompt length of 128 tokens):
 ```python
 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
 ```
 
-**Note**: By default, the inference example will run with Llama-3.1-70B. To run with Llama-3.1-8B, Llama-3.2-1B, or Llama-3.2-3B, ensure that the apprioriate environement variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/llama3), then set `MESH_DEVICE=N150` and one of the following:
+**Note 1**: To run Llama70B on Galaxy, set `MESH_DEVICE=TG` and do not set `WH_ARCH_YAML=...`.
+
+**Note 2**: By default, the inference example will run with Llama-3.1-70B. To run with Llama-3.1-8B, Llama-3.2-1B, or Llama-3.2-3B, ensure that the apprioriate environement variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/llama3), then set `MESH_DEVICE=N150` and one of the following:
 - Llama-3.1-8B: `--model "meta-llama/Meta-Llama-3.1-8B"`
 - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
 - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
@@ -88,4 +90,5 @@ MESH_DEVICE=N300 WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examp
 VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/server_example_tt.py
 ```
 
-**Note**: By default, the server will run with Llama-3.1-70B. To run with Llama-3.2-11B-Vision-Instruct set `MESH_DEVICE=N300` and `--model "meta-llama/Llama-3.2-11B-Vision-Instruct"`.
+**Note**: By default, the server will run with Llama-3.1-70B. To run with other Llama versions, set `MESH_DEVICE` and `--model` as described in [Running the offline inference example](#running-the-offline-inference-example).
+
