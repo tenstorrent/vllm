@@ -63,9 +63,7 @@ To measure performance (Llama70B) for a single batch (with the default prompt le
 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
 ```
 
-**Note 1**: To run Llama70B on Galaxy, set `MESH_DEVICE=TG` and do not set `WH_ARCH_YAML=...`.
-
-**Note 2**: By default, the inference example will run with Llama-3.1-70B. To run with Llama-3.1-8B, Llama-3.2-1B, or Llama-3.2-3B, ensure that the apprioriate environement variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/llama3), then set `MESH_DEVICE=N150` and one of the following:
+**Note**: By default, the inference example will run with Llama-3.1-70B. To run with Llama-3.1-8B, Llama-3.2-1B, or Llama-3.2-3B, ensure that the apprioriate environement variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/llama3), then set `MESH_DEVICE=N150` and one of the following:
 - Llama-3.1-8B: `--model "meta-llama/Meta-Llama-3.1-8B"`
 - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
 - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
