@@ -53,17 +53,17 @@ To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging
 
 ### Llama-3.1/3.2 Text Models (1B, 3B, 8B, 70B)
 
-To generate tokens (Llama70B) for sample prompts:
+To generate tokens (Llama70B) for sample prompts (with batch size 32):
 ```python
 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py
 ```
 
-To measure performance (Llama70B) for a single batch (with the default prompt length of 128 tokens):
+To measure performance (Llama70B) for a single batch of 32 prompts (with the default prompt length of 128 tokens):
 ```python
 MESH_DEVICE=T3K_LINE WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
 ```
 
-**Note**: By default, the inference example will run with Llama-3.1-70B. To run with Llama-3.1-8B, Llama-3.2-1B, or Llama-3.2-3B, ensure that the apprioriate environement variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/llama3), then set `MESH_DEVICE=N150` and one of the following:
+**Note**: By default, the inference example will run with Llama-3.1-70B. To run with Llama-3.1-8B, Llama-3.2-1B, or Llama-3.2-3B, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/llama3), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, or `T3K_LINE`) and one of the following:
 - Llama-3.1-8B: `--model "meta-llama/Meta-Llama-3.1-8B"`
 - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
 - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
