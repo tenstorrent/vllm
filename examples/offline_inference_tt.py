@@ -26,6 +26,9 @@ def register_tt_models():
     
     from models.demos.llama3.tt.generator_vllm import TtMllamaForConditionalGeneration
     ModelRegistry.register_model("TTMllamaForConditionalGeneration", TtMllamaForConditionalGeneration)
+    
+    from models.demos.llama3.tt.generator_vllm import TtQwen2ForCausalLM
+    ModelRegistry.register_model("TTQwen2ForCausalLM", TtQwen2ForCausalLM)
 
 register_tt_models()  # Import and register models from tt-metal
 
@@ -65,6 +68,10 @@ def check_tt_model_supported(model):
         "meta-llama/Llama-3.2-3B",
         "meta-llama/Llama-3.2-3B-Instruct",
         "meta-llama/Llama-3.2-11B-Vision-Instruct",
+        "Qwen/Qwen2.5-7B",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-72B",
+        "Qwen/Qwen2.5-72B-Instruct",
     ]
     assert model in supported_models, f"Invalid model: {model}"
 
