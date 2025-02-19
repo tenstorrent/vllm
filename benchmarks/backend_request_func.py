@@ -46,6 +46,10 @@ class RequestFuncOutput:
     error: str = ""
 
 
+def backport_removeprefix(string: str, prefix: str) -> str:
+    return string[len(prefix):] if string.startswith(prefix) else string
+
+
 async def async_request_tgi(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -87,7 +91,7 @@ async def async_request_tgi(
                         # any data, we should skip it.
                         if chunk_bytes.startswith(":"):
                             continue
-                        chunk = chunk_bytes.removeprefix("data:")
+                        chunk = backport_removeprefix(chunk_bytes, "data:")
 
                         data = json.loads(chunk)
                         timestamp = time.perf_counter()
@@ -153,8 +157,7 @@ async def async_request_trt_llm(
                         if not chunk_bytes:
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data:")
+                        chunk = backport_removeprefix(chunk_bytes.decode("utf-8"), "data:")
 
                         data = json.loads(chunk)
                         output.generated_text += data["text_output"]
@@ -279,8 +282,7 @@ async def async_request_openai_completions(
                         if not chunk_bytes:
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
+                        chunk = backport_removeprefix(chunk_bytes.decode("utf-8"), "data: ")
                         if chunk != "[DONE]":
                             data = json.loads(chunk)
 
@@ -385,8 +387,7 @@ async def async_request_openai_chat_completions(
                         if not chunk_bytes:
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
+                        chunk = backport_removeprefix(chunk_bytes.decode("utf-8"), "data: ")
                         if chunk != "[DONE]":
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
