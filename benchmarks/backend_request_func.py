@@ -45,7 +45,9 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
 
-
+# TODO: remove before upstream: remove once we can drop support of Python 3.8
+# Since vllm must support Python 3.8, we can't use str.removeprefix(prefix)
+# introduced in Python 3.9
 def backport_removeprefix(string: str, prefix: str) -> str:
     return string[len(prefix):] if string.startswith(prefix) else string
 
@@ -250,6 +252,7 @@ async def async_request_openai_completions(
                 if request_func_input.model_name else request_func_input.model,
             "prompt": request_func_input.prompt,
             "temperature": 0.0,
+            # TODO: remove before upstream: best_of and logprobs not currently supported: https://github.com/tenstorrent/vllm/issues/44
             # "best_of": request_func_input.best_of,
             "max_tokens": request_func_input.output_len,
             # "logprobs": request_func_input.logprobs,
