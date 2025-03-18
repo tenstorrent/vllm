@@ -83,9 +83,12 @@ def run_seq_len_tests(engine_kw_args, sampling_params):
     '''
 
     model = engine_kw_args["model"]
-    is_instruct = "Instruct" in model
-    count_sizes = [10, 100, 2000, 16000, 40000]
-    
+    is_instruct = False #"Instruct" in model
+    #count_sizes = [10, 100, 2000, 16000, 40000]
+    #count_sizes = [10, 100, 128, 256, 512, 1024, 2000, 16000]
+    count_sizes = [x for x in range(10, 10000, 10)]
+    print("Count sizes:", count_sizes)
+
     if is_instruct:
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     
@@ -126,7 +129,7 @@ def run_inference(
     # LLM args
     engine_kw_args = {
         "model": model,
-        "block_size": 64,
+        "block_size": 32,
         "max_num_seqs": max_seqs_in_batch,
         "max_model_len": 131072,
         "disable_log_stats": False,

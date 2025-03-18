@@ -16,8 +16,8 @@ def main():
     
     sys.argv.extend([
         "--model", args.model,
-        "--block_size", "64",
-        "--max_num_seqs", "32",
+        "--block_size", "32",
+        "--max_num_seqs", "1",
         "--max_model_len", "131072",
         "--max_num_batched_tokens", "131072",
         "--num_scheduler_steps", "10",
