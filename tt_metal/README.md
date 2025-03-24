@@ -34,7 +34,7 @@ Git-checkout the following branches in each repo separately:
 
 To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging Face. To gain access:
 1. Request access on Hugging Face:
-    - Llama-3.1: [https://huggingface.co/meta-llama/Meta-Llama-3.1-70B](https://huggingface.co/meta-llama/Meta-Llama-3.1-70B)
+    - Llama-3.1: [https://huggingface.co/meta-llama/Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B)
     - Llama-3.2: [https://huggingface.co/meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
     - Llama-3.2-Vision: [https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
 2. Once you have received access, create and copy your access token from the settings tab on Hugging Face.
@@ -68,7 +68,7 @@ MESH_DEVICE=T3K WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python exampl
 **Note 2 (Llama70B)**: By default, this will run the newer tt-metal implementation of Llama70B from the [Llama3 demo](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers). To run with the [old Llama70B implemenentation](https://github.com/tenstorrent/tt-metal/tree/main/models/demos/t3000/llama3_70b), modify the `TtLlamaForCausalLM` model import in [offline_inference_tt.py](https://github.com/tenstorrent/vllm/blob/dev/examples/offline_inference_tt.py) to `from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM`.
 
 **Note 3 (Other Models)**: By default, the inference example will run with Llama-3.1-70B. To run with other Llama models, or Qwen-2.5, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, `T3K`, or `TG`) and one of the following:
-- Llama-3.1-8B: `--model "meta-llama/Meta-Llama-3.1-8B"`
+- Llama-3.1-8B: `--model "meta-llama/Llama-3.1-8B"`
 - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
 - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
 - Qwen-2.5-7B: `--model "Qwen/Qwen2.5-7B"` (currently only supported on N300)
