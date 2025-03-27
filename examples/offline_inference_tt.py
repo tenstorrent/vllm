@@ -19,16 +19,20 @@ from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.model_executor.models.mllama import MLLAMA_IMAGE_TOKEN, MLLAMA_IMAGE_TOKEN_ID
 
 def register_tt_models():
-    from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM
-    # To use old version of llama70b tt-metal model, use the import below
-    # from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM as LlamaForCausalLM
-    ModelRegistry.register_model("TTLlamaForCausalLM", LlamaForCausalLM)
+    import os
+    if os.environ.get("FAKE_DEVICE") == "TG":
+        from models.demos.llama3_subdevices.tt.generator_vllm import LlamaForCausalLM
+        ModelRegistry.register_model("TTLlamaForCausalLM", LlamaForCausalLM)
+    else:
+        from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM
+        # To use old version of llama70b tt-metal model, use the import below
+        # from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM as LlamaForCausalLM
+        ModelRegistry.register_model("TTLlamaForCausalLM", LlamaForCausalLM)
+    # from models.tt_transformers.tt.generator_vllm import MllamaForConditionalGeneration
+    # ModelRegistry.register_model("TTMllamaForConditionalGeneration", MllamaForConditionalGeneration)
     
-    from models.tt_transformers.tt.generator_vllm import MllamaForConditionalGeneration
-    ModelRegistry.register_model("TTMllamaForConditionalGeneration", MllamaForConditionalGeneration)
-    
-    from models.tt_transformers.tt.generator_vllm import Qwen2ForCausalLM
-    ModelRegistry.register_model("TTQwen2ForCausalLM", Qwen2ForCausalLM)
+    # from models.tt_transformers.tt.generator_vllm import Qwen2ForCausalLM
+    # ModelRegistry.register_model("TTQwen2ForCausalLM", Qwen2ForCausalLM)
 
 register_tt_models()  # Import and register models from tt-metal
 
@@ -178,7 +182,7 @@ def run_inference(
             random_pixels = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
             rand_img = PIL_Image.fromarray(random_pixels, 'RGB')  # Create a PIL Image from the random pixel data
             prompts = [{"prompt_token_ids": prompt_token_ids_user, "multi_modal_data": {"image": rand_img}} for _ in range(max_seqs_in_batch)]
-        
+        prompts = prompts[0:1]
         # Sampling params
         sampling_params = sampling_params[:max_seqs_in_batch] if isinstance(sampling_params, list) else sampling_params
         sampling_params.max_tokens = max_tokens

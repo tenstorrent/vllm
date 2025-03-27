@@ -353,7 +353,6 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         intermediate_tensors = None
         orig_model_execute_time = 0.0
-        
         output = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache
@@ -412,9 +411,9 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             assert f"Requested mesh grid shape {mesh_grid} is larger than number of available devices {num_devices_available}"
         
         if self.trace_mode:
-            device_params = {"trace_region_size": 23887872}  # TODO: make this configurable
+            device_params = {"trace_region_size": 23887872, "dispatch_core_axis": ttnn.DispatchCoreAxis.COL}  # TODO: make this configurable
         else:
-            device_params = {}
+            device_params = {"dispatch_core_axis": ttnn.DispatchCoreAxis.COL}
         mesh_device = ttnn.open_mesh_device(
             ttnn.MeshShape(*mesh_grid),
             dispatch_core_config=self._get_dispatch_core_config(device_params),
