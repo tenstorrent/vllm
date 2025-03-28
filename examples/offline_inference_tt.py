@@ -167,6 +167,7 @@ def run_inference(
             prompts = get_sample_multi_modal_llama_inputs() 
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
+        prompts = prompts[:1] * 32
         print("Number of prompts:", len(prompts))
     else:
         assert perf_prompt_len is not None, "perf_prompt_len is required to generate dummy prompts"
@@ -245,7 +246,7 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
     # that contain the prompt, generated text, and other information.
     outputs = llm.generate(prompts, sampling_params, prompt_token_ids)
     # Print the outputs.
-    for output in outputs:
+    for output in outputs[:1]:
         request_id = int(output.request_id) + 1
         prompt = output.prompt
         generated_text = output.outputs[0].text
