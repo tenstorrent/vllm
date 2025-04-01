@@ -1165,6 +1165,8 @@ class LLMEngine:
             if self.log_stats and 'global' in self.stat_loggers:
                 self.stat_loggers['global'].log_out()
                 self.stat_loggers['global'].reset()
+                
+        #breakpoint()
 
         # For multi-step without streaming, don't create outputs each iteration
         if not is_last_step and not ctx.multi_step_stream_outputs:
@@ -1185,6 +1187,8 @@ class LLMEngine:
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
             if not seq_group.is_prefill():
+                if i == 0:
+                    print("setting last token time")
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(
                 seq_group,
@@ -1192,6 +1196,9 @@ class LLMEngine:
                 use_cache=self.use_cached_outputs)
             if request_output:
                 ctx.request_outputs.append(request_output)
+                
+        self.do_log_stats(scheduler_outputs, outputs, finished_before,
+                              skip)
 
         # For multi-step with streaming, create outputs each iteration
         if not is_last_step and ctx.multi_step_stream_outputs:
@@ -1716,7 +1723,12 @@ class LLMEngine:
                     # TPOTs.
                     latency = seq_group.get_last_token_latency()
                     time_per_output_tokens_iter.append(latency)
+                    if idx == 0:
+                        print("Time per output tokens iter: ", latency)
                     if seq_group.state.current_step == 0:
+                        if idx == 0:
+                            print("Current step is 0")
+                            print(seq_group.state.num_steps - 1)
                         # For async_output_proc, the do_log_stats()
                         # is called following init_multi_step(), which
                         # sets the current_step to zero.
@@ -1725,6 +1737,10 @@ class LLMEngine:
                     else:
                         actual_num_batched_tokens +=\
                             seq_group.state.current_step - 1
+                        if idx == 0:
+                            print(seq_group.state.current_step - 1)
+                    if idx == 0:
+                        print("Actual num batched tokens: ", actual_num_batched_tokens)
 
                 # Because of chunked prefill, we can have a single sequence
                 # group that does multiple prompt_runs. To prevent logging
