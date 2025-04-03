@@ -1160,12 +1160,6 @@ class LLMEngine:
             for scheduler in self.scheduler:
                 scheduler.free_finished_seq_groups()
 
-        # Log and reset global stats if there are no unfinished requests left
-        if not self.has_unfinished_requests():
-            if self.log_stats and 'global' in self.stat_loggers:
-                self.stat_loggers['global'].log_out()
-                self.stat_loggers['global'].reset()
-
         # For multi-step without streaming, don't create outputs each iteration
         if not is_last_step and not ctx.multi_step_stream_outputs:
             # Immediately process request outputs here (if callback is given)
@@ -1192,6 +1186,19 @@ class LLMEngine:
                 use_cache=self.use_cached_outputs)
             if request_output:
                 ctx.request_outputs.append(request_output)
+                
+        # For multi-step, log stats here.
+        # For non-async case or last step, the stats are done in the
+        # LLMEngine/AsyncLLMEngine directly.
+        if not is_last_step:
+            self.do_log_stats(scheduler_outputs, outputs, finished_before,
+                                skip)
+        
+        # Log and reset global stats if there are no unfinished requests left
+        if not self.has_unfinished_requests():
+            if self.log_stats and 'global' in self.stat_loggers:
+                self.stat_loggers['global'].log_out()
+                self.stat_loggers['global'].reset()
 
         # For multi-step with streaming, create outputs each iteration
         if not is_last_step and ctx.multi_step_stream_outputs:
