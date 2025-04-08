@@ -1190,9 +1190,9 @@ class LLMEngine:
         # For multi-step, log stats here.
         # For non-async case or last step, the stats are done in the
         # LLMEngine/AsyncLLMEngine directly.
-        if not is_last_step:
-            self.do_log_stats(scheduler_outputs, outputs, finished_before,
-                                skip)
+        # if not is_last_step:
+        #     self.do_log_stats(scheduler_outputs, outputs, finished_before,
+        #                         skip)
         
         # Log and reset global stats if there are no unfinished requests left
         if not self.has_unfinished_requests():
@@ -1232,6 +1232,7 @@ class LLMEngine:
         # For non-async case, the stats are done in the
         # LLMEngine/AsyncLLMEngine directly
         if is_async:
+            print("HI1")
             # Log stats.
             self.do_log_stats(scheduler_outputs, outputs, finished_before,
                               skip)
@@ -1444,6 +1445,9 @@ class LLMEngine:
             # multi_step_model_runner does the first-step output append.
             is_first_step_output: bool = False if not seq_group_metadata_list \
                 else seq_group_metadata_list[0].state.num_steps == 1
+                
+            print("APPEND OUT")
+            print("outputs", outputs)
 
             # Add results to the output_queue
             ctx.append_output(outputs=outputs,
@@ -1464,6 +1468,8 @@ class LLMEngine:
             # Check if need to run the usual non-async path
             if not allow_async_output_proc:
                 self._process_model_outputs(ctx=ctx)
+                
+                print("HI2")
 
                 # Log stats.
                 self.do_log_stats(scheduler_outputs, outputs)
@@ -1723,15 +1729,24 @@ class LLMEngine:
                     # TPOTs.
                     latency = seq_group.get_last_token_latency()
                     time_per_output_tokens_iter.append(latency)
+                    if idx == 0:
+                         print("Time per output tokens iter: ", latency)
                     if seq_group.state.current_step == 0:
+                        if idx == 0:
+                            print("Current step is 0")
+                            print(seq_group.state.num_steps - 1)
                         # For async_output_proc, the do_log_stats()
                         # is called following init_multi_step(), which
                         # sets the current_step to zero.
                         actual_num_batched_tokens +=\
                             seq_group.state.num_steps - 1
+                        if idx == 0:
+                             print(seq_group.state.current_step - 1)
                     else:
                         actual_num_batched_tokens +=\
                             seq_group.state.current_step - 1
+                    if idx == 0:
+                         print("Actual num batched tokens: ", actual_num_batched_tokens)
 
                 # Because of chunked prefill, we can have a single sequence
                 # group that does multiple prompt_runs. To prevent logging

@@ -491,6 +491,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             )
             if async_out_proc_per_trace:
                 # trigger output processor on host while device is executing next step
+                print("Sending previous step async out", step_idx)
                 self._send_prev_step_async_out(model_input, step_idx)
             logits = self.model.read_decode_output(tt_logits, model_input.unpadded_batch_size)
 

@@ -355,6 +355,8 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         intermediate_tensors = None
         orig_model_execute_time = 0.0
         
+        start_exec = time.time()
+        
         output = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache
@@ -362,6 +364,10 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             intermediate_tensors=intermediate_tensors,
             num_steps=num_steps,
         )
+        
+        is_decode = model_input.prompt_lens is None
+        if is_decode:
+             print(f"Model execution time: {time.time() - start_exec}")
 
         model_execute_time = time.perf_counter() - start_time
         
