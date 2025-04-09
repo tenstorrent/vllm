@@ -117,7 +117,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.block_size = cache_config.block_size
 
         self.trace_mode = trace_mode  # whether to use ttnn tracing for model execution
-        self.sample_on_device_decode = False  # whether to sample on device for decode, TODO: make this configurable
+        override_tt_config = model_config.override_tt_config
+        if override_tt_config is not None and "sample_on_device_decode" in override_tt_config:
+            self.sample_on_device_decode = override_tt_config["sample_on_device_decode"]
+        else:
+            self.sample_on_device_decode = False  # whether to sample on device for decode
         logger.info(f"TTModelRunner: trace_mode={self.trace_mode}, sample_on_device_decode={self.sample_on_device_decode}")
 
         self.cached_step_outputs: List[torch.Tensor] = []  # Only used for multi-step execution
