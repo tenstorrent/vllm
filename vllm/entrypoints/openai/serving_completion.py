@@ -415,21 +415,21 @@ class OpenAIServingCompletion(OpenAIServing):
                 assert request.max_tokens is not None
                 if request.echo and request.max_tokens == 0:
                     assert prompt_text is not None
-                    token_ids = prompt_token_ids
+                    # token_ids = prompt_token_ids
                     out_logprobs = prompt_logprobs
                     output_text = prompt_text
                 elif request.echo and request.max_tokens > 0:
                     assert prompt_text is not None
-                    token_ids = [*prompt_token_ids, *output.token_ids]
+                    # token_ids = [*prompt_token_ids, *output.token_ids]
+                    token_ids = [*output.token_ids]
 
                     if request.logprobs is None:
                         out_logprobs = None
                     else:
-                        assert prompt_logprobs is not None
+                        # assert prompt_logprobs is not None
                         assert output.logprobs is not None
                         out_logprobs = [
-                            *prompt_logprobs,
-                            *output.logprobs,
+                            *output.logprobs
                         ]
 
                     output_text = prompt_text + output.text
@@ -496,7 +496,10 @@ class OpenAIServingCompletion(OpenAIServing):
         last_token_len = 0
 
         for i, token_id in enumerate(token_ids):
+            print("\nTOKEN-ID: ", token_id)
+
             step_top_logprobs = top_logprobs[i]
+            print("step_top_logprobs: ", step_top_logprobs)
             if step_top_logprobs is None:
                 token = tokenizer.decode(token_id)
                 if self.return_tokens_as_token_ids:

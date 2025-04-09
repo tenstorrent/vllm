@@ -695,7 +695,7 @@ class LLMEngine:
                 "Either SamplingParams or PoolingParams must be provided.")
 
         # Validate that the sequence group is compatible with the device's model executor.
-        self._validate_device_inputs(seq_group)
+        self._validate_device_inputs(seq_group) # TODO: Validate that the sequence group is compatible with the device's model executor.
 
         # Add the sequence group to the scheduler with least unfinished seqs.
         costs = [
