@@ -2,6 +2,7 @@ import json
 import argparse
 from tqdm import tqdm
 import uvloop
+import os
 import time
 from pathlib import Path
 from pkg_resources import resource_filename
@@ -19,14 +20,18 @@ from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.model_executor.models.mllama import MLLAMA_IMAGE_TOKEN, MLLAMA_IMAGE_TOKEN_ID
 
 def register_tt_models():
-    from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM
-    # To use old version of llama70b tt-metal model, use the import below
-    # from models.demos.t3000.llama2_70b.tt.generator_vllm import TtLlamaForCausalLM as LlamaForCausalLM
-    ModelRegistry.register_model("TTLlamaForCausalLM", LlamaForCausalLM)
-    
-    from models.tt_transformers.tt.generator_vllm import MllamaForConditionalGeneration
-    ModelRegistry.register_model("TTMllamaForConditionalGeneration", MllamaForConditionalGeneration)
-    
+    llama_version = os.getenv("TT_LLAMA_VER", "tt_transformers")
+
+    if llama_version == "llama3_subdevices":
+        from models.demos.llama3_subdevices.tt.generator_vllm import LlamaForCausalLM
+        ModelRegistry.register_model("TTLlamaForCausalLM", LlamaForCausalLM)
+
+    elif llama_version == "tt_transformers":
+        from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM
+        ModelRegistry.register_model("TTLlamaForCausalLM", LlamaForCausalLM)
+        from models.tt_transformers.tt.generator_vllm import MllamaForConditionalGeneration
+        ModelRegistry.register_model("TTMllamaForConditionalGeneration", MllamaForConditionalGeneration)
+
     from models.tt_transformers.tt.generator_vllm import Qwen2ForCausalLM
     ModelRegistry.register_model("TTQwen2ForCausalLM", Qwen2ForCausalLM)
 
