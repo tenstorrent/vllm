@@ -396,11 +396,15 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def _get_dispatch_core_config(self, device_params):
         dispatch_core_type = self._get_dispatch_core_type()
 
-        dispatch_core_type_default = ttnn.DispatchCoreAxis.COL
-        if os.getenv("MESH_DEVICE") != "TG" and os.getenv("ARCH_NAME") != "blackhole":
-            dispatch_core_type_default = ttnn.DispatchCoreAxis.ROW
+        override_tt_config = self.model_config.override_tt_config
+        if override_tt_config is not None and "dispatch_core_axis" in override_tt_config:
+            dispatch_core_axis = ttnn.DispatchCoreAxis.COL if override_tt_config["dispatch_core_axis"] == "col" else ttnn.DispatchCoreAxis.ROW,
+        else:
+            dispatch_core_axis = device_params.pop(
+                "dispatch_core_axis",
+                ttnn.DispatchCoreAxis.COL if os.environ["ARCH_NAME"] == "blackhole" else ttnn.DispatchCoreAxis.ROW,
+            )
 
-        dispatch_core_axis = device_params.pop("dispatch_core_axis", dispatch_core_type_default)
         dispatch_core_config = ttnn.DispatchCoreConfig(dispatch_core_type, dispatch_core_axis)
         return dispatch_core_config
 
