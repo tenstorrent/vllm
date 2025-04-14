@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import TopPLogitsWarper
 
@@ -133,6 +134,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         )
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = self.model.max_cross_attn_tokens // self.cache_config.block_size
+            
+    def get_model(self) -> nn.Module:
+        return self.model
 
     def make_model_input_from_broadcasted_tensor_dict(
         self,
