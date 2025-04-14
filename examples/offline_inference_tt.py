@@ -140,6 +140,8 @@ def run_inference(
     if sample_on_device_decode:
         override_tt_config["sample_on_device_decode"] = True
     if dispatch_core_axis:
+        if dispatch_core_axis.lower() not in ["row", "col"]:
+            raise ValueError(f"Invalid dispatch_core_axis: {dispatch_core_axis}, must be 'row' or 'col'")
         override_tt_config["dispatch_core_axis"] = dispatch_core_axis.lower()
     
     # LLM args
