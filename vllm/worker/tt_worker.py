@@ -398,6 +398,8 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         override_tt_config = self.model_config.override_tt_config
         if override_tt_config is not None and "dispatch_core_axis" in override_tt_config:
+            assert override_tt_config["dispatch_core_axis"] in ["row", "col"], \
+                f"Invalid dispatch_core_axis: {override_tt_config['dispatch_core_axis']}. Expected: row, col."
             dispatch_core_axis = ttnn.DispatchCoreAxis.COL if override_tt_config["dispatch_core_axis"] == "col" else ttnn.DispatchCoreAxis.ROW
         else:
             dispatch_core_axis = device_params.pop(

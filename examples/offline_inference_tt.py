@@ -140,8 +140,6 @@ def run_inference(
     if sample_on_device_decode:
         override_tt_config["sample_on_device_decode"] = True
     if dispatch_core_axis:
-        if dispatch_core_axis.lower() not in ["row", "col"]:
-            raise ValueError(f"Invalid dispatch_core_axis: {dispatch_core_axis}, must be 'row' or 'col'")
         override_tt_config["dispatch_core_axis"] = dispatch_core_axis.lower()
     
     # LLM args
@@ -313,7 +311,7 @@ if __name__ == "__main__":
     parser.add_argument("--multi_modal", action="store_true", help="Run multi-modal inference with Llama3.2-11b")
     parser.add_argument("--test_increasing_seq_lens", action="store_true", help="Test generations of small to large sequences")
     parser.add_argument("--sample_on_device_decode", action="store_true", help="Enable sampling on device during decode")
-    parser.add_argument("--dispatch_core_axis", type=str, default=None, help="Dispatch core axis [row, col]")
+    parser.add_argument("--dispatch_core_axis", type=str, choices=["row", "col", None], default=None, help="Dispatch core axis [row, col]")
     args = parser.parse_args()
 
     run_inference(
