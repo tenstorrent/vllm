@@ -14,7 +14,7 @@ from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, LayerBlockType
 from vllm.worker.worker import raise_if_cache_size_invalid
 from vllm.worker.tt_model_runner import TTModelRunner, TTModelInput
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
-                                     LoraNotSupportedWorkerBase, WorkerBase, WorkerInput)
+                                     LoRANotSupportedWorkerBase, WorkerBase, WorkerInput)
 
 import ttnn
 
@@ -143,7 +143,7 @@ class TTCacheEngine:
         return dtype_size * total
 
 
-class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def __init__(
         self,
         vllm_config: VllmConfig,
