@@ -83,15 +83,16 @@ def top_pk_logits_efficient(logits, p=0.9, k=10, temperature=1.0, return_probs=F
         top_k_values, top_k_indices = torch.topk(logits, k=k)
     top_p_values = TopPLogitsWarper(top_p=p)(None, top_k_values)
     probs = F.softmax(top_p_values / temperature, dim=-1)
+    log_probs = torch.log_softmax(top_p_values / temperature, dim=-1)
+    log_probs = torch.nan_to_num(log_probs)
     probs = torch.nan_to_num(probs)  # convert nan to num to prevent error in multinomial
-    log_probs = torch.log(probs + 1e-9) # add for stability when taking log, will not effect token sampling since top_k_id will not choose 0 prob tokens
     top_k_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
     token = top_k_indices.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1)
-    logprob = log_probs.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1) # along each batch, get the correct token idx 
+    logprob = log_probs.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1) # along each batch, get the logprob of the selected token
     if return_probs:
         return token, (probs, top_k_indices)
     elif return_log_probs:
-        return token, log_probs
+        return token, logprob 
     else:
         return token
 
@@ -418,10 +419,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 assert num_outputs == 1, "Last step should only have one output"
             for i in range(num_outputs):
                 next_token_ids = self.cached_step_outputs.pop(0)
-                # if not is_decode:
-                #     log_probs =  self.cached_step_output_prompt_logprobs.pop(0)
-                # else:
-                #     log_probs = self.cached_step_output_logprobs.pop(0)
                 log_probs = self.cached_step_output_logprobs.pop(0)
                 # TODO: add read back from device once model can keep executing steps on device
                 sampler_output = self._make_sampler_output(
@@ -456,21 +453,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         log_probs: List[float],
         is_decode: bool,
         seq_groups: List[int],
-    ) -> SamplerOutput: # TODO: should take in log probs
+    ) -> SamplerOutput:
         # Minimal code to construct the sampler outputs, based on tpu_model_runner.py
-        # TT backend does not support the advanced sampling parameters such as logprobs.
-        # zero_logprob = Logprob(0.0)
         sampler_outputs = []
-        # if not is_decode: # if prefill 
-        #     for batch_idx, seq_id in enumerate(seq_groups):
-        #         next_token_id = int(next_token_ids[batch_idx])
-        #         log_prob = Logprob(log_probs[batch_idx])
-        #         seq_outputs = [SequenceOutput(seq_id, next_token_id,
-        #                             {next_token_id: log_prob})]
-        #         x = CompletionSequenceGroupOutput(seq_outputs, None)
-        #         x.prompt_logprobs = [log_prob]
-        #         sampler_outputs.append(x)
-        # else: 
         for batch_idx, seq_id in enumerate(seq_groups):
             next_token_id = int(next_token_ids[batch_idx])
             log_prob = Logprob(log_probs[batch_idx])
@@ -549,7 +534,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if tt_sampling_params.temperature == 0:  # greedy decoding
             log_probs = torch.log_softmax(logits, dim=-1)
             return torch.argmax(logits, dim=-1), torch.max(log_probs, dim=-1)[0]
-            # return torch.argmax(logits, dim=-1)
         else:  # top-k top-p sampling
             return top_pk_logits_efficient(
                 logits,

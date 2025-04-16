@@ -109,7 +109,9 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_adapter_request,
             ) = self._maybe_get_adapters(request)
 
+
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
 
             prompts = list(
                 self._tokenize_prompt_input_or_inputs(
@@ -305,6 +307,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
 
+
                         if not delta_text and not delta_token_ids \
                             and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
@@ -403,8 +406,13 @@ class OpenAIServingCompletion(OpenAIServing):
 
         for final_res in final_res_batch:
             prompt_token_ids = final_res.prompt_token_ids
-            assert prompt_token_ids is not None
-            prompt_logprobs = final_res.prompt_logprobs
+            assert prompt_token_ids is not None # TODO: what is this 
+            try:
+                prompt_logprobs = final_res.prompt_logprobs
+            except:
+                if prompt_logprobs is None:
+                    print("Currently not supporting prompt_logprobs")
+
             prompt_text = final_res.prompt
 
             token_ids: GenericSequence[int]
@@ -415,22 +423,33 @@ class OpenAIServingCompletion(OpenAIServing):
                 assert request.max_tokens is not None
                 if request.echo and request.max_tokens == 0:
                     assert prompt_text is not None
-                    # token_ids = prompt_token_ids
+                    token_ids = prompt_token_ids # TODO: check if we can comment this 
                     out_logprobs = prompt_logprobs
                     output_text = prompt_text
                 elif request.echo and request.max_tokens > 0:
                     assert prompt_text is not None
-                    # token_ids = [*prompt_token_ids, *output.token_ids]
-                    token_ids = [*output.token_ids]
+                    token_ids = [*prompt_token_ids, *output.token_ids] 
+                    token_ids = [*output.token_ids] 
 
                     if request.logprobs is None:
                         out_logprobs = None
                     else:
-                        # assert prompt_logprobs is not None
+                        try:
+                            assert prompt_logprobs is not None
+                        except AssertionError:
+                            print("Currently not supporting prompt_logprobs")
+
                         assert output.logprobs is not None
-                        out_logprobs = [
-                            *output.logprobs
-                        ]
+                        if prompt_logprobs is None:
+                            out_logprobs = [
+                                *output.logprobs
+                            ]
+                        else:
+                            out_logprobs = [
+                                *prompt_logprobs,
+                                *output.logprobs,
+                    
+                            ]
 
                     output_text = prompt_text + output.text
                 else:
@@ -493,13 +512,13 @@ class OpenAIServingCompletion(OpenAIServing):
         out_tokens: List[str] = []
         out_top_logprobs: List[Optional[Dict[str, float]]] = []
 
+
         last_token_len = 0
 
         for i, token_id in enumerate(token_ids):
-            print("\nTOKEN-ID: ", token_id)
+
 
             step_top_logprobs = top_logprobs[i]
-            print("step_top_logprobs: ", step_top_logprobs)
             if step_top_logprobs is None:
                 token = tokenizer.decode(token_id)
                 if self.return_tokens_as_token_ids:
