@@ -133,6 +133,7 @@ def run_inference(
     test_increasing_seq_lens=False,
     sample_on_device_mode=None,
     dispatch_core_axis=None,
+    fabric_config=None
 ):
     check_tt_model_supported(model)
     
@@ -141,7 +142,9 @@ def run_inference(
         override_tt_config["sample_on_device_mode"] = sample_on_device_mode
     if dispatch_core_axis:
         override_tt_config["dispatch_core_axis"] = dispatch_core_axis.lower()
-    
+    if fabric_config:
+        override_tt_config["fabric_config"] = fabric_config.upper()
+
     # LLM args
     engine_kw_args = {
         "model": model,
@@ -312,6 +315,8 @@ if __name__ == "__main__":
     parser.add_argument("--test_increasing_seq_lens", action="store_true", help="Test generations of small to large sequences")
     parser.add_argument("--sample_on_device_mode", type=str, choices=["all", "decode_only"], default=None, help="Enable sampling on device (during prefill and decode, or only during decode)")
     parser.add_argument("--dispatch_core_axis", type=str, choices=["row", "col", None], default=None, help="Dispatch core axis [row, col]")
+    parser.add_argument("--fabric_config", type=str, choices=["DISABLED", "FABRIC_1D", "FABRIC_2D", "CUSTOM", None], default=None, help="Fabric configuration, check out ttnn.FabricConfig for options")
+    
     args = parser.parse_args()
 
     run_inference(
@@ -330,4 +335,5 @@ if __name__ == "__main__":
         test_increasing_seq_lens=args.test_increasing_seq_lens,
         sample_on_device_mode=args.sample_on_device_mode,
         dispatch_core_axis=args.dispatch_core_axis,
+        fabric_config=args.fabric_config,
     )
