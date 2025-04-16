@@ -406,7 +406,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
         for final_res in final_res_batch:
             prompt_token_ids = final_res.prompt_token_ids
-            assert prompt_token_ids is not None # TODO: what is this 
+            assert prompt_token_ids is not None 
             try:
                 prompt_logprobs = final_res.prompt_logprobs
             except:
@@ -423,13 +423,17 @@ class OpenAIServingCompletion(OpenAIServing):
                 assert request.max_tokens is not None
                 if request.echo and request.max_tokens == 0:
                     assert prompt_text is not None
-                    token_ids = prompt_token_ids # TODO: check if we can comment this 
+                    token_ids = prompt_token_ids 
                     out_logprobs = prompt_logprobs
                     output_text = prompt_text
                 elif request.echo and request.max_tokens > 0:
                     assert prompt_text is not None
-                    token_ids = [*prompt_token_ids, *output.token_ids] 
-                    token_ids = [*output.token_ids] 
+                    if prompt_logprobs is not None:
+                        token_ids = [*prompt_token_ids, *output.token_ids] 
+                    else:
+                        # currently not supporting prompt log probs 
+                        # don't return associated tokens so there are no index issues in _create_completion_logprobs
+                        token_ids = [*output.token_ids] 
 
                     if request.logprobs is None:
                         out_logprobs = None
