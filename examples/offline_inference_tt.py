@@ -138,14 +138,10 @@ def run_inference(
     
     # Generation args
     ignore_eos = True if measure_perf else False
-
     if greedy_sampling:
-        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=ignore_eos, temperature=0.0, prompt_logprobs=1)
+        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=ignore_eos, temperature=0.0)
     else:
-        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=ignore_eos, top_k=10, top_p=0.9, 
-                                         temperature=1.0,
-                                         logprobs=1) #TODO: set logprobs true here for testing and see what happens
-
+        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=ignore_eos, top_k=10, top_p=0.9, temperature=1.0)
     if test_increasing_seq_lens:
         assert not measure_perf, "measure_perf option not supported with test_increasing_seq_lens"
         assert not async_engine, "async_engine option not supported with test_increasing_seq_lens"
@@ -242,7 +238,6 @@ def generate_tokens(llm : LLM, prompts, sampling_params, prompt_token_ids=None, 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
     outputs = llm.generate(prompts, sampling_params, prompt_token_ids)
-    breakpoint()
     # Print the outputs.
     for output in outputs:
         request_id = int(output.request_id) + 1
