@@ -416,6 +416,16 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             assert fabric_config is not None, f"Invalid fabric_config: {fabric_config_str}. Expected one of {list(fabric_config_map.keys())}."
             ttnn.initialize_fabric_config(fabric_config)
 
+    def _device_params_from_override_tt_config(self):
+        override_tt_config = self.model_config.override_tt_config
+        device_params = {}
+        if override_tt_config is not None:
+            if "trace_region_size" in override_tt_config and self.trace_mode:
+                device_params["trace_region_size"] = override_tt_config["trace_region_size"]
+            if "worker_l1_size" in override_tt_config:
+                device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
+        return device_params
+
     def _open_mesh_device(self):
         num_devices_available = len(ttnn.get_device_ids())
         
@@ -428,11 +438,7 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         if mesh_grid[0] * mesh_grid[1] > num_devices_available:
             assert f"Requested mesh grid shape {mesh_grid} is larger than number of available devices {num_devices_available}"
 
-        device_params = {}
-        if self.trace_mode:
-            device_params["trace_region_size"] = 23887872  # TODO: make this configurable
-
-        device_params["worker_l1_size"] = 1344544
+        device_params = self._device_params_from_override_tt_config()
 
         self._set_fabric()
 
