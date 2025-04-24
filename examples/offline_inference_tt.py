@@ -183,6 +183,7 @@ def run_inference(
             prompts = get_sample_multi_modal_llama_inputs() 
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
+        prompts = prompts[:1]
         print("Number of prompts:", len(prompts))
     else:
         assert perf_prompt_len is not None, "perf_prompt_len is required to generate dummy prompts"
