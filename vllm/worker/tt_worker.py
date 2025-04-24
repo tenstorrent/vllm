@@ -419,11 +419,16 @@ class TTWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def _device_params_from_override_tt_config(self):
         override_tt_config = self.model_config.override_tt_config
         device_params = {}
-        if override_tt_config is not None:
-            if "trace_region_size" in override_tt_config and self.trace_mode:
+
+        if self.trace_mode:
+            # Set the most common value as default, override later
+            device_params["trace_region_size"] = 23887872
+            if override_tt_config and "trace_region_size" in override_tt_config:
                 device_params["trace_region_size"] = override_tt_config["trace_region_size"]
-            if "worker_l1_size" in override_tt_config:
-                device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
+
+        if override_tt_config and "worker_l1_size" in override_tt_config:
+            device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
+
         return device_params
 
     def _open_mesh_device(self):
