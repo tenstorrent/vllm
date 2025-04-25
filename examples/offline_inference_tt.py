@@ -38,32 +38,72 @@ def register_tt_models():
 
     # Qwen2.5 - Text
     ModelRegistry.register_model("TTQwen2ForCausalLM", "models.tt_transformers.tt.generator_vllm:Qwen2ForCausalLM")
+    
+    # Qwen2.5 - Vision
+    ModelRegistry.register_model("TTQwen2_5_VLForConditionalGeneration", "models.demos.qwen25_vl.tt.generator_vllm:Qwen2_5_VLForConditionalGeneration")
+    
 
 register_tt_models()  # Import and register models from tt-metal
 
 
-def get_sample_multi_modal_llama_inputs():
-    '''
-    Prepare 4 sample multi-modal prompts for Llama3.2-11B
-    '''
-    MLLAMA_IMAGE_TOKEN = "<|image|>"
-    IMG_PATH = Path(resource_filename("llama_models", "scripts/resources/"))
-    relative_img_paths = [None, "pasta.jpeg", "ocr_image.jpeg", "clutter.jpeg"]
-    questions = [
-        "Write a haiku.",
-        "What is for dinner?",
-        "What is the full text of this image? Do OCR",
-        "What objects are in this image?"
-    ]
+def get_sample_multi_modal_inputs(model):
+    text_prompts = []
+    imgs = []
+    if "Llama-3.2" in model:
+        #Prepare 4 sample multi-modal prompts for Llama3.2-11B
+        MLLAMA_IMAGE_TOKEN = "<|image|>"
+        IMG_PATH = Path(resource_filename("llama_models", "scripts/resources/"))
+        relative_img_paths = [None, "pasta.jpeg", "ocr_image.jpeg", "clutter.jpeg"]
+        questions = [
+            "Write a haiku.",
+            "What is for dinner?",
+            "What is the full text of this image? Do OCR",
+            "What objects are in this image?"
+        ]
+        # TODO: chat template should be applied to these prompts
+        for relative_img_path, question in zip(relative_img_paths, questions):
+            if relative_img_path is not None:
+                with open(IMG_PATH / relative_img_path, "rb") as f:
+                    img = PIL_Image.open(f).convert("RGB")
+                    imgs.append(img)
+                text_prompts.append(f"{MLLAMA_IMAGE_TOKEN}{question}")
+            else:
+                imgs.append(None)
+                text_prompts.append(question)
+    elif "Qwen2" in model:
+        # Prepare a sample multi-modal prompt for Qwen2.5-VL
+        from qwen_vl_utils import process_vision_info  # Import here to avoid for other models
+        questions = ["Describe this image."]
+        img_refs = ["https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"]
+        for img_ref, question in zip(img_refs, questions):
+            prompt = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img_ref},
+                    {"type": "text", "text": question}
+                ]
+            }]
+            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+            chat_prompt = tokenizer.apply_chat_template(prompt,
+                                                        tokenize=False,
+                                                        add_generation_prompt=True)
+            if img_ref is not None:
+                image_inputs, video_inputs = process_vision_info(prompt)
+                assert video_inputs is None, "Video inputs not supported yet"
+                assert len(image_inputs) == 1, "Multi-image inputs not supported yet"
+                imgs.append(image_inputs[0])
+            else:
+                imgs.append(None)
+            text_prompts.append(chat_prompt)
+    else:
+        raise ValueError(f"Unsupported model for multi-modal inference test: {model}")
+    
     inputs = []
-    for relative_img_path, question in zip(relative_img_paths, questions):
-        if relative_img_path is not None:
-            with open(IMG_PATH / relative_img_path, "rb") as f:
-                img = PIL_Image.open(f).convert("RGB")
-            prompt = f"{MLLAMA_IMAGE_TOKEN}{question}"
-            inputs.append({"prompt": prompt, "multi_modal_data": {"image": img}})
+    for img, text_prompt in zip(imgs, text_prompts):
+        if img is not None:
+            inputs.append({"prompt": text_prompt, "multi_modal_data": {"image": img}})
         else:
-            inputs.append({"prompt": question})
+            inputs.append({"prompt": text_prompt})
     return inputs
 
 
@@ -86,6 +126,7 @@ def check_tt_model_supported(model):
         "Qwen/Qwen2.5-72B",
         "Qwen/Qwen2.5-72B-Instruct",
         "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+        "Qwen/Qwen2.5-VL-3B-Instruct",
     ]
     assert model in supported_models, f"Invalid model: {model}"
 
@@ -137,9 +178,6 @@ def run_inference(
 ):
     check_tt_model_supported(model)
     
-    if multi_modal:
-        assert "Llama-3.2" in model, "The multi-modal inference test currently only supports Llama-3.2 models"
-    
     # LLM args
     engine_kw_args = {
         "model": model,
@@ -183,7 +221,7 @@ def run_inference(
             assert isinstance(prompts, list), "Prompts must be a list of strings"
         else:
             print("Ignoring prompts json for multi-modal inference")
-            prompts = get_sample_multi_modal_llama_inputs() 
+            prompts = get_sample_multi_modal_inputs(model)
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))
@@ -197,6 +235,7 @@ def run_inference(
         if not multi_modal:
             prompts = [{"prompt_token_ids": prompt_token_ids_user} for _ in range(max_seqs_in_batch)]
         else:
+            assert "Llama-3.2" in model, "The multi-modal inference perf test currently only supports Llama-3.2 models"
             MLLAMA_IMAGE_TOKEN_ID = 128256  # Specific to multi-modal llama
             prompt_token_ids_user.insert(0, MLLAMA_IMAGE_TOKEN_ID)
             random_pixels = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
