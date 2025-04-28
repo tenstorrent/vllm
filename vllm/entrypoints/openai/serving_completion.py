@@ -407,8 +407,12 @@ class OpenAIServingCompletion(OpenAIServing):
 
         for final_res in final_res_batch:
             prompt_token_ids = final_res.prompt_token_ids
-            assert prompt_token_ids is not None
-            prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
+            assert prompt_token_ids is not None 
+            try:
+                prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
+            except:
+                if prompt_logprobs is None:
+                    print("Currently not supporting prompt_logprobs")
             prompt_text = final_res.prompt
 
             token_ids: GenericSequence[int]
@@ -424,17 +428,32 @@ class OpenAIServingCompletion(OpenAIServing):
                         out_logprobs = prompt_logprobs
                         output_text = prompt_text
                     else:
-                        token_ids = [*prompt_token_ids, *output.token_ids]
+                        if prompt_logprobs is not None:
+                            token_ids = [*prompt_token_ids, *output.token_ids] 
+                        else:
+                            # currently not supporting prompt log probs 
+                            # don't return associated tokens so there are no index issues in _create_completion_logprobs
+                            token_ids = [*output.token_ids] 
 
                         if request.logprobs is None:
                             out_logprobs = None
                         else:
-                            assert prompt_logprobs is not None
+                            try:
+                                assert prompt_logprobs is not None
+                            except AssertionError:
+                                print("Currently not supporting prompt_logprobs")
+                            
                             assert output.logprobs is not None
-                            out_logprobs = [
-                                *prompt_logprobs,
-                                *output.logprobs,
-                            ]
+                            if prompt_logprobs is None:
+                                out_logprobs = [
+                                    *output.logprobs
+                                ]
+                            else:
+                                out_logprobs = [
+                                    *prompt_logprobs,
+                                    *output.logprobs,
+
+                                ]
 
                         output_text = prompt_text + output.text
                 else:

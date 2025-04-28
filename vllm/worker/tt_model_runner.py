@@ -73,7 +73,7 @@ class TTModelInput(ModelRunnerInputBase):
         return cls(**tensor_dict)
     
 
-def top_pk_logits_efficient(logits, p=0.9, k=10, temperature=1.0, return_probs=False):
+def top_pk_logits_efficient(logits, p=0.9, k=10, temperature=1.0, return_probs=False, return_log_probs=False):
     # do not keep the entire vocab size after top k. Instead, keep the k size tensor and record the associated indices
     if k == -1:  # no top-k sampling
         top_k_values, top_k_indices = logits, torch.arange(logits.shape[-1]).unsqueeze(0).repeat(logits.shape[0],1)
@@ -81,14 +81,18 @@ def top_pk_logits_efficient(logits, p=0.9, k=10, temperature=1.0, return_probs=F
         top_k_values, top_k_indices = torch.topk(logits, k=k)
     top_p_values = TopPLogitsWarper(top_p=p)(None, top_k_values)
     probs = F.softmax(top_p_values / temperature, dim=-1)
+    log_probs = torch.log_softmax(top_p_values / temperature, dim=-1)
+    log_probs = torch.nan_to_num(log_probs)
     probs = torch.nan_to_num(probs)  # convert nan to num to prevent error in multinomial
     top_k_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
     token = top_k_indices.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1)
+    logprob = log_probs.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1) # along each batch, get the logprob of the selected token
     if return_probs:
         return token, (probs, top_k_indices)
+    elif return_log_probs:
+        return token, logprob 
     else:
         return token
-
 
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
@@ -339,9 +343,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         if model_input.is_first_multi_step:  # always true if not using multi-step
             self.cached_step_outputs = []
+            self.cached_step_output_logprobs = []
             for i in range(num_steps):
-                next_token_ids = self._execute_model_single_step(model_input, kv_caches, is_decode, async_out_proc_per_trace, step_idx=i)
+                next_token_ids, log_probs = self._execute_model_single_step(model_input, kv_caches, is_decode, async_out_proc_per_trace, step_idx=i)
                 self.cached_step_outputs.append(next_token_ids)
+                self.cached_step_output_logprobs.append(log_probs)
                 
                 if i < num_steps - 1:
                     # Prepare the inputs for the next step
@@ -377,9 +383,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 assert num_outputs == 1, "Last step should only have one output"
             for i in range(num_outputs):
                 next_token_ids = self.cached_step_outputs.pop(0)
+                log_probs = self.cached_step_output_logprobs.pop(0)
                 # TODO: add read back from device once model can keep executing steps on device
                 sampler_output = self._make_sampler_output(
                     next_token_ids,
+                    log_probs,
                     model_input.seq_groups
                 )
                 sampler_outputs.append(sampler_output)
@@ -404,16 +412,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     def _make_sampler_output(
         self,
         next_token_ids: List[int],
+        log_probs: List[float],
         seq_groups: List[int],
     ) -> SamplerOutput:
         # Minimal code to construct the sampler outputs, based on tpu_model_runner.py
         # TT backend does not support the advanced sampling parameters such as logprobs.
-        zero_logprob = Logprob(0.0)
         sampler_outputs = []
         for batch_idx, seq_id in enumerate(seq_groups):
             next_token_id = int(next_token_ids[batch_idx])
+            if log_probs[batch_idx] is None:
+                log_probs = Logprob(0.0) 
+            else:
+                log_prob = Logprob(log_probs[batch_idx])
             seq_outputs = [SequenceOutput(seq_id, next_token_id,
-                                {next_token_id: zero_logprob})]
+                                {next_token_id: log_prob})]
             sampler_outputs.append(
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
@@ -421,8 +433,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         if step_idx > 0:
             next_token_ids = self.cached_step_outputs.pop(0)
+            log_prob = self.cached_step_output_logprobs.pop(0)
             sampler_output = self._make_sampler_output(
                 next_token_ids,
+                log_prob,
                 model_input.seq_groups
             )
             self._send_async_out(sampler_output, model_input.async_callback, is_first_step_output=(step_idx == 1))
@@ -477,21 +491,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
+        log_probs = None
         if not self.sample_on_device_mode or (self.sample_on_device_mode == "decode_only" and not is_decode):
             next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]  # unpadded batch, vocab of last token
-            next_token_ids = self._sample_tokens(next_logits, model_input.tt_sampling_params)
+            next_token_ids, log_probs  = self._sample_tokens(next_logits, model_input.tt_sampling_params)
         else:
             next_token_ids = tt_out
-        
-        return next_token_ids
+
+        return next_token_ids, log_probs
 
     def _sample_tokens(self, logits, tt_sampling_params : TTSamplingParams):
         if tt_sampling_params.temperature == 0:  # greedy decoding
-            return torch.argmax(logits, dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            return torch.argmax(logits, dim=-1), torch.max(log_probs, dim=-1)[0]
         else:  # top-k top-p sampling
             return top_pk_logits_efficient(
                 logits,
                 p=tt_sampling_params.top_p,
                 k=tt_sampling_params.top_k,
-                temperature=tt_sampling_params.temperature
+                temperature=tt_sampling_params.temperature,
+                return_log_probs=True
             )
