@@ -239,6 +239,8 @@ async def async_request_openai_completions(
             "logprobs": request_func_input.logprobs,
             "stream": True,
         }
+        # Temporary workaround! This is already fixed on latest vLLM/main.
+        # Just run it over when rebasing.
         if request_func_input.best_of is not None and request_func_input.best_of > 1:
             payload["best_of"] = request_func_input.best_of
         if request_func_input.ignore_eos:
