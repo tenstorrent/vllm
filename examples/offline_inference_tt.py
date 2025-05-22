@@ -70,11 +70,11 @@ def get_sample_multi_modal_inputs(model):
             else:
                 imgs.append(None)
                 text_prompts.append(question)
-    elif "Qwen2" in model:
+    elif "Qwen2.5-VL" in model:
         # Prepare a sample multi-modal prompt for Qwen2.5-VL
         from qwen_vl_utils import process_vision_info  # Import here to avoid for other models
-        questions = ["Describe this image."]
-        img_refs = ["https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"]
+        questions = ["Describe this image.", "Is there a cat in this image? If not, what animal do you see in the image? Describe the image in detail."]
+        img_refs = ["file://models/sample_data/house_in_field_1080p.jpg", "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"]
         for img_ref, question in zip(img_refs, questions):
             prompt = [{
                 "role": "user",
@@ -253,6 +253,10 @@ def run_inference(
     # Create and run LLM
     if not async_engine:
         llm = LLM(**engine_kw_args)
+        if 'Qwen2.5-VL' in model:
+            # todo)) LLM(**engine_kw_args) does not accept input_processor as an argument; is there a better way than the following (in upstream vLLM)?
+            llm.llm_engine.input_processor = llm.llm_engine.model_executor.driver_worker.worker.model_runner.model.input_processor
+            print("Qwen2.5-VL model requires a different input_processor than the default one; Using the custom one through the generator_vllm module.")
         if not measure_perf:
             generate_tokens(llm, prompts, sampling_params, print_output=True)
         else:
