@@ -253,10 +253,6 @@ def run_inference(
     # Create and run LLM
     if not async_engine:
         llm = LLM(**engine_kw_args)
-        if 'Qwen2.5-VL' in model:
-            # todo)) LLM(**engine_kw_args) does not accept input_processor as an argument; is there a better way than the following (in upstream vLLM)?
-            llm.llm_engine.input_processor = llm.llm_engine.model_executor.driver_worker.worker.model_runner.model.input_processor
-            print("Qwen2.5-VL model requires a different input_processor than the default one; Using the custom one through the generator_vllm module.")
         if not measure_perf:
             generate_tokens(llm, prompts, sampling_params, print_output=True)
         else:
