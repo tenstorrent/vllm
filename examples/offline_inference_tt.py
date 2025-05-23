@@ -46,10 +46,11 @@ def register_tt_models():
 register_tt_models()  # Import and register models from tt-metal
 
 
-def get_sample_multi_modal_inputs(model):
+def get_sample_multi_modal_inputs(model, prompts_json):
     text_prompts = []
     imgs = []
     if "Llama-3.2" in model:
+        assert prompts_json is None, "Prompts JSON file not supported for Llama3.2-11B"
         #Prepare 4 sample multi-modal prompts for Llama3.2-11B
         MLLAMA_IMAGE_TOKEN = "<|image|>"
         IMG_PATH = Path(resource_filename("llama_models", "scripts/resources/"))
@@ -71,26 +72,32 @@ def get_sample_multi_modal_inputs(model):
                 imgs.append(None)
                 text_prompts.append(question)
     elif "Qwen2.5-VL" in model:
-        # Prepare a sample multi-modal prompt for Qwen2.5-VL
-        from qwen_vl_utils import process_vision_info  # Import here to avoid for other models
-        questions = ["Describe this image.", "Is there a cat in this image? If not, what animal do you see in the image? Describe the image in detail."]
-        img_refs = ["file://models/sample_data/house_in_field_1080p.jpg", "file://models/sample_data/demo.jpeg"]
-        for img_ref, question in zip(img_refs, questions):
-            prompt = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img_ref},
-                    {"type": "text", "text": question}
-                ]
-            }]
-            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        if prompts_json is not None:
+            with open(prompts_json, 'r') as file:
+                prompts = json.load(file)
+        else:
+            # Prepare a sample multi-modal prompt for Qwen2.5-VL
+            questions = ["Describe this image."]
+            img_refs = ["https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"]
+
+            prompts = [[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img_ref},
+                        {"type": "text", "text": question}
+                    ]
+                }] for img_ref, question in zip(img_refs, questions)
+            ]
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        for prompt in prompts:
             chat_prompt = tokenizer.apply_chat_template(prompt,
                                                         tokenize=False,
                                                         add_generation_prompt=True)
-            if img_ref is not None:
+            if any(ctnt["type"] == "image" for entry in prompt for ctnt in entry['content']):
+                from qwen_vl_utils import process_vision_info  # Import here to avoid for other models
                 image_inputs, video_inputs = process_vision_info(prompt)
                 assert video_inputs is None, "Video inputs not supported yet"
-                assert len(image_inputs) == 1, "Multi-image inputs not supported yet"
+                assert len(image_inputs) == 1, "Multi-image inputs not supported yet" # todo)) add support for multiple images
                 imgs.append(image_inputs[0])
             else:
                 imgs.append(None)
@@ -216,12 +223,14 @@ def run_inference(
     if not measure_perf:
         if not multi_modal:
             # Load prompts from a JSON file
+            assert os.path.exists(prompts_json), f"Prompts JSON file not found: {prompts_json}"
             with open(prompts_json, 'r') as file:
                 prompts = json.load(file)
             assert isinstance(prompts, list), "Prompts must be a list of strings"
         else:
-            print("Ignoring prompts json for multi-modal inference")
-            prompts = get_sample_multi_modal_inputs(model)
+            if not os.path.exists(prompts_json):
+                prompts_json = None
+            prompts = get_sample_multi_modal_inputs(model, prompts_json)
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))
