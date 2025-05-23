@@ -74,7 +74,7 @@ def get_sample_multi_modal_inputs(model):
         # Prepare a sample multi-modal prompt for Qwen2.5-VL
         from qwen_vl_utils import process_vision_info  # Import here to avoid for other models
         questions = ["Describe this image.", "Is there a cat in this image? If not, what animal do you see in the image? Describe the image in detail."]
-        img_refs = ["file://models/sample_data/house_in_field_1080p.jpg", "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"]
+        img_refs = ["file://models/sample_data/house_in_field_1080p.jpg", "file://models/sample_data/demo.jpeg"]
         for img_ref, question in zip(img_refs, questions):
             prompt = [{
                 "role": "user",
@@ -128,7 +128,7 @@ def check_tt_model_supported(model):
         "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
         "Qwen/Qwen2.5-VL-3B-Instruct",
     ]
-    assert model in supported_models, f"Invalid model: {model}"
+    assert any(model.endswith(l) for l in supported_models), f"Invalid model: {model}"
 
 
 def run_seq_len_tests(engine_kw_args, sampling_params):
