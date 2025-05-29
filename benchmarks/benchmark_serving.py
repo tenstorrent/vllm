@@ -19,6 +19,13 @@ On the client side, run:
     when using tgi backend, add
         --endpoint /generate_stream
     to the end of the command above.
+
+Server-side tokenization improvements:
+    - New dataset-name option "cleaned-random" for server-side tokenized prompts
+    - Uses CleanedPromptGenerator for more stable and consistent prompts
+    - Automatic trace capture for performance analysis
+    - Simple authentication support compatible with vLLM patterns
+    - Optional server-side tokenization for more accurate token counting
 """
 import argparse
 import asyncio
@@ -57,7 +64,96 @@ from benchmark_dataset import (AIMODataset, BurstGPTDataset,
                                VisionArenaDataset)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 
+# Server-side tokenization imports (optional)
+try:
+    from benchmark_utils import CleanedPromptGenerator, PromptClient
+    CLEANED_PROMPT_AVAILABLE = True
+except ImportError:
+    CLEANED_PROMPT_AVAILABLE = False
+    print("Warning: CleanedPromptGenerator not available. Server-side tokenization disabled.")
+
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
+
+def setup_server_client(args, model_config):
+    """Set up the client for server-side tokenization"""
+    if not CLEANED_PROMPT_AVAILABLE:
+        return None
+    
+    # Create prompt client using simplified API
+    client = PromptClient(
+        model_name=model_config,
+        host=args.host,
+        port=args.port
+    )
+    
+    # Wait for server to be healthy (optional)
+    print("Checking server health...")
+    if client.wait_for_healthy(timeout=30):
+        print("Server is healthy and ready!")
+        return client
+    else:
+        print("Server health check failed!")
+        return None
+
+
+def generate_cleaned_random_requests(
+    num_prompts: int,
+    input_len: int,
+    output_len: int,
+    model_name: str,
+    client: PromptClient,
+    seed: int = 42,
+) -> list[SampleRequest]:
+    """
+    Generate cleaned random prompts using CleanedPromptGenerator with server-side tokenization.
+    
+    Returns list of SampleRequest objects.
+    """
+    if not CLEANED_PROMPT_AVAILABLE or client is None:
+        raise ValueError("CleanedPromptGenerator not available or client not set up")
+        
+    print(f"Generating {num_prompts} cleaned random prompts...")
+    
+    # Initialize the generator with server-side tokenization
+    generator = CleanedPromptGenerator(
+        model_name=model_name,
+        server_tokenizer=True,
+        client=client,
+        seed=seed
+    )
+    
+    input_requests = []
+    
+    # Generate prompts with a progress bar
+    for i in range(num_prompts):
+        # Generate stable tokens
+        tokens = generator.generate_stable_tokens(
+            input_length=input_len,
+            max_length=input_len,  # Keep it at the exact requested length
+            seed=seed + i  # Different seed for each prompt
+        )
+        
+        # Decode tokens back to text for the prompt
+        prompt_text = generator._decode(tokens)
+        
+        # The actual token count might be slightly different due to cleaning
+        prompt_len = len(tokens)
+        
+        # Create SampleRequest object
+        request = SampleRequest(
+            prompt=prompt_text,
+            prompt_len=prompt_len,
+            expected_output_len=output_len,
+            multi_modal_data=None
+        )
+        input_requests.append(request)
+    
+    print(f"Generated {len(input_requests)} cleaned prompts")
+    avg_prompt_len = sum(r.prompt_len for r in input_requests) / len(input_requests)
+    print(f"Average prompt length: {avg_prompt_len:.1f} tokens")
+    
+    return input_requests
 
 
 @dataclass
@@ -262,6 +358,7 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    auth_headers: Optional[dict] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -292,7 +389,8 @@ async def benchmark(
         extra_body=extra_body,
     )
 
-    test_output = await request_func(request_func_input=test_input)
+    test_output = await request_func(request_func_input=test_input,
+                                     auth_headers=auth_headers)
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
@@ -318,7 +416,8 @@ async def benchmark(
                                          multi_modal_content=test_mm_content,
                                          ignore_eos=ignore_eos,
                                          extra_body=extra_body)
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await request_func(request_func_input=profile_input,
+                                            auth_headers=auth_headers)
         if profile_output.success:
             print("Profiler started")
 
@@ -343,10 +442,12 @@ async def benchmark(
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+                                      pbar=pbar,
+                                      auth_headers=auth_headers)
         async with semaphore:
             return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+                                      pbar=pbar,
+                                      auth_headers=auth_headers)
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -385,7 +486,8 @@ async def benchmark(
             output_len=test_output_len,
             logprobs=logprobs,
         )
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await request_func(request_func_input=profile_input,
+                                            auth_headers=auth_headers)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -560,6 +662,14 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
 
+    # Set up server client for server-side tokenization (if available)
+    server_client = None
+    if (args.dataset_name == "cleaned-random" or 
+        getattr(args, 'use_server_tokenization', False)):
+        server_client = setup_server_client(args, model_id)
+        if server_client is None and args.dataset_name == "cleaned-random":
+            raise ValueError("Server client setup failed but cleaned-random dataset requires it")
+
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
                               trust_remote_code=args.trust_remote_code)
@@ -569,7 +679,32 @@ def main(args: argparse.Namespace):
             "Please specify '--dataset-name' and the corresponding "
             "'--dataset-path' if required.")
 
-    if args.dataset_name == "sonnet":
+    if args.dataset_name == "cleaned-random":
+        # Use server-side tokenization for cleaned random prompts
+        if not CLEANED_PROMPT_AVAILABLE or server_client is None:
+            raise ValueError(
+                "CleanedPromptGenerator not available or server client not set up. "
+                "This is required for cleaned-random dataset."
+            )
+        
+        # Capture traces for the input/output length combination (unless disabled)
+        if not getattr(args, 'disable_trace_capture', False):
+            print("Capturing traces for input/output length combination...")
+            context_lens = [(args.random_input_len, args.random_output_len)]
+            server_client.capture_traces(context_lens=context_lens, timeout=1200.0)
+        else:
+            print("Trace capture disabled, skipping...")
+        
+        input_requests = generate_cleaned_random_requests(
+            num_prompts=args.num_prompts,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            model_name=model_id,
+            client=server_client,
+            seed=args.seed,
+        )
+
+    elif args.dataset_name == "sonnet":
         dataset = SonnetDataset(dataset_path=args.dataset_path)
         # For the "sonnet" dataset, formatting depends on the backend.
         if args.backend == "openai-chat":
@@ -704,6 +839,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            auth_headers=getattr(server_client, 'headers', None) if server_client else None,
         ))
 
     # Save config and results to json
@@ -789,7 +925,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "cleaned-random"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -1082,6 +1218,21 @@ if __name__ == "__main__":
                         help="A subset of LoRA module names passed in when "
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
+
+    # Server-side tokenization and trace capture arguments
+    parser.add_argument(
+        "--use-server-tokenization",
+        action="store_true",
+        help="Use server-side tokenization for more accurate token counting. "
+        "Requires CleanedPromptGenerator and PromptClient to be available."
+    )
+    
+    parser.add_argument(
+        "--disable-trace-capture",
+        action="store_true",
+        help="Disable trace capture when using cleaned-random dataset. "
+        "Use this to speed up execution if traces are already captured."
+    )
 
     args = parser.parse_args()
 
