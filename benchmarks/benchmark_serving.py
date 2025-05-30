@@ -66,7 +66,7 @@ from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 
 # Server-side tokenization imports (optional)
 try:
-    from benchmark_utils import CleanedPromptGenerator, PromptClient
+    from prompt_utils import CleanedPromptGenerator, PromptClient
     CLEANED_PROMPT_AVAILABLE = True
 except ImportError:
     CLEANED_PROMPT_AVAILABLE = False
@@ -80,11 +80,11 @@ def setup_server_client(args, model_config):
     if not CLEANED_PROMPT_AVAILABLE:
         return None
     
-    # Create prompt client using simplified API
+    # Create prompt client using simplified API (matches original vLLM pattern)
     client = PromptClient(
         model_name=model_config,
         host=args.host,
-        port=args.port
+        port=args.port,
     )
     
     # Wait for server to be healthy (optional)

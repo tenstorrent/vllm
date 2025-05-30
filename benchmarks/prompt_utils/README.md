@@ -1,4 +1,4 @@
-# Benchmark Utilities for vLLM
+# Prompt Utilities for vLLM
 
 This directory contains utilities for advanced benchmarking of vLLM, including server-side tokenization and cleaned prompt generation.
 
@@ -6,7 +6,7 @@ This directory contains utilities for advanced benchmarking of vLLM, including s
 
 - **Server-side tokenization**: More accurate token counting using the server's tokenizer
 - **Cleaned prompt generation**: Stable, reproducible prompts through encode/decode cycles
-- **Standard authentication**: Uses vLLM's standard environment variable authentication
+- **Simple authentication**: Compatible with vLLM's standard authentication patterns
 
 ## Additional Requirements
 
@@ -24,6 +24,11 @@ These utilities are automatically used by `benchmark_serving.py` when:
 - Using the `--dataset-name cleaned-random` option
 - Enabling `--use-server-tokenization`
 
+Example import:
+```python
+from prompt_utils import PromptClient, CleanedPromptGenerator
+```
+
 ## Authentication
 
 The utilities follow the exact same authentication pattern as the original vLLM benchmark code:
@@ -31,7 +36,7 @@ The utilities follow the exact same authentication pattern as the original vLLM 
 1. **Environment variables**: `AUTHORIZATION` or `OPENAI_API_KEY`
 2. **Fallback**: Empty string (for open servers)
 
-No command line arguments needed - uses only environment variables for authentication.
+No command line arguments needed - just set the environment variables as you would for any vLLM benchmark.
 
 ## Components
 

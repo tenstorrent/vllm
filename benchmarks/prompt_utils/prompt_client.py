@@ -24,7 +24,7 @@ class PromptClient:
         self, 
         model_name: str,
         host: str = "127.0.0.1",
-        port: int = 8000
+        port: int = 8000,
     ):
         self.model_name = model_name
         self.host = host
@@ -39,12 +39,12 @@ class PromptClient:
         self.server_ready = False
 
     def _get_authorization(self) -> str:
-        """Get authorization token following vLLM's original pattern."""
+        """Get authorization token following vLLM's original pattern exactly."""
         # Check AUTHORIZATION environment variable (for custom auth tokens)
         if env_auth := os.environ.get("AUTHORIZATION"):
             return env_auth
         
-        # Fallback to OPENAI_API_KEY (matching original vLLM pattern)
+        # Use OPENAI_API_KEY (exact original vLLM pattern)
         return os.environ.get("OPENAI_API_KEY", "")
 
     def _get_api_base_url(self) -> str:
