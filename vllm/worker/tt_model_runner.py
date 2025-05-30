@@ -506,7 +506,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if async_out_proc_per_trace:
                 # trigger output processor on host while device is executing next step
                 self._send_prev_step_async_out(model_input, step_idx)
-            tt_out = self.model.read_decode_output(tt_out, model_input.unpadded_batch_size, is_tokens=(self.sample_on_device_mode is not None))
+            tt_out = self.model.read_decode_output(tt_out, model_input.unpadded_batch_size, padded_batch=len(model_input.input_tokens), is_tokens=(self.sample_on_device_mode is not None))
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
