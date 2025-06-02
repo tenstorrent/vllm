@@ -365,7 +365,14 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
+    # NOTE: The initial single prompt test run has been commented out as it's
+    # largely redundant with the capture_traces functionality that already
+    # validates authentication, request/response format compatibility, and
+    # basic server functionality. However, we still extract the test variables
+    # needed for the profiler from the first input request.
+    # print("Starting initial single prompt test run...")
+    
+    # Extract test variables needed for profiler (if enabled)
     test_prompt, test_prompt_len, test_output_len, test_mm_content = \
         input_requests[0].prompt, input_requests[0].prompt_len, \
         input_requests[0].expected_output_len, \
@@ -376,27 +383,30 @@ async def benchmark(
         raise ValueError(
             "Multi-modal content is only supported on 'openai-chat' backend.")
     assert test_mm_content is None or isinstance(test_mm_content, dict)
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-        extra_body=extra_body,
-    )
 
-    test_output = await request_func(request_func_input=test_input,
-                                     auth_headers=auth_headers)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+    # COMMENTED OUT: Initial single prompt test run - redundant with capture_traces
+    # print("Starting initial single prompt test run...")
+    # test_input = RequestFuncInput(
+    #     model=model_id,
+    #     model_name=model_name,
+    #     prompt=test_prompt,
+    #     api_url=api_url,
+    #     prompt_len=test_prompt_len,
+    #     output_len=test_output_len,
+    #     logprobs=logprobs,
+    #     multi_modal_content=test_mm_content,
+    #     ignore_eos=ignore_eos,
+    #     extra_body=extra_body,
+    # )
+    # 
+    # test_output = await request_func(request_func_input=test_input,
+    #                                  auth_headers=auth_headers)
+    # if not test_output.success:
+    #     raise ValueError(
+    #         "Initial test run failed - Please make sure benchmark arguments "
+    #         f"are correctly specified. Error: {test_output.error}")
+    # else:
+    #     print("Initial test run completed. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
