@@ -51,7 +51,6 @@ class RequestFuncOutput:
 async def async_request_tgi(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
-    auth_headers: Optional[dict] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
@@ -128,7 +127,6 @@ async def async_request_tgi(
 async def async_request_trt_llm(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
-    auth_headers: Optional[dict] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
@@ -196,7 +194,6 @@ async def async_request_trt_llm(
 async def async_request_deepspeed_mii(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
-    auth_headers: Optional[dict] = None,
 ) -> RequestFuncOutput:
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
@@ -352,7 +349,6 @@ async def async_request_openai_completions(
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
-    auth_headers: Optional[dict] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith(
@@ -385,17 +381,10 @@ async def async_request_openai_chat_completions(
         if request_func_input.extra_body:
             payload.update(request_func_input.extra_body)
         
-        # Use auth_headers if provided, otherwise fall back to OPENAI_API_KEY
-        if auth_headers:
-            headers = auth_headers.copy()
-            # Ensure Content-Type is set for chat completions
-            if "Content-Type" not in headers:
-                headers["Content-Type"] = "application/json"
-        else:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-            }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        }
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
