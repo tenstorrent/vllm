@@ -1,53 +1,14 @@
 
-## vLLM and tt-metal Branches
+## vLLM and TT-Metal Branches
 Git-checkout the following branches in each repo separately:
 - vLLM branch: [dev](https://github.com/tenstorrent/vllm/tree/dev) (last verified commit: [f1cb301](https://github.com/tenstorrent/vllm/tree/f1cb30141b662650353d40a330366c50b83b5a98))
 - tt-metal branch: [main](https://github.com/tenstorrent/tt-metal) (last verified commit: [v0.57.0-rc44](https://github.com/tenstorrent/tt-metal/tree/v0.57.0-rc44))
 
-## Environment Creation
+>[!NOTE]
+> Make sure you check for different commits based on the model version you want to bring up.
 
-**To create the vLLM+tt-metal environment (first time):**
-1. Set tt-metal environment variables (see INSTALLING.md in tt-metal repo)
-2. From the main vLLM directory, run:
-    ```sh
-    export vllm_dir=$(pwd)
-    source $vllm_dir/tt_metal/setup-metal.sh
-    ```
-3. From the main tt-metal directory, build and create the environment as usual:
-    ```sh
-    ./build_metal.sh && ./create_venv.sh
-    source $PYTHON_ENV_DIR/bin/activate
-    ```
-4. Install vLLM:
-    ```sh
-    pip3 install --upgrade pip
-    cd $vllm_dir && pip install -e .
-    ```
-
-**To activate the vLLM+tt-metal environment (after the first time):**
-1. Ensure `$vllm_dir` contains the path to vLLM and run:
-    ```sh
-    source $vllm_dir/tt_metal/setup-metal.sh && source $PYTHON_ENV_DIR/bin/activate
-    ```
-
-## Accessing the Meta-Llama Hugging Face Models
-
-To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging Face. To gain access:
-1. Request access on Hugging Face:
-    - Llama-3.1: [https://huggingface.co/meta-llama/Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B)
-    - Llama-3.2: [https://huggingface.co/meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
-    - Llama-3.2-Vision: [https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
-2. Once you have received access, create and copy your access token from the settings tab on Hugging Face.
-3. Run this code in python and paste your access token:
-    ```python
-    from huggingface_hub import login
-    login()
-    ```
-
-## Preparing the tt-metal models
-
-1. Ensure that `$PYTHONPATH` contains the path to tt-metal (should already have been done when installing tt-metal)
-2. For the desired model, follow the setup instructions (if any) for the corresponding tt-metal demo. E.g. For Llama-3.1/3.2 and Qwen-2.5, follow the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers) for preparing the weights and environment variables, and install any extra requirements (e.g. `pip install -r models/tt_transformers/requirements.txt`).
+>[!NOTE]
+> For TT-Metalium installation instructions see [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) in the TT-Metal repository.
 
 ## Running the offline inference example
 
@@ -63,27 +24,31 @@ To measure performance (Llama70B) for a single batch of 32 prompts (with the def
 MESH_DEVICE=T3K WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/offline_inference_tt.py --measure_perf
 ```
 
-**Note 1**: Custom TT options can be set using `--override_tt_config` with a json string, e.g. `--override_tt_config '{"sample_on_device_mode": "all"}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters are:
-- `sample_on_device_mode`: ["all", "decode_only"]
-- `trace_region_size`: [default: 23887872]
-- `worker_l1_size`
-- `fabric_config`: ["DISABLED", "FABRIC_1D", "FABRIC_2D", "CUSTOM"]
-- `dispatch_core_axis`: ["row", "col"]
-- `data_parallel`: [default: 1]
+>[!NOTE]
+> Custom TT options can be set using `--override_tt_config` with a json string, e.g. `--override_tt_config '{"sample_on_device_mode": "all"}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters are:
+> - `sample_on_device_mode`: ["all", "decode_only"]
+> - `trace_region_size`: [default: 23887872]
+> - `worker_l1_size`
+> - `fabric_config`: ["DISABLED", "FABRIC_1D", "FABRIC_2D", "CUSTOM"]
+> - `dispatch_core_axis`: ["row", "col"]
+> - `data_parallel`: [default: 1]
 
-**Note 2 (Llama70B)**: To run Llama70B on Galaxy, set `MESH_DEVICE=TG` and do not set `WH_ARCH_YAML=...`.
+>[!NOTE]
+> To run Llama70B on Galaxy, set `MESH_DEVICE=TG` and do not set `WH_ARCH_YAML=...`.
 
-**Note 3 (Llama70B)**: By default, this will run the newer tt-metal implementation of Llama70B from the [tt_transformers demo](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers). To run other implementations use the `TT_LLAMA_TEXT_VER` environment variable:
-- `"llama3_subdevices"` for the Llama TG implementation
-- `"llama2_70b"` for the old Llama implementation
+>[!NOTE]
+> By default, this will run the newer tt-metal implementation of Llama70B from the [tt_transformers demo](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers). To run other implementations use the `TT_LLAMA_TEXT_VER` environment variable:
+> - `"llama3_subdevices"` for the Llama TG implementation
+> - `"llama2_70b"` for the old Llama implementation
 
-**Note 4 (Other Models)**: By default, the inference example will run with Llama-3.1-70B. To run with other Llama models, or Qwen-2.5, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, `T3K`, or `TG`) and one of the following:
-- Llama-3.1-8B: `--model "meta-llama/Llama-3.1-8B"`
-- Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
-- Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
-- Qwen-2.5-7B: `--model "Qwen/Qwen2.5-7B"` (currently only supported on N300)
-- Qwen-2.5-72B: `--model "Qwen/Qwen2.5-72B"` (currently only supported on T3K)
-- DeepSeek-R1-Distill-Llama-70B: `--model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"`
+>[!NOTE]
+> By default, the inference example will run with Llama-3.1-70B. To run with other Llama models, or Qwen-2.5, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, `T3K`, or `TG`) and one of the following:
+> - Llama-3.1-8B: `--model "meta-llama/Llama-3.1-8B"`
+> - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
+> - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
+> - Qwen-2.5-7B: `--model "Qwen/Qwen2.5-7B"` (currently only supported on N300)
+> - Qwen-2.5-72B: `--model "Qwen/Qwen2.5-72B"` (currently only supported on T3K)
+> - DeepSeek-R1-Distill-Llama-70B: `--model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"`
 
 Command line to run Llama70B on TG is:
 ```sh
@@ -117,9 +82,9 @@ To start up the server:
 VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python examples/server_example_tt.py
 ```
 
-**Note**: By default, the server will run with Llama-3.1-70B-Instruct. To run with other models, set `MESH_DEVICE` and `--model` as described in [Running the offline inference example](#running-the-offline-inference-example).
-
-**Note**: Custom TT options can be set using `--override_tt_config` as described in [Running the offline inference example](#running-the-offline-inference-example).
+>[!NOTE]
+> By default, the server will run with Llama-3.1-70B-Instruct. To run with other models, set `MESH_DEVICE` and `--model` as described in [Running the offline inference example](#running-the-offline-inference-example).
+> Custom TT options can be set using `--override_tt_config` as described in [Running the offline inference example](#running-the-offline-inference-example).
 
 To send a request to the server:
 ```sh
