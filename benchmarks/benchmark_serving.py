@@ -106,9 +106,9 @@ class BenchmarkMetrics:
 
 
 async def get_request(
-        input_requests: list[SampleRequest],
-        request_rate: float,
-        burstiness: float = 1.0,
+    input_requests: list[SampleRequest],
+    request_rate: float,
+    burstiness: float = 1.0,
 ) -> AsyncGenerator[SampleRequest, None]:
     """
     Asynchronously generates requests at a specified rate
@@ -150,13 +150,13 @@ async def get_request(
 
 
 def calculate_metrics(
-        input_requests: list[SampleRequest],
-        outputs: list[RequestFuncOutput],
-        dur_s: float,
-        tokenizer: PreTrainedTokenizerBase,
-        selected_percentile_metrics: list[str],
-        selected_percentiles: list[float],
-        goodput_config_dict: dict[str, float],
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+    dur_s: float,
+    tokenizer: PreTrainedTokenizerBase,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    goodput_config_dict: dict[str, float],
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -232,7 +232,7 @@ def calculate_metrics(
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0) *
-                     1000,  # ttfts is empty if streaming is not supported by backend
+        1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
@@ -258,25 +258,25 @@ def calculate_metrics(
 
 
 async def benchmark(
-        backend: str,
-        api_url: str,
-        base_url: str,
-        model_id: str,
-        model_name: str,
-        tokenizer: PreTrainedTokenizerBase,
-        input_requests: list[SampleRequest],
-        logprobs: Optional[int],
-        request_rate: float,
-        burstiness: float,
-        disable_tqdm: bool,
-        profile: bool,
-        selected_percentile_metrics: list[str],
-        selected_percentiles: list[float],
-        ignore_eos: bool,
-        goodput_config_dict: dict[str, float],
-        max_concurrency: Optional[int],
-        lora_modules: Optional[Iterable[str]],
-        extra_body: Optional[dict],
+    backend: str,
+    api_url: str,
+    base_url: str,
+    model_id: str,
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    input_requests: list[SampleRequest],
+    logprobs: Optional[int],
+    request_rate: float,
+    burstiness: float,
+    disable_tqdm: bool,
+    profile: bool,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    ignore_eos: bool,
+    goodput_config_dict: dict[str, float],
+    max_concurrency: Optional[int],
+    lora_modules: Optional[Iterable[str]],
+    extra_body: Optional[dict],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -286,7 +286,7 @@ async def benchmark(
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = \
         input_requests[0].prompt, input_requests[0].prompt_len, \
-            input_requests[0].expected_output_len, \
+        input_requests[0].expected_output_len, \
             input_requests[0].multi_modal_data
 
     if backend != "openai-chat" and test_mm_content is not None:
@@ -319,7 +319,7 @@ async def benchmark(
         # For each input request, choose a LoRA module at random.
         lora_modules = iter(
             [random.choice(lora_modules) \
-             for _ in range(len(input_requests))])
+                for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")
@@ -368,7 +368,7 @@ async def benchmark(
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request.prompt, \
             request.prompt_len, request.expected_output_len, \
-            request.multi_modal_data
+                request.multi_modal_data
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -443,7 +443,7 @@ async def benchmark(
         "total_output_tokens": metrics.total_output,
         "request_throughput": metrics.request_throughput,
         "request_goodput:":
-            metrics.request_goodput if goodput_config_dict else None,
+        metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": [output.prompt_len for output in outputs],
@@ -455,12 +455,12 @@ async def benchmark(
     }
 
     def process_one_metric(
-            # E.g., "ttft"
-            metric_attribute_name: str,
-            # E.g., "TTFT"
-            metric_name: str,
-            # E.g., "Time to First Token"
-            metric_header: str,
+        # E.g., "ttft"
+        metric_attribute_name: str,
+        # E.g., "TTFT"
+        metric_name: str,
+        # E.g., "Time to First Token"
+        metric_header: str,
     ):
         # This function prints and adds statistics of the specified
         # metric.
@@ -683,25 +683,25 @@ def main(args: argparse.Namespace):
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
             "sharegpt":
-                lambda: ShareGPTDataset(random_seed=args.seed,
-                                        dataset_path=args.dataset_path).sample(
-                    tokenizer=tokenizer,
-                    num_requests=args.num_prompts,
-                    output_len=args.sharegpt_output_len,
-                ),
+            lambda: ShareGPTDataset(random_seed=args.seed,
+                                    dataset_path=args.dataset_path).sample(
+                                        tokenizer=tokenizer,
+                                        num_requests=args.num_prompts,
+                                        output_len=args.sharegpt_output_len,
+                                    ),
             "burstgpt":
-                lambda: BurstGPTDataset(random_seed=args.seed,
-                                        dataset_path=args.dataset_path).
-                sample(tokenizer=tokenizer, num_requests=args.num_prompts),
+            lambda: BurstGPTDataset(random_seed=args.seed,
+                                    dataset_path=args.dataset_path).
+            sample(tokenizer=tokenizer, num_requests=args.num_prompts),
             "random":
-                lambda: RandomDataset(dataset_path=args.dataset_path).sample(
-                    tokenizer=tokenizer,
-                    num_requests=args.num_prompts,
-                    prefix_len=args.random_prefix_len,
-                    input_len=args.random_input_len,
-                    output_len=args.random_output_len,
-                    range_ratio=args.random_range_ratio,
-                )
+            lambda: RandomDataset(dataset_path=args.dataset_path).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                prefix_len=args.random_prefix_len,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+                range_ratio=args.random_range_ratio,
+            )
         }
 
         try:
@@ -785,15 +785,15 @@ def main(args: argparse.Namespace):
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
-                "input_lens", "output_lens", "ttfts", "itls",
-                "generated_texts", "errors"
+                    "input_lens", "output_lens", "ttfts", "itls",
+                    "generated_texts", "errors"
             ]:
                 if field in result_json:
                     del result_json[field]
 
         # Traffic
         result_json["request_rate"] = (args.request_rate if args.request_rate
-                                                            < float("inf") else "inf")
+                                       < float("inf") else "inf")
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
 
@@ -804,7 +804,7 @@ def main(args: argparse.Namespace):
         base_model_id = model_id.split("/")[-1]
         max_concurrency_str = (f"-concurrency{args.max_concurrency}"
                                if args.max_concurrency is not None else "")
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  #noqa
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -849,19 +849,19 @@ if __name__ == "__main__":
                         type=str,
                         default=None,
                         help="Path to the sharegpt/sonnet dataset. "
-                             "Or the huggingface dataset ID if using HF dataset.")
+                        "Or the huggingface dataset ID if using HF dataset.")
     parser.add_argument(
         "--max-concurrency",
         type=int,
         default=None,
         help="Maximum number of concurrent requests. This can be used "
-             "to help simulate an environment where a higher level component "
-             "is enforcing a maximum number of concurrent requests. While the "
-             "--request-rate argument controls the rate at which requests are "
-             "initiated, this argument will control how many are actually allowed "
-             "to execute at a time. This means that when used in combination, the "
-             "actual request rate may be lower than specified with --request-rate, "
-             "if the server is not processing requests fast enough to keep up.")
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.")
 
     parser.add_argument(
         "--model",
@@ -897,21 +897,21 @@ if __name__ == "__main__":
         type=float,
         default=float("inf"),
         help="Number of requests per second. If this is inf, "
-             "then all the requests are sent at time 0. "
-             "Otherwise, we use Poisson process or gamma distribution "
-             "to synthesize the request arrival times.",
+        "then all the requests are sent at time 0. "
+        "Otherwise, we use Poisson process or gamma distribution "
+        "to synthesize the request arrival times.",
     )
     parser.add_argument(
         "--burstiness",
         type=float,
         default=1.0,
         help="Burstiness factor of the request generation. "
-             "Only take effect when request_rate is not inf. "
-             "Default value is 1, which follows Poisson process. "
-             "Otherwise, the request intervals follow a gamma distribution. "
-             "A lower burstiness value (0 < burstiness < 1) results in more "
-             "bursty requests. A higher burstiness value (burstiness > 1) "
-             "results in a more uniform arrival of requests.",
+        "Only take effect when request_rate is not inf. "
+        "Default value is 1, which follows Poisson process. "
+        "Otherwise, the request intervals follow a gamma distribution. "
+        "A lower burstiness value (0 < burstiness < 1) results in more "
+        "bursty requests. A higher burstiness value (burstiness > 1) "
+        "results in a more uniform arrival of requests.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -928,7 +928,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-             "VLLM_TORCH_PROFILER_DIR to enable profiler.",
+        "VLLM_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--save-result",
@@ -939,65 +939,65 @@ if __name__ == "__main__":
         "--save-detailed",
         action="store_true",
         help="When saving the results, whether to include per request "
-             "information such as response, error, ttfs, tpots, etc.",
+        "information such as response, error, ttfs, tpots, etc.",
     )
     parser.add_argument(
         "--metadata",
         metavar="KEY=VALUE",
         nargs="*",
         help="Key-value pairs (e.g, --metadata version=0.3.3 tp=1) "
-             "for metadata of this run to be saved in the result JSON file "
-             "for record keeping purposes.",
+        "for metadata of this run to be saved in the result JSON file "
+        "for record keeping purposes.",
     )
     parser.add_argument(
         "--result-dir",
         type=str,
         default=None,
         help="Specify directory to save benchmark json results."
-             "If not specified, results are saved in the current directory.",
+        "If not specified, results are saved in the current directory.",
     )
     parser.add_argument(
         "--result-filename",
         type=str,
         default=None,
         help="Specify the filename to save benchmark json results."
-             "If not specified, results will be saved in "
-             "{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
-             " format.",
+        "If not specified, results will be saved in "
+        "{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
+        " format.",
     )
     parser.add_argument(
         "--ignore-eos",
         action="store_true",
         help="Set ignore_eos flag when sending the benchmark request."
-             "Warning: ignore_eos is not supported in deepspeed_mii and tgi.")
+        "Warning: ignore_eos is not supported in deepspeed_mii and tgi.")
     parser.add_argument(
         "--percentile-metrics",
         type=str,
         default="ttft,tpot,itl",
         help="Comma-separated list of selected metrics to report percentils. "
-             "This argument specifies the metrics to report percentiles. "
-             "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
-             "Default value is \"ttft,tpot,itl\".")
+        "This argument specifies the metrics to report percentiles. "
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
+        "Default value is \"ttft,tpot,itl\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,
         default="99",
         help="Comma-separated list of percentiles for selected metrics. "
-             "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
-             "Default value is \"99\". "
-             "Use \"--percentile-metrics\" to select metrics.",
+        "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
+        "Default value is \"99\". "
+        "Use \"--percentile-metrics\" to select metrics.",
     )
     parser.add_argument(
         "--goodput",
         nargs="+",
         required=False,
         help="Specify service level objectives for goodput as \"KEY:VALUE\" "
-             "pairs, where the key is a metric name, and the value is in "
-             "milliseconds. Multiple \"KEY:VALUE\" pairs can be provided, "
-             "separated by spaces. Allowed request level metric names are "
-             "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
-             "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
-             "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
+        "pairs, where the key is a metric name, and the value is in "
+        "milliseconds. Multiple \"KEY:VALUE\" pairs can be provided, "
+        "separated by spaces. Allowed request level metric names are "
+        "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
+        "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
+        "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
 
     # group for dataset specific arguments
     sonnet_group = parser.add_argument_group("sonnet dataset options")
@@ -1029,7 +1029,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Output length for each request. Overrides the output length "
-             "from the ShareGPT dataset.")
+        "from the ShareGPT dataset.")
 
     random_group = parser.add_argument_group("random dataset options")
     random_group.add_argument(
@@ -1051,9 +1051,9 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Range ratio for sampling input/output length, "
-             "used only for random sampling. Must be in the range [0, 1) to define "
-             "a symmetric sampling range"
-             "[length * (1 - range_ratio), length * (1 + range_ratio)].",
+        "used only for random sampling. Must be in the range [0, 1) to define "
+        "a symmetric sampling range"
+        "[length * (1 - range_ratio), length * (1 + range_ratio)].",
     )
     random_group.add_argument(
         "--random-prefix-len",
@@ -1081,7 +1081,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Output length for each request. Overrides the output lengths "
-             "from the sampled HF dataset.",
+        "from the sampled HF dataset.",
     )
 
     sampling_group = parser.add_argument_group("sampling parameters")
@@ -1090,26 +1090,26 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="Top-p sampling parameter. Only has effect on openai-compatible "
-             "backends.")
+        "backends.")
     sampling_group.add_argument(
         "--top-k",
         type=int,
         default=None,
         help="Top-k sampling parameter. Only has effect on openai-compatible "
-             "backends.")
+        "backends.")
     sampling_group.add_argument(
         "--min-p",
         type=float,
         default=None,
         help="Min-p sampling parameter. Only has effect on openai-compatible "
-             "backends.")
+        "backends.")
     sampling_group.add_argument(
         "--temperature",
         type=float,
         default=None,
         help="Temperature sampling parameter. Only has effect on "
-             "openai-compatible backends. If not specified, default to greedy "
-             "decoding (i.e. temperature==0.0).")
+        "openai-compatible backends. If not specified, default to greedy "
+        "decoding (i.e. temperature==0.0).")
 
     parser.add_argument(
         '--tokenizer-mode',
@@ -1117,24 +1117,24 @@ if __name__ == "__main__":
         default="auto",
         choices=['auto', 'slow', 'mistral', 'custom'],
         help='The tokenizer mode.\n\n* "auto" will use the '
-             'fast tokenizer if available.\n* "slow" will '
-             'always use the slow tokenizer. \n* '
-             '"mistral" will always use the `mistral_common` tokenizer. \n*'
-             '"custom" will use --tokenizer to select the preregistered tokenizer.')
+        'fast tokenizer if available.\n* "slow" will '
+        'always use the slow tokenizer. \n* '
+        '"mistral" will always use the `mistral_common` tokenizer. \n*'
+        '"custom" will use --tokenizer to select the preregistered tokenizer.')
 
     parser.add_argument("--served-model-name",
                         type=str,
                         default=None,
                         help="The model name used in the API. "
-                             "If not specified, the model name will be the "
-                             "same as the ``--model`` argument. ")
+                        "If not specified, the model name will be the "
+                        "same as the ``--model`` argument. ")
 
     parser.add_argument("--lora-modules",
                         nargs='+',
                         default=None,
                         help="A subset of LoRA module names passed in when "
-                             "launching the server. For each request, the "
-                             "script chooses a LoRA module at random.")
+                        "launching the server. For each request, the "
+                        "script chooses a LoRA module at random.")
 
     args = parser.parse_args()
 
