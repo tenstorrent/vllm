@@ -86,7 +86,7 @@ MESH_DEVICE=T3K WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python exampl
 
 The command to run Llama70B on Galaxy is:
 ```sh
-MESH_DEVICE=TG LLAMA_DIR=<path to weights> TT_LLAMA_TEXT_VER="llama3_subdevices" python examples/offline_inference_tt.py --model "meta-llama/Llama-3.1-70B-Instruct" --override_tt_config '{"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D", "worker_l1_size": 1344544, "trace_region_size": 62000000}'
+MESH_DEVICE=TG CKPT_DIR=<path to weights> TT_LLAMA_TEXT_VER="llama3_subdevices" python examples/offline_inference_tt.py --model "meta-llama/Llama-3.1-70B-Instruct" --override_tt_config '{"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D", "worker_l1_size": 1344544, "trace_region_size": 62000000}'
 ```
 
 ### Llama-3.2 (11B and 90B) Vision models
