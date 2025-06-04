@@ -36,6 +36,7 @@ class TTModelInput(ModelRunnerInputBase):
     """
     input_tokens: Optional[torch.Tensor] = None
     input_positions: Optional[torch.Tensor] = None
+    finished_requests_seq_ids: Optional[torch.Tensor] = None
     prompt_lens: Optional[torch.Tensor] = None
     seq_groups: Optional[List[int]] = None
     block_tables: Optional[torch.Tensor] = None
@@ -123,6 +124,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.model_config.uses_mrope:
             assert "TTModelRunner does not currently support models with mrope rope_scaling"
 
+        self.req_id_to_seq_id: Dict[str, int] = {}
+        
     def load_model(self) -> None:
         # Note: using custom TT loader instead of selecting from default vllm loaders
         loader = TTModelLoader(self.load_config)
@@ -152,7 +155,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             virtual_engine: int = 0,
             finished_requests_ids: Optional[List[str]] = None
     ) -> TTModelInput:
-        
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = seq_group_metadata_list[0].is_prompt  # prefill if True, otherwise decode
@@ -177,7 +179,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert len(seq_ids) == 1, "Currently only supporting one sequence per request group"
             seq_id = seq_ids[0]
             seq_groups.append(seq_id)
-
+            self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
             
@@ -314,8 +316,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         cross_block_tables,
                         torch.zeros(cross_block_tables.shape[0], self.max_cross_blocks - cross_block_tables.shape[1], dtype=torch.int32, device="cpu")
                     ], dim=1)
-        
-        return TTModelInput(input_tokens, input_positions, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs, cross_block_tables)
+            
+        finished_requests_seq_ids = [self.req_id_to_seq_id[req_id] for req_id in finished_requests_ids]
+        return TTModelInput(input_tokens, input_positions, finished_requests_seq_ids, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs, cross_block_tables)
 
     @torch.no_grad()
     def execute_model(
@@ -444,7 +447,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["cross_page_table"] = model_input.cross_block_tables
         
         if not is_decode:
-            outputs = self.model.prefill_forward(**execute_model_kwargs)
+            outputs = self.model.prefill_forward(**execute_model_kwargs, seq_groups=model_input.seq_groups, finished_requests_ids=model_input.finished_requests_seq_ids)
             
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps (may need to be updated for future models)
@@ -468,12 +471,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
             
             tt_out = self.model.decode_forward(
-                **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=False
+                **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=False, seq_groups = model_input.seq_groups, finished_requests_ids=model_input.finished_requests_seq_ids
             )
-            if async_out_proc_per_trace:
-                # trigger output processor on host while device is executing next step
-                self._send_prev_step_async_out(model_input, step_idx)
-            tt_out = self.model.read_decode_output(tt_out, model_input.unpadded_batch_size, is_tokens=(self.sample_on_device_mode is not None))
+            # if async_out_proc_per_trace:
+            #     # trigger output processor on host while device is executing next step
+            #     self._send_prev_step_async_out(model_input, step_idx)
+            # tt_out = self.model.read_decode_output(tt_out, model_input.unpadded_batch_size, is_tokens=(self.sample_on_device_mode is not None))
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
