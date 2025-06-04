@@ -126,7 +126,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # Detect if the model is a TG Llama to use DP KV cache
         # TODO: Remove extend this to support other DP models
-        if "70B" in self.model_config.model and self.device_config.device.get_num_devices()==32:
+        if "70B" in self.model_config.model and self.device_config.device.get_num_devices()==32 and (self.model_config.override_tt_config.get("data_parallel", 1)==1):
             self.dp_kv_cache = True
         else:
             self.dp_kv_cache = False
