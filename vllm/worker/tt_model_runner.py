@@ -151,7 +151,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.max_cross_blocks = self.model.max_cross_attn_tokens // self.cache_config.block_size
 
         # Detect if the model is a TG Llama to use DP KV cache
-        # vLLM doesn't which blocks corrensponds to which DP device pool so may allocate non-local blocks to a user
+        # vLLM doesn't know which blocks corresponds to which DP device pool so may allocate non-local blocks to a user
         # To avoid bad output because of this, we maintain a seq_id_to_batch_slot mapping so that we can place the users on the correct devices
         # This requires passing seq_id and finished requests to the generator
         # TODO: Extend this to support other DP models
@@ -210,8 +210,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             ) == 1, "Currently only supporting one sequence per request group"
             seq_id = seq_ids[0]
             seq_groups.append(seq_id)
-
-            self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
+            if self.dp_kv_cache
+                self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
 
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
@@ -374,15 +374,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
+        if self.dp_kv_cache:
+            # Prepare finished request ids
+            finished_requests_seq_ids = [
+                self.req_id_to_seq_id[req_id] for req_id in finished_requests_ids
+            ]
 
-        # Prepare finished request ids
-        finished_requests_seq_ids = [
-            self.req_id_to_seq_id[req_id] for req_id in finished_requests_ids
-        ]
-
-        # Delete the finished requests from req_id_to_seq_id
-        for req_id in finished_requests_ids:
-            del self.req_id_to_seq_id[req_id]
+            # Delete the finished requests from req_id_to_seq_id
+            for req_id in finished_requests_ids:
+                del self.req_id_to_seq_id[req_id]
 
         return TTModelInput(input_tokens, input_positions,
                             finished_requests_seq_ids, prompt_lens, seq_groups,
