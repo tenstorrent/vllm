@@ -166,7 +166,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
 
-
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -375,7 +374,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
-
 
         # Prepare finished request ids
         finished_requests_seq_ids = [
