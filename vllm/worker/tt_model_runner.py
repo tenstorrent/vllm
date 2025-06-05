@@ -124,15 +124,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.model_config.uses_mrope:
             assert "TTModelRunner does not currently support models with mrope rope_scaling"
 
-        # Detect if the model is a TG Llama to use DP KV cache
-        # TODO: Remove extend this to support other DP models
-        if "70B" in self.model_config.model and self.device_config.device.get_num_devices()==32 and (self.model_config.override_tt_config.get("data_parallel", 1)==1):
-            self.dp_kv_cache = True
-        else:
-            self.dp_kv_cache = False
-
-        # Map request id strs to seq group ids
-        self.req_id_to_seq_id: Dict[str, int] = {}
 
     def load_model(self) -> None:
         # Note: using custom TT loader instead of selecting from default vllm loaders
@@ -145,7 +136,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         )
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = self.model.max_cross_attn_tokens // self.cache_config.block_size
-            
+        # Detect if the model is a TG Llama to use DP KV cache
+        # vLLM doesn't which blocks corrensponds to which DP device pool so may allocate non-local blocks to a user
+        # To avoid bad output because of this, we maintain a seq_id_to_batch_slot mapping so that we can place the users on the correct devices
+        # This requires passing seq_id and finished requests to the generator 
+        # TODO: Extend this to support other DP models
+        if "70B" in self.model_config.model and self.device_config.device.get_num_devices()==32 and (self.model_config.override_tt_config.get("data_parallel", 1)==1):
+            self.dp_kv_cache = True
+        else:
+            self.dp_kv_cache = False
+
+        if self.dp_kv_cache:
+            # Map request id strs to seq group ids
+            self.req_id_to_seq_id: Dict[str, int] = {}  
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -330,6 +333,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         
         # Prepare finished request ids 
         finished_requests_seq_ids = [self.req_id_to_seq_id[req_id] for req_id in finished_requests_ids]
+
+        # Delete the finished requests from req_id_to_seq_id
+        for req_id in finished_requests_ids:
+            del self.req_id_to_seq_id[req_id]
         
         return TTModelInput(input_tokens, input_positions, finished_requests_seq_ids, prompt_lens, seq_groups, block_tables, unpadded_batch_size, tt_sampling_params, multi_modal_kwargs, cross_block_tables)
 
@@ -461,7 +468,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         if self.dp_kv_cache:
             # Send finished request ids and seq groups to generator 
-            execute_model_kwargs["finished_requests_seq_ids"] = model_input.finished_requests_seq_ids
+            execute_model_kwargs["finished_requests_ids"] = model_input.finished_requests_seq_ids
             execute_model_kwargs["seq_groups"] = model_input.seq_groups
         
         if not is_decode:
@@ -488,19 +495,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             else:
                 enc_dec_kwargs = {}
             
-            if self.dp_kv_cache:
-                # We need to read from device to get the output tokens in the same order as the input requests
-                tt_out = self.model.decode_forward(
-                    **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=True
-                )
-            else:
-                tt_out = self.model.decode_forward(
-                    **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=False
-                )
-                if async_out_proc_per_trace:
-                    # trigger output processor on host while device is executing next step
-                    self._send_prev_step_async_out(model_input, step_idx)
-                tt_out = self.model.read_decode_output(tt_out, model_input.unpadded_batch_size, is_tokens=(self.sample_on_device_mode is not None))
+            tt_out = self.model.decode_forward(
+                **execute_model_kwargs, **enc_dec_kwargs, enable_trace=self.trace_mode, read_from_device=False
+            )
+            if async_out_proc_per_trace:
+                # trigger output processor on host while device is executing next step
+                self._send_prev_step_async_out(model_input, step_idx)
+            tt_out = self.model.read_decode_output(tt_out, model_input.unpadded_batch_size, is_tokens=(self.sample_on_device_mode is not None))
 
         # Note: for other devices, vLLM applies vllm.model_executor.layers.logits_processor::LogitsProcessor::_apply_logits_processors on logits, we don't use this
         # Note: for other devices, vLLM applies vllm.model_executor.layers.sampler::Sampler for sampling tokens, we don't use this
