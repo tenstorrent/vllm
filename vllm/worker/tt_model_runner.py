@@ -149,6 +149,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                        cache_config=self.cache_config)
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = self.model.max_cross_attn_tokens // self.cache_config.block_size
+
         # Detect if the model is a TG Llama to use DP KV cache
         # vLLM doesn't which blocks corrensponds to which DP device pool so may allocate non-local blocks to a user
         # To avoid bad output because of this, we maintain a seq_id_to_batch_slot mapping so that we can place the users on the correct devices
@@ -164,6 +165,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
+
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -373,6 +375,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
+
 
         # Prepare finished request ids
         finished_requests_seq_ids = [
