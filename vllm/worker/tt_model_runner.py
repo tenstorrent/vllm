@@ -154,7 +154,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # To avoid bad output because of this, we maintain a seq_id_to_batch_slot mapping so that we can place the users on the correct devices
         # This requires passing seq_id and finished requests to the generator
         # TODO: Extend this to support other DP models
-        if "70B" in self.model_config.model and self.device_config.device.get_num_devices(
+        if "Llama" in self.model_config.model and "70B" in self.model_config.model and self.device_config.device.get_num_devices(
         ) == 32 and (self.model_config.override_tt_config.get(
                 "data_parallel", 1) == 1):
             self.dp_kv_cache = True
