@@ -149,13 +149,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Note: using custom TT loader
         # instead of selecting from default vllm loaders
         loader = TTModelLoader(self.load_config)
-        self.model = loader.load_model(
+
+        vllm_config = VllmConfig(
             model_config=self.model_config,
             device_config=self.device_config,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
             cache_config=self.cache_config,
         )
+
+        self.model = loader.load_model(vllm_config=vllm_config)
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = (self.model.max_cross_attn_tokens //
                                      self.cache_config.block_size)
