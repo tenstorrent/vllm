@@ -19,7 +19,8 @@ class TTModelLoader(BaseModelLoader):
                    cache_config: CacheConfig) -> nn.Module:
         """Load a model with the given configurations."""
 
-        # For TT models, prepend "TT" to the architecture name, e.g. "TTLlamaForCausalLM"
+        # For TT models, prepend "TT" to the architecture name,
+        # e.g. "TTLlamaForCausalLM"
         arch_names = model_config.hf_config.architectures
         assert len(model_config.hf_config.architectures) == 1
         arch_names[0] = "TT" + arch_names[0]
@@ -27,9 +28,10 @@ class TTModelLoader(BaseModelLoader):
         model_class, _ = get_model_architecture(model_config)
 
         data_parallel = 1
-        if model_config.override_tt_config and 'data_parallel' in model_config.override_tt_config:
+        if (model_config.override_tt_config
+                and 'data_parallel' in model_config.override_tt_config):
             data_parallel = model_config.override_tt_config['data_parallel']
-            logger.info(f"Overriding data_parallel to {data_parallel}")
+            logger.info("Overriding data_parallel to %d", data_parallel)
 
         model = model_class.initialize_vllm_model(
             model_config.hf_config,

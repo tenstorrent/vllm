@@ -75,7 +75,8 @@ class TTCacheEngine:
         The assumption is that KV cache for a layer is packed into one tensor. 
         We will have a separate tensor for K and V.
         """
-        # K and V each have the following shape: (num_blocks, num_kv_heads, block_size, head_size)
+        # K and V each have the following shape:
+        # (num_blocks, num_kv_heads, block_size, head_size)
         kv_cache_shape = (num_blocks, self.num_kv_heads, self.block_size,
                           self.head_size)
         num_layers = self.num_attention_layers
@@ -113,8 +114,9 @@ class TTCacheEngine:
         device_config: DeviceConfig,
     ) -> int:
         '''
-        Returns the number of KV heads per attention layer (per device). Makes the assumption
-        that we are tensor parallel by min(number of devices, number of KV heads).
+        Returns the number of KV heads per attention layer (per device). Makes 
+        the assumption that we are tensor parallel by min(number of devices, 
+        number of KV heads).
         '''
         num_devices = device_config.device.get_num_devices()
         num_kv_heads = model_config.get_num_kv_heads(parallel_config)
@@ -166,7 +168,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
-        self.trace_mode = True  # whether to use ttnn tracing for model execution, TODO: make this configurable
+        # whether to use ttnn tracing for model execution,
+        # TODO: make this configurable
+        self.trace_mode = True
 
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=vllm_config,
@@ -221,7 +225,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
               and "wormhole_b0" in ttnn.get_arch_name()):  # Llama90B on WH T3K
             max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
         else:
-            max_tokens_all_users = 131072  # Note: includes num vision tokens for multi-modal
+            # Note: includes num vision tokens for multi-modal
+            max_tokens_all_users = 131072
         num_tt_blocks = math.ceil(max_tokens_all_users /
                                   self.cache_config.block_size)
         num_tt_blocks = int(
@@ -243,8 +248,13 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         
         Note that CPU, TPU, and openvino workers don't use standard CacheEngine
         """
-        # SKip check, since we're setting num_gpu_blocks much lower than would fit max_model_len
-        # raise_if_cache_size_invalid(num_gpu_blocks, self.cache_config.block_size, self.model_config.max_model_len)
+        # Skip check, since we're setting num_gpu_blocks much lower than would
+        # fit max_model_len
+        # raise_if_cache_size_invalid(
+        #     num_gpu_blocks,
+        #     self.cache_config.block_size,
+        #     self.model_config.max_model_len
+        # )
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
@@ -254,7 +264,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         assert self.cache_config.num_gpu_blocks is not None
 
         # Get helper function from TT model for allocating the kv cache
-        self.cache_config.tt_allocate_kv_cache = self.model_runner.model.allocate_kv_cache
+        self.cache_config.tt_allocate_kv_cache = (
+            self.model_runner.model.allocate_kv_cache)
 
         self.cache_engine = TTCacheEngine(self.cache_config, self.model_config,
                                           self.parallel_config,
@@ -298,12 +309,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         """
         Process an execution request.
         
-        Appears to do swap_in, swap_out, copy for KV blocks, right before executing the model.
+        Appears to do swap_in, swap_out, copy for KV blocks,
+        right before executing the model.
         """
         # TODO: Add proper implementation, ignoring block allocation for now
         pass
 
-    # Based on LocalOrDistributedWorkerBase::execute_model, excluding the distributed execution
+    # Based on LocalOrDistributedWorkerBase::execute_model,
+    # excluding the distributed execution
     def execute_model(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
@@ -379,11 +392,16 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         dispatch_core_type = self._get_dispatch_core_type()
 
         override_tt_config = self.model_config.override_tt_config
-        if override_tt_config is not None and "dispatch_core_axis" in override_tt_config:
-            assert override_tt_config["dispatch_core_axis"] in ["row", "col"], \
-                f"Invalid dispatch_core_axis: {override_tt_config['dispatch_core_axis']}. Expected: row, col."
-            dispatch_core_axis = ttnn.DispatchCoreAxis.COL if override_tt_config[
-                "dispatch_core_axis"] == "col" else ttnn.DispatchCoreAxis.ROW
+        if (override_tt_config is not None
+                and "dispatch_core_axis" in override_tt_config):
+            assert override_tt_config["dispatch_core_axis"] in [
+                "row", "col"
+            ], ("Invalid dispatch_core_axis:"
+                f"{override_tt_config['dispatch_core_axis']}. "
+                "Expected: row, col.")
+            dispatch_core_axis = (ttnn.DispatchCoreAxis.COL
+                                  if override_tt_config["dispatch_core_axis"]
+                                  == "col" else ttnn.DispatchCoreAxis.ROW)
         else:
             dispatch_core_axis = device_params.pop(
                 "dispatch_core_axis",
@@ -397,7 +415,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def _get_fabric_config(self):
         override_tt_config = self.model_config.override_tt_config
-        if override_tt_config is not None and "fabric_config" in override_tt_config:
+        if (override_tt_config is not None
+                and "fabric_config" in override_tt_config):
             fabric_config_str = override_tt_config["fabric_config"]
             fabric_config_map = {
                 "DISABLED": ttnn.FabricConfig.DISABLED,
@@ -406,7 +425,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                 "CUSTOM": ttnn.FabricConfig.CUSTOM,
             }
             fabric_config = fabric_config_map.get(fabric_config_str)
-            assert fabric_config is not None, f"Invalid fabric_config: {fabric_config_str}. Expected one of {list(fabric_config_map.keys())}."
+            assert fabric_config is not None, (
+                f"Invalid fabric_config: {fabric_config_str}. "
+                f"Expected one of {list(fabric_config_map.keys())}.")
             return fabric_config
         return None
 
@@ -461,11 +482,13 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         }
         mesh_device = os.environ.get("MESH_DEVICE")
         if mesh_device is not None:
-            assert mesh_device in mesh_grid_dict, f"Invalid MESH_DEVICE: {mesh_device}"
+            assert mesh_device in mesh_grid_dict, (
+                f"Invalid MESH_DEVICE: {mesh_device}")
         mesh_grid = mesh_grid_dict.get(mesh_device, (1, num_devices_available))
 
         if mesh_grid[0] * mesh_grid[1] > num_devices_available:
-            assert f"Requested mesh grid shape {mesh_grid} is larger than number of available devices {num_devices_available}"
+            assert (f"Requested mesh grid shape {mesh_grid} is larger than "
+                    f"number of available devices {num_devices_available}")
 
         device_params = self._device_params_from_override_tt_config()
 
@@ -477,9 +500,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             dispatch_core_config=self._get_dispatch_core_config(device_params),
             **device_params,
         )
-        logger.info(
-            f"multidevice with {mesh_device.get_num_devices()} devices and grid {mesh_grid} is created"
-        )
+        logger.info("multidevice with %d devices and grid %s is created",
+                    mesh_device.get_num_devices(), mesh_grid)
         return mesh_device
 
     def _enable_program_cache(self):
@@ -489,7 +511,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     ## Destructor (used to close devices)
 
     def __del__(self):
-        del self.model_runner  # Delete model runner first in case there are model arifacts
+        # Delete model runner first in case there are model arifacts
+        del self.model_runner
 
         if self.mesh_device:
             # Disable program cache
