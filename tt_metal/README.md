@@ -15,18 +15,18 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 **To create the vLLM+tt-metal environment (first time):**
 1. Install and build tt-metal following the instructions in [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md). Ensure that the necessary environment variables for running tt-metal tests were set.
 2. From the main vLLM directory, run:
-  
- ```sh
+
+    ```sh
     export vllm_dir=$(pwd)
     source $vllm_dir/tt_metal/setup-metal.sh
     ```
-   
+  
 3. (Optional step when installing tt-metal from source) In step 2, `PYTHON_ENV_DIR` is set to `${TT_METAL_HOME}/build/python_env_vllm`. Create the tt-metal virtual environment following the instructions in [INSTALLING.md#option-1-from-source](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md#option-1-from-source). Then, enter that virtual environment with `source $PYTHON_ENV_DIR/bin/activate`.
 4. Install vLLM:
 
     ```sh
     pip3 install --upgrade pip
- cd $vllm_dir && pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu
+    cd $vllm_dir && pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu
     ```
 
 **To activate the vLLM+tt-metal environment (after the first time):**
@@ -40,14 +40,14 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 
 To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging Face. To gain access:
 1. Request access on Hugging Face:
-    - Llama-3.1: [https://huggingface.co/meta-llama/Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B)
-    - Llama-3.2: [https://huggingface.co/meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
-    - Llama-3.2-Vision: [https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
+   - Llama-3.1: [https://huggingface.co/meta-llama/Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B)
+   - Llama-3.2: [https://huggingface.co/meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
+   - Llama-3.2-Vision: [https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
 2. Once you have received access, create and copy your access token from the settings tab on Hugging Face.
 3. Run this code in python and paste your access token:
-   
+  
     ```python
- from huggingface_hub import login
+    from huggingface_hub import login
     login()
     ```
 
