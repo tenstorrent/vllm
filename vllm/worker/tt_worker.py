@@ -13,7 +13,7 @@ from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, get_dtype_size
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType
 from vllm.worker.tt_model_runner import TTModelInput, TTModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
                                      LoRANotSupportedWorkerBase, WorkerBase,
@@ -124,28 +124,6 @@ class TTCacheEngine:
             num_devices,
             num_kv_heads)  # TP = num_devices if num_devices < num_kv_heads
         return num_kv_heads
-
-    @staticmethod
-    def get_cache_block_size(
-        cache_config: CacheConfig,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-    ) -> int:
-        head_size = model_config.get_head_size()
-        num_heads = TTCacheEngine.get_num_kv_heads(model_config,
-                                                   parallel_config)
-        num_attention_layers = model_config.get_num_layers_by_block_type(
-            parallel_config, LayerBlockType.attention)
-
-        key_cache_block = cache_config.block_size * num_heads * head_size
-        value_cache_block = key_cache_block
-        total = num_attention_layers * (key_cache_block + value_cache_block)
-        if cache_config.cache_dtype == "auto":
-            dtype = model_config.dtype
-        else:
-            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-        dtype_size = get_dtype_size(dtype)
-        return dtype_size * total
 
 
 class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
