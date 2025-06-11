@@ -3,7 +3,7 @@ import dataclasses
 import math
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 import torch
 import ttnn
@@ -177,13 +177,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             trace_mode=self.trace_mode,
         )
 
-        self.cache_engine: List[TTCacheEngine]
-        self.tt_cache: List[List]
+        self.cache_engine: TTCacheEngine
+        self.tt_cache: List
 
-        self.mesh_device = None  # initialized by init_device
+        # initialized by init_device
+        self.mesh_device = None
 
-        self.cached_model_input: Optional[
-            TTModelInput] = None  # Only used for multi-step execution
+        # Only used for multi-step execution
+        self.cached_model_input: TTModelInput
 
     @property
     def do_metadata_broadcast(self) -> bool:
@@ -323,6 +324,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     ) -> Optional[List[SamplerOutput]]:
         """Executes at least one model step on the given sequences, unless no
         sequences are provided."""
+        if execute_model_req is None:
+            return None
+
         start_time = time.perf_counter()
 
         is_first_multi_step = execute_model_req.is_first_multi_step
@@ -335,17 +339,15 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         if self.scheduler_config.is_multi_step:
             if is_first_multi_step:
-                self.cached_model_input = model_input
+                self.cached_model_input = cast(TTModelInput, model_input)
                 worker_input = dataclasses.replace(
                     worker_input,
                     num_steps=execute_model_req.num_lookahead_slots + 1)
             else:
-                assert self.cached_model_input is not None
-                model_input = self.cached_model_input
                 worker_input = WorkerInput(
                 )  # no worker input needed for subsequent steps
-            model_input = dataclasses.replace(
-                model_input,
+            self.cached_model_input = dataclasses.replace(
+                self.cached_model_input,
                 is_first_multi_step=is_first_multi_step,
                 is_last_step=execute_model_req.is_last_step)
 
@@ -361,7 +363,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         orig_model_execute_time = 0.0
 
         output = self.model_runner.execute_model(
-            model_input=model_input,
+            model_input=self.cached_model_input,
             kv_caches=self.kv_cache if self.kv_cache is not None else None,
             intermediate_tensors=intermediate_tensors,
             num_steps=num_steps,
@@ -480,11 +482,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             "T3K": (1, 8),
             "TG": (8, 4)
         }
-        mesh_device = os.environ.get("MESH_DEVICE")
-        if mesh_device is not None:
-            assert mesh_device in mesh_grid_dict, (
-                f"Invalid MESH_DEVICE: {mesh_device}")
-        mesh_grid = mesh_grid_dict.get(mesh_device, (1, num_devices_available))
+        env = os.environ.get("MESH_DEVICE", "")
+        assert env in mesh_grid_dict, f"Invalid MESH_DEVICE: {env}"
+        mesh_grid = mesh_grid_dict.get(env, (1, num_devices_available))
 
         if mesh_grid[0] * mesh_grid[1] > num_devices_available:
             assert (f"Requested mesh grid shape {mesh_grid} is larger than "
@@ -530,4 +530,4 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             del self.mesh_device
 
         if hasattr(super(), '__del__'):
-            super().__del__()
+            super().__del__()  # type: ignore

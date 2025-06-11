@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import TopPLogitsWarper
 
+from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -36,16 +37,16 @@ class TTModelInput(ModelRunnerInputBase):
     """
     Used by the TTModelRunner.
     """
-    input_tokens: Optional[torch.Tensor] = None
-    input_positions: Optional[torch.Tensor] = None
-    finished_requests_seq_ids: Optional[List[int]] = None
-    prompt_lens: Optional[torch.Tensor] = None
-    seq_groups: Optional[List[int]] = None
-    block_tables: Optional[torch.Tensor] = None
-    unpadded_batch_size: Optional[int] = None
-    tt_sampling_params: Optional[TTSamplingParams] = None
-    multi_modal_kwargs: Optional[List[Dict[str, Any]]] = None
-    cross_block_tables: Optional[torch.Tensor] = None
+    input_tokens: torch.Tensor
+    input_positions: torch.Tensor
+    finished_requests_seq_ids: Optional[List[int]]
+    prompt_lens: torch.Tensor
+    seq_groups: List[int]
+    block_tables: torch.Tensor
+    unpadded_batch_size: int
+    tt_sampling_params: TTSamplingParams
+    multi_modal_kwargs: Dict[str, Any]
+    cross_block_tables: torch.Tensor
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
@@ -72,6 +73,7 @@ class TTModelInput(ModelRunnerInputBase):
     def from_broadcasted_tensor_dict(
         cls: Type["TTModelInput"],
         tensor_dict: Dict[str, Any],
+        attn_backend: Optional["AttentionBackend"] = None,
     ) -> "TTModelInput":
         return cls(**tensor_dict)
 
@@ -209,16 +211,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         unpadded_batch_size = len(seq_group_metadata_list)
         assert unpadded_batch_size > 0
 
-        input_tokens: List[int] = []
-        input_positions: List[int] = []
-        prompt_lens: List[int] = []
-        block_tables: List[List[int]] = []
-        seq_groups: List[int] = []
-        top_pk_sampling_params = {}
+        input_tokens_list: List[int] = []
+        input_positions_list: List[int] = []
+        prompt_lens_list: List[int] = []
+        block_tables_list: List[List[int]] = []
+        seq_groups_list: List[int] = []
+        top_pk_sampling_params: Dict[str, Any] = {}
         multi_modal_kwargs: Dict[str, Any] = {}
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
-        cross_block_tables: List[List[int]] = []
+        cross_block_tables_list: List[List[int]] = []
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -226,7 +228,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 seq_ids
             ) == 1, "Currently only supporting one sequence per request group"
             seq_id = seq_ids[0]
-            seq_groups.append(seq_id)
+            seq_groups_list.append(seq_id)
             if self.dp_kv_cache:
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
 
@@ -236,21 +238,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if is_prompt:
                 # tokens
                 prompt_tokens = seq_data.get_token_ids()
-                input_tokens.append(prompt_tokens)
+                input_tokens_list.append(prompt_tokens)
 
                 # prompt lengths
-                prompt_lens.append(len(prompt_tokens))
+                prompt_lens_list.append(len(prompt_tokens))
             else:
                 # tokens
                 generation_token = seq_data.get_last_token_id()
-                input_tokens.append(generation_token)
+                input_tokens_list.append(generation_token)
 
                 # positions
                 position = seq_data.get_len() - 1
-                input_positions.append(position)
+                input_positions_list.append(position)
 
             block_table = seq_group_metadata.block_tables[seq_id]
-            block_tables.append(block_table)
+            block_tables_list.append(block_table)
 
             # Multi-modal data
             # TODO: Replace with multi_modal_input_mapper
@@ -271,7 +273,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # and not additional encoder data)
             if self.model_config.is_encoder_decoder:
                 cross_block_table = seq_group_metadata.cross_block_table
-                cross_block_tables.append(cross_block_table)
+                cross_block_tables_list.append(cross_block_table)
 
             # Sampling params
             # TODO: Add support for different sampling params in the same batch
@@ -314,38 +316,38 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 and self.cached_enc_dec_data):
             seq_ids_to_del = []
             for seq_id in self.cached_enc_dec_data:
-                if seq_id not in seq_groups:
+                if seq_id not in seq_groups_list:
                     seq_ids_to_del.append(seq_id)
             for seq_id in seq_ids_to_del:
                 del self.cached_enc_dec_data[seq_id]
 
         # Convert lists to tensors and add padding
 
-        block_tables = make_tensor_with_pad(block_tables,
+        block_tables = make_tensor_with_pad(block_tables_list,
                                             dtype=torch.int32,
                                             device="cpu",
                                             pad=0)
         if self.model_config.is_encoder_decoder:
-            cross_block_tables = make_tensor_with_pad(cross_block_tables,
+            cross_block_tables = make_tensor_with_pad(cross_block_tables_list,
                                                       dtype=torch.int32,
                                                       device="cpu",
                                                       pad=0)
         else:
             cross_block_tables = None
         if is_prompt:
-            input_tokens = make_tensor_with_pad(input_tokens,
+            input_tokens = make_tensor_with_pad(input_tokens_list,
                                                 dtype=torch.int32,
                                                 device="cpu",
                                                 pad=0)
             input_positions = 0
-            prompt_lens = torch.tensor(prompt_lens,
+            prompt_lens = torch.tensor(prompt_lens_list,
                                        dtype=torch.int32,
                                        device="cpu")
         else:
-            input_tokens = torch.tensor(input_tokens,
+            input_tokens = torch.tensor(input_tokens_list,
                                         dtype=torch.int32,
                                         device="cpu").view(-1, 1)
-            input_positions = torch.tensor(input_positions,
+            input_positions = torch.tensor(input_positions_list,
                                            dtype=torch.int32,
                                            device="cpu")
             prompt_lens = None
@@ -408,7 +410,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
-        if self.dp_kv_cache:
+        if self.dp_kv_cache and finished_requests_ids is not None:
             # Prepare finished request ids
             finished_requests_seq_ids = [
                 self.req_id_to_seq_id[req_id]
@@ -422,8 +424,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             finished_requests_seq_ids = None
 
         return TTModelInput(input_tokens, input_positions,
-                            finished_requests_seq_ids, prompt_lens, seq_groups,
-                            block_tables, unpadded_batch_size,
+                            finished_requests_seq_ids, prompt_lens,
+                            seq_groups_list, block_tables, unpadded_batch_size,
                             tt_sampling_params, multi_modal_kwargs,
                             cross_block_tables)
 
@@ -444,10 +446,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # so async_out_proc does not help unless using async_out_proc_per_trace
         # which triggers the output processor for step (i) on host while device
         # is executing step (i+1).
-        use_async_out_proc = model_input.async_callback is not None
         async_out_proc_per_trace = (self.trace_mode
                                     and self.scheduler_config.is_multi_step
-                                    and use_async_out_proc)
+                                    and model_input.async_callback is not None)
 
         if not is_decode:
             assert num_steps == 1, "Num steps must be 1 for prefill"
@@ -492,7 +493,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         input_tokens=new_input_tokens,
                         input_positions=new_input_positions)
 
-            if use_async_out_proc:
+            if model_input.async_callback is not None:
                 model_input.async_callback()  # trigger output processor
 
         sampler_outputs = []  # no outputs unless last step
@@ -507,11 +508,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = self._make_sampler_output(
                     next_token_ids, model_input.seq_groups)
                 sampler_outputs.append(sampler_output)
-                if i < num_outputs - 1 and use_async_out_proc:
+                if (i < num_outputs - 1
+                        and model_input.async_callback is not None):
                     self._send_async_out(sampler_output,
                                          model_input.async_callback,
                                          is_first_step_output=i == 0)
-            if use_async_out_proc:
+            if model_input.async_callback is not None:
                 return [
                     sampler_outputs[-1]
                 ]  # only return the last output for async output processor
@@ -611,6 +613,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
         else:
             if self.model_config.is_encoder_decoder:
+                if self.cached_enc_dec_data is None:
+                    self.cached_enc_dec_data = {}
+
                 # Use encoder-decoder data from prefill step
                 cross_attention_masks = [
                     self.cached_enc_dec_data[seq_id]["cross_attention_masks"]
