@@ -162,7 +162,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.mesh_device = None
 
         # Only used for multi-step execution
-        self.cached_model_input: TTModelInput
+        self.cached_model_input: Optional[TTModelInput] = None
 
     @property
     def do_metadata_broadcast(self) -> bool:
@@ -317,15 +317,18 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         if self.scheduler_config.is_multi_step:
             if is_first_multi_step:
-                self.cached_model_input = cast(TTModelInput, model_input)
+                model_input = cast(TTModelInput, model_input)
+                self.cached_model_input = model_input
                 worker_input = dataclasses.replace(
                     worker_input,
                     num_steps=execute_model_req.num_lookahead_slots + 1)
             else:
+                assert self.cached_model_input is not None
+                model_input = self.cached_model_input
                 worker_input = WorkerInput(
                 )  # no worker input needed for subsequent steps
-            self.cached_model_input = dataclasses.replace(
-                self.cached_model_input,
+            model_input = dataclasses.replace(
+                model_input,
                 is_first_multi_step=is_first_multi_step,
                 is_last_step=execute_model_req.is_last_step)
 
@@ -341,7 +344,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         orig_model_execute_time = 0.0
 
         output = self.model_runner.execute_model(
-            model_input=self.cached_model_input,
+            model_input=model_input,
             kv_caches=self.kv_cache if self.kv_cache is not None else None,
             intermediate_tensors=intermediate_tensors,
             num_steps=num_steps,
