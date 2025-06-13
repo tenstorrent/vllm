@@ -171,7 +171,7 @@ def run_inference(
     check_tt_model_supported(model)
 
     if multi_modal:
-        assert "Llama-3.2" in model, "The multi-modal inference test" + \
+        assert "Llama-3.2" in model, "The multi-modal inference test " + \
             "currently only supports Llama-3.2 models"
 
     # LLM args

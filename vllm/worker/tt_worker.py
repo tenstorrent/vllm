@@ -460,9 +460,11 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             "T3K": (1, 8),
             "TG": (8, 4)
         }
-        env = os.environ.get("MESH_DEVICE", "")
-        assert env in mesh_grid_dict, f"Invalid MESH_DEVICE: {env}"
-        mesh_grid = mesh_grid_dict.get(env, (1, num_devices_available))
+        mesh_device_env = os.environ.get("MESH_DEVICE", "")
+        assert mesh_device_env in mesh_grid_dict, (
+            f"Invalid MESH_DEVICE: {mesh_device_env}")
+        mesh_grid = mesh_grid_dict.get(mesh_device_env,
+                                       (1, num_devices_available))
 
         if mesh_grid[0] * mesh_grid[1] > num_devices_available:
             assert (f"Requested mesh grid shape {mesh_grid} is larger than "

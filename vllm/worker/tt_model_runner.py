@@ -152,15 +152,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # instead of selecting from default vllm loaders
         loader = TTModelLoader(self.load_config)
 
-        vllm_config = VllmConfig(
-            model_config=self.model_config,
-            device_config=self.device_config,
-            parallel_config=self.parallel_config,
-            scheduler_config=self.scheduler_config,
-            cache_config=self.cache_config,
-        )
-
-        self.model = loader.load_model(vllm_config=vllm_config)
+        self.model = loader.load_model(vllm_config=self.vllm_config)
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = (self.model.max_cross_attn_tokens //
                                      self.cache_config.block_size)
@@ -446,9 +438,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # so async_out_proc does not help unless using async_out_proc_per_trace
         # which triggers the output processor for step (i) on host while device
         # is executing step (i+1).
+        use_async_out_proc = model_input.async_callback is not None
         async_out_proc_per_trace = (self.trace_mode
                                     and self.scheduler_config.is_multi_step
-                                    and model_input.async_callback is not None)
+                                    and use_async_out_proc)
 
         if not is_decode:
             assert num_steps == 1, "Num steps must be 1 for prefill"
@@ -493,7 +486,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         input_tokens=new_input_tokens,
                         input_positions=new_input_positions)
 
-            if model_input.async_callback is not None:
+            if use_async_out_proc:
+                assert model_input.async_callback is not None
                 model_input.async_callback()  # trigger output processor
 
         sampler_outputs = []  # no outputs unless last step
@@ -508,12 +502,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = self._make_sampler_output(
                     next_token_ids, model_input.seq_groups)
                 sampler_outputs.append(sampler_output)
-                if (i < num_outputs - 1
-                        and model_input.async_callback is not None):
+                if i < num_outputs - 1 and use_async_out_proc:
                     self._send_async_out(sampler_output,
                                          model_input.async_callback,
                                          is_first_step_output=i == 0)
-            if model_input.async_callback is not None:
+            if use_async_out_proc:
                 return [
                     sampler_outputs[-1]
                 ]  # only return the last output for async output processor
@@ -613,8 +606,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
         else:
             if self.model_config.is_encoder_decoder:
-                if self.cached_enc_dec_data is None:
-                    self.cached_enc_dec_data = {}
+                assert self.cached_enc_dec_data is not None
 
                 # Use encoder-decoder data from prefill step
                 cross_attention_masks = [

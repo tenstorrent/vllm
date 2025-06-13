@@ -213,7 +213,8 @@ class LLMEngine:
         vllm_config: VllmConfig,
         executor_class: Type[ExecutorBase],
         log_stats: bool,
-        log_global_stats: bool = False,
+        log_global_stats: bool = False,  # if True and log_stats is True, 
+        # log with GlobalStatLogger as well
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
