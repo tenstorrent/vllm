@@ -420,16 +420,18 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     # Must be called before creating the mesh device
     def _set_fabric(self):
         fabric_config = self._get_fabric_config()
-        if fabric_config:        
+        if fabric_config:
             ttnn.set_fabric_config(fabric_config)
 
     # From tt-metal/conftest.py:
     # Reset fabric config to DISABLED if not None, and do nothing otherwise
-    # Temporarily require previous state to be passed in as even setting it to DISABLED might be unstable
-    # This is to ensure that we don't propagate the instability to the rest of CI
+    # Temporarily require previous state to be passed
+    # in as even setting it to DISABLED might be unstable
+    # This is to ensure that we don't propagate
+    # the instability to the rest of CI
     def _reset_fabric(self):
         fabric_config = self._get_fabric_config()
-        if fabric_config:        
+        if fabric_config:
             ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
     def _device_params_from_override_tt_config(self):
