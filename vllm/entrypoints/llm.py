@@ -1420,7 +1420,9 @@ class LLM:
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
+            logger.info("START STEP")
             step_outputs = self.llm_engine.step()
+            logger.info("END STEP")
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)

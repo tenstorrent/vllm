@@ -777,6 +777,8 @@ class LLMEngine:
             raise ValueError(
                 "Guided decoding and logits processors are not supported "
                 "in multi-step decoding")
+            
+        start_add_req = time.perf_counter()
 
         if arrival_time is None:
             arrival_time = time.time()
@@ -810,6 +812,8 @@ class LLMEngine:
             trace_headers=trace_headers,
             priority=priority,
         )
+        
+        logger.info(f"Time to add request {time.perf_counter() - start_add_req:.6f} seconds, ")
 
     def _validate_token_prompt(self, prompt: PromptType,
                                tokenizer: AnyTokenizer):
@@ -1040,6 +1044,8 @@ class LLMEngine:
         """
 
         now = time.time()
+        
+        logger.info("len(ctx.output_queue) = %d", len(ctx.output_queue))
 
         if len(ctx.output_queue) == 0:
             return None
@@ -1228,6 +1234,7 @@ class LLMEngine:
                 # set time after all steps since _get_stats sets
                 # actual_num_batched_tokens based on num steps
                 seq_group.set_last_token_time(now)
+                logger.info("Last token time set")
             request_output = RequestOutputFactory.create(
                 seq_group,
                 self.seq_id_to_seq_group,
@@ -1391,6 +1398,8 @@ class LLMEngine:
 
         # Clear outputs for each new scheduler iteration
         ctx.request_outputs.clear()
+        
+        start_scheduler_time = time.perf_counter()
 
         # Skip the scheduler if there are any remaining steps in the seq groups.
         # This ensures that the scheduler is only called again when the current
@@ -1432,6 +1441,10 @@ class LLMEngine:
 
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
+        
+        logger.info(f"Scheduler step took {time.perf_counter() - start_scheduler_time:.6f} seconds")
+        
+        start_exec = time.perf_counter()
 
         if not scheduler_outputs.is_empty():
 
@@ -1459,8 +1472,10 @@ class LLMEngine:
                     virtual_engine]
 
             try:
+                logger.info("CALL EXEC MODEL")
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
+                logger.info("EXEC MODEL DONE")
                 self._skip_scheduling_next_step = False
             except InputProcessingError as e:
                 # The input for this request cannot be processed, so we must
@@ -1487,6 +1502,10 @@ class LLMEngine:
                 self._process_model_outputs(ctx=ctx)
             # No outputs in this case
             outputs = []
+            
+        logger.info(f"Model execution took {time.perf_counter() - start_exec:.6f} seconds")
+        
+        start_output_proc = time.perf_counter()
 
         # Finish the current step for all the sequence groups.
         if self.scheduler_config.is_multi_step:
@@ -1546,6 +1565,8 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+        
+        logger.info(f"Output processing took {time.perf_counter() - start_output_proc:.6f} seconds")
 
         return ctx.request_outputs
 
@@ -1810,6 +1831,8 @@ class LLMEngine:
                         # One generation token per finished prefill.
                         num_generation_tokens_from_prefill_groups += (
                             seq_group.num_seqs())
+                        logger.info(f"latency for prefill: {latency:.6f} seconds")
+                        # breakpoint()
                 else:
                     # TPOTs.
                     latency = seq_group.get_last_token_latency()

@@ -351,6 +351,12 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         )
 
         model_execute_time = time.perf_counter() - start_time
+        if model_input.prompt_lens is not None:
+            logger.info("Model prefill took %.4f seconds",
+                        model_execute_time)
+        else:
+            logger.info("Model decode took %.4f seconds",
+                        model_execute_time)
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_execute_time
