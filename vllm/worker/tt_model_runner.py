@@ -435,7 +435,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # enqueued on device and the last step will trigger the output
         # processor for all outputs but the last. Currently for TT,
         # the inputs/outputs of each step are transferred between host/device,
-        # and async_out_proc will triggers the output processor for step (i)
+        # and async_out_proc will trigger the output processor for step (i)
         # on host while device is executing step (i+1).
         use_async_out_proc = model_input.async_callback is not None
 
@@ -498,10 +498,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = self._make_sampler_output(
                     next_token_ids, model_input.seq_groups)
                 sampler_outputs.append(sampler_output)
-            if use_async_out_proc:
-                return [
-                    sampler_outputs[-1]
-                ]  # only return the last output for async output processor
 
         return sampler_outputs
 
