@@ -546,7 +546,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                  model_input.async_callback,
                                  is_first_step_output=(step_idx == 1))
         else:
-            # trigger output processor on first step in case prefill just finished
+            # trigger output processor in case last step was prefill
             assert model_input.async_callback is not None
             model_input.async_callback()
 
