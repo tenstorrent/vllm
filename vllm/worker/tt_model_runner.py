@@ -176,6 +176,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
+            self.empty_slots = list(range(32))
+            self.seq_groups_to_batch_slot = {}
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -574,14 +576,25 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
 
-        if self.dp_kv_cache:
-            # Send finished request ids and seq groups to generator
-            execute_model_kwargs["finished_requests_ids"] = (
-                model_input.finished_requests_seq_ids)
-            execute_model_kwargs["seq_groups"] = model_input.seq_groups
 
         if not is_decode:
+            if self.dp_kv_cache:
+                batch, _ = model_input.input_tokens.shape
+                for req in model_input.finished_requests_seq_ids:
+                    empty_batch_slot = self.seq_groups_to_batch_slot[req]
+                    self.empty_slots.append(empty_batch_slot)
+                    del self.seq_groups_to_batch_slot[req]
+                execute_model_kwargs["empty_slots"] = self.empty_slots[:batch]
+
             outputs = self.model.prefill_forward(**execute_model_kwargs)
+            
+            if self.dp_kv_cache:
+                # update the batch slot table
+                recently_filled_slots = self.empty_slots[:batch]
+                self.empty_slots = self.empty_slots[batch:]
+
+                for s in model_input.seq_groups:
+                    self.seq_groups_to_batch_slot[s] = recently_filled_slots.pop(0)
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
@@ -622,6 +635,34 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             else:
                 enc_dec_kwargs = {}
 
+            if self.dp_kv_cache:
+                for req in model_input.finished_requests_seq_ids:
+                    empty_batch_slot = self.seq_groups_to_batch_slot[req]
+                    self.empty_slots.append(empty_batch_slot)
+                    del self.seq_groups_to_batch_slot[req]
+
+                # Calculate perm_table_tensor: perm_table_tensor[new_idx] = current_slot_idx that should move to new_idx
+                perm_table_tensor = torch.as_tensor(
+                    [self.seq_groups_to_batch_slot[s] for s in model_input.seq_groups] + self.empty_slots,
+                    dtype=torch.long,
+                )
+                # Calculate inverse_perm_indices: inverse_perm_indices[current_slot_idx] = new_idx where current_slot_idx should go
+                inverse_perm_indices = torch.empty_like(perm_table_tensor)
+                inverse_perm_indices[perm_table_tensor] = torch.arange(
+                    perm_table_tensor.size(0),
+                    dtype=torch.long,
+                )
+
+                # permute the start_pos, tokens, and page_table
+                start_pos = start_pos[inverse_perm_indices]
+                tokens = tokens[inverse_perm_indices, :]
+                page_table = page_table[inverse_perm_indices, :]
+
+                execute_model_kwargs["start_pos"] = start_pos
+                execute_model_kwargs["tokens"] = tokens
+                execute_model_kwargs["page_table"] = page_table
+
+
             tt_out = self.model.decode_forward(**execute_model_kwargs,
                                                **enc_dec_kwargs,
                                                enable_trace=self.trace_mode,
@@ -634,6 +675,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out,
                 model_input.unpadded_batch_size,
                 is_tokens=(self.sample_on_device_mode is not None))
+            if self.dp_kv_cache:
+                # permute the tt_out
+                tt_out = tt_out[perm_table_tensor, :]
 
         # Note: for other devices, vLLM applies
         # vllm.model_executor.layers.logits_processor::LogitsProcessor::
