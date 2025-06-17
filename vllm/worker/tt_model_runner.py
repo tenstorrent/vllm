@@ -547,6 +547,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                  is_first_step_output=(step_idx == 1))
         else:
             # trigger output processor on first step in case prefill just finished
+            assert model_input.async_callback is not None
             model_input.async_callback()
 
     def _execute_model_single_step(self,
