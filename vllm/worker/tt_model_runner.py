@@ -654,9 +654,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 )
 
                 # permute the start_pos, tokens, and page_table
-                start_pos = start_pos[inverse_perm_indices]
-                tokens = tokens[inverse_perm_indices, :]
-                page_table = page_table[inverse_perm_indices, :]
+                start_pos = model_input.input_positions[inverse_perm_indices]
+                tokens = model_input.input_tokens[inverse_perm_indices, :]
+                page_table = model_input.block_tables[inverse_perm_indices, :]
 
                 execute_model_kwargs["start_pos"] = start_pos
                 execute_model_kwargs["tokens"] = tokens
@@ -677,7 +677,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 is_tokens=(self.sample_on_device_mode is not None))
             if self.dp_kv_cache:
                 # permute the tt_out
-                tt_out = tt_out[perm_table_tensor, :]
+                tt_out = tt_out[perm_table_tensor]
 
         # Note: for other devices, vLLM applies
         # vllm.model_executor.layers.logits_processor::LogitsProcessor::
