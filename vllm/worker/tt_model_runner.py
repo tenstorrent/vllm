@@ -572,12 +572,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
 
-        if self.dp_kv_cache:
-            if model_input.finished_requests_seq_ids is not None:
-                for req in model_input.finished_requests_seq_ids:
-                    empty_batch_slot = self.seq_groups_to_batch_slot[req]
-                    self.empty_slots.append(empty_batch_slot)
-                    del self.seq_groups_to_batch_slot[req]
+        if (self.dp_kv_cache
+                and model_input.finished_requests_seq_ids is not None):
+            # update the empty slots
+            for req in model_input.finished_requests_seq_ids:
+                empty_batch_slot = self.seq_groups_to_batch_slot[req]
+                self.empty_slots.append(empty_batch_slot)
+                del self.seq_groups_to_batch_slot[req]
 
         if not is_decode:
             if self.dp_kv_cache:
@@ -639,7 +640,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             if self.dp_kv_cache:
                 # Calculate perm_table_tensor:
-                # perm_table_tensor[new_idx] = current_slot_idx that should move to new_idx
+                # perm_table_tensor[new_idx] = current_slot_idx
                 perm_table_tensor = torch.as_tensor(
                     [
                         self.seq_groups_to_batch_slot[s]
@@ -648,7 +649,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     dtype=torch.long,
                 )
                 # Calculate inverse_perm_indices:
-                # inverse_perm_indices[current_slot_idx] = new_idx where current_slot_idx should go
+                # inverse_perm_indices[current_slot_idx] = new_idx
                 inverse_perm_indices = torch.empty_like(perm_table_tensor)
                 inverse_perm_indices[perm_table_tensor] = torch.arange(
                     perm_table_tensor.size(0),
