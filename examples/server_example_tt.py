@@ -32,7 +32,7 @@ def main():
         "--max_num_seqs",
         str(args.max_num_seqs),
         "--num_scheduler_steps",
-        "10",
+        "1",
     ])
     runpy.run_module('vllm.entrypoints.openai.api_server', run_name='__main__')
 
