@@ -365,10 +365,10 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     # TT-NN utilities
 
     def _get_dispatch_core_type(self):
-        dispatch_core_type = ttnn.device.DispatchCoreType.WORKER
+        dispatch_core_type = ttnn.DispatchCoreType.WORKER
         if ("WH_ARCH_YAML" in os.environ) and os.environ[
                 "WH_ARCH_YAML"] == "wormhole_b0_80_arch_eth_dispatch.yaml":
-            dispatch_core_type = ttnn.device.DispatchCoreType.ETH
+            dispatch_core_type = ttnn.DispatchCoreType.ETH
         return dispatch_core_type
 
     def _get_dispatch_core_config(self, device_params):
@@ -482,9 +482,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # Set fabric before opening the device
         self._set_fabric()
 
+        mesh_shape = ttnn.MeshShape(*mesh_grid)
+        dispatch_core_config = self._get_dispatch_core_config(device_params)
+        logger.info("Opening mesh device with mesh shape %s", mesh_shape)
+        logger.info("Dispatch core config: %s", dispatch_core_config)
+        logger.info("Device params: %s", device_params)
         mesh_device = ttnn.open_mesh_device(
-            ttnn.MeshShape(*mesh_grid),
-            dispatch_core_config=self._get_dispatch_core_config(device_params),
+            mesh_shape,
+            dispatch_core_config=dispatch_core_config,
             **device_params,
         )
         logger.info("multidevice with %d devices and grid %s is created",
