@@ -177,7 +177,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
-            self.seq_groups_to_batch_slot = {}
+            self.seq_groups_to_batch_slot: Dict[int, int] = {}
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -413,7 +413,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for req_id in finished_requests_ids:
                 del self.req_id_to_seq_id[req_id]
         else:
-            finished_requests_seq_ids = None
+            finished_requests_seq_ids = []
 
         return TTModelInput(input_tokens, input_positions,
                             finished_requests_seq_ids, prompt_lens,
