@@ -573,10 +573,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 "cross_page_table"] = model_input.cross_block_tables
 
         if self.dp_kv_cache:
-            for req in model_input.finished_requests_seq_ids:
-                empty_batch_slot = self.seq_groups_to_batch_slot[req]
-                self.empty_slots.append(empty_batch_slot)
-                del self.seq_groups_to_batch_slot[req]
+            if model_input.finished_requests_seq_ids is not None:
+                for req in model_input.finished_requests_seq_ids:
+                    empty_batch_slot = self.seq_groups_to_batch_slot[req]
+                    self.empty_slots.append(empty_batch_slot)
+                    del self.seq_groups_to_batch_slot[req]
 
         if not is_decode:
             if self.dp_kv_cache:
