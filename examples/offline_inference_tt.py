@@ -436,7 +436,7 @@ if __name__ == "__main__":
                         help="Disable async output processing")
     parser.add_argument("--num_scheduler_steps",
                         type=int,
-                        default=1,
+                        default=10,
                         help="Number of scheduler steps")
     parser.add_argument("--multi_modal",
                         action="store_true",
