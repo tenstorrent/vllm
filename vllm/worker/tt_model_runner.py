@@ -412,15 +412,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Delete the finished requests from req_id_to_seq_id
             for req_id in finished_requests_ids:
                 del self.req_id_to_seq_id[req_id]
-        else:
-            finished_requests_seq_ids = []
-        if (self.dp_kv_cache
-        and finished_requests_seq_ids is not None):
+
             # update the empty slots
             for req in finished_requests_seq_ids:
                 empty_batch_slot = self.seq_groups_to_batch_slot[req]
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
+        else:
+            finished_requests_seq_ids = []
 
         return TTModelInput(input_tokens, input_positions,
                             finished_requests_seq_ids, prompt_lens,
