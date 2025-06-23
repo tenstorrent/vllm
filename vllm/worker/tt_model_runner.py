@@ -39,7 +39,6 @@ class TTModelInput(ModelRunnerInputBase):
     """
     input_tokens: torch.Tensor
     input_positions: torch.Tensor
-    finished_requests_seq_ids: Optional[List[int]]
     prompt_lens: Optional[List[int]]
     seq_groups: List[int]
     block_tables: torch.Tensor
@@ -422,7 +421,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             finished_requests_seq_ids = []
 
         return TTModelInput(input_tokens, input_positions,
-                            finished_requests_seq_ids, prompt_lens,
+                            prompt_lens,
                             seq_groups_list, block_tables, unpadded_batch_size,
                             tt_sampling_params, multi_modal_kwargs,
                             cross_block_tables)
