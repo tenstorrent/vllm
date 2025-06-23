@@ -414,6 +414,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 del self.req_id_to_seq_id[req_id]
         else:
             finished_requests_seq_ids = []
+        if (self.dp_kv_cache
+        and finished_requests_seq_ids is not None):
+            # update the empty slots
+            for req in finished_requests_seq_ids:
+                empty_batch_slot = self.seq_groups_to_batch_slot[req]
+                self.empty_slots.append(empty_batch_slot)
+                del self.seq_groups_to_batch_slot[req]
 
         return TTModelInput(input_tokens, input_positions,
                             finished_requests_seq_ids, prompt_lens,
@@ -572,13 +579,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
 
-        if (self.dp_kv_cache
-                and model_input.finished_requests_seq_ids is not None):
-            # update the empty slots
-            for req in model_input.finished_requests_seq_ids:
-                empty_batch_slot = self.seq_groups_to_batch_slot[req]
-                self.empty_slots.append(empty_batch_slot)
-                del self.seq_groups_to_batch_slot[req]
 
         if not is_decode:
             if self.dp_kv_cache:
