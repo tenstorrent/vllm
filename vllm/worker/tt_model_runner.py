@@ -417,11 +417,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 empty_batch_slot = self.seq_groups_to_batch_slot[req]
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
-        else:
-            finished_requests_seq_ids = []
 
-        return TTModelInput(input_tokens, input_positions,
-                            prompt_lens,
+        return TTModelInput(input_tokens, input_positions, prompt_lens,
                             seq_groups_list, block_tables, unpadded_batch_size,
                             tt_sampling_params, multi_modal_kwargs,
                             cross_block_tables)
@@ -576,7 +573,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.cross_block_tables is not None:
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
-
 
         if not is_decode:
             if self.dp_kv_cache:
