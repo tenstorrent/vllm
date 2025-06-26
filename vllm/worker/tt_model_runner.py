@@ -598,14 +598,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # (may need to be updated for future models)
                 tt_out, prefill_cross_attention_masks, \
                 prefill_full_text_row_masked_out_mask, \
-                decode_cross_attention_masks, decode_full_text_row_masked_out_mask = outputs
+                decode_cross_attention_masks, \
+                 decode_full_text_row_masked_out_mask = outputs
                 if self.cached_enc_dec_data is None:
                     self.cached_enc_dec_data = {}
                 for i, seq_id in enumerate(model_input.seq_groups):
-                    enc_dec_data = {"prefill_cross_attention_masks": prefill_cross_attention_masks[i], 
-                                        "prefill_full_text_row_masked_out_mask": prefill_full_text_row_masked_out_mask[i],
-                                        "decode_cross_attention_masks": decode_cross_attention_masks[i],
-                                        "decode_full_text_row_masked_out_mask": decode_full_text_row_masked_out_mask[i]
+                    enc_dec_data = {
+                        "prefill_cross_attention_masks":
+                        prefill_cross_attention_masks[i],
+                        "prefill_full_text_row_masked_out_mask":
+                        prefill_full_text_row_masked_out_mask[i],
+                        "decode_cross_attention_masks":
+                        decode_cross_attention_masks[i],
+                        "decode_full_text_row_masked_out_mask":
+                        decode_full_text_row_masked_out_mask[i]
                     }
                     self.cached_enc_dec_data[seq_id] = enc_dec_data
             else:
@@ -616,26 +622,34 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
                 # Use encoder-decoder data from prefill step
                 prefill_cross_attention_masks = [
-                    self.cached_enc_dec_data[seq_id]["prefill_cross_attention_masks"]
+                    self.cached_enc_dec_data[seq_id]
+                    ["prefill_cross_attention_masks"]
                     for seq_id in model_input.seq_groups
                 ]
                 prefill_full_text_row_masked_out_mask = [
-                    self.cached_enc_dec_data[seq_id]["prefill_full_text_row_masked_out_mask"]
+                    self.cached_enc_dec_data[seq_id]
+                    ["prefill_full_text_row_masked_out_mask"]
                     for seq_id in model_input.seq_groups
                 ]
                 decode_cross_attention_masks = [
-                    self.cached_enc_dec_data[seq_id]["decode_cross_attention_masks"]
+                    self.cached_enc_dec_data[seq_id]
+                    ["decode_cross_attention_masks"]
                     for seq_id in model_input.seq_groups
                 ]
                 decode_full_text_row_masked_out_mask = [
-                    self.cached_enc_dec_data[seq_id]["decode_full_text_row_masked_out_mask"]
+                    self.cached_enc_dec_data[seq_id]
+                    ["decode_full_text_row_masked_out_mask"]
                     for seq_id in model_input.seq_groups
                 ]
                 enc_dec_kwargs = {
-                    "prefill_cross_attention_masks": prefill_cross_attention_masks,
-                    "prefill_full_text_row_masked_out_mask": prefill_full_text_row_masked_out_mask,
-                    "decode_cross_attention_masks": decode_cross_attention_masks,
-                    "decode_full_text_row_masked_out_mask": decode_full_text_row_masked_out_mask
+                    "prefill_cross_attention_masks":
+                    prefill_cross_attention_masks,
+                    "prefill_full_text_row_masked_out_mask":
+                    prefill_full_text_row_masked_out_mask,
+                    "decode_cross_attention_masks":
+                    decode_cross_attention_masks,
+                    "decode_full_text_row_masked_out_mask":
+                    decode_full_text_row_masked_out_mask
                 }
             else:
                 enc_dec_kwargs = {}
