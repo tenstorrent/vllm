@@ -424,13 +424,23 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.prev_seq_groups_list is None:
                 self.prev_seq_groups_list = seq_groups_list
 
-            # check for finished requests
-            finished_requests_seq_ids_current = []
-            for seq_id in self.prev_seq_groups_list:
-                if (not is_prompt and seq_id not in seq_groups_list
-                    ) or seq_id in finished_requests_seq_ids:
+            # check for pe-empted requests
+            if seq_groups_list != self.prev_seq_groups_list and not is_prompt:
+                finished_requests_seq_ids_current = [
+                    seq_id for seq_id in self.prev_seq_groups_list
+                    if seq_id not in seq_groups_list
+                ]
+                self.prev_seq_groups_list = seq_groups_list
+            else:
+                finished_requests_seq_ids_current = []
+
+            # check for any remaining finished requests
+            for seq_id in finished_requests_seq_ids:
+                if seq_id not in finished_requests_seq_ids_current:
                     finished_requests_seq_ids_current.append(seq_id)
-            self.prev_seq_groups_list = seq_groups_list
+                    # remove seq_id from prev_seq_groups_list
+                    if seq_id in self.prev_seq_groups_list:
+                        self.prev_seq_groups_list.remove(seq_id)
 
             # update the empty slots
             for req in finished_requests_seq_ids_current:
