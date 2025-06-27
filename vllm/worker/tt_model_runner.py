@@ -172,6 +172,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.dp_kv_cache = False
 
+        if ("Llama" in self.model_config.model
+                and "70B" in self.model_config.model
+                and self.device_config.device.get_num_devices() == 32
+                and (self.model_config.override_tt_config.get(
+                    "data_parallel", 1) == 1)):
+            self.llama_tg = True
+        else:
+            self.llama_tg = False
+
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
@@ -215,7 +224,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
-
         if self.dp_kv_cache and finished_requests_ids is not None:
             # Delete finished requests from req_id_to_seq_id
             finished_requests_seq_ids = []
@@ -411,28 +419,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     ],
                                                    dim=1)
 
-        if self.dp_kv_cache and finished_requests_ids is not None:
+        if self.dp_kv_cache:
 
             if self.prev_seq_groups_list is None:
                 self.prev_seq_groups_list = seq_groups_list
 
-            # check for pe-empted requests
-            if seq_groups_list != self.prev_seq_groups_list and not is_prompt:
-                finished_requests_seq_ids_current = [
-                    seq_id for seq_id in self.prev_seq_groups_list
-                    if seq_id not in seq_groups_list
-                ]
-                self.prev_seq_groups_list = seq_groups_list
-            else:
-                finished_requests_seq_ids_current = []
-
-            # check for any remaining finished requests
-            for seq_id in finished_requests_seq_ids:
-                if seq_id not in finished_requests_seq_ids_current:
+            # check for finished requests
+            finished_requests_seq_ids_current = []
+            for seq_id in self.prev_seq_groups_list:
+                if (not is_prompt and seq_id not in seq_groups_list
+                    ) or seq_id in finished_requests_seq_ids:
                     finished_requests_seq_ids_current.append(seq_id)
-                    # remove seq_id from prev_seq_groups_list
-                    if seq_id in self.prev_seq_groups_list:
-                        self.prev_seq_groups_list.remove(seq_id)
+            self.prev_seq_groups_list = seq_groups_list
+
             # update the empty slots
             for req in finished_requests_seq_ids_current:
                 empty_batch_slot = self.seq_groups_to_batch_slot[req]
@@ -464,7 +463,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         if not is_decode:
             assert num_steps == 1, "Num steps must be 1 for prefill"
-
         # always true if not using multi-step
         if model_input.is_first_multi_step:
             self.cached_step_outputs = []
@@ -476,7 +474,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     use_async_out_proc,
                     step_idx=i)
                 self.cached_step_outputs.append(next_token_ids)
-                if not self.dp_kv_cache and i < num_steps - 1:
+                if not self.llama_tg and i < num_steps - 1:
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
                     if new_input_tokens.shape[
@@ -662,6 +660,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     ] + self.empty_slots,
                     dtype=torch.long,
                 )
+
+                assert perm_table_tensor.shape[
+                    0] == self.scheduler_config.max_num_seqs
                 # Calculate inverse_perm_indices:
                 # inverse_perm_indices[current_slot_idx] = new_idx
                 inverse_perm_indices = torch.empty_like(perm_table_tensor)
