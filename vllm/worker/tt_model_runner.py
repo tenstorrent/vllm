@@ -163,14 +163,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # place the users on the correct devices. This requires passing seq_id
         # and finished requests to the generator.
         # TODO: Extend this to support other DP models
-        if ("Llama" in self.model_config.model
-                and "70B" in self.model_config.model
-                and self.device_config.device.get_num_devices() == 32
-                and (self.model_config.override_tt_config.get(
-                    "data_parallel", 1) == 1)):
-            self.dp_kv_cache = True
-        else:
-            self.dp_kv_cache = False
 
         if ("Llama" in self.model_config.model
                 and "70B" in self.model_config.model
@@ -180,6 +172,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.llama_tg = True
         else:
             self.llama_tg = False
+            
+        if self.llama_tg:
+            self.dp_kv_cache = True
+        else:
+            self.dp_kv_cache = False 
 
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
