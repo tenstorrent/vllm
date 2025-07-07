@@ -172,11 +172,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.llama_tg = True
         else:
             self.llama_tg = False
-            
+
         if self.llama_tg:
             self.dp_kv_cache = True
         else:
-            self.dp_kv_cache = False 
+            self.dp_kv_cache = False
 
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
