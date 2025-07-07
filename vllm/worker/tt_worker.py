@@ -118,12 +118,12 @@ class TTCacheEngine:
         the assumption that we are tensor parallel by min(number of devices, 
         number of KV heads).
         '''
-        num_devices = device_config.device.get_num_devices()
+        data_parallel = model_config.override_tt_config.get("data_parallel", 1)
+        num_devices = device_config.device.get_num_devices() // data_parallel
         num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-        num_kv_heads //= min(
-            num_devices,
-            num_kv_heads)  # TP = num_devices if num_devices < num_kv_heads
-        return num_kv_heads
+
+        # TP = num_devices if num_devices < num_kv_heads
+        return num_kv_heads // min(num_devices, num_kv_heads)
 
 
 class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
