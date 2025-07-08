@@ -118,7 +118,10 @@ class TTCacheEngine:
         the assumption that we are tensor parallel by min(number of devices, 
         number of KV heads).
         '''
-        data_parallel = model_config.override_tt_config.get("data_parallel", 1)
+        data_parallel = 1
+        if (model_config.override_tt_config 
+            and "data_parallel" in model_config.override_tt_config):
+            data_parallel = model_config.override_tt_config["data_parallel"]
         num_devices = device_config.device.get_num_devices() // data_parallel
         num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
