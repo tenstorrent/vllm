@@ -384,9 +384,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def _get_dispatch_core_type(self):
         dispatch_core_type = ttnn.device.DispatchCoreType.WORKER
-        if ("WH_ARCH_YAML" in os.environ) and os.environ[
-                "WH_ARCH_YAML"] == "wormhole_b0_80_arch_eth_dispatch.yaml":
-            dispatch_core_type = ttnn.device.DispatchCoreType.ETH
+        # if ("WH_ARCH_YAML" in os.environ) and os.environ[
+        #         "WH_ARCH_YAML"] == "wormhole_b0_80_arch_eth_dispatch.yaml":
+        #     dispatch_core_type = ttnn.device.DispatchCoreType.ETH
         return dispatch_core_type
 
     def _get_dispatch_core_config(self, device_params):
@@ -410,6 +410,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                 in ttnn.get_arch_name() else ttnn.DispatchCoreAxis.ROW,
             )
 
+        logger.info("Using dispatch core type: %s, axis: %s",
+                    dispatch_core_type.name,
+                    dispatch_core_axis.name)
         dispatch_core_config = ttnn.DispatchCoreConfig(dispatch_core_type,
                                                        dispatch_core_axis)
         return dispatch_core_config
@@ -481,7 +484,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             "P300": (1, 2),
             "N150x4": (1, 4),
             "P150x4": (1, 4),
-            "T3K": (1, 8),
+            "T3K": (2, 4),
             "TG": (8, 4)
         }
         mesh_device_env = os.environ.get("MESH_DEVICE")
@@ -508,6 +511,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         )
         logger.info("multidevice with %d devices and grid %s is created",
                     mesh_device.get_num_devices(), mesh_grid)
+
+        if mesh_device_env == "T3K":
+            mesh_device.reshape(ttnn.MeshShape(1, 8))
         return mesh_device
 
     def _enable_program_cache(self):
