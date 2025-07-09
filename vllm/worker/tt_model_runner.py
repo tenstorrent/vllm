@@ -191,9 +191,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
             self.prev_seq_groups_list: Optional[List[int]] = None
             if self.async_torch_proc:
-                self.cached_read_events = [
+                self.cached_read_events: List[Any] = [
                 ]  # Only used for multi-step execution
-                self.perm_table_tensor = []
+                self.perm_table_tensor: List[torch.Tensor] = []
 
     def get_model(self) -> nn.Module:
         return self.model
