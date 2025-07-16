@@ -174,7 +174,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.llama_tg = False
 
-        if self.llama_tg:
+        is_dp = (self.model_config.override_tt_config
+                 and self.model_config.override_tt_config.get(
+                     "data_parallel", 1) > 1)
+
+        if self.llama_tg or is_dp:
             self.dp_kv_cache = True
         else:
             self.dp_kv_cache = False
