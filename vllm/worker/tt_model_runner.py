@@ -491,8 +491,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         sampler_outputs = []  # no outputs unless last step
         if model_input.is_last_step:  # always true if not using multi-step
             num_outputs = len(self.cached_step_outputs)
-            # if use_async_out_proc:
-            #     assert num_outputs == 1, "Last step should only have one output"
+            if use_async_out_proc:
+                # the last step should have 1 output unless we have 
+                # scheduled less than self.scheduler_config.num_lookahead_slots + 1 steps
+                # in which case there will be 0 outputs
+                assert num_outputs <= 1, "Last step should have at most one output"
             for i in range(num_outputs):
                 next_token_ids = self.cached_step_outputs.pop(0)
                 # TODO: sync read back from device
