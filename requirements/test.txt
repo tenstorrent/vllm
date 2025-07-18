@@ -579,13 +579,13 @@ setuptools==75.8.0
     # via
     #   mamba-ssm
     #   pytablewriter
+    #   torch
 shellingham==1.5.4
     # via typer
 six==1.16.0
     # via
     #   python-dateutil
     #   rouge-score
-    #   torch
 sniffio==1.3.1
     # via
     #   anyio
