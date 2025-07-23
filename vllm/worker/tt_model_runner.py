@@ -430,6 +430,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                    dim=1)
 
         if self.dp_kv_cache:
+            if is_prompt:
+                self.prev_seq_groups_list = None
 
             if self.prev_seq_groups_list is None:
                 self.prev_seq_groups_list = seq_groups_list
