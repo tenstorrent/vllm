@@ -1814,7 +1814,11 @@ class LLMEngine:
                     # TPOTs.
                     latency = seq_group.get_last_token_latency()
                     # last_token_time is set only for the last step so take avg
-                    num_outputs = scheduler_outputs.num_lookahead_slots + 1
+                    total_tokens = sum(
+                        [seq.get_output_len() - 1 for seq in seq_group.seqs])
+                    max_steps = scheduler_outputs.num_lookahead_slots + 1
+                    num_outputs = (total_tokens % max_steps if total_tokens %
+                                   max_steps != 0 else max_steps)
                     latency /= num_outputs
                     time_per_output_tokens_iter.append(latency)
                     if seq_group.state.current_step == 0:
