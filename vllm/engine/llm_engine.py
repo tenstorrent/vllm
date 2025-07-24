@@ -1820,7 +1820,9 @@ class LLMEngine:
                         # executed is not always the same as the number of
                         # lookahead slots but rather the number of balance
                         # tokens left to be generated.
-                        assert len(seq_group.seqs) == 1, "Only one seq per group is allowed for TT"
+                        assert len(
+                            seq_group.seqs
+                        ) == 1, "Only one seq per group is allowed for TT"
                         total_tokens = seq_group.seqs[0].get_output_len() - 1
                         max_steps = scheduler_outputs.num_lookahead_slots + 1
                         num_outputs = (total_tokens %
