@@ -1815,7 +1815,11 @@ class LLMEngine:
                     # TPOTs.
                     latency = seq_group.get_last_token_latency()
                     # last_token_time is set only for the last step so take avg
-                    if current_platform.is_tt:
+                    if current_platform.is_tt():
+                        # for the current tt model runner, the number of steps
+                        # executed is not always the same as the number of
+                        # lookahead slots but rather the number of balance
+                        # tokens left to be generated.
                         total_tokens = sum([
                             seq.get_output_len() - 1 for seq in seq_group.seqs
                         ])
