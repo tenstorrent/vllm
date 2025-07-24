@@ -430,6 +430,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                    dim=1)
 
         if self.dp_kv_cache:
+            if 1661 in seq_groups_list:
+                logger.warning("Seq group: %s", seq_groups_list)
+                logger.warning("Empty slots: %s",
+                                self.empty_slots)
+                logger.warning("Prev seq groups list: %s",
+                                self.prev_seq_groups_list)
+                logger.warning("Seq groups to batch slot: %s",
+                                self.seq_groups_to_batch_slot)
 
             if self.prev_seq_groups_list is None:
                 self.prev_seq_groups_list = seq_groups_list
@@ -457,6 +465,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 empty_batch_slot = self.seq_groups_to_batch_slot[req]
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
+
+            if not is_prompt:
+                missing_requests = []
+                for req, slot in self.seq_groups_to_batch_slot.items():
+                    if req not in seq_groups_list:
+                        self.empty_slots.append(slot)
+                        missing_requests.append(req)
+
+                if len(missing_requests) > 0:
+                    logger.warning("Missing requests: %s", missing_requests)
+
+                for req in missing_requests:
+                    del self.seq_groups_to_batch_slot[req]
+
+            assert len(self.empty_slots) + len(self.seq_groups_to_batch_slot
+                   ) == self.scheduler_config.max_num_seqs
+            assert len(seq_groups_list) == unpadded_batch_size
+
 
         return TTModelInput(input_tokens, input_positions, prompt_lens,
                             seq_groups_list, block_tables, unpadded_batch_size,
@@ -649,6 +675,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             if self.dp_kv_cache:
                 # update the batch slot table
+                assert len(self.empty_slots
+                           ) >= model_input.unpadded_batch_size, (
+                               "Not enough empty slots for batch size")
+
                 recently_filled_slots = self.empty_slots[:model_input.
                                                          unpadded_batch_size]
                 self.empty_slots = self.empty_slots[model_input.
@@ -731,6 +761,25 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 )
                 if self.async_torch_proc:
                     self.perm_table_tensor.append(perm_table_tensor)
+
+                if perm_table_tensor.shape[
+                        0] != self.scheduler_config.max_num_seqs:
+                    logger.warning(
+                        "Perm table tensor shape (%s) does not match "
+                        "max_num_seqs (%s), padding with zeros",
+                        perm_table_tensor.shape,
+                        self.scheduler_config.max_num_seqs)
+                    logger.warning("Empty slots: %s",
+                                   self.empty_slots)
+                    logger.warning("Len seq groups to batch slot: %s",
+                                   len(self.seq_groups_to_batch_slot))
+                    logger.warning("Len seq groups: %s",
+                                   len(model_input.seq_groups))
+                    logger.warning("Seq groups to batch slot: %s",
+                                   self.seq_groups_to_batch_slot)
+                    logger.warning("Seq groups: %s",
+                                   model_input.seq_groups)
+                        
 
                 assert perm_table_tensor.shape[
                     0] == self.scheduler_config.max_num_seqs
