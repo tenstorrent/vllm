@@ -3,15 +3,17 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+import vllm.envs as envs
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.sampling_params import SamplingParams
 
 from .interface import Platform, PlatformEnum
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.pooling_params import PoolingParams
 else:
+    ModelConfig = None
     VllmConfig = None
     PoolingParams = None
 
@@ -43,7 +45,19 @@ class TTPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
+            if envs.VLLM_USE_V1:
+                parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
+            else:
+                parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
+
+    @classmethod
+    def is_pin_memory_available(cls):
+        return False
+
+    @classmethod
+    def supports_v1(cls, model_config: ModelConfig) -> bool:
+        # V1 support on TT is experimental
+        return True
 
     @classmethod
     def validate_request(

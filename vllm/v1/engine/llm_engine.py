@@ -120,6 +120,7 @@ class LLMEngine:
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         disable_log_stats: bool = False,
+        log_global_stats: bool = False,  # Currently ignored in V1 (used in V0)
     ) -> "LLMEngine":
         return cls(vllm_config=vllm_config,
                    executor_class=Executor.get_class(vllm_config),
