@@ -784,7 +784,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.llama_tg:
                 next_token_ids = tt_out
             else:
-                next_token_ids = tt_out[:model_input.unpadded_batch_size] # this segfaults with LLama TG prefetcher
+                next_token_ids = tt_out[:model_input.unpadded_batch_size]
         if not is_decode or not self.async_torch_proc:
             return next_token_ids
         else:
