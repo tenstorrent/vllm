@@ -781,7 +781,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             next_token_ids = self._sample_tokens(
                 next_logits, model_input.tt_sampling_params)
         else:
-            if llama_tg:
+            if self.llama_tg:
                 next_token_ids = tt_out
             else:
                 next_token_ids = tt_out[:model_input.unpadded_batch_size] # this segfaults with LLama TG prefetcher
