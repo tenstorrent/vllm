@@ -74,6 +74,7 @@ MESH_DEVICE=T3K WH_ARCH_YAML=wormhole_b0_80_arch_eth_dispatch.yaml python exampl
 
 **Note 1**: Custom TT options can be set using `--override_tt_config` with a json string, e.g. `--override_tt_config '{"sample_on_device_mode": "all"}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters are:
 - `sample_on_device_mode`: ["all", "decode_only"]
+- `trace_mode`: [true, false]
 - `trace_region_size`: [default: 25000000]
 - `worker_l1_size`
 - `fabric_config`: ["DISABLED", "FABRIC_1D", "FABRIC_2D", "CUSTOM"]

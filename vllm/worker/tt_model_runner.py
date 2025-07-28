@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
@@ -152,7 +154,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # instead of selecting from default vllm loaders
         loader = TTModelLoader(self.load_config)
 
-        self.model = loader.load_model(vllm_config=self.vllm_config)
+        self.model = loader.load_model(vllm_config=self.vllm_config,
+                                       model_config=self.model_config)
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = (self.model.max_cross_attn_tokens //
                                      self.cache_config.block_size)
