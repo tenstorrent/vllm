@@ -19,28 +19,12 @@ from .utils import (
 )
 
 
-def pytest_configure(config):
-    """Configure pytest for TT tests."""
-    config.addinivalue_line(
-        "markers", "tt: mark test as requiring TT hardware"
-    )
-
-
 def pytest_collection_modifyitems(config, items):
-    """Automatically mark TT tests and skip if hardware not available."""
+    """Automatically skip TT tests if hardware not available."""
     for item in items:
         if "tt" in item.nodeid or item.fspath.dirname.endswith("tt"):
-            item.add_marker(pytest.mark.tt)
             if not current_platform.is_tt():
                 item.add_marker(pytest.mark.skip(reason="TT hardware not available"))
-
-
-@pytest.fixture(scope="session") 
-def tt_available():
-    """Check if TT hardware is available."""
-    if not current_platform.is_tt():
-        pytest.skip("TT hardware not available")
-    return True
 
 
 @pytest.fixture(scope="session")

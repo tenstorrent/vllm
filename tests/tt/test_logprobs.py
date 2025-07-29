@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from vllm import SamplingParams
-from vllm.platforms import current_platform
 
 from ..conftest import VllmRunner
 from ..models.utils import check_logprobs_close
@@ -44,10 +43,6 @@ ASYNC_CONFIGS = [
 class TestTTLogprobsCurrentBehavior:
     """Test current TT hardware behavior - should reject logprobs requests."""
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.parametrize("logprobs", [1, 5])
     def test_logprobs_currently_rejected(
         self,
@@ -70,10 +65,6 @@ class TestTTLogprobsCurrentBehavior:
                 )
                 vllm_model.model.generate(prompts, sampling_params)
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.parametrize("prompt_logprobs", [1, 5])
     def test_prompt_logprobs_currently_rejected(
         self,
@@ -104,10 +95,6 @@ class TestTTLogprobsFutureBehavior:
     Mark with @pytest.mark.xfail initially, then remove when implementation is ready.
     """
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
     @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
@@ -189,10 +176,6 @@ class TestTTLogprobsFutureBehavior:
 
         print(f"✓ Logprobs working with {sampling_desc} + {async_desc} (logprobs={logprobs}, max_tokens={max_tokens})")
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
     @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
@@ -251,10 +234,6 @@ class TestTTLogprobsFutureBehavior:
 
         print(f"✓ Prompt logprobs working with {sampling_desc} + {async_desc} (prompt_logprobs={prompt_logprobs})")
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
     def test_tt_combined_logprobs_across_async_modes(
@@ -295,10 +274,6 @@ class TestTTLogprobsFutureBehavior:
 
         print(f"✓ Combined logprobs working with {async_desc}")
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
     def test_tt_logprobs_determinism_across_async_modes(
@@ -347,10 +322,6 @@ class TestTTLogprobsFutureBehavior:
 
         print(f"✓ Greedy sampling determinism verified with {async_desc}")
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     def test_tt_logprobs_batch_consistency_across_code_paths(
         self,
@@ -416,10 +387,6 @@ class TestTTLogprobsFutureBehavior:
 class TestTTLogprobsEdgeCases:
     """Test edge cases and error conditions for TT logprobs across all code paths."""
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
     def test_tt_logprobs_with_stop_tokens_across_async_modes(
@@ -454,10 +421,6 @@ class TestTTLogprobsEdgeCases:
 
         print(f"✓ Stop tokens handled correctly with {async_desc}")
 
-    @pytest.mark.skipif(
-        not current_platform.is_tt(),
-        reason="This test is specific to TT hardware"
-    )
     @pytest.mark.xfail(reason="TT logprobs not yet implemented - remove when ready")
     @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
     def test_tt_logprobs_memory_efficiency_across_async_modes(

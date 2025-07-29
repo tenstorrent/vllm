@@ -17,9 +17,8 @@ from .utils import (
 class TestTTFixtures:
     """Test suite for TT hardware pytest fixtures."""
 
-    def test_tt_fixtures_are_available(self, tt_available, small_tt_model, tt_test_config, tt_sampling_params):
+    def test_tt_fixtures_are_available(self, small_tt_model, tt_test_config, tt_sampling_params):
         """Test that all TT fixtures are available and working."""
-        assert tt_available is True
         assert isinstance(small_tt_model, str)
         assert len(small_tt_model) > 0
         assert isinstance(tt_test_config, dict)

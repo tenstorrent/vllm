@@ -14,13 +14,8 @@ Usage:
 
 import pytest
 from vllm import LLM, SamplingParams
-from vllm.platforms import current_platform
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 def test_current_logprobs_rejection(small_tt_model, tt_test_config):
     """Test that logprobs are currently rejected on TT hardware.
     
@@ -41,10 +36,6 @@ def test_current_logprobs_rejection(small_tt_model, tt_test_config):
         llm.generate(prompts, sampling_params)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 def test_current_prompt_logprobs_rejection(small_tt_model, tt_test_config):
     """Test that prompt_logprobs are currently rejected on TT hardware."""
     prompts = ["Hello, my name is"]
@@ -76,10 +67,6 @@ ASYNC_CONFIGS = [
 ]
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 @pytest.mark.xfail(reason="TT logprobs not yet implemented")
 @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
@@ -141,10 +128,6 @@ def test_logprobs_across_all_code_paths(
     print(f"✓ Logprobs working correctly with {sampling_desc} + {async_desc}")
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 @pytest.mark.xfail(reason="TT logprobs not yet implemented")
 @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
@@ -193,10 +176,6 @@ def test_prompt_logprobs_across_all_code_paths(
     print(f"✓ Prompt logprobs working correctly with {sampling_desc} + {async_desc}")
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 @pytest.mark.xfail(reason="TT logprobs not yet implemented")
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
 def test_combined_logprobs_across_async_modes(
@@ -239,10 +218,6 @@ def test_combined_logprobs_across_async_modes(
     print(f"✓ Combined logprobs working correctly with {async_desc}")
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 @pytest.mark.xfail(reason="TT logprobs not yet implemented")
 def test_sampling_determinism_with_logprobs(small_tt_model, tt_test_config):
     """Test that greedy sampling with logprobs is deterministic across runs."""
@@ -284,10 +259,6 @@ def test_sampling_determinism_with_logprobs(small_tt_model, tt_test_config):
     print("✓ Greedy sampling with logprobs is deterministic")
 
 
-@pytest.mark.skipif(
-    not current_platform.is_tt(),
-    reason="This test requires TT hardware"
-)
 @pytest.mark.xfail(reason="TT logprobs not yet implemented")
 def test_non_greedy_sampling_variety_with_logprobs(small_tt_model, tt_test_config):
     """Test that non-greedy sampling with logprobs produces variety across runs."""
@@ -328,44 +299,3 @@ def test_non_greedy_sampling_variety_with_logprobs(small_tt_model, tt_test_confi
     for i, output in enumerate(outputs):
         assert output.logprobs is not None, f"Output {i} should have logprobs"
         assert len(output.logprobs) == 5, f"Output {i} should have 5 token logprobs"
-
-
-if __name__ == "__main__":
-    # Allow running this file directly for debugging
-    print("Running TT logprobs integration tests...")
-    
-    # Mock fixtures for direct execution
-    small_tt_model = "meta-llama/Llama-3.2-1B"
-    tt_test_config = {
-        "trust_remote_code": True,
-        "max_model_len": 1024,
-        "device": "tt",
-        "dtype": "bfloat16",
-        "enforce_eager": True,
-        "tensor_parallel_size": 1,
-        "block_size": 64,
-        "max_num_seqs": 32,
-        "num_scheduler_steps": 10,
-        "disable_log_stats": False,
-        "disable_async_output_proc": False,
-    }
-    
-    # Test current behavior
-    try:
-        test_current_logprobs_rejection(small_tt_model, tt_test_config)
-        print("✓ Current logprobs rejection test passed")
-    except Exception as e:
-        print(f"✗ Current logprobs rejection test failed: {e}")
-    
-    try:
-        test_current_prompt_logprobs_rejection(small_tt_model, tt_test_config)
-        print("✓ Current prompt_logprobs rejection test passed")
-    except Exception as e:
-        print(f"✗ Current prompt_logprobs rejection test failed: {e}")
-    
-    print("\nFuture functionality tests (expected to fail until implemented):")
-    print("- Testing all combinations of greedy/non-greedy × async/non-async")
-    print("- Testing determinism and variety")
-    print("- Run with --runxfail to see actual test execution")
-    
-    print("✓ Test matrix covers all TT code paths!") 
