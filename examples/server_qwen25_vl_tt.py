@@ -17,7 +17,7 @@ def main():
     sys.argv.extend([
         "--model", args.model,
         "--block_size", "32",
-        "--max_num_seqs", "32",
+        "--max_num_seqs", "1",
     ])
     runpy.run_module('vllm.entrypoints.openai.api_server', run_name='__main__')
 
