@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING, Optional
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.tt_model_runner import TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.worker.tt_worker import (close_mesh_device,
                                    get_num_available_blocks_tt,
                                    open_mesh_device)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -118,8 +124,26 @@ class TTWorker(WorkerBase):
         """Allocate TT KV cache with the specified kv_cache_config."""
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
+        # Cache is already initialized in initialize_from_config.
+        self.cache_config.num_gpu_blocks = num_gpu_blocks
+        self.cache_config.num_cpu_blocks = num_cpu_blocks
+
+    def compile_or_warm_up_model(self) -> None:
+        # Currently skip and compile/capture-trace during the first execution.
+        pass
+
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> Optional[ModelRunnerOutput]:
+        assert self.is_driver_worker, "There should only be one Worker for TT"
+        output = self.model_runner.execute_model(scheduler_output)
+        return output
+
     def check_health(self) -> None:
-        # worker will always be healthy as long as it's running.
+        # Worker will always be healthy as long as it's running.
         return
 
     ## Destructor (used to close devices)

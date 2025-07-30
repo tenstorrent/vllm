@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING, Optional
+
+import torch
 import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
+from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.outputs import ModelRunnerOutput
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -103,3 +111,12 @@ class TTModelRunner:
         # Allocate KV cache tensors.
         self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape, dtype,
                                                       num_layers)
+
+    @torch.no_grad()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> ModelRunnerOutput:
+
+        raise NotImplementedError
