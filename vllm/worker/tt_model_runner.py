@@ -295,6 +295,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Sampling params
             # TODO: Add support for different sampling params in the same batch
             sampling_params = seq_group_metadata.sampling_params
+            
+            # Hardcoded override (force greedy decoding)
+            sampling_params.temperature = 0.0
+            sampling_params.top_p = 1.0
+            sampling_params.top_k = -1
+            
             if len(top_pk_sampling_params) == 0:
                 top_pk_sampling_params[
                     "temperature"] = sampling_params.temperature
