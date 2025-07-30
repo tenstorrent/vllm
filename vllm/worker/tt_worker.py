@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple, cast
 import torch
 import ttnn
 
+import vllm.envs as envs
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
                          ParallelConfig, VllmConfig)
 from vllm.logger import init_logger
@@ -198,37 +199,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         appended to.
         """
         # TODO: Add proper implementation which runs profiling on TT devices
-        if ("Llama-3.1-8B" in self.model_config.model
-                and self.device_config.device.get_num_devices() == 1
-                and "wormhole_b0" in ttnn.get_arch_name()):  # Llama8B on N150
-            max_tokens_all_users = 65536
-        elif ("Llama-3.2-90B" in self.model_config.model
-              and self.device_config.device.get_num_devices() == 8
-              and "wormhole_b0" in ttnn.get_arch_name()):  # Llama90B on WH T3K
-            max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
-        else:
-            # Note: includes num vision tokens for multi-modal
-            max_tokens_all_users = 131072
-
-        # To fit a max batch with (max_tokens_all_users / max batch) per user,
-        # allocate an extra block_size per user since vLLM uses a worst-case
-        # heuristic and assumes each touched block will require a new
-        # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-        max_batch = self.scheduler_config.max_num_seqs
-        max_tokens_all_users += self.cache_config.block_size * max_batch
-
-        # For multi-step, to fit (max_tokens_all_users / max batch) per user,
-        # allocate an extra num_lookahead_slots (num_scheduler_steps - 1 when
-        # not using speculative decoding) per user.
-        # E.g. batch 32, num_lookahead_slots 9 needs 288 extra tokens.
-        max_tokens_all_users += (self.scheduler_config.num_lookahead_slots *
-                                 max_batch)
-
-        num_tt_blocks = math.ceil(max_tokens_all_users /
-                                  self.cache_config.block_size)
-        num_tt_blocks = int(
-            num_tt_blocks *
-            1.01)  # Add 1% to account for vLLM's watermark_blocks
+        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)
         num_cpu_blocks = 0
         return num_tt_blocks, num_cpu_blocks
 
@@ -405,6 +376,54 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         if hasattr(super(), '__del__'):
             super().__del__()  # type: ignore
+
+
+def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
+    """
+    Used to set the number of available blocks for the TT KV cache as we 
+    currently do not run profiling to determine available memory. 
+    Also used by the V1 TTWorker.
+    """
+
+    model_config = vllm_config.model_config
+    device_config = vllm_config.device_config
+    scheduler_config = vllm_config.scheduler_config
+    cache_config = vllm_config.cache_config
+
+    if ("Llama-3.1-8B" in model_config.model
+            and device_config.device.get_num_devices() == 1
+            and "wormhole_b0" in ttnn.get_arch_name()):  # Llama8B on N150
+        max_tokens_all_users = 65536
+    elif ("Llama-3.2-90B" in model_config.model
+          and device_config.device.get_num_devices() == 8
+          and "wormhole_b0" in ttnn.get_arch_name()):  # Llama90B on WH T3K
+        max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
+    else:
+        # Note: includes num vision tokens for multi-modal
+        max_tokens_all_users = 131072
+
+    # To fit a max batch with (max_tokens_all_users / max batch) per user,
+    # allocate an extra block_size per user since vLLM uses a worst-case
+    # heuristic and assumes each touched block will require a new
+    # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
+    max_batch = scheduler_config.max_num_seqs
+    max_tokens_all_users += cache_config.block_size * max_batch
+
+    if not envs.VLLM_USE_V1:
+        # For multi-step, to fit (max_tokens_all_users / max batch) per user,
+        # allocate an extra num_lookahead_slots (num_scheduler_steps - 1 when
+        # not using speculative decoding) per user.
+        # E.g. batch 32, num_lookahead_slots 9 needs 288 extra tokens.
+        max_tokens_all_users += (scheduler_config.num_lookahead_slots *
+                                 max_batch)
+
+    num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+
+    if not envs.VLLM_USE_V1:
+        # Add 1% to account for vLLM's watermark_blocks
+        num_tt_blocks = int(num_tt_blocks * 1.01)
+
+    return num_tt_blocks
 
 
 # TT-NN utilities, also used by V1 TTWorker

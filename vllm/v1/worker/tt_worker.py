@@ -3,10 +3,14 @@
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        KVCacheSpec)
 from vllm.v1.worker.tt_model_runner import TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm.worker.tt_worker import close_mesh_device, open_mesh_device
+from vllm.worker.tt_worker import (close_mesh_device,
+                                   get_num_available_blocks_tt,
+                                   open_mesh_device)
 
 logger = init_logger(__name__)
 
@@ -52,8 +56,71 @@ class TTWorker(WorkerBase):
         self.model_runner.load_model()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """Get specifications for KV cache implementation."""
-        raise NotImplementedError
+        """
+        For the GPU/TPU backends, this method generates the KVCacheSpec by
+        parsing the kv cache format from each Attention module in the static
+        forward context (compilation_config.static_forward_context).
+        core/kv_cache_utils.py uses the KVCacheSpec along with available
+        memory info from a profiling run to determine num blocks.
+        
+        For the TT backend, the static forward context is not populated since
+        the modelling code is independent so we currently skip creating a
+        kv cache spec for each layer, similar to the Spyre/Neuron backends.
+        Currently we also don't run profiling to determine available memory.
+        
+        Return a dummy single layer KVCacheSpec and in the
+        determine_available_memory function override num blocks using
+        self.cache_config.num_gpu_blocks_override.
+        """
+
+        # TODO: Once we're able to populate a static forward context,
+        # generate separate specs per layer (e.g. also sliding window, local
+        # attention).
+
+        model_config = self.model_config
+        parallel_config = self.parallel_config
+        cache_config = self.cache_config
+
+        # Excludes TP factor since that is handled on the model side for TT.
+        total_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        head_size = model_config.get_head_size()
+        dtype = (model_config.dtype if cache_config.cache_dtype == "auto" else
+                 STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype])
+
+        attn_spec = FullAttentionSpec(
+            block_size=cache_config.block_size,
+            num_kv_heads=total_num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            use_mla=model_config.use_mla,
+            sliding_window=model_config.get_sliding_window())
+        kv_cache_spec: dict[str, KVCacheSpec] = {"foo": attn_spec}
+        return kv_cache_spec
+
+    def determine_available_memory(self) -> int:
+        """
+        For the GPU/TPU backends, this method runs profiling to determine
+        available memory for the KV cache. The available memory is then used
+        in conjunction with the output of get_kv_cache_spec to determine
+        the number of kv cache blocks (total memory / page_size / num layers).
+        
+        Currenly we just return a large dummy number of bytes similar to the
+        Spyre/Neuron backends and override the number of kv cache blocks.
+        """
+
+        # TODO: Once we can run profiling, return real available memory
+        # instead of overriding the number of blocks.
+        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)
+        self.cache_config.num_gpu_blocks_override = num_tt_blocks
+        return 1 << 64
+
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Allocate TT KV cache with the specified kv_cache_config."""
+        self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def check_health(self) -> None:
+        # worker will always be healthy as long as it's running.
+        return
 
     ## Destructor (used to close devices)
 
