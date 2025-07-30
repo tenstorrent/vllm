@@ -16,32 +16,38 @@ import pytest
 from vllm import LLM, SamplingParams
 
 
-def test_current_logprobs_rejection(small_tt_model, tt_test_config):
-    """Test that logprobs are currently rejected on TT hardware.
+def test_current_logprobs_basic_support(tt_llm):
+    """Test that basic logprobs support works on TT hardware.
     
-    This test should PASS with current implementation and FAIL after logprobs are implemented.
+    This test verifies that logprobs parameter is accepted and returns some logprobs data.
     """
     prompts = ["Hello, my name is"]
     
-    # Initialize TT model using fixtures
-    llm = LLM(model=small_tt_model, **tt_test_config)
+    # Test that logprobs parameter works
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=5,
+        logprobs=1
+    )
+    outputs = tt_llm.generate(prompts, sampling_params)
+
+    # Verify basic structure
+    assert len(outputs) == 1
+    output = outputs[0]
+    assert len(output.outputs) == 1
+    seq_output = output.outputs[0]
     
-    # Test that logprobs parameter raises an error
-    with pytest.raises(ValueError, match="Currently not supporting logprobs on tt"):
-        sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=5,
-            logprobs=1
-        )
-        llm.generate(prompts, sampling_params)
+    # Should have some tokens generated
+    assert len(seq_output.token_ids) > 0
+    
+    # Should have logprobs (even if basic/placeholder for now)
+    assert seq_output.logprobs is not None
+    assert len(seq_output.logprobs) == len(seq_output.token_ids)
 
 
-def test_current_prompt_logprobs_rejection(small_tt_model, tt_test_config):
+def test_current_prompt_logprobs_rejection(tt_llm):
     """Test that prompt_logprobs are currently rejected on TT hardware."""
     prompts = ["Hello, my name is"]
-    
-    # Initialize TT model using fixtures
-    llm = LLM(model=small_tt_model, **tt_test_config)
     
     # Test that prompt_logprobs parameter raises an error
     with pytest.raises(ValueError, match="Currently not supporting prompt_logprobs on tt"):
@@ -50,7 +56,7 @@ def test_current_prompt_logprobs_rejection(small_tt_model, tt_test_config):
             max_tokens=5,
             prompt_logprobs=1
         )
-        llm.generate(prompts, sampling_params)
+        tt_llm.generate(prompts, sampling_params)
 
 
 # Test matrix: All combinations of sampling and async processing
@@ -85,7 +91,7 @@ def test_logprobs_across_all_code_paths(
     """
     prompts = ["Hello, my name is", "The capital of France is"]
     
-    # Combine configurations
+    # Combine configurations (need custom config, can't use session LLM)
     config = {**tt_test_config, **async_config, "max_logprobs": 3}
     config["override_tt_config"] = '{"sample_on_device_mode": null}'  # Force host-side sampling
     
