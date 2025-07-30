@@ -134,7 +134,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.sample_on_device_mode,
         )
 
-        self.cached_step_outputs: List[torch.Tensor] = [
+        self.cached_token_ids: List[torch.Tensor] = [
         ]  # Only used for multi-step execution
 
         if self.model_config.is_encoder_decoder:
@@ -182,6 +182,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.dp_kv_cache = False
 
+        # LLama TG doesn't return torch tensors. It returns ttnn tensors, along with a read event
+        # Before reading the output, wait on the read event to be completed.
+        # It also always uses device-side sampling.
         if self.llama_tg:
             self.async_torch_proc = True
         else:
@@ -473,16 +476,26 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # and async_out_proc will trigger the output processor for step (i)
         # on host while device is executing step (i+1).
         use_async_out_proc = model_input.async_callback is not None
+        # model_input.async_callback is set in the worker.prepare_input function
+        # it's a partial function, and ctx is the context object that contains the output queue
+
 
         if not is_decode:
             assert num_steps == 1, "Num steps must be 1 for prefill"
         # always true if not using multi-step
         if model_input.is_first_multi_step:
-            self.cached_step_outputs = []
+            # This is a queue of sampled tokens.
+            # If we are using async_torch_proc (LLama TG) AND decoding, the step result is a ttnn host tensor that may not have been copied to host yet
+            # We need to wait on the read event to be completed before we can use the result
+            # The corresponding read event is cached in self.cached_read_events
+            # Otherwise, the result is a torch tensor with sampled tokens
+            # If we do async output processing, the queue is consumed by _send_prev_step_async_out, except the last step
+            # If not, we consume the whole queue after executing the last step.
+            self.cached_token_ids = []
             if is_decode:
                 self.cached_read_events = []
             for i in range(num_steps):
-                next_token_ids = self._execute_model_single_step(
+                single_step_output = self._execute_model_single_step(
                     model_input,
                     kv_caches,
                     is_decode,
@@ -491,7 +504,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if is_decode and self.async_torch_proc:
                     next_token_ids, read_event = next_token_ids
                     self.cached_read_events.append(read_event)
-                self.cached_step_outputs.append(next_token_ids)
+                else:
+                    next_token_ids = single_step_output
+                self.cached_token_ids.append(next_token_ids)
                 if not self.llama_tg and i < num_steps - 1:
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
@@ -526,16 +541,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         sampler_outputs = []  # no outputs unless last step
         if model_input.is_last_step:  # always true if not using multi-step
-            num_outputs = len(self.cached_step_outputs)
+            num_outputs = len(self.cached_token_ids)
             if use_async_out_proc:
+                # The queue should be getting consumed by _send_prev_step_async_out
                 # the last step should have 1 output unless we have
                 # scheduled less than self.scheduler_config.num_lookahead_slots
                 # + 1 steps in which case there will be 0 outputs
                 assert num_outputs <= 1, (
                     "Last step should have at most one output")
             for i in range(num_outputs):
-                next_token_ids = self.cached_step_outputs.pop(0)
+                next_token_ids = self.cached_token_ids.pop(0)
                 if is_decode and self.async_torch_proc:
+                    # In this case,next_token_ids is a ttnn host tensor that may not have been copied to host yet,
+                    # synchronize, change to torch and possibly permute
                     read_event = self.cached_read_events.pop(0)
                     ttnn.event_synchronize(read_event)
                     next_token_ids = ttnn.to_torch(
@@ -585,9 +603,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         return SamplerOutput(sampler_outputs)
 
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
+        # Get previous step's sampled tokens and send them to the output queue
         if step_idx > 0:
-            next_token_ids = self.cached_step_outputs.pop(0)
+            next_token_ids = self.cached_token_ids.pop(0)
             if self.async_torch_proc:
+                # In this case,next_token_ids is a ttnn host tensor that may not have been copied to host yet,
+                # synchronize, change to torch and possibly permute
                 read_event = self.cached_read_events.pop(0)
                 ttnn.event_synchronize(read_event)
                 next_token_ids = ttnn.to_torch(
@@ -757,6 +778,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 is_tokens=(self.sample_on_device_mode is not None))
             if self.async_torch_proc:
                 tt_out, read_event = tt_out
+            # If we are using async_torch_proc, we will permute after turning into torch tensor
             if self.dp_kv_cache and not self.async_torch_proc:
                 tt_out = tt_out[perm_table_tensor]
 
@@ -780,7 +802,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 next_token_ids = tt_out[:model_input.unpadded_batch_size]
         if not is_decode or not self.async_torch_proc:
             return next_token_ids
-        else:
+        else: #is_decode and async_torch_proc
             return tt_out, read_event
 
     def _sample_tokens(self, logits, tt_sampling_params: TTSamplingParams):
