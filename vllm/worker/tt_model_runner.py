@@ -31,6 +31,7 @@ class TTSamplingParams:
     temperature: float
     top_k: int
     top_p: float
+    logprobs: Optional[int] = None  # Add logprobs support
 
 
 @dataclass(frozen=True)
@@ -305,6 +306,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "temperature"] = sampling_params.temperature
                 top_pk_sampling_params["top_k"] = sampling_params.top_k
                 top_pk_sampling_params["top_p"] = sampling_params.top_p
+                top_pk_sampling_params["logprobs"] = sampling_params.logprobs
             else:
                 if (top_pk_sampling_params["temperature"]
                         != sampling_params.temperature):
@@ -325,11 +327,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         "for all sequences in batch, "
                         "falling back to first sequence's top_p (%s)",
                         top_pk_sampling_params['top_p'])
+                if top_pk_sampling_params["logprobs"] != sampling_params.logprobs:
+                    logger.warning(
+                        "Currently only supporting same logprobs"
+                        "for all sequences in batch, "
+                        "falling back to first sequence's logprobs (%s)",
+                        top_pk_sampling_params['logprobs'])
 
         tt_sampling_params = TTSamplingParams(
             temperature=top_pk_sampling_params["temperature"],
             top_k=top_pk_sampling_params["top_k"],
-            top_p=top_pk_sampling_params["top_p"])
+            top_p=top_pk_sampling_params["top_p"],
+            logprobs=top_pk_sampling_params["logprobs"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -502,7 +511,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     use_async_out_proc,
                     step_idx=i)
                 if is_decode and self.async_torch_proc:
-                    next_token_ids, read_event = next_token_ids
+                    next_token_ids, read_event = single_step_output
                     self.cached_read_events.append(read_event)
                 else:
                     next_token_ids = single_step_output
