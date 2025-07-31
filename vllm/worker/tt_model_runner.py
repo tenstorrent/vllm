@@ -82,8 +82,7 @@ class TTModelInput(ModelRunnerInputBase):
 def top_pk_logits_efficient(logits,
                             p=0.9,
                             k=10,
-                            temperature=1.0,
-                            return_probs=False):
+                            temperature=1.0):
     # Do not keep the entire vocab size after top k.
     # Instead, keep the k size tensor and record the associated indices.
     if k == -1:  # no top-k sampling
@@ -91,16 +90,21 @@ def top_pk_logits_efficient(logits,
             logits.shape[-1]).unsqueeze(0).repeat(logits.shape[0], 1)
     else:
         top_k_values, top_k_indices = torch.topk(logits, k=k)
-    top_p_values = TopPLogitsWarper(top_p=p)(None, top_k_values)
+    top_p_values = TopPLogitsWarper(top_p=p)(None, top_k_values) # does not change shape, but masks with -inf
     probs = F.softmax(top_p_values / temperature, dim=-1)
-    probs = torch.nan_to_num(
-        probs)  # convert nan to num to prevent error in multinomial
+    probs = torch.nan_to_num(probs)  # convert nan to 0 to prevent error in multinomial
     top_k_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
     token = top_k_indices.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1)
-    if return_probs:
-        return token, (probs, top_k_indices)
-    else:
-        return token
+    return token, top_k_id # top_k_id is the rank of the selected token
+
+def v1_logprobs(logits, num_logprobs, selected_token) -> List[Dict[int, float]]:
+    # v1 vLLM returns logprobs according to raw logits
+    # v0 had logprobs after penalties
+    # selected token is always included even if not in top num_logprobs
+    log_probs = torch.log_softmax(logits, dim=-1)
+    top_n_logprobs, top_n_indices = torch.topk(log_probs, num_logprobs, dim=-1)
+    selected_logprob = log_probs.gather(-1, selected_token.unsqueeze(-1)).squeeze(-1)
+    return top_n_indices, top_n_logprobs, selected_logprob
 
 
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
@@ -802,7 +806,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.sample_on_device_mode == "decode_only" and not is_decode):
             next_logits = tt_out[:model_input.unpadded_batch_size,
                                  -1, :]  # unpadded batch, vocab of last token
-            next_token_ids = self._sample_tokens(
+            next_token_ids, ranks = self._sample_tokens(
                 next_logits, model_input.tt_sampling_params)
         else:
             if self.llama_tg:
@@ -816,7 +820,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def _sample_tokens(self, logits, tt_sampling_params: TTSamplingParams):
         if tt_sampling_params.temperature == 0:  # greedy decoding
-            return torch.argmax(logits, dim=-1)
+            # in greedy decoding the chosen tokens are always rank 0
+            chosen_tokens = torch.argmax(logits, dim=-1)
+            ranks = torch.zeros_like(chosen_tokens)
+            return chosen_tokens, ranks
         else:  # top-k top-p sampling
             return top_pk_logits_efficient(
                 logits,
