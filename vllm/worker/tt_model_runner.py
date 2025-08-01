@@ -345,7 +345,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         block_tables = make_tensor_with_pad(block_tables_list,
                                             dtype=torch.int32,
                                             device="cpu",
-                                            pad=0)
+                                            pad=128*1024)
         if self.model_config.is_encoder_decoder:
             cross_block_tables = make_tensor_with_pad(cross_block_tables_list,
                                                       dtype=torch.int32,
