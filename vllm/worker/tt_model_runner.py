@@ -101,7 +101,7 @@ def top_pk_logits_efficient(logits,
     probs = torch.nan_to_num(probs)  # convert nan to 0 to prevent error in multinomial
     top_k_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
     token = top_k_indices.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1)
-    return token, top_k_id # top_k_id is the rank of the selected token
+    return token, top_k_id + 1  # top_k_id is the rank of the selected token, 1-indexed
 
 def v1_logprobs(logits, num_logprobs, selected_token) -> List[Dict[int, float]]:
     # v1 vLLM returns logprobs according to raw logits
@@ -131,7 +131,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.trace_mode = trace_mode
         override_tt_config = self.model_config.override_tt_config
         if (override_tt_config is not None
-                and "sample_on_device_mode" in override_tt_config):
+                and "sample_on_device_mode" in override_tt_config
+                and override_tt_config["sample_on_device_mode"] is not None):
             self.sample_on_device_mode = override_tt_config[
                 "sample_on_device_mode"]
             assert self.sample_on_device_mode in [
@@ -612,17 +613,39 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # based on tpu_model_runner.py
         # TT backend does not support the advanced sampling parameters
         # such as logprobs.
-        zero_logprob = Logprob(0.0)
-        sampler_outputs = []
-        for batch_idx, seq_id in enumerate(seq_groups):
-            next_token_id = int(next_token_ids[batch_idx])
-            seq_outputs = [
-                SequenceOutput(seq_id, next_token_id,
-                               {next_token_id: zero_logprob})
-            ]
-            sampler_outputs.append(
-                CompletionSequenceGroupOutput(seq_outputs, None))
-        return SamplerOutput(sampler_outputs)
+        if logprob_data is None:
+            #fall back to old codepath
+            zero_logprob = Logprob(0.0)
+            sampler_outputs = []
+            for batch_idx, seq_id in enumerate(seq_groups):
+                next_token_id = int(next_token_ids[batch_idx])
+                seq_outputs = [
+                    SequenceOutput(seq_id, next_token_id,
+                                {next_token_id: zero_logprob})
+                ]
+                sampler_outputs.append(
+                    CompletionSequenceGroupOutput(seq_outputs, None))
+            return SamplerOutput(sampler_outputs)
+        else:
+            sampler_outputs = []
+            for batch_idx, seq_id in enumerate(seq_groups):
+                top_n_logprobs = logprob_data.top_n_logprobs[batch_idx]
+                top_n_tokens = logprob_data.top_n_tokens[batch_idx]
+                top_n_ranks = range(1, len(top_n_tokens) + 1)  # 1-indexed
+                logprob_dict = {}
+                for rank, token, logprob in zip(top_n_ranks, top_n_tokens, top_n_logprobs):
+                    logprob_dict[int(token)] = Logprob(float(logprob), rank)
+                # chosen token is always included even if not in top num_logprobs
+                next_token_id = int(next_token_ids[batch_idx])
+                chosen_logprob = logprob_data.chosen_logprobs[batch_idx]
+                chosen_rank = logprob_data.chosen_ranks[batch_idx]
+                logprob_dict[next_token_id] = Logprob(float(chosen_logprob), int(chosen_rank))
+                seq_outputs = [
+                    SequenceOutput(seq_id, next_token_id, logprob_dict)
+                ]
+                sampler_outputs.append(
+                    CompletionSequenceGroupOutput(seq_outputs, None))
+            return SamplerOutput(sampler_outputs)
 
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         # Get previous step's sampled tokens and send them to the output queue
@@ -840,9 +863,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def _sample_tokens(self, logits: torch.Tensor, tt_sampling_params: TTSamplingParams) -> Tuple[torch.Tensor, torch.Tensor]:
         if tt_sampling_params.temperature == 0:  # greedy decoding
-            # in greedy decoding the chosen tokens are always rank 0
+            # in greedy decoding the chosen tokens are always rank 1, ranks are 1-indexed
             chosen_tokens = torch.argmax(logits, dim=-1)
-            ranks = torch.zeros_like(chosen_tokens)
+            ranks = torch.ones_like(chosen_tokens)
         else:  # top-k top-p sampling
             chosen_tokens, ranks = top_pk_logits_efficient(
                 logits,
