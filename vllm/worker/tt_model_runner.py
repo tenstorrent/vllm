@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,12 @@ class TTSamplingParams:
     top_p: float
     logprobs: Optional[int] = None  # Add logprobs support
 
+@dataclass(frozen=True)
+class TTLogprobData:
+    chosen_ranks: torch.Tensor
+    chosen_logprobs: torch.Tensor
+    top_n_tokens: torch.Tensor
+    top_n_logprobs: torch.Tensor
 
 @dataclass(frozen=True)
 class TTModelInput(ModelRunnerInputBase):
@@ -505,21 +511,22 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # If we do async output processing, the queue is consumed by _send_prev_step_async_out, except the last step
             # If not, we consume the whole queue after executing the last step.
             self.cached_token_ids = []
+            self.cached_logprob_data = []
             if is_decode:
                 self.cached_read_events = []
             for i in range(num_steps):
-                single_step_output = self._execute_model_single_step(
+                next_token_ids, logprob_data, read_event = self._execute_model_single_step(
                     model_input,
                     kv_caches,
                     is_decode,
                     use_async_out_proc,
                     step_idx=i)
                 if is_decode and self.async_torch_proc:
-                    next_token_ids, read_event = single_step_output
                     self.cached_read_events.append(read_event)
                 else:
-                    next_token_ids = single_step_output
+                    pass # read_event is None
                 self.cached_token_ids.append(next_token_ids)
+                self.cached_logprob_data.append(logprob_data) # may be None
                 if not self.llama_tg and i < num_steps - 1:
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
@@ -564,6 +571,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "Last step should have at most one output")
             for i in range(num_outputs):
                 next_token_ids = self.cached_token_ids.pop(0)
+                logprob_data = self.cached_logprob_data.pop(0)
                 if is_decode and self.async_torch_proc:
                     # In this case,next_token_ids is a ttnn host tensor that may not have been copied to host yet,
                     # synchronize, change to torch and possibly permute
@@ -578,7 +586,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # TODO: sync read back from device
                 # once model can keep executing steps on device
                 sampler_output = self._make_sampler_output(
-                    next_token_ids, model_input.seq_groups)
+                    next_token_ids, model_input.seq_groups, logprob_data)
                 sampler_outputs.append(sampler_output)
 
         return sampler_outputs
@@ -598,6 +606,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self,
         next_token_ids: List[int],
         seq_groups: List[int],
+        logprob_data: Optional[TTLogprobData] = None,
     ) -> SamplerOutput:
         # Minimal code to construct the sampler outputs,
         # based on tpu_model_runner.py
@@ -619,6 +628,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Get previous step's sampled tokens and send them to the output queue
         if step_idx > 0:
             next_token_ids = self.cached_token_ids.pop(0)
+            logprob_data = self.cached_logprob_data.pop(0)
             if self.async_torch_proc:
                 # In this case,next_token_ids is a ttnn host tensor that may not have been copied to host yet,
                 # synchronize, change to torch and possibly permute
@@ -633,7 +643,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # TODO: sync read back from device
             # once model can keep executing steps on device
             sampler_output = self._make_sampler_output(next_token_ids,
-                                                       model_input.seq_groups)
+                                                       model_input.seq_groups,
+                                                       logprob_data)
             self._send_async_out(sampler_output,
                                  model_input.async_callback,
                                  is_first_step_output=(step_idx == 1))
@@ -802,31 +813,40 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Note: for other devices, vLLM applies
         # vllm.model_executor.layers.sampler::Sampler for sampling tokens,
         # we don't use this
+        logprob_data = None
+
         if not self.sample_on_device_mode or (
                 self.sample_on_device_mode == "decode_only" and not is_decode):
             next_logits = tt_out[:model_input.unpadded_batch_size,
                                  -1, :]  # unpadded batch, vocab of last token
-            next_token_ids, ranks = self._sample_tokens(
+            next_token_ids, chosen_ranks = self._sample_tokens(
                 next_logits, model_input.tt_sampling_params)
+            if model_input.tt_sampling_params.logprobs is not None:
+                top_n_indices, top_n_logprobs, chosen_logprob = v1_logprobs(
+                    next_logits, model_input.tt_sampling_params.logprobs, next_token_ids)
+                logprob_data = TTLogprobData(chosen_ranks, chosen_logprob, top_n_indices, top_n_logprobs)
+
         else:
+            # decoding on device, tensors already contain tokens, logprobs not supported
             if self.llama_tg:
-                next_token_ids = tt_out
+                next_token_ids = tt_out #this tensor might be in process of being copied to host, don't mess with it
             else:
                 next_token_ids = tt_out[:model_input.unpadded_batch_size]
-        if not is_decode or not self.async_torch_proc:
-            return next_token_ids
+        
+        if is_decode and self.async_torch_proc:
+            return next_token_ids, logprob_data, read_event
         else: #is_decode and async_torch_proc
-            return tt_out, read_event
+            return next_token_ids, logprob_data, None
 
-    def _sample_tokens(self, logits, tt_sampling_params: TTSamplingParams):
+    def _sample_tokens(self, logits: torch.Tensor, tt_sampling_params: TTSamplingParams) -> Tuple[torch.Tensor, torch.Tensor]:
         if tt_sampling_params.temperature == 0:  # greedy decoding
             # in greedy decoding the chosen tokens are always rank 0
             chosen_tokens = torch.argmax(logits, dim=-1)
             ranks = torch.zeros_like(chosen_tokens)
-            return chosen_tokens, ranks
         else:  # top-k top-p sampling
-            return top_pk_logits_efficient(
+            chosen_tokens, ranks = top_pk_logits_efficient(
                 logits,
                 p=tt_sampling_params.top_p,
                 k=tt_sampling_params.top_k,
                 temperature=tt_sampling_params.temperature)
+        return chosen_tokens, ranks
