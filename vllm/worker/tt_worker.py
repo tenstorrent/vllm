@@ -530,7 +530,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         if self.mesh_device:
             # Dump device profiler
-            ttnn.DumpDeviceProfiler(self.mesh_device)
+            ttnn.ReadDeviceProfiler(self.mesh_device)
 
             # Close devices
             ttnn.close_mesh_device(self.mesh_device)
