@@ -965,7 +965,7 @@ class ModelConfig:
         if self.is_attention_free:
             return 0
 
-        if hasattr(self.hf_text_config, "head_dim"):
+        if hasattr(self.hf_text_config, "head_dim") and (self.hf_text_config.head_dim is not None):
             return self.hf_text_config.head_dim
         # FIXME(woosuk): This may not be true for all models.
         return (self.hf_text_config.hidden_size //
