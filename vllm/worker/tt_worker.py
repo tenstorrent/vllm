@@ -542,8 +542,8 @@ def open_mesh_device(override_tt_config, trace_mode):
 
 
 def close_mesh_device(mesh_device, override_tt_config):
-    # Dump device profiler
-    ttnn.DumpDeviceProfiler(mesh_device)
+    # Read device profiler (no-op if not profiling with tracy)
+    ttnn.ReadDeviceProfiler(mesh_device)
 
     # Close devices
     ttnn.close_mesh_device(mesh_device)
