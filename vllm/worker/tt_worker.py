@@ -206,7 +206,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
         else:
             # Note: includes num vision tokens for multi-modal
-            max_tokens_all_users = 131072
+            max_tokens_all_users = self.model_config.max_model_len
+
+        data_parallel = 1
+        if (self.model_config.override_tt_config
+                and "data_parallel" in self.model_config.override_tt_config):
+            data_parallel = self.model_config.override_tt_config[
+                "data_parallel"]
+        max_tokens_all_users *= data_parallel
 
         # To fit a max batch with (max_tokens_all_users / max batch) per user,
         # allocate an extra block_size per user since vLLM uses a worst-case
@@ -222,12 +229,12 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         max_tokens_all_users += (self.scheduler_config.num_lookahead_slots *
                                  max_batch)
 
-        num_tt_blocks = math.ceil(max_tokens_all_users /
-                                  self.cache_config.block_size)
-        num_tt_blocks = int(
-            num_tt_blocks *
-            1.01)  # Add 1% to account for vLLM's watermark_blocks
+        num_tt_blocks = max_tokens_all_users / (self.cache_config.block_size *
+                                                data_parallel)
+        # Add 1% to account for vLLM's watermark_blocks
+        num_tt_blocks = int(math.ceil(num_tt_blocks) * 1.01)
         num_cpu_blocks = 0
+
         return num_tt_blocks, num_cpu_blocks
 
     def initialize_cache(
