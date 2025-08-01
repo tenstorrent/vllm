@@ -73,7 +73,6 @@ ASYNC_CONFIGS = [
 ]
 
 
-@pytest.mark.xfail(reason="TT logprobs not yet implemented")
 @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
 def test_logprobs_across_all_code_paths(
@@ -93,7 +92,7 @@ def test_logprobs_across_all_code_paths(
     
     # Combine configurations (need custom config, can't use session LLM)
     config = {**tt_test_config, **async_config, "max_logprobs": 3}
-    config["override_tt_config"] = '{"sample_on_device_mode": null}'  # Force host-side sampling
+    config["override_tt_config"] = {"sample_on_device_mode": None}  # Force host-side sampling
     
     llm = LLM(model=small_tt_model, **config)
     
@@ -134,7 +133,6 @@ def test_logprobs_across_all_code_paths(
     print(f"✓ Logprobs working correctly with {sampling_desc} + {async_desc}")
 
 
-@pytest.mark.xfail(reason="TT logprobs not yet implemented")
 @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
 def test_prompt_logprobs_across_all_code_paths(
@@ -147,7 +145,7 @@ def test_prompt_logprobs_across_all_code_paths(
     
     # Combine configurations
     config = {**tt_test_config, **async_config, "max_logprobs": 3}
-    config["override_tt_config"] = '{"sample_on_device_mode": null}'  # Host-side sampling
+    config["override_tt_config"] = {"sample_on_device_mode": None}  # Host-side sampling
     
     llm = LLM(model=small_tt_model, **config)
     
@@ -182,7 +180,6 @@ def test_prompt_logprobs_across_all_code_paths(
     print(f"✓ Prompt logprobs working correctly with {sampling_desc} + {async_desc}")
 
 
-@pytest.mark.xfail(reason="TT logprobs not yet implemented")
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
 def test_combined_logprobs_across_async_modes(
     small_tt_model, tt_test_config,
@@ -193,7 +190,7 @@ def test_combined_logprobs_across_async_modes(
     
     # Combine configurations
     config = {**tt_test_config, **async_config, "max_logprobs": 5}
-    config["override_tt_config"] = '{"sample_on_device_mode": null}'  # Host-side sampling
+    config["override_tt_config"] = {"sample_on_device_mode": None}  # Host-side sampling
     
     llm = LLM(model=small_tt_model, **config)
     
@@ -224,13 +221,12 @@ def test_combined_logprobs_across_async_modes(
     print(f"✓ Combined logprobs working correctly with {async_desc}")
 
 
-@pytest.mark.xfail(reason="TT logprobs not yet implemented")
 def test_sampling_determinism_with_logprobs(small_tt_model, tt_test_config):
     """Test that greedy sampling with logprobs is deterministic across runs."""
     prompts = ["The meaning of life is"]
     
     config = {**tt_test_config, "max_logprobs": 3}
-    config["override_tt_config"] = '{"sample_on_device_mode": null}'
+    config["override_tt_config"] = {"sample_on_device_mode": None}
     
     llm = LLM(model=small_tt_model, **config)
     
@@ -265,13 +261,12 @@ def test_sampling_determinism_with_logprobs(small_tt_model, tt_test_config):
     print("✓ Greedy sampling with logprobs is deterministic")
 
 
-@pytest.mark.xfail(reason="TT logprobs not yet implemented")
 def test_non_greedy_sampling_variety_with_logprobs(small_tt_model, tt_test_config):
     """Test that non-greedy sampling with logprobs produces variety across runs."""
     prompts = ["The weather today is"]
     
     config = {**tt_test_config, "max_logprobs": 3}
-    config["override_tt_config"] = '{"sample_on_device_mode": null}'
+    config["override_tt_config"] = {"sample_on_device_mode": None}
     
     llm = LLM(model=small_tt_model, **config)
     
