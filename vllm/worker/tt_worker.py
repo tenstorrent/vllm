@@ -177,9 +177,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def init_device(self) -> None:
         self.mesh_device = open_mesh_device(
-            self.model_config.override_tt_config,
-            self.trace_mode
-        )
+            self.model_config.override_tt_config, self.trace_mode)
         self.device_config.device = self.mesh_device
 
     def load_model(self):
@@ -399,7 +397,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         del self.model_runner
 
         if self.mesh_device:
-            close_mesh_device(self.mesh_device, self.model_config.override_tt_config)
+            close_mesh_device(self.mesh_device,
+                              self.model_config.override_tt_config)
             del self.mesh_device
 
         if hasattr(super(), '__del__'):
@@ -408,12 +407,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
 # TT-NN utilities, also used by V1 TTWorker
 
+
 def get_dispatch_core_type():
     dispatch_core_type = ttnn.device.DispatchCoreType.WORKER
     if ("WH_ARCH_YAML" in os.environ) and os.environ[
             "WH_ARCH_YAML"] == "wormhole_b0_80_arch_eth_dispatch.yaml":
         dispatch_core_type = ttnn.device.DispatchCoreType.ETH
     return dispatch_core_type
+
 
 def get_dispatch_core_config(override_tt_config, device_params):
     dispatch_core_type = get_dispatch_core_type()
@@ -426,18 +427,19 @@ def get_dispatch_core_config(override_tt_config, device_params):
             f"{override_tt_config['dispatch_core_axis']}. "
             "Expected: row, col.")
         dispatch_core_axis = (ttnn.DispatchCoreAxis.COL
-                                if override_tt_config["dispatch_core_axis"]
-                                == "col" else ttnn.DispatchCoreAxis.ROW)
+                              if override_tt_config["dispatch_core_axis"]
+                              == "col" else ttnn.DispatchCoreAxis.ROW)
     else:
         dispatch_core_axis = device_params.pop(
             "dispatch_core_axis",
-            ttnn.DispatchCoreAxis.COL if "blackhole"
-            in ttnn.get_arch_name() else ttnn.DispatchCoreAxis.ROW,
+            ttnn.DispatchCoreAxis.COL if "blackhole" in ttnn.get_arch_name()
+            else ttnn.DispatchCoreAxis.ROW,
         )
 
     dispatch_core_config = ttnn.DispatchCoreConfig(dispatch_core_type,
-                                                    dispatch_core_axis)
+                                                   dispatch_core_axis)
     return dispatch_core_config
+
 
 def get_fabric_config(override_tt_config):
     if (override_tt_config is not None
@@ -457,6 +459,7 @@ def get_fabric_config(override_tt_config):
         return fabric_config
     return None
 
+
 # From tt-metal/conftest.py:
 # Set fabric config to passed in value
 # Do nothing if not set
@@ -465,6 +468,7 @@ def set_fabric(override_tt_config):
     fabric_config = get_fabric_config(override_tt_config)
     if fabric_config:
         ttnn.set_fabric_config(fabric_config)
+
 
 # From tt-metal/conftest.py:
 # Reset fabric config to DISABLED if not None, and do nothing otherwise
@@ -477,6 +481,7 @@ def reset_fabric(override_tt_config):
     if fabric_config:
         ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
+
 def device_params_from_override_tt_config(override_tt_config, trace_mode):
     device_params = {}
 
@@ -488,10 +493,10 @@ def device_params_from_override_tt_config(override_tt_config, trace_mode):
                 "trace_region_size"]
 
     if override_tt_config and "worker_l1_size" in override_tt_config:
-        device_params["worker_l1_size"] = override_tt_config[
-            "worker_l1_size"]
+        device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
 
     return device_params
+
 
 def open_mesh_device(override_tt_config, trace_mode):
     num_devices_available = len(ttnn.get_device_ids())
@@ -519,19 +524,22 @@ def open_mesh_device(override_tt_config, trace_mode):
         assert (f"Requested mesh grid shape {mesh_grid} is larger than "
                 f"number of available devices {num_devices_available}")
 
-    device_params = device_params_from_override_tt_config(override_tt_config, trace_mode)
+    device_params = device_params_from_override_tt_config(
+        override_tt_config, trace_mode)
 
     # Set fabric before opening the device
     set_fabric(override_tt_config)
 
     mesh_device = ttnn.open_mesh_device(
         ttnn.MeshShape(*mesh_grid),
-        dispatch_core_config=get_dispatch_core_config(override_tt_config, device_params),
+        dispatch_core_config=get_dispatch_core_config(override_tt_config,
+                                                      device_params),
         **device_params,
     )
     logger.info("multidevice with %d devices and grid %s is created",
                 mesh_device.get_num_devices(), mesh_grid)
     return mesh_device
+
 
 def close_mesh_device(mesh_device, override_tt_config):
     # Dump device profiler
