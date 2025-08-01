@@ -102,10 +102,3 @@ def tt_sampling_params():
         max_tokens=10,    # Short generation for fast tests
         ignore_eos=False  # Respect EOS tokens
     ) 
-
-
-@pytest.fixture(scope="session")
-def tt_llm(small_tt_model, tt_test_config):
-    """Session-scoped LLM instance to avoid slow repeated initialization."""
-    from vllm import LLM
-    return LLM(model=small_tt_model, **tt_test_config) 

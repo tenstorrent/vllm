@@ -12,15 +12,18 @@ Usage:
     pytest tests/tt/test_basic_logprobs_integration.py::test_basic_logprobs_functionality -v --runxfail
 """
 
+import gc
 import pytest
 from vllm import LLM, SamplingParams
 
 
-def test_current_logprobs_basic_support(tt_llm):
+def test_current_logprobs_basic_support(small_tt_model, tt_test_config):
     """Test that basic logprobs support works on TT hardware.
     
     This test verifies that logprobs parameter is accepted and returns some logprobs data.
     """
+
+    llm = LLM(model=small_tt_model, **tt_test_config) 
     prompts = ["Hello, my name is"]
     
     # Test that logprobs parameter works
@@ -29,7 +32,7 @@ def test_current_logprobs_basic_support(tt_llm):
         max_tokens=5,
         logprobs=1
     )
-    outputs = tt_llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params)
 
     # Verify basic structure
     assert len(outputs) == 1
@@ -44,9 +47,15 @@ def test_current_logprobs_basic_support(tt_llm):
     assert seq_output.logprobs is not None
     assert len(seq_output.logprobs) == len(seq_output.token_ids)
 
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
 
-def test_current_prompt_logprobs_rejection(tt_llm):
+
+def test_current_prompt_logprobs_rejection(small_tt_model, tt_test_config):
     """Test that prompt_logprobs are currently rejected on TT hardware."""
+
+    llm = LLM(model=small_tt_model, **tt_test_config) 
     prompts = ["Hello, my name is"]
     
     # Test that prompt_logprobs parameter raises an error
@@ -56,7 +65,11 @@ def test_current_prompt_logprobs_rejection(tt_llm):
             max_tokens=5,
             prompt_logprobs=1
         )
-        tt_llm.generate(prompts, sampling_params)
+        llm.generate(prompts, sampling_params)
+
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
 
 
 # Test matrix: All combinations of sampling and async processing
@@ -132,6 +145,10 @@ def test_logprobs_across_all_code_paths(
     
     print(f"✓ Logprobs working correctly with {sampling_desc} + {async_desc}")
 
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
+
 
 @pytest.mark.parametrize("sampling_name,sampling_config,sampling_desc", SAMPLING_CONFIGS)
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
@@ -179,6 +196,10 @@ def test_prompt_logprobs_across_all_code_paths(
     
     print(f"✓ Prompt logprobs working correctly with {sampling_desc} + {async_desc}")
 
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
+
 
 @pytest.mark.parametrize("async_name,async_config,async_desc", ASYNC_CONFIGS)
 def test_combined_logprobs_across_async_modes(
@@ -220,6 +241,10 @@ def test_combined_logprobs_across_async_modes(
     
     print(f"✓ Combined logprobs working correctly with {async_desc}")
 
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
+
 
 def test_sampling_determinism_with_logprobs(small_tt_model, tt_test_config):
     """Test that greedy sampling with logprobs is deterministic across runs."""
@@ -259,6 +284,10 @@ def test_sampling_determinism_with_logprobs(small_tt_model, tt_test_config):
                 "Logprobs should be deterministic with greedy sampling"
     
     print("✓ Greedy sampling with logprobs is deterministic")
+
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
 
 
 def test_non_greedy_sampling_variety_with_logprobs(small_tt_model, tt_test_config):
@@ -300,3 +329,7 @@ def test_non_greedy_sampling_variety_with_logprobs(small_tt_model, tt_test_confi
     for i, output in enumerate(outputs):
         assert output.logprobs is not None, f"Output {i} should have logprobs"
         assert len(output.logprobs) == 5, f"Output {i} should have 5 token logprobs"
+
+    #force deletion of LLM instance, so the worker is torn down and device is closed, workaround for https://github.com/tenstorrent/tt-metal/issues/26128
+    del llm
+    gc.collect()
