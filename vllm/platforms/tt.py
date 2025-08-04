@@ -61,10 +61,10 @@ class TTPlatform(Platform):
             if params.best_of is not None:
                 raise ValueError(
                     f"Currently not supporting best_of on {cls.device_name}")
-            if params.prompt_logprobs is not None:
-                raise ValueError(
-                    f"Currently not supporting prompt_logprobs on "
-                    f"{cls.device_name}")
+            # if params.prompt_logprobs is not None:
+            #     raise ValueError(
+            #         f"Currently not supporting prompt_logprobs on "
+            #         f"{cls.device_name}")
             if params.guided_decoding is not None:
                 raise ValueError(
                     f"Currently not supporting guided decoding on "
