@@ -858,7 +858,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         
         if is_decode and self.async_torch_proc:
             return next_token_ids, logprob_data, read_event
-        else: #is_decode and async_torch_proc
+        else:
             return next_token_ids, logprob_data, None
 
     def _sample_tokens(self, logits: torch.Tensor, tt_sampling_params: TTSamplingParams) -> Tuple[torch.Tensor, torch.Tensor]:
