@@ -628,6 +628,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.sample_on_device_mode == "decode_only" and is_decode):
             execute_model_kwargs[
                 "sampling_params"] = model_input.tt_sampling_params
+            execute_model_kwargs["update_on_device"] = True
         if model_input.cross_block_tables is not None:
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
