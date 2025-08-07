@@ -134,11 +134,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.sample_on_device_mode,
         )
 
-        self.update_on_device = False
-        if self.sample_on_device_mode:
-            # If sample_on_device_mode is set, we can update on device
-            self.update_on_device = True
-
         self.cached_step_outputs: List[torch.Tensor] = [
         ]  # Only used for multi-step execution
 
@@ -498,7 +493,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
                 if (not self.llama_tg and i < num_steps - 1
-                        and not self.update_on_device):
+                        and not self.sample_on_device_mode):
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
                     if new_input_tokens.shape[
@@ -639,9 +634,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.cross_block_tables is not None:
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
-
-        if is_decode:
-            execute_model_kwargs["update_on_device"] = self.update_on_device
 
         if not is_decode:
             if self.dp_kv_cache:
