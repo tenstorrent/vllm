@@ -206,7 +206,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
         else:
             # Note: includes num vision tokens for multi-modal
-            max_tokens_all_users = 131072
+            max_tokens_all_users = self.model_config.max_model_len
 
         # To fit a max batch with (max_tokens_all_users / max batch) per user,
         # allocate an extra block_size per user since vLLM uses a worst-case
