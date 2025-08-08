@@ -44,6 +44,7 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
+
     @classmethod
     def validate_request(
         cls,

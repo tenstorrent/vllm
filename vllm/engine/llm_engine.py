@@ -801,13 +801,6 @@ class LLMEngine:
             processed_inputs=processed_inputs,
         )
 
-        from vllm.platforms import current_platform
-        current_platform.validate_request(
-            prompt=prompt,
-            params=params,
-            processed_inputs=processed_inputs,
-        )
-
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,

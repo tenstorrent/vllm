@@ -10,9 +10,6 @@ For the latest versions of vLLM and tt-metal, git-checkout the following branche
 ## System Requirements
 vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.04).
 
-## System Requirements
-vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.04).
-
 ## Environment Creation
 
 **To create the vLLM+tt-metal environment (first time):**
