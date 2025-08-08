@@ -793,7 +793,7 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
         processed_inputs = self.input_processor(preprocessed_inputs)
-        
+
         from vllm.platforms import current_platform
         current_platform.validate_request(
             prompt=prompt,
