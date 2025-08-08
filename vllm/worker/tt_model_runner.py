@@ -104,6 +104,17 @@ def top_pk_logits_efficient(logits,
         return token
 
 
+def sample_tokens(logits, tt_sampling_params: TTSamplingParams):
+    if tt_sampling_params.temperature == 0:  # greedy decoding
+        return torch.argmax(logits, dim=-1)
+    else:  # top-k top-p sampling
+        return top_pk_logits_efficient(
+            logits,
+            p=tt_sampling_params.top_p,
+            k=tt_sampling_params.top_k,
+            temperature=tt_sampling_params.temperature)
+
+
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def __init__(
@@ -774,8 +785,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.sample_on_device_mode == "decode_only" and not is_decode):
             next_logits = tt_out[:model_input.unpadded_batch_size,
                                  -1, :]  # unpadded batch, vocab of last token
-            next_token_ids = self._sample_tokens(
-                next_logits, model_input.tt_sampling_params)
+            next_token_ids = sample_tokens(next_logits,
+                                           model_input.tt_sampling_params)
         else:
             if self.llama_tg:
                 next_token_ids = tt_out
@@ -785,13 +796,3 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             return next_token_ids
         else:
             return tt_out, read_event
-
-    def _sample_tokens(self, logits, tt_sampling_params: TTSamplingParams):
-        if tt_sampling_params.temperature == 0:  # greedy decoding
-            return torch.argmax(logits, dim=-1)
-        else:  # top-k top-p sampling
-            return top_pk_logits_efficient(
-                logits,
-                p=tt_sampling_params.top_p,
-                k=tt_sampling_params.top_k,
-                temperature=tt_sampling_params.temperature)

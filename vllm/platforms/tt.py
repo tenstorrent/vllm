@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -42,6 +44,8 @@ class TTPlatform(Platform):
                 == 1), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, (
             "LoRA is not supported for TT backend")
+        assert not vllm_config.cache_config.enable_prefix_caching, (
+            "Automatic prefix caching is not yet supported for TT backend")
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":

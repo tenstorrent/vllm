@@ -4,9 +4,18 @@
 from typing import Optional, cast
 
 import numpy as np
+import torch
 
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+
+class SamplingInputBatch:
+
+    def __init__(self, max_num_reqs: int):
+        self.temperature_cpu = np.empty(max_num_reqs, dtype=np.float32)
+        self.top_p_cpu = np.empty(max_num_reqs, dtype=np.float32)
+        self.top_k_cpu = np.empty(max_num_reqs, dtype=np.int32)
 
 
 class InputBatch:
@@ -26,10 +35,11 @@ class InputBatch:
 
         # TODO(woosuk): This buffer could be too large if max_model_len is big.
         # Find a way to reduce the CPU memory usage.
-        self.token_ids_cpu = np.zeros(
+        self.token_ids_cpu_tensor = torch.zeros(
             (max_num_reqs, max_model_len),
-            dtype=np.int32,
+            dtype=torch.int32,
         )
+        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
 
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -46,6 +56,9 @@ class InputBatch:
         )
 
         self.req_output_token_ids: list[Optional[list[int]]] = []
+
+        # Sampling-related.
+        self.sampling = SamplingInputBatch(max_num_reqs)
 
     @property
     def req_ids(self) -> list[str]:
@@ -90,6 +103,13 @@ class InputBatch:
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
+
+        # Sampling-related.
+        sampling_params = request.sampling_params
+        assert sampling_params is not None, "pooling requests not supported yet"
+        self.sampling.temperature_cpu[req_index] = sampling_params.temperature
+        self.sampling.top_p_cpu[req_index] = sampling_params.top_p
+        self.sampling.top_k_cpu[req_index] = sampling_params.top_k
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -147,6 +167,15 @@ class InputBatch:
             self.num_computed_tokens_cpu[
                 empty_index] = self.num_computed_tokens_cpu[last_req_index]
             self.block_table.move_row(last_req_index, empty_index)
+
+            # Sampling-related.
+            sampling = self.sampling
+            sampling.temperature_cpu[empty_index] = sampling.temperature_cpu[
+                last_req_index]
+            sampling.top_p_cpu[empty_index] = sampling.top_p_cpu[
+                last_req_index]
+            sampling.top_k_cpu[empty_index] = sampling.top_k_cpu[
+                last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
