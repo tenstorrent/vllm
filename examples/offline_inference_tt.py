@@ -220,8 +220,8 @@ def run_inference(
     check_tt_model_supported(model)
 
     if multi_modal:
-        assert "Llama-3.2" in model, "The multi-modal inference test " + \
-            "currently only supports Llama-3.2 models"
+        assert "Llama-3.2" in model or "Qwen2.5-VL" in model, "The multi-modal inference test " + \
+            "currently only supports Llama-3.2 and Qwen2.5-VL models"
 
     # LLM args
     engine_kw_args = {
