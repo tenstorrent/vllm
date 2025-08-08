@@ -510,7 +510,7 @@ class ModelConfig:
             self.override_neuron_config = override_neuron_config
         else:
             self.override_neuron_config = None
-        
+
         if current_platform.is_tt():
             self.override_tt_config = override_tt_config
         else:
@@ -965,7 +965,8 @@ class ModelConfig:
         if self.is_attention_free:
             return 0
 
-        if hasattr(self.hf_text_config, "head_dim"):
+        # NOTE: Some configs may set head_dim=None in the config
+        if getattr(self.hf_text_config, "head_dim", None) is not None:
             return self.hf_text_config.head_dim
         # FIXME(woosuk): This may not be true for all models.
         return (self.hf_text_config.hidden_size //

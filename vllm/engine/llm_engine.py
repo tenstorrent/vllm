@@ -21,6 +21,7 @@ from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          VllmConfig)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.metrics import GlobalStatLogger
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
@@ -43,6 +44,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import (PoolingRequestOutput, RequestOutput,
                           RequestOutputFactory)
+from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -212,7 +214,8 @@ class LLMEngine:
         vllm_config: VllmConfig,
         executor_class: Type[ExecutorBase],
         log_stats: bool,
-        log_global_stats: bool = False,  # if True and log_stats is True, log with GlobalStatLogger as well
+        log_global_stats: bool = False,  # if True and log_stats is True, 
+        # log with GlobalStatLogger as well
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
@@ -798,6 +801,13 @@ class LLMEngine:
             processed_inputs=processed_inputs,
         )
 
+        from vllm.platforms import current_platform
+        current_platform.validate_request(
+            prompt=prompt,
+            params=params,
+            processed_inputs=processed_inputs,
+        )
+
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,
@@ -1168,7 +1178,9 @@ class LLMEngine:
 
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
-            if not seq_group.is_prefill():
+            if not seq_group.is_prefill() and is_last_step:
+                # set time after all steps since _get_stats sets
+                # actual_num_batched_tokens based on num steps
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(
                 seq_group,
@@ -1195,10 +1207,12 @@ class LLMEngine:
                 scheduler.free_finished_seq_groups()
 
         # Log and reset global stats if there are no unfinished requests left
-        if not self.has_unfinished_requests():
-            if self.log_stats and 'global' in self.stat_loggers:
-                self.stat_loggers['global'].log_out()
-                self.stat_loggers['global'].reset()
+        if (not self.has_unfinished_requests() and self.log_stats
+                and 'global' in self.stat_loggers):
+            global_stat_logger = cast(GlobalStatLogger,
+                                      self.stat_loggers['global'])
+            global_stat_logger.log_out()
+            global_stat_logger.reset()
 
         # For multi-step without streaming, don't create outputs each iteration
         if not is_last_step and not ctx.multi_step_stream_outputs:
@@ -1218,7 +1232,9 @@ class LLMEngine:
 
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
-            if not seq_group.is_prefill():
+            if not seq_group.is_prefill() and is_last_step:
+                # set time after all steps since _get_stats sets
+                # actual_num_batched_tokens based on num steps
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(
                 seq_group,
@@ -1805,6 +1821,23 @@ class LLMEngine:
                 else:
                     # TPOTs.
                     latency = seq_group.get_last_token_latency()
+                    # last_token_time is set only for the last step so take avg
+                    if current_platform.is_tt():
+                        # for the current tt model runner, the number of steps
+                        # executed is not always the same as the number of
+                        # lookahead slots but rather the number of balance
+                        # tokens left to be generated.
+                        assert len(
+                            seq_group.seqs
+                        ) == 1, "Only one seq per group is allowed for TT"
+                        total_tokens = seq_group.seqs[0].get_output_len() - 1
+                        max_steps = scheduler_outputs.num_lookahead_slots + 1
+                        num_outputs = (total_tokens %
+                                       max_steps if total_tokens %
+                                       max_steps != 0 else max_steps)
+                    else:
+                        num_outputs = scheduler_outputs.num_lookahead_slots + 1
+                    latency /= num_outputs
                     time_per_output_tokens_iter.append(latency)
                     if seq_group.state.current_step == 0:
                         # For async_output_proc, the do_log_stats()
