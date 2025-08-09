@@ -126,8 +126,7 @@ def get_sample_multi_modal_qwen_inputs(model):
             image_inputs, video_inputs = process_vision_info(prompt)
             assert video_inputs is None, "Video inputs not supported yet"
             assert len(
-                image_inputs
-            ) == 1, "Multi-image inputs not supported yet"  # todo)) add support for multiple images
+                image_inputs) == 1, "Multi-image inputs not supported yet"
             imgs.append(image_inputs[0])
         else:
             imgs.append(None)
@@ -183,8 +182,8 @@ def check_tt_model_supported(model):
         "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
         "mistralai/Mistral-7B-Instruct-v0.3",
     ]
-    assert any(model.endswith(l)
-               for l in supported_models), f"Invalid model: {model}"
+    assert any(model.endswith(model_name)
+               for model_name in supported_models), f"Invalid model: {model}"
 
 
 def run_seq_len_tests(engine_kw_args, sampling_params):
@@ -239,8 +238,9 @@ def run_inference(
     check_tt_model_supported(model)
 
     if multi_modal:
-        assert "Llama-3.2" in model or "Qwen2.5-VL" in model, "The multi-modal inference test " + \
-            "currently only supports Llama-3.2 and Qwen2.5-VL models"
+        assert "Llama-3.2" in model or "Qwen2.5-VL" in model, (
+            "The multi-modal inference test "
+            "currently only supports Llama-3.2 and Qwen2.5-VL models")
 
     # LLM args
     engine_kw_args = {
