@@ -52,7 +52,10 @@ def register_tt_models():
     ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen_text)
 
     # Qwen2.5 - Vision
-    ModelRegistry.register_model("TTQwen2_5_VLForConditionalGeneration", "models.demos.qwen25_vl.tt.generator_vllm:Qwen2_5_VLForConditionalGeneration")
+    ModelRegistry.register_model(
+        "TTQwen2_5_VLForConditionalGeneration",
+        "models.demos.qwen25_vl.tt.generator_vllm:Qwen2_5_VLForConditionalGeneration"
+    )
 
     # Mistral
     ModelRegistry.register_model(
@@ -61,6 +64,7 @@ def register_tt_models():
 
 
 register_tt_models()  # Import and register models from tt-metal
+
 
 def get_sample_multi_modal_llama_inputs():
     '''
@@ -96,34 +100,48 @@ def get_sample_multi_modal_qwen_inputs(model):
     text_prompts = []
     imgs = []
     questions = ["Describe this image."]
-    img_refs = ["https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"]
-    prompts = [[{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img_ref},
-                {"type": "text", "text": question}
-            ]
-        }] for img_ref, question in zip(img_refs, questions)
+    img_refs = [
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
     ]
+    prompts = [[{
+        "role":
+        "user",
+        "content": [{
+            "type": "image",
+            "image": img_ref
+        }, {
+            "type": "text",
+            "text": question
+        }]
+    }] for img_ref, question in zip(img_refs, questions)]
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     for prompt in prompts:
         chat_prompt = tokenizer.apply_chat_template(prompt,
                                                     tokenize=False,
                                                     add_generation_prompt=True)
-        if any(ctnt["type"] == "image" for entry in prompt for ctnt in entry['content']):
-            from qwen_vl_utils import process_vision_info  # Import here to avoid for other models
+        if any(ctnt["type"] == "image" for entry in prompt
+               for ctnt in entry['content']):
+            from qwen_vl_utils import (
+                process_vision_info)  # Import here to avoid for other models
             image_inputs, video_inputs = process_vision_info(prompt)
             assert video_inputs is None, "Video inputs not supported yet"
-            assert len(image_inputs) == 1, "Multi-image inputs not supported yet" # todo)) add support for multiple images
+            assert len(
+                image_inputs
+            ) == 1, "Multi-image inputs not supported yet"  # todo)) add support for multiple images
             imgs.append(image_inputs[0])
         else:
             imgs.append(None)
         text_prompts.append(chat_prompt)
-    
+
     inputs = []
     for img, text_prompt in zip(imgs, text_prompts):
         if img is not None:
-            inputs.append({"prompt": text_prompt, "multi_modal_data": {"image": img}})
+            inputs.append({
+                "prompt": text_prompt,
+                "multi_modal_data": {
+                    "image": img
+                }
+            })
         else:
             inputs.append({"prompt": text_prompt})
     return inputs
@@ -165,7 +183,8 @@ def check_tt_model_supported(model):
         "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
         "mistralai/Mistral-7B-Instruct-v0.3",
     ]
-    assert any(model.endswith(l) for l in supported_models), f"Invalid model: {model}"
+    assert any(model.endswith(l)
+               for l in supported_models), f"Invalid model: {model}"
 
 
 def run_seq_len_tests(engine_kw_args, sampling_params):
@@ -282,7 +301,9 @@ def run_inference(
             elif "Qwen2.5-VL" in model:
                 prompts = get_sample_multi_modal_qwen_inputs(model)
             else:
-                raise ValueError(f"Unsupported model for multi-modal inference test: {model}")
+                raise ValueError(
+                    f"Unsupported model for multi-modal inference test: {model}"
+                )
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))
