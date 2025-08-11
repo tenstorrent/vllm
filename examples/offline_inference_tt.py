@@ -326,7 +326,8 @@ def run_inference(
                 MLLAMA_IMAGE_TOKEN_ID = 151655  # Specific to multi-modal qwen
             else:
                 raise ValueError(
-                    f"Unsupported model for multi-modal inference test in perf mode: {model}"
+                    "Unsupported model for multi-modal inference test in perf mode: "
+                    f"{model}"
                 )
             prompt_token_ids_user.insert(0, MLLAMA_IMAGE_TOKEN_ID)
             random_pixels = np.random.randint(0,
