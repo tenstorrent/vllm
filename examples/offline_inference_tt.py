@@ -326,8 +326,8 @@ def run_inference(
                 IMAGE_TOKEN_ID = 151655  # Specific to multi-modal qwen
             else:
                 raise ValueError(
-                    "Unsupported model for multi-modal inference test in perf mode: "
-                    f"{model}")
+                    f"Unsupported model for multi-modal inference test in perf "
+                    f"mode: {model}")
             prompt_token_ids_user.insert(0, IMAGE_TOKEN_ID)
             random_pixels = np.random.randint(0,
                                               256, (512, 512, 3),
