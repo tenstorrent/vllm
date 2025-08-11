@@ -182,8 +182,7 @@ def check_tt_model_supported(model):
         "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
         "mistralai/Mistral-7B-Instruct-v0.3",
     ]
-    assert any(model.endswith(model_name)
-               for model_name in supported_models), f"Invalid model: {model}"
+    assert model in supported_models, f"Invalid model: {model}"
 
 
 def run_seq_len_tests(engine_kw_args, sampling_params):
