@@ -321,15 +321,15 @@ def run_inference(
             } for _ in range(max_seqs_in_batch)]
         else:
             if "Llama-3.2" in model:
-                MLLAMA_IMAGE_TOKEN_ID = 128256  # Specific to multi-modal llama
+                IMAGE_TOKEN_ID = 128256  # Specific to multi-modal llama
             elif "Qwen2.5-VL" in model:
-                MLLAMA_IMAGE_TOKEN_ID = 151655  # Specific to multi-modal qwen
+                IMAGE_TOKEN_ID = 151655  # Specific to multi-modal qwen
             else:
                 raise ValueError(
                     "Unsupported model for multi-modal inference test in perf mode: "
                     f"{model}"
                 )
-            prompt_token_ids_user.insert(0, MLLAMA_IMAGE_TOKEN_ID)
+            prompt_token_ids_user.insert(0, IMAGE_TOKEN_ID)
             random_pixels = np.random.randint(0,
                                               256, (512, 512, 3),
                                               dtype=np.uint8)
