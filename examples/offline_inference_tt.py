@@ -327,8 +327,7 @@ def run_inference(
             else:
                 raise ValueError(
                     "Unsupported model for multi-modal inference test in perf mode: "
-                    f"{model}"
-                )
+                    f"{model}")
             prompt_token_ids_user.insert(0, IMAGE_TOKEN_ID)
             random_pixels = np.random.randint(0,
                                               256, (512, 512, 3),
