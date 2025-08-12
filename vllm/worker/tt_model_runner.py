@@ -197,6 +197,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 ]  # Only used for multi-step execution
                 self.perm_table_tensor: List[torch.Tensor] = []
 
+        # detect if the model is a Qwen2.5-VL model
+        self.is_qwen25_vl = 'Qwen2.5-VL' in self.model.model_args.model_name
+        if self.is_qwen25_vl:
+            assert (
+                not hasattr(self, 'cached_enc_dec_data')
+                or self.cached_enc_dec_data is None
+            ), "Qwen2.5-VL should not overwrite existing encoder-decoder data"
+            # seq_id -> {"rot_mats": (cos, sin)}
+            self.cached_enc_dec_data = {}
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -331,8 +341,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
-        if (self.model_config.is_encoder_decoder and not is_prompt
-                and self.cached_enc_dec_data):
+        if ((self.model_config.is_encoder_decoder or self.is_qwen25_vl)
+                and not is_prompt and self.cached_enc_dec_data):
             seq_ids_to_del = []
             for seq_id in self.cached_enc_dec_data:
                 if seq_id not in seq_groups_list:
@@ -675,6 +685,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         decode_full_text_row_masked_out_mask[i]
                     }
                     self.cached_enc_dec_data[seq_id] = enc_dec_data
+            elif self.is_qwen25_vl:
+                tt_out, rot_mats = outputs
+                # tt_out: [batch_size, seq_len, vocab_size];
+                # rot_mats: List[[batch_size, 1, seq_len, head_dim]]
+                for i, seq_id in enumerate(model_input.seq_groups):
+                    self.cached_enc_dec_data[seq_id] = {
+                        "rot_mats": (
+                            # cos: [1, 1, seq_len, head_dim]
+                            rot_mats[0][i:i + 1],
+                            # sin: [1, 1, seq_len, head_dim]
+                            rot_mats[1][i:i + 1],
+                        )
+                    }
             else:
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
         else:
@@ -711,6 +734,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     decode_cross_attention_masks,
                     "decode_full_text_row_masked_out_mask":
                     decode_full_text_row_masked_out_mask
+                }
+            elif self.is_qwen25_vl:
+                enc_dec_kwargs = {
+                    "rot_mats_seq_ids": {
+                        seq_id: self.cached_enc_dec_data[seq_id]["rot_mats"]
+                        for seq_id in model_input.seq_groups
+                    }
                 }
             else:
                 enc_dec_kwargs = {}
