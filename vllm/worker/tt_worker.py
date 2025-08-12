@@ -390,9 +390,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
-    if ("Llama-3.1-8B" in model_config.model
-            and device_config.device.get_num_devices() == 1
-            and "wormhole_b0" in ttnn.get_arch_name()):  # Llama8B on N150
+    if (("Llama-3.1-8B" in model_config.model
+         or "Mistral-7B" in model_config.model)
+            and device_config.device.get_num_devices() == 1 and "wormhole_b0"
+            in ttnn.get_arch_name()):  # Llama8B on N150 and Mistral7B on N150
         max_tokens_all_users = 65536
     elif ("Llama-3.2-90B" in model_config.model
           and device_config.device.get_num_devices() == 8
@@ -445,7 +446,18 @@ def get_dispatch_core_config(override_tt_config):
     return ttnn.DispatchCoreConfig(axis=dispatch_core_axis)
 
 
-def get_fabric_config(override_tt_config):
+def get_fabric_config(override_tt_config, num_devices):
+    if num_devices == 1:
+        # No fabric config for single device
+        fabric_config = None
+    else:
+        # Set the most common value as default
+        is_6u = (
+            ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY)
+        fabric_config = (ttnn.FabricConfig.FABRIC_1D_RING
+                         if is_6u else ttnn.FabricConfig.FABRIC_1D)
+
+    # Override fabric_config if specified in override_tt_config
     if (override_tt_config is not None
             and "fabric_config" in override_tt_config):
         fabric_config_str = override_tt_config["fabric_config"]
@@ -460,16 +472,15 @@ def get_fabric_config(override_tt_config):
         assert fabric_config is not None, (
             f"Invalid fabric_config: {fabric_config_str}. "
             f"Expected one of {list(fabric_config_map.keys())}.")
-        return fabric_config
-    return None
+    return fabric_config
 
 
 # From tt-metal/conftest.py:
 # Set fabric config to passed in value
 # Do nothing if not set
 # Must be called before creating the mesh device
-def set_fabric(override_tt_config):
-    fabric_config = get_fabric_config(override_tt_config)
+def set_fabric(override_tt_config, num_devices):
+    fabric_config = get_fabric_config(override_tt_config, num_devices)
     if fabric_config:
         ttnn.set_fabric_config(fabric_config)
 
@@ -480,8 +491,8 @@ def set_fabric(override_tt_config):
 # in as even setting it to DISABLED might be unstable
 # This is to ensure that we don't propagate
 # the instability to the rest of CI
-def reset_fabric(override_tt_config):
-    fabric_config = get_fabric_config(override_tt_config)
+def reset_fabric(override_tt_config, num_devices):
+    fabric_config = get_fabric_config(override_tt_config, num_devices)
     if fabric_config:
         ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
@@ -532,7 +543,8 @@ def open_mesh_device(override_tt_config, trace_mode):
         override_tt_config, trace_mode)
 
     # Set fabric before opening the device
-    set_fabric(override_tt_config)
+    num_devices_requested = mesh_grid[0] * mesh_grid[1]
+    set_fabric(override_tt_config, num_devices_requested)
 
     mesh_device = ttnn.open_mesh_device(
         ttnn.MeshShape(*mesh_grid),
@@ -549,7 +561,8 @@ def close_mesh_device(mesh_device, override_tt_config):
     ttnn.ReadDeviceProfiler(mesh_device)
 
     # Close devices
+    num_devices = mesh_device.get_num_devices()
     ttnn.close_mesh_device(mesh_device)
 
     # Reset fabric
-    reset_fabric(override_tt_config)
+    reset_fabric(override_tt_config, num_devices)
