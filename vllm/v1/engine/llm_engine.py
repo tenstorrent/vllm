@@ -46,6 +46,8 @@ class LLMEngine:
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        log_global_stats: bool = False,  # if True and log_stats is True, 
+        # log with GlobalStatLogger instead
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
@@ -69,9 +71,14 @@ class LLMEngine:
         self.cache_config = vllm_config.cache_config
 
         self.log_stats = log_stats
+        self.log_global_stats = log_global_stats
         self.stat_logger: Optional[StatLoggerBase] = None
         if self.log_stats:
-            self.stat_logger = PrometheusStatLogger(vllm_config)
+            if self.log_global_stats:
+                from vllm.v1.metrics.loggers import GlobalStatLogger
+                self.stat_logger = GlobalStatLogger(vllm_config)
+            else:
+                self.stat_logger = PrometheusStatLogger(vllm_config)
 
         # important: init dp group before init the engine_core
         # In the decoupled engine case this is handled in EngineCoreProc.
@@ -120,11 +127,12 @@ class LLMEngine:
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         disable_log_stats: bool = False,
-        log_global_stats: bool = False,  # Currently ignored in V1 (used in V0)
+        log_global_stats: bool = False,
     ) -> "LLMEngine":
         return cls(vllm_config=vllm_config,
                    executor_class=Executor.get_class(vllm_config),
                    log_stats=(not disable_log_stats),
+                   log_global_stats=log_global_stats,
                    usage_context=usage_context,
                    stat_loggers=stat_loggers,
                    multiprocess_mode=envs.VLLM_ENABLE_V1_MULTIPROCESSING)
@@ -252,6 +260,11 @@ class LLMEngine:
             assert outputs.scheduler_stats is not None
             self.stat_logger.record(scheduler_stats=outputs.scheduler_stats,
                                     iteration_stats=iteration_stats)
+
+        if (self.log_stats and self.log_global_stats
+                and not self.has_unfinished_requests()):
+            self.stat_logger.log_out()
+            self.stat_logger.reset()
 
         return processed_outputs.request_outputs
 

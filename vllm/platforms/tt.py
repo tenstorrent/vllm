@@ -51,6 +51,8 @@ class TTPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             if envs.VLLM_USE_V1:
                 parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm.v1.core.sched.ascend_scheduler.AscendScheduler")
             else:
                 parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
 
