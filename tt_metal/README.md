@@ -118,7 +118,7 @@ MESH_DEVICE=N300 python examples/offline_inference_tt.py --model "meta-llama/Lla
 > - To run the 11B model on QuietBox, set `MESH_DEVICE=T3K` and `--max_seqs_in_batch 32`.
 > - To run the 90B model, set `MESH_DEVICE=T3K`, `--model "meta-llama/Llama-3.2-90B-Vision-Instruct"` and `--max_seqs_in_batch 4`.
 > - To run the 32B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-32B"` and `--max_seqs_in_batch 32`.
-> - To run the 72B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, and `--override_tt_config '{"trace_region_size": 28467200, "num_command_queues": 1}'`.
+> - To run the 72B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, and `--override_tt_config '{"trace_region_size": 28467200}'`.
 
 ## Running the server example
 
@@ -190,7 +190,7 @@ with open("server-instruct-mm-prompt.json", "w") as json_file:
 ```
 
 > **Notes:**
-> - Qwen-2.5-VL models can also work with real url like `"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"` instead of `"data:image/jpeg;base64,{base64_image}"`.
+> - Qwen-2.5-VL models can also work with a real url like `"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"` instead of `"data:image/jpeg;base64,{base64_image}"`.
 
 Finally, send a request to the server:
 
