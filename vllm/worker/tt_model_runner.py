@@ -138,8 +138,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         ]  # Only used for multi-step execution
 
         if self.model_config.is_encoder_decoder:
-            self.cached_enc_dec_data: Optional[Dict[int, Dict[
-                str, Any]]] = None  # seq_id -> enc_dec_data
+            # seq_id -> enc_dec_data
+            self.cached_enc_dec_data: Dict[int, Dict[str, Any]] = {}
 
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keep "rope_deltas" between prompt and decoding phases.
