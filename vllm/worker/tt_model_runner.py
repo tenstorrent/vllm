@@ -138,8 +138,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         ]  # Only used for multi-step execution
 
         if self.model_config.is_encoder_decoder:
-            # seq_id -> enc_dec_data
-            self.cached_enc_dec_data: Dict[int, Dict[str, Any]] = {}
+            # seq_id -> cached_req_data
+            self.cached_req_data: Dict[int, Dict[str, Any]] = {}
+
+        # detect if the model is a Qwen2.5-VL model
+        self.request_specific_rope = 'Qwen2.5-VL' in self.model_config.model
+        if self.request_specific_rope:
+            assert (
+                not hasattr(self, 'cached_req_data')
+                or self.cached_req_data is None
+            ), "Qwen2.5-VL should not overwrite existing encoder-decoder data"
+            # seq_id -> {"rot_mats": (cos, sin)}
+            self.cached_req_data = {}
 
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keep "rope_deltas" between prompt and decoding phases.
@@ -196,16 +206,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.cached_read_events: List[Any] = [
                 ]  # Only used for multi-step execution
                 self.perm_table_tensor: List[torch.Tensor] = []
-
-        # detect if the model is a Qwen2.5-VL model
-        self.is_qwen25_vl = 'Qwen2.5-VL' in self.model.model_args.model_name
-        if self.is_qwen25_vl:
-            assert (
-                not hasattr(self, 'cached_enc_dec_data')
-                or self.cached_enc_dec_data is None
-            ), "Qwen2.5-VL should not overwrite existing encoder-decoder data"
-            # seq_id -> {"rot_mats": (cos, sin)}
-            self.cached_enc_dec_data = {}
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -341,14 +341,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
-        if ((self.model_config.is_encoder_decoder or self.is_qwen25_vl)
-                and not is_prompt and self.cached_enc_dec_data):
+        if ((self.model_config.is_encoder_decoder
+             or self.request_specific_rope) and not is_prompt
+                and self.cached_req_data):
             seq_ids_to_del = []
-            for seq_id in self.cached_enc_dec_data:
+            for seq_id in self.cached_req_data:
                 if seq_id not in seq_groups_list:
                     seq_ids_to_del.append(seq_id)
             for seq_id in seq_ids_to_del:
-                del self.cached_enc_dec_data[seq_id]
+                del self.cached_req_data[seq_id]
 
         # Convert lists to tensors and add padding
 
@@ -671,8 +672,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 prefill_full_text_row_masked_out_mask, \
                 decode_cross_attention_masks, \
                  decode_full_text_row_masked_out_mask = outputs
-                if self.cached_enc_dec_data is None:
-                    self.cached_enc_dec_data = {}
+                if self.cached_req_data is None:
+                    self.cached_req_data = {}
                 for i, seq_id in enumerate(model_input.seq_groups):
                     enc_dec_data = {
                         "prefill_cross_attention_masks":
@@ -684,13 +685,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         "decode_full_text_row_masked_out_mask":
                         decode_full_text_row_masked_out_mask[i]
                     }
-                    self.cached_enc_dec_data[seq_id] = enc_dec_data
-            elif self.is_qwen25_vl:
+                    self.cached_req_data[seq_id] = enc_dec_data
+            elif self.request_specific_rope:
                 tt_out, rot_mats = outputs
                 # tt_out: [batch_size, seq_len, vocab_size];
                 # rot_mats: List[[batch_size, 1, seq_len, head_dim]]
                 for i, seq_id in enumerate(model_input.seq_groups):
-                    self.cached_enc_dec_data[seq_id] = {
+                    self.cached_req_data[seq_id] = {
                         "rot_mats": (
                             # cos: [1, 1, seq_len, head_dim]
                             rot_mats[0][i:i + 1],
@@ -702,26 +703,26 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
         else:
             if self.model_config.is_encoder_decoder:
-                assert self.cached_enc_dec_data is not None
+                assert self.cached_req_data is not None
 
                 # Use encoder-decoder data from prefill step
                 prefill_cross_attention_masks = [
-                    self.cached_enc_dec_data[seq_id]
+                    self.cached_req_data[seq_id]
                     ["prefill_cross_attention_masks"]
                     for seq_id in model_input.seq_groups
                 ]
                 prefill_full_text_row_masked_out_mask = [
-                    self.cached_enc_dec_data[seq_id]
+                    self.cached_req_data[seq_id]
                     ["prefill_full_text_row_masked_out_mask"]
                     for seq_id in model_input.seq_groups
                 ]
                 decode_cross_attention_masks = [
-                    self.cached_enc_dec_data[seq_id]
+                    self.cached_req_data[seq_id]
                     ["decode_cross_attention_masks"]
                     for seq_id in model_input.seq_groups
                 ]
                 decode_full_text_row_masked_out_mask = [
-                    self.cached_enc_dec_data[seq_id]
+                    self.cached_req_data[seq_id]
                     ["decode_full_text_row_masked_out_mask"]
                     for seq_id in model_input.seq_groups
                 ]
@@ -735,10 +736,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "decode_full_text_row_masked_out_mask":
                     decode_full_text_row_masked_out_mask
                 }
-            elif self.is_qwen25_vl:
+            elif self.request_specific_rope:
                 enc_dec_kwargs = {
                     "rot_mats_seq_ids": [
-                        self.cached_enc_dec_data[seq_id]["rot_mats"]
+                        self.cached_req_data[seq_id]["rot_mats"]
                         for seq_id in model_input.seq_groups
                     ]
                 }
