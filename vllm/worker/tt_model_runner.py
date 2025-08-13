@@ -737,10 +737,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 }
             elif self.is_qwen25_vl:
                 enc_dec_kwargs = {
-                    "rot_mats_seq_ids": {
-                        seq_id: self.cached_enc_dec_data[seq_id]["rot_mats"]
+                    "rot_mats_seq_ids": [
+                        self.cached_enc_dec_data[seq_id]["rot_mats"]
                         for seq_id in model_input.seq_groups
-                    }
+                    ]
                 }
             else:
                 enc_dec_kwargs = {}
