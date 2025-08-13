@@ -115,8 +115,8 @@ MESH_DEVICE=N300 python examples/offline_inference_tt.py --model "meta-llama/Lla
 ```
 
 > **Notes:**
-> - To run the 11B model on QuietBox, set `MESH_DEVICE=T3K` and `--max_seqs_in_batch 32`.
-> - To run the 90B model, set `MESH_DEVICE=T3K`, `--model "meta-llama/Llama-3.2-90B-Vision-Instruct"` and `--max_seqs_in_batch 4`.
+> - To run the 11B Llama-3.2 model on QuietBox, set `MESH_DEVICE=T3K` and `--max_seqs_in_batch 32`.
+> - To run the 90B Llama-3.2 model, set `MESH_DEVICE=T3K`, `--model "meta-llama/Llama-3.2-90B-Vision-Instruct"` and `--max_seqs_in_batch 4`.
 > - To run the 32B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-32B"` and `--max_seqs_in_batch 32`.
 > - To run the 72B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, and `--override_tt_config '{"trace_region_size": 28467200}'`.
 
