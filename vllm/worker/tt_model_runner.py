@@ -738,7 +738,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 }
             elif self.request_specific_rope:
                 enc_dec_kwargs = {
-                    "rot_mats_seq_ids": [
+                    "rot_mats_all_users": [
                         self.cached_req_data[seq_id]["rot_mats"]
                         for seq_id in model_input.seq_groups
                     ]
