@@ -141,7 +141,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.model_config.is_encoder_decoder or self.request_specific_rope:
             assert (
                 self.model_config.is_encoder_decoder
-                and self.rope_config.is_request_specific
+                and self.request_specific_rope
             ) is False, (
                 "a model cannot be encoder-decoder and request-specific rope")
             # seq_id -> cached_req_data
