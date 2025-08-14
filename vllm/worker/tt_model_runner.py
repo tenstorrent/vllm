@@ -668,8 +668,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 prefill_full_text_row_masked_out_mask, \
                 decode_cross_attention_masks, \
                  decode_full_text_row_masked_out_mask = outputs
-                if self.cached_req_data is None:
-                    self.cached_req_data = {}
+
                 for i, seq_id in enumerate(model_input.seq_groups):
                     enc_dec_data = {
                         "prefill_cross_attention_masks":
