@@ -139,6 +139,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         self.request_specific_rope = 'Qwen2.5-VL' in self.model_config.model
         if self.model_config.is_encoder_decoder or self.request_specific_rope:
+            assert (
+                self.model_config.is_encoder_decoder
+                and self.rope_config.is_request_specific
+            ) is False, (
+                "a model cannot be encoder-decoder and request-specific rope")
             # seq_id -> cached_req_data
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
 
