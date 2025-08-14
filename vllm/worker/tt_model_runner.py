@@ -698,7 +698,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
         else:
             if self.model_config.is_encoder_decoder:
-                assert self.cached_req_data is not None
+                assert self.cached_req_data
 
                 # Use encoder-decoder data from prefill step
                 prefill_cross_attention_masks = [
