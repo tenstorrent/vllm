@@ -137,19 +137,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.cached_step_outputs: List[torch.Tensor] = [
         ]  # Only used for multi-step execution
 
-        if self.model_config.is_encoder_decoder:
+        self.request_specific_rope = 'Qwen2.5-VL' in self.model_config.model
+        if self.model_config.is_encoder_decoder or self.request_specific_rope:
             # seq_id -> cached_req_data
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
-
-        # detect if the model is a Qwen2.5-VL model
-        self.request_specific_rope = 'Qwen2.5-VL' in self.model_config.model
-        if self.request_specific_rope:
-            assert (
-                not hasattr(self, 'cached_req_data')
-                or self.cached_req_data is None
-            ), "Qwen2.5-VL should not overwrite existing encoder-decoder data"
-            # seq_id -> {"rot_mats": (cos, sin)}
-            self.cached_req_data = {}
 
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keep "rope_deltas" between prompt and decoding phases.
