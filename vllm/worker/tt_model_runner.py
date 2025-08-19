@@ -785,7 +785,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out, read_event = self.model.read_decode_output(
                     tt_out, async_read=True)
             else:
+                # outputs ttnn host tensors
                 tt_out = self.model.read_decode_output(tt_out)
+                # outputs torch tensor
                 tt_out = self.model.process_decode_output_host(
                     tt_out, is_tokens=(self.sample_on_device_mode is not None))
             if self.dp_kv_cache and not self.async_torch_proc:
