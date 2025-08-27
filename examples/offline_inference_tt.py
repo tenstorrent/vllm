@@ -62,6 +62,11 @@ def register_tt_models():
         "TTMistralForCausalLM",
         "models.tt_transformers.tt.generator_vllm:MistralForCausalLM")
 
+    # Arcee AFM-4.5B - Text
+    ModelRegistry.register_model(
+        "TTArceeForCausalLM",
+        "models.tt_transformers.tt.generator_vllm:TTArceeForCausalLM")
+
 
 register_tt_models()  # Import and register models from tt-metal
 
@@ -183,6 +188,7 @@ def check_tt_model_supported(model):
         "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
         "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
         "mistralai/Mistral-7B-Instruct-v0.3",
+        "arcee-ai/AFM-4.5B"
     ]
     assert model in supported_models, f"Invalid model: {model}"
 
