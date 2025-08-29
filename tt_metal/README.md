@@ -76,6 +76,7 @@ MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 - `sample_on_device_mode`: ["all", "decode_only"]
 - `trace_region_size`: [default: 25000000]
 - `worker_l1_size`
+- `l1_small_size`
 - `fabric_config`: ["DISABLED", "FABRIC_1D", "FABRIC_2D", "CUSTOM"]
 - `dispatch_core_axis`: ["row", "col"]
 - `data_parallel`: [default: 1]
