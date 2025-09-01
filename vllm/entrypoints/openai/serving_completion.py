@@ -424,17 +424,23 @@ class OpenAIServingCompletion(OpenAIServing):
                         out_logprobs = prompt_logprobs
                         output_text = prompt_text
                     else:
-                        token_ids = [*prompt_token_ids, *output.token_ids]
+                        if prompt_logprobs is None:
+                            token_ids = output.token_ids
+                        else:
+                            token_ids = [*prompt_token_ids, *output.token_ids]
 
                         if request.logprobs is None:
                             out_logprobs = None
                         else:
                             assert prompt_logprobs is not None
                             assert output.logprobs is not None
-                            out_logprobs = [
-                                *prompt_logprobs,
-                                *output.logprobs,
-                            ]
+                            if prompt_logprobs is None:
+                                out_logprobs = output.logprobs
+                            else:
+                                out_logprobs = [
+                                    *prompt_logprobs,
+                                    *output.logprobs,
+                                ]
 
                         output_text = prompt_text + output.text
                 else:
