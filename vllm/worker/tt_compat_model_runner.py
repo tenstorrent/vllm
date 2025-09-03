@@ -12,7 +12,8 @@ from transformers import TopPLogitsWarper
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.model_executor.layers.sampler import get_sampler
+from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.model_executor.models import supports_multimodal
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
@@ -22,16 +23,17 @@ from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
 
 logger = init_logger(__name__)
 
+"""
+TLDR we drop support for TG llama (it was using device-side sampling anyway) and get a bunch of benefits
+We don't support:
+- data parallel, since it's only used by tg llama
+- for async_out_proc we fully construct sample output synchronousl, only send it out async #TODO check if it makes sense
+- aysnc_torch_proc, because that is a tg llama specific feature
 
-@dataclass(frozen=True)
-class TTSamplingParams:
-    """
-    Used by TTModelInput.
-    """
-    temperature: float
-    top_k: int
-    top_p: float
-    logprobs: Optional[int] = None  # Add logprobs support
+
+
+TG llama always uses sampling on device, 
+"""
 
 @dataclass(frozen=True)
 class TTLogprobData:
@@ -51,7 +53,7 @@ class TTModelInput(ModelRunnerInputBase):
     seq_groups: List[int]
     block_tables: torch.Tensor
     unpadded_batch_size: int
-    tt_sampling_params: TTSamplingParams
+    sampling_params_list: List[Any] #TODO add proper type
     multi_modal_kwargs: Dict[str, Any]
     cross_block_tables: torch.Tensor
     is_first_multi_step: bool = True
@@ -67,7 +69,7 @@ class TTModelInput(ModelRunnerInputBase):
             "seq_groups": self.seq_groups,
             "block_tables": self.block_tables,
             "unpadded_batch_size": self.unpadded_batch_size,
-            "tt_sampling_params": self.tt_sampling_params,
+            "sampling_params_list": self.sampling_params_list,
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "cross_block_tables": self.cross_block_tables,
             "is_first_multi_step": self.is_first_multi_step,
@@ -133,11 +135,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if (override_tt_config is not None
                 and "sample_on_device_mode" in override_tt_config
                 and override_tt_config["sample_on_device_mode"] is not None):
-            self.sample_on_device_mode = override_tt_config[
-                "sample_on_device_mode"]
-            assert self.sample_on_device_mode in [
-                "all", "decode_only"
-            ], f"Invalid sample_on_device_mode: {self.sample_on_device_mode}"
+            raise ValueError("sample_on_device_mode is not supported")
         else:
             self.sample_on_device_mode = None  # whether to sample on device
         logger.info(
@@ -146,8 +144,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.sample_on_device_mode,
         )
 
-        self.cached_token_ids: List[torch.Tensor] = [
-        ]  # Only used for multi-step execution
 
         if self.model_config.is_encoder_decoder:
             self.cached_enc_dec_data: Optional[Dict[int, Dict[
@@ -189,28 +185,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.llama_tg = False
 
-        if self.llama_tg or is_dp:
+        if  is_dp:
             self.dp_kv_cache = True
         else:
             self.dp_kv_cache = False
 
-        # LLama TG doesn't return torch tensors. It returns ttnn tensors, along with a read event
-        # Before reading the output, wait on the read event to be completed.
-        # It also always uses device-side sampling.
-        if self.llama_tg:
-            self.async_torch_proc = True
-        else:
-            self.async_torch_proc = False
 
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            if self.async_torch_proc:
-                self.cached_read_events: List[Any] = [
-                ]  # Only used for multi-step execution
-                self.perm_table_tensor: List[torch.Tensor] = []
+
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -243,7 +229,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         prompt_lens_list: List[int] = []
         block_tables_list: List[List[int]] = []
         seq_groups_list: List[int] = []
-        top_pk_sampling_params: Dict[str, Any] = {}
+        sampling_params_list = []
         multi_modal_kwargs: Dict[str, Any] = {}
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
@@ -309,47 +295,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 cross_block_table = seq_group_metadata.cross_block_table
                 cross_block_tables_list.append(cross_block_table)
 
-            # Sampling params
-            # TODO: Add support for different sampling params in the same batch
-            sampling_params = seq_group_metadata.sampling_params
-            if len(top_pk_sampling_params) == 0:
-                top_pk_sampling_params[
-                    "temperature"] = sampling_params.temperature
-                top_pk_sampling_params["top_k"] = sampling_params.top_k
-                top_pk_sampling_params["top_p"] = sampling_params.top_p
-                top_pk_sampling_params["logprobs"] = sampling_params.logprobs
-            else:
-                if (top_pk_sampling_params["temperature"]
-                        != sampling_params.temperature):
-                    logger.warning(
-                        "Currently only supporting same temperature for all "
-                        "sequences in batch, falling back to first sequence's "
-                        "temperature (%s)",
-                        top_pk_sampling_params['temperature'])
-                if top_pk_sampling_params["top_k"] != sampling_params.top_k:
-                    logger.warning(
-                        "Currently only supporting same top_k"
-                        "for all sequences in batch, "
-                        "falling back to first sequence's top_k (%s)",
-                        top_pk_sampling_params['top_k'])
-                if top_pk_sampling_params["top_p"] != sampling_params.top_p:
-                    logger.warning(
-                        "Currently only supporting same top_p"
-                        "for all sequences in batch, "
-                        "falling back to first sequence's top_p (%s)",
-                        top_pk_sampling_params['top_p'])
-                if top_pk_sampling_params["logprobs"] != sampling_params.logprobs:
-                    logger.warning(
-                        "Currently only supporting same logprobs"
-                        "for all sequences in batch, "
-                        "falling back to first sequence's logprobs (%s)",
-                        top_pk_sampling_params['logprobs'])
+            sampling_params_list.append(seq_group_metadata.sampling_params)
 
-        tt_sampling_params = TTSamplingParams(
-            temperature=top_pk_sampling_params["temperature"],
-            top_k=top_pk_sampling_params["top_k"],
-            top_p=top_pk_sampling_params["top_p"],
-            logprobs=top_pk_sampling_params["logprobs"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -474,9 +421,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
 
+
+        # prepare sampling metadata
+        sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
+                                                     model_input.seq_lens,
+                                                     model_input.query_lens,
+                                                     self.device,
+                                                     pin_memory=False,
+                                                     generators=generators)
+
         return TTModelInput(input_tokens, input_positions, prompt_lens,
                             seq_groups_list, block_tables, unpadded_batch_size,
-                            tt_sampling_params, multi_modal_kwargs,
+                            sampling_params_list, multi_modal_kwargs,
                             cross_block_tables)
 
     @torch.no_grad()
@@ -504,31 +460,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert num_steps == 1, "Num steps must be 1 for prefill"
         # always true if not using multi-step
         if model_input.is_first_multi_step:
-            # This is a queue of sampled tokens.
-            # If we are using async_torch_proc (LLama TG) AND decoding, the step result is a ttnn host tensor that may not have been copied to host yet
-            # We need to wait on the read event to be completed before we can use the result
-            # The corresponding read event is cached in self.cached_read_events
-            # Otherwise, the result is a torch tensor with sampled tokens
+            # This is a queue of torch tensor with sampled tokens
             # If we do async output processing, the queue is consumed by _send_prev_step_async_out, except the last step
             # If not, we consume the whole queue after executing the last step.
-            self.cached_token_ids = []
-            self.cached_logprob_data = []
-            if is_decode:
-                self.cached_read_events = []
+            self.cached_sampler_outputs = []
             for i in range(num_steps):
-                next_token_ids, logprob_data, read_event = self._execute_model_single_step(
+                sampler_outputs = self._execute_model_single_step(
                     model_input,
                     kv_caches,
                     is_decode,
                     use_async_out_proc,
                     step_idx=i)
-                if is_decode and self.async_torch_proc:
-                    self.cached_read_events.append(read_event)
-                else:
-                    pass # read_event is None
-                self.cached_token_ids.append(next_token_ids)
-                self.cached_logprob_data.append(logprob_data) # may be None
-                if not self.llama_tg and i < num_steps - 1:
+                self.cached_sampler_outputs.append(sampler_outputs)
+                next_token_ids = get_next_token_ids(sampler_outputs) #TODO IMPLEMENT
+                if i < num_steps - 1:
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
                     if new_input_tokens.shape[
@@ -558,11 +503,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             if use_async_out_proc:
                 assert model_input.async_callback is not None
-                model_input.async_callback()  # trigger output processor
+                model_input.async_callback()  # trigger output processor, i'm not sure why we trigger here without appending any outputs to the context?
 
         sampler_outputs = []  # no outputs unless last step
         if model_input.is_last_step:  # always true if not using multi-step
-            num_outputs = len(self.cached_token_ids)
+            num_outputs = len(self.cached_sampler_outputs)
             if use_async_out_proc:
                 # The queue should be getting consumed by _send_prev_step_async_out
                 # the last step should have 1 output unless we have
@@ -571,108 +516,28 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 assert num_outputs <= 1, (
                     "Last step should have at most one output")
             for i in range(num_outputs):
-                next_token_ids = self.cached_token_ids.pop(0)
-                logprob_data = self.cached_logprob_data.pop(0)
-                if is_decode and self.async_torch_proc:
-                    # In this case,next_token_ids is a ttnn host tensor that may not have been copied to host yet,
-                    # synchronize, change to torch and possibly permute
-                    read_event = self.cached_read_events.pop(0)
-                    ttnn.event_synchronize(read_event)
-                    next_token_ids = ttnn.to_torch(
-                        ttnn.get_device_tensors(next_token_ids)[0])[0, 0, 0, :]
-                    if self.dp_kv_cache:
-                        # permute the tt_out
-                        next_token_ids = next_token_ids[
-                            self.perm_table_tensor.pop(0)]
-                # TODO: sync read back from device
-                # once model can keep executing steps on device
-                sampler_output = self._make_sampler_output(
-                    next_token_ids, model_input.seq_groups, logprob_data)
+                sampler_output = self.cached_sampler_outputs.pop(0)
                 sampler_outputs.append(sampler_output)
 
         return sampler_outputs
 
-    def _send_async_out(self, sampler_output, async_callback,
-                        is_first_step_output):
-        ctx = async_callback.keywords["ctx"]
-        ctx.append_output(outputs=[sampler_output],
-                          seq_group_metadata_list=ctx.seq_group_metadata_list,
-                          scheduler_outputs=ctx.scheduler_outputs,
-                          is_async=False,
-                          is_last_step=False,
-                          is_first_step_output=is_first_step_output)
-        async_callback()  # trigger output processor
-
-    def _make_sampler_output(
-        self,
-        next_token_ids: List[int],
-        seq_groups: List[int],
-        logprob_data: Optional[TTLogprobData] = None,
-    ) -> SamplerOutput:
-        # Minimal code to construct the sampler outputs,
-        # based on tpu_model_runner.py
-        # TT backend does not support the advanced sampling parameters
-        # such as logprobs.
-        if logprob_data is None:
-            #fall back to old codepath
-            zero_logprob = Logprob(0.0)
-            sampler_outputs = []
-            for batch_idx, seq_id in enumerate(seq_groups):
-                next_token_id = int(next_token_ids[batch_idx])
-                seq_outputs = [
-                    SequenceOutput(seq_id, next_token_id,
-                                {next_token_id: zero_logprob})
-                ]
-                sampler_outputs.append(
-                    CompletionSequenceGroupOutput(seq_outputs, None))
-            return SamplerOutput(sampler_outputs)
-        else:
-            sampler_outputs = []
-            for batch_idx, seq_id in enumerate(seq_groups):
-                top_n_logprobs = logprob_data.top_n_logprobs[batch_idx]
-                top_n_tokens = logprob_data.top_n_tokens[batch_idx]
-                top_n_ranks = range(1, len(top_n_tokens) + 1)  # 1-indexed
-                logprob_dict = {}
-                for rank, token, logprob in zip(top_n_ranks, top_n_tokens, top_n_logprobs):
-                    logprob_dict[int(token)] = Logprob(float(logprob), rank)
-                # chosen token is always included even if not in top num_logprobs
-                next_token_id = int(next_token_ids[batch_idx])
-                chosen_logprob = logprob_data.chosen_logprobs[batch_idx]
-                chosen_rank = logprob_data.chosen_ranks[batch_idx]
-                logprob_dict[next_token_id] = Logprob(float(chosen_logprob), int(chosen_rank))
-                seq_outputs = [
-                    SequenceOutput(seq_id, next_token_id, logprob_dict)
-                ]
-                sampler_outputs.append(
-                    CompletionSequenceGroupOutput(seq_outputs, None))
-            return SamplerOutput(sampler_outputs)
-
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         # Get previous step's sampled tokens and send them to the output queue
         if step_idx > 0:
-            next_token_ids = self.cached_token_ids.pop(0)
-            logprob_data = self.cached_logprob_data.pop(0)
-            if self.async_torch_proc:
-                # In this case,next_token_ids is a ttnn host tensor that may not have been copied to host yet,
-                # synchronize, change to torch and possibly permute
-                read_event = self.cached_read_events.pop(0)
-                ttnn.event_synchronize(read_event)
-                next_token_ids = ttnn.to_torch(
-                    ttnn.get_device_tensors(next_token_ids)[0])[0, 0, 0, :]
-                if self.dp_kv_cache:
-                    # permute the tt_out
-                    next_token_ids = next_token_ids[self.perm_table_tensor.pop(
-                        0)]
-            # TODO: sync read back from device
-            # once model can keep executing steps on device
-            sampler_output = self._make_sampler_output(next_token_ids,
-                                                       model_input.seq_groups,
-                                                       logprob_data)
-            self._send_async_out(sampler_output,
-                                 model_input.async_callback,
-                                 is_first_step_output=(step_idx == 1))
+            sampler_output = self.cached_sampler_outputs.pop(0)
+            async_callback = model_input.async_callback
+            is_first_step_output = (step_idx == 1)
+            ctx = async_callback.keywords["ctx"]
+            ctx.append_output(outputs=[sampler_output],
+                            seq_group_metadata_list=ctx.seq_group_metadata_list,
+                            scheduler_outputs=ctx.scheduler_outputs,
+                            is_async=False,
+                            is_last_step=False,
+                            is_first_step_output=is_first_step_output)
+            async_callback()  # trigger output processor
         else:
             # trigger output processor in case last step was prefill
+            # i don't quite get this, 
             assert model_input.async_callback is not None
             model_input.async_callback()
 
@@ -692,10 +557,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
-        if self.sample_on_device_mode == "all" or (
-                self.sample_on_device_mode == "decode_only" and is_decode):
-            execute_model_kwargs[
-                "sampling_params"] = model_input.tt_sampling_params
         if model_input.cross_block_tables is not None:
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
@@ -742,7 +603,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self.cached_enc_dec_data[seq_id] = enc_dec_data
             else:
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
-        else:
+        else: #decode
             if self.model_config.is_encoder_decoder:
                 assert self.cached_enc_dec_data is not None
 
@@ -790,8 +651,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     ] + self.empty_slots,
                     dtype=torch.long,
                 )
-                if self.async_torch_proc:
-                    self.perm_table_tensor.append(perm_table_tensor)
 
                 assert perm_table_tensor.shape[
                     0] == self.scheduler_config.max_num_seqs
@@ -822,54 +681,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             tt_out = self.model.read_decode_output(
                 tt_out,
                 model_input.unpadded_batch_size,
-                is_tokens=(self.sample_on_device_mode is not None))
-            if self.async_torch_proc:
-                tt_out, read_event = tt_out
-            # If we are using async_torch_proc, we will permute after turning into torch tensor
-            if self.dp_kv_cache and not self.async_torch_proc:
+                is_tokens=False)
+            if self.dp_kv_cache:
                 tt_out = tt_out[perm_table_tensor]
 
-        # Note: for other devices, vLLM applies
-        # vllm.model_executor.layers.logits_processor::LogitsProcessor::
-        # _apply_logits_processors
-        # on logits, we don't use this
-        # Note: for other devices, vLLM applies
-        # vllm.model_executor.layers.sampler::Sampler for sampling tokens,
-        # we don't use this
-        logprob_data = None
+        sampler = get_sampler()
 
-        if not self.sample_on_device_mode or (
-                self.sample_on_device_mode == "decode_only" and not is_decode):
-            next_logits = tt_out[:model_input.unpadded_batch_size,
-                                 -1, :]  # unpadded batch, vocab of last token
-            next_token_ids, chosen_ranks = self._sample_tokens(
-                next_logits, model_input.tt_sampling_params)
-            if model_input.tt_sampling_params.logprobs is not None:
-                top_n_indices, top_n_logprobs, chosen_logprob = v1_logprobs(
-                    next_logits, model_input.tt_sampling_params.logprobs, next_token_ids)
-                logprob_data = TTLogprobData(chosen_ranks, chosen_logprob, top_n_indices, top_n_logprobs)
+        # TODO here we need to call the regular smampler with logit processors
+        next_logits = tt_out[:model_input.unpadded_batch_size,
+                                -1, :]  # unpadded batch, vocab of last token
 
-        else:
-            # decoding on device, tensors already contain tokens, logprobs not supported
-            if self.llama_tg:
-                next_token_ids = tt_out #this tensor might be in process of being copied to host, don't mess with it
-            else:
-                next_token_ids = tt_out[:model_input.unpadded_batch_size]
-        
-        if is_decode and self.async_torch_proc:
-            return next_token_ids, logprob_data, read_event
-        else:
-            return next_token_ids, logprob_data, None
 
-    def _sample_tokens(self, logits: torch.Tensor, tt_sampling_params: TTSamplingParams) -> Tuple[torch.Tensor, torch.Tensor]:
-        if tt_sampling_params.temperature == 0:  # greedy decoding
-            # in greedy decoding the chosen tokens are always rank 1, ranks are 1-indexed
-            chosen_tokens = torch.argmax(logits, dim=-1)
-            ranks = torch.ones_like(chosen_tokens)
-        else:  # top-k top-p sampling
-            chosen_tokens, ranks = top_pk_logits_efficient(
-                logits,
-                p=tt_sampling_params.top_p,
-                k=tt_sampling_params.top_k,
-                temperature=tt_sampling_params.temperature)
-        return chosen_tokens, ranks
+        return sampler_output
