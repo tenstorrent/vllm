@@ -65,7 +65,4 @@ class TTPlatform(Platform):
                 raise ValueError(
                     f"Currently not supporting prompt_logprobs on "
                     f"{cls.device_name}")
-            if params.guided_decoding is not None:
-                raise ValueError(
-                    f"Currently not supporting guided decoding on "
-                    f"{cls.device_name}")
+            # Structured output (guided decoding) is now supported!
