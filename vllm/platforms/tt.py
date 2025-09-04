@@ -46,6 +46,11 @@ class TTPlatform(Platform):
             parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
 
     @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        #logger.warning("Pin memory is not supported on CPU.")
+        return False
+
+    @classmethod
     def validate_request(
         cls,
         prompt: PromptType,

@@ -55,9 +55,9 @@ class TTModelInput(ModelRunnerInputBase):
     block_tables: torch.Tensor
     unpadded_batch_size: int
     sampling_params_list: List[Any] #TODO add proper type
-    sampling_metadata: Optional["SamplingMetadata"] = None
-    seq_lens: Optional[List[int]] = None
-    query_lens: Optional[List[int]] = None
+    sampling_metadata: Optional["SamplingMetadata"]
+    seq_lens: Optional[List[int]]
+    query_lens: Optional[List[int]]
     multi_modal_kwargs: Dict[str, Any]
     cross_block_tables: torch.Tensor
     is_first_multi_step: bool = True
@@ -453,7 +453,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
-            seq_groups_list=seq_groups_list,
+            seq_groups=seq_groups_list,
             block_tables=block_tables, unpadded_batch_size=unpadded_batch_size,
             sampling_params_list=sampling_params_list, multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=cross_block_tables,
@@ -720,7 +720,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Apply logits processing (including structured output filtering!)
         filtered_logits = self.logits_processor(
             lm_head=None,  # Ignored in our subclass
-            hidden_states_or_logits=tt_logits,  # Pass pre-computed logits
+            hidden_states=tt_logits,  # Pass pre-computed logits
             sampling_metadata=model_input.sampling_metadata
         )
 
