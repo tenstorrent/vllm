@@ -12,8 +12,9 @@ from transformers import TopPLogitsWarper
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.sampler import get_sampler
+from vllm.model_executor.layers.sampler import get_sampler, SamplerOutput
 from vllm.model_executor import SamplingMetadata
+from vllm.model_executor.layers.logits_processor import LogitsProcessor, _apply_logits_processors
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.model_executor.models import supports_multimodal
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
@@ -54,6 +55,9 @@ class TTModelInput(ModelRunnerInputBase):
     block_tables: torch.Tensor
     unpadded_batch_size: int
     sampling_params_list: List[Any] #TODO add proper type
+    sampling_metadata: Optional["SamplingMetadata"] = None
+    seq_lens: Optional[List[int]] = None
+    query_lens: Optional[List[int]] = None
     multi_modal_kwargs: Dict[str, Any]
     cross_block_tables: torch.Tensor
     is_first_multi_step: bool = True
@@ -70,6 +74,9 @@ class TTModelInput(ModelRunnerInputBase):
             "block_tables": self.block_tables,
             "unpadded_batch_size": self.unpadded_batch_size,
             "sampling_params_list": self.sampling_params_list,
+            "sampling_metadata": self.sampling_metadata,
+            "seq_lens": self.seq_lens,
+            "query_lens": self.query_lens,
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "cross_block_tables": self.cross_block_tables,
             "is_first_multi_step": self.is_first_multi_step,
@@ -85,34 +92,6 @@ class TTModelInput(ModelRunnerInputBase):
         attn_backend: Optional["AttentionBackend"] = None,
     ) -> "TTModelInput":
         return cls(**tensor_dict)
-
-
-def top_pk_logits_efficient(logits,
-                            p=0.9,
-                            k=10,
-                            temperature=1.0):
-    # Do not keep the entire vocab size after top k.
-    # Instead, keep the k size tensor and record the associated indices.
-    if k == -1:  # no top-k sampling
-        top_k_values, top_k_indices = logits, torch.arange(
-            logits.shape[-1]).unsqueeze(0).repeat(logits.shape[0], 1)
-    else:
-        top_k_values, top_k_indices = torch.topk(logits, k=k)
-    top_p_values = TopPLogitsWarper(top_p=p)(None, top_k_values) # does not change shape, but masks with -inf
-    probs = F.softmax(top_p_values / temperature, dim=-1)
-    probs = torch.nan_to_num(probs)  # convert nan to 0 to prevent error in multinomial
-    top_k_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    token = top_k_indices.gather(-1, top_k_id.unsqueeze(-1)).squeeze(-1)
-    return token, top_k_id + 1  # top_k_id is the rank of the selected token, 1-indexed
-
-def v1_logprobs(logits, num_logprobs, selected_token) -> List[Dict[int, float]]:
-    # v1 vLLM returns logprobs according to raw logits
-    # v0 had logprobs after penalties
-    # selected token is always included even if not in top num_logprobs
-    log_probs = torch.log_softmax(logits, dim=-1)
-    top_n_logprobs, top_n_indices = torch.topk(log_probs, num_logprobs, dim=-1)
-    selected_logprob = log_probs.gather(-1, selected_token.unsqueeze(-1)).squeeze(-1)
-    return top_n_indices, top_n_logprobs, selected_logprob
 
 
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
@@ -154,6 +133,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.model_config.uses_mrope:
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
+                
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -164,6 +144,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.model_config.is_encoder_decoder:
             self.max_cross_blocks = (self.model.max_cross_attn_tokens //
                                      self.cache_config.block_size)
+
+        # Initialize vLLM sampling components
+        vocab_size = self.model_config.get_vocab_size()
+        self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
+        #TODO we are banking on having our logits shaped correctly, as if they came froma regular vllm model
+        # and then got trimmed by the logitsprocessor. If we add prompt_logprobs or something,
+        # we need to subclass logitsprocessor and do the prune_hidden_states but on logits.
+        self.sampler = get_sampler()
 
         is_dp = (self.model_config.override_tt_config
                  and self.model_config.override_tt_config.get(
@@ -200,6 +188,30 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def get_model(self) -> nn.Module:
         return self.model
+        
+    def _compute_seq_lens_and_query_lens(self, seq_group_metadata_list, is_prompt):
+        """Compute seq_lens and query_lens needed for SamplingMetadata"""
+        seq_lens = []
+        query_lens = []
+        """
+        This is needed for sampling, because regular vllm models process flattened batches.
+        seq_len means how many tokens are in teh sequence in total,
+        query lens means how many tokens are newly being processed,
+        and are contained in the output logits.
+        """
+        for seq_group_metadata in seq_group_metadata_list:
+            for seq_id, seq_data in seq_group_metadata.seq_data.items():
+                if is_prompt:
+                    seq_len = seq_data.get_len()
+                    query_len = seq_len
+                else:
+                    seq_len = seq_data.get_len()
+                    query_len = 1
+                
+                seq_lens.append(seq_len)
+                query_lens.append(query_len)
+        
+        return seq_lens, query_lens
 
     def make_model_input_from_broadcasted_tensor_dict(
         self,
@@ -422,18 +434,33 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 del self.seq_groups_to_batch_slot[req]
 
 
-        # prepare sampling metadata
-        sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
-                                                     model_input.seq_lens,
-                                                     model_input.query_lens,
-                                                     self.device,
-                                                     pin_memory=False,
-                                                     generators=generators)
+        # Compute seq_lens and query_lens
+        seq_lens, query_lens = self._compute_seq_lens_and_query_lens(
+            seq_group_metadata_list, is_prompt)
 
-        return TTModelInput(input_tokens, input_positions, prompt_lens,
-                            seq_groups_list, block_tables, unpadded_batch_size,
-                            sampling_params_list, multi_modal_kwargs,
-                            cross_block_tables)
+        # Build sampling metadata
+        generators = self.get_generators(finished_requests_ids)
+        sampling_metadata = SamplingMetadata.prepare(
+            seq_group_metadata_list,
+            seq_lens,
+            query_lens,
+            "cpu",
+            pin_memory=False,
+            generators=generators
+        )
+
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=prompt_lens,
+            seq_groups_list=seq_groups_list,
+            block_tables=block_tables, unpadded_batch_size=unpadded_batch_size,
+            sampling_params_list=sampling_params_list, multi_modal_kwargs=multi_modal_kwargs,
+            cross_block_tables=cross_block_tables,
+            sampling_metadata=sampling_metadata,
+            seq_lens=seq_lens,
+            query_lens=query_lens
+        )
 
     @torch.no_grad()
     def execute_model(
@@ -472,7 +499,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     use_async_out_proc,
                     step_idx=i)
                 self.cached_sampler_outputs.append(sampler_outputs)
-                next_token_ids = get_next_token_ids(sampler_outputs) #TODO IMPLEMENT
+                next_token_ids = self._get_next_token_ids(sampler_outputs)
                 if i < num_steps - 1:
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
@@ -602,7 +629,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     }
                     self.cached_enc_dec_data[seq_id] = enc_dec_data
             else:
-                tt_out = outputs  # [batch_size, seq_len, vocab_size]
+                tt_out = outputs  # [batch_size, 1, vocab_size]
         else: #decode
             if self.model_config.is_encoder_decoder:
                 assert self.cached_enc_dec_data is not None
@@ -685,11 +712,30 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.dp_kv_cache:
                 tt_out = tt_out[perm_table_tensor]
 
-        sampler = get_sampler()
+        # TT model already produced logits
+        tt_logits = tt_out[:model_input.unpadded_batch_size, -1, :]  # [unpadded batch, vocab]
+        #This is coincidentally the same shape as the logits we would get from a regular vllm model,
+        # assuming we have no prompt logprobs, and one sequence per group.
 
-        # TODO here we need to call the regular smampler with logit processors
-        next_logits = tt_out[:model_input.unpadded_batch_size,
-                                -1, :]  # unpadded batch, vocab of last token
+        # Apply logits processing (including structured output filtering!)
+        filtered_logits = self.logits_processor(
+            lm_head=None,  # Ignored in our subclass
+            hidden_states_or_logits=tt_logits,  # Pass pre-computed logits
+            sampling_metadata=model_input.sampling_metadata
+        )
 
+        # Sample tokens using standard vLLM sampler
+        sampler_output = self.sampler(
+            logits=filtered_logits,
+            sampling_metadata=model_input.sampling_metadata
+        )
 
         return sampler_output
+        
+    def _get_next_token_ids(self, sampler_output: SamplerOutput) -> torch.Tensor:
+        """Extract next token IDs from sampler output."""
+        next_token_ids = []
+        for seq_group_output in sampler_output.outputs:
+            for seq_output in seq_group_output.samples:
+                next_token_ids.append(seq_output.output_token)
+        return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
