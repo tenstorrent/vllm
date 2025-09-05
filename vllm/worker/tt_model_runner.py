@@ -690,7 +690,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         )
                     }
             else:
-                tt_out = outputs  # [batch_size, seq_len, vocab_size]
+                # [ batch_size] if sampling on device
+                # [ batch_size, len, vocab_size] if not sampling on device
+                # the logits are not guaranteed to be for the whole sequence, usually only last token.
+                tt_out = outputs
         else:
             if self.model_config.is_encoder_decoder:
                 assert self.cached_req_data
