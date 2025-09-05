@@ -151,7 +151,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         # whether to use ttnn tracing for model execution,
         # TODO: make this configurable
-        self.trace_mode = True
+        self.trace_mode = False
 
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=vllm_config,
