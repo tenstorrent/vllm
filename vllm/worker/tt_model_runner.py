@@ -806,10 +806,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 next_token_ids = tt_out
             else:
                 next_token_ids = tt_out[:model_input.unpadded_batch_size]
-        if not is_decode or not self.async_torch_proc:
-            return next_token_ids
-        else: # async torch proc only works in decode
+        if is_decode and self.async_torch_proc: # async torch proc only works in decode
             return tt_out, read_event
+        else:
+            return next_token_ids
+            
 
     def _sample_tokens(self, logits, tt_sampling_params: TTSamplingParams):
         if tt_sampling_params.temperature == 0:  # greedy decoding
