@@ -102,7 +102,7 @@ def get_sample_multi_modal_llama_inputs():
     return inputs
 
 
-def get_sample_multi_modal_inputs(model: str):
+def get_sample_multi_modal_inputs(model: str, multi_image: bool):
     """
     Build sample multi-modal inputs for vision-language models.
     Currently supports Qwen2.5-VL and Gemma-3.
@@ -116,28 +116,51 @@ def get_sample_multi_modal_inputs(model: str):
     text_prompts = []
     imgs = []
 
-    # Example data
-    questions = ["Describe this image.", "What is the capital of France?"]
-    img_refs = [
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-        None
-    ]
+    if not multi_image:
+        # Example data
+        questions = ["Describe this image.", "What is the capital of France?"]
+        img_refs = [
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+            None
+        ]
+        # Build chat-style prompts
+        prompts = [[{
+            "role":
+            "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": img_ref
+                },
+                {
+                    "type": "text",
+                    "text": question
+                },
+            ],
+        }] for img_ref, question in zip(img_refs, questions)]
+    else:
+        # Example data
+        question = "Compare these images."
+        img_refs = [
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.jpeg",
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.png",
+        ]
+        prompt = {
+            "role": "user",
+            "content": []
+        }
 
-    # Build chat-style prompts
-    prompts = [[{
-        "role":
-        "user",
-        "content": [
-            {
+        for img_ref in img_refs:
+            prompt["content"].append({
                 "type": "image",
                 "image": img_ref
-            },
-            {
-                "type": "text",
-                "text": question
-            },
-        ],
-    }] for img_ref, question in zip(img_refs, questions)]
+            })
+        prompt["content"].append({
+            "type": "text",
+            "text": question
+        })
+
+        prompts = [[prompt]]
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
@@ -150,16 +173,17 @@ def get_sample_multi_modal_inputs(model: str):
 
         image_inputs = None
         if "Qwen2.5-VL" in model:
+            assert multi_image == False, "Multi-image inputs not supported yet for Qwen2.5-VL"
             # Lazy import only when needed
             from qwen_vl_utils import process_vision_info
             image_inputs, video_inputs = process_vision_info(prompt)
             assert video_inputs is None, "Video inputs not supported yet"
+            image_inputs = image_inputs[0]
         elif "gemma-3" in model:
             image_inputs = [
                 ctnt["image"] for entry in prompt for ctnt in entry["content"]
                 if ctnt["type"] == "image"
             ]
-
             image_inputs = [
                 PIL_Image.open(requests.get(image_url, stream=True).raw)
                 if image_url is not None else None
@@ -170,8 +194,7 @@ def get_sample_multi_modal_inputs(model: str):
                 f"Multi-modal preprocessing not implemented for model: {model}"
             )
 
-        assert len(image_inputs) == 1, "Multi-image inputs not supported yet"
-        imgs.append(image_inputs[0])
+        imgs.append(image_inputs)
         text_prompts.append(chat_prompt)
 
     # Pack inputs
@@ -273,6 +296,7 @@ def run_inference(
         num_scheduler_steps=10,
         disable_async_output_proc=False,
         multi_modal=False,
+        multi_image=False,
         test_increasing_seq_lens=False,
         override_tt_config=None,
         max_model_len=None,
@@ -346,7 +370,7 @@ def run_inference(
             if "Llama-3.2" in model:
                 prompts = get_sample_multi_modal_llama_inputs()
             elif any(name in model for name in ["Qwen2.5-VL", "gemma"]):
-                prompts = get_sample_multi_modal_inputs(model)
+                prompts = get_sample_multi_modal_inputs(model, multi_image)
             else:
                 raise ValueError(
                     f"Unsupported model for multi-modal inference test: {model}"
@@ -571,7 +595,10 @@ if __name__ == "__main__":
                         help="Number of scheduler steps")
     parser.add_argument("--multi_modal",
                         action="store_true",
-                        help="Run multi-modal inference with Llama3.2-11b")
+                        help="Run multi-modal inference (vision + text)")
+    parser.add_argument("--multi_image",
+                        action="store_true",
+                        help="Run multi-image inference")
     parser.add_argument("--test_increasing_seq_lens",
                         action="store_true",
                         help="Test generations of small to large sequences")
@@ -603,6 +630,7 @@ if __name__ == "__main__":
         num_scheduler_steps=args.num_scheduler_steps,
         disable_async_output_proc=args.disable_async_output_proc,
         multi_modal=args.multi_modal,
+        multi_image=args.multi_image,
         test_increasing_seq_lens=args.test_increasing_seq_lens,
         override_tt_config=args.override_tt_config,
         max_model_len=args.max_model_len,
