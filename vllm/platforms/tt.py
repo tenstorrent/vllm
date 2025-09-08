@@ -46,6 +46,11 @@ class TTPlatform(Platform):
             parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
 
     @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        # The sampling code tries to use pinned memory in case we're using GPUs.
+        return False
+
+    @classmethod
     def validate_request(
         cls,
         prompt: PromptType,
@@ -61,14 +66,7 @@ class TTPlatform(Platform):
             if params.best_of is not None:
                 raise ValueError(
                     f"Currently not supporting best_of on {cls.device_name}")
-            if params.logprobs is not None:
-                raise ValueError(
-                    f"Currently not supporting logprobs on {cls.device_name}")
             if params.prompt_logprobs is not None:
                 raise ValueError(
                     f"Currently not supporting prompt_logprobs on "
-                    f"{cls.device_name}")
-            if params.guided_decoding is not None:
-                raise ValueError(
-                    f"Currently not supporting guided decoding on "
                     f"{cls.device_name}")

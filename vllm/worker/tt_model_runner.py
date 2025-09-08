@@ -12,7 +12,9 @@ from transformers import TopPLogitsWarper
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor import SamplingMetadata
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.model_executor.models import supports_multimodal
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
@@ -44,7 +46,9 @@ class TTModelInput(ModelRunnerInputBase):
     seq_groups: List[int]
     block_tables: torch.Tensor
     unpadded_batch_size: int
-    tt_sampling_params: TTSamplingParams
+    tt_sampling_params: Optional[TTSamplingParams]
+    sampling_params_list: Optional[List[Any]]
+    sampling_metadata: Optional["SamplingMetadata"]
     multi_modal_kwargs: Dict[str, Any]
     cross_block_tables: torch.Tensor
     is_first_multi_step: bool = True
@@ -61,6 +65,8 @@ class TTModelInput(ModelRunnerInputBase):
             "block_tables": self.block_tables,
             "unpadded_batch_size": self.unpadded_batch_size,
             "tt_sampling_params": self.tt_sampling_params,
+            "sampling_params_list": self.sampling_params_list,
+            "sampling_metadata": self.sampling_metadata,
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "cross_block_tables": self.cross_block_tables,
             "is_first_multi_step": self.is_first_multi_step,
@@ -153,6 +159,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
 
+        self.compat_sampling = False
+        if override_tt_config is not None and "compat_sampling" in override_tt_config:
+            logger.info("Compatibility sampling mode enabled")
+            self.compat_sampling = override_tt_config["compat_sampling"]
+            assert self.compat_sampling in [True, False], "compat_sampling must be a boolean"
+        if self.compat_sampling:
+            if self.sample_on_device_mode is not None:
+                raise ValueError("Compatibility sampling mode only works with sample_on_device_mode=None")
+        
+
     def load_model(self) -> None:
         # Note: using custom TT loader
         # instead of selecting from default vllm loaders
@@ -193,6 +209,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.cached_read_events: List[List[Any]] = [
                 ]  # Only used for multi-step execution
                 self.perm_table_tensor: List[torch.Tensor] = []
+        
+        if self.compat_sampling:
+            vocab_size = self.model_config.get_vocab_size()
+            self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
+            #TODO we are banking on having our logits shaped correctly, as if they came froma regular vllm model
+            # and then got trimmed by the logitsprocessor. If we add prompt_logprobs or something,
+            # we need to subclass logitsprocessor and do the prune_hidden_states but on logits.
+            self.sampler = get_sampler()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -225,6 +249,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         prompt_lens_list: List[int] = []
         block_tables_list: List[List[int]] = []
         seq_groups_list: List[int] = []
+        sampling_params_list = []
         top_pk_sampling_params: Dict[str, Any] = {}
         multi_modal_kwargs: Dict[str, Any] = {}
         if supports_multimodal(self.model) and is_prompt:
@@ -291,39 +316,63 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 cross_block_table = seq_group_metadata.cross_block_table
                 cross_block_tables_list.append(cross_block_table)
 
-            # Sampling params
-            # TODO: Add support for different sampling params in the same batch
             sampling_params = seq_group_metadata.sampling_params
-            if len(top_pk_sampling_params) == 0:
-                top_pk_sampling_params[
-                    "temperature"] = sampling_params.temperature
-                top_pk_sampling_params["top_k"] = sampling_params.top_k
-                top_pk_sampling_params["top_p"] = sampling_params.top_p
+            if self.compat_sampling:
+                sampling_params_list.append(sampling_params)
             else:
-                if (top_pk_sampling_params["temperature"]
-                        != sampling_params.temperature):
-                    logger.warning(
-                        "Currently only supporting same temperature for all "
-                        "sequences in batch, falling back to first sequence's "
-                        "temperature (%s)",
-                        top_pk_sampling_params['temperature'])
-                if top_pk_sampling_params["top_k"] != sampling_params.top_k:
-                    logger.warning(
-                        "Currently only supporting same top_k"
-                        "for all sequences in batch, "
-                        "falling back to first sequence's top_k (%s)",
-                        top_pk_sampling_params['top_k'])
-                if top_pk_sampling_params["top_p"] != sampling_params.top_p:
-                    logger.warning(
-                        "Currently only supporting same top_p"
-                        "for all sequences in batch, "
-                        "falling back to first sequence's top_p (%s)",
-                        top_pk_sampling_params['top_p'])
+                # unfortunately we cannot validate in platforms/tt.py, as we dont know if compat sampling is enabled
+                # this means we crash instead of gently returning an error
+                if (sampling_params.presence_penalty != 0.0
+                    or sampling_params.frequency_penalty != 0.0
+                    or sampling_params.repetition_penalty != 1.0
+                    or sampling_params.min_p != 0.0
+                    or sampling_params.bad_words != None
+                    or sampling_params.logprobs != None
+                    or sampling_params.prompt_logprobs != None
+                    or sampling_params.logits_processors != None
+                    or sampling_params.truncate_prompt_tokens != None
+                    or sampling_params.guided_decoding != None
+                    or sampling_params.logit_bias != None
+                    or sampling_params.allowed_token_ids != None):
+                    assert False, "Sampling params beyond temperature, top_k, top_p require enabling compatibility sampling mode " \
+                                   r'Pass --override_tt_config "{\"compat_sampling\": true}" to enable compatibility sampling mode.'
 
-        tt_sampling_params = TTSamplingParams(
-            temperature=top_pk_sampling_params["temperature"],
-            top_k=top_pk_sampling_params["top_k"],
-            top_p=top_pk_sampling_params["top_p"])
+
+                # TODO: Add support for different sampling params in the same batch
+                if len(top_pk_sampling_params) == 0:
+                    top_pk_sampling_params[
+                        "temperature"] = sampling_params.temperature
+                    top_pk_sampling_params["top_k"] = sampling_params.top_k
+                    top_pk_sampling_params["top_p"] = sampling_params.top_p
+                else:
+                    if (top_pk_sampling_params["temperature"]
+                            != sampling_params.temperature):
+                        logger.warning(
+                            "Currently only supporting same temperature for all "
+                            "sequences in batch, falling back to first sequence's "
+                            "temperature (%s)",
+                            top_pk_sampling_params['temperature'])
+                    if top_pk_sampling_params["top_k"] != sampling_params.top_k:
+                        logger.warning(
+                            "Currently only supporting same top_k"
+                            "for all sequences in batch, "
+                            "falling back to first sequence's top_k (%s)",
+                            top_pk_sampling_params['top_k'])
+                    if top_pk_sampling_params["top_p"] != sampling_params.top_p:
+                        logger.warning(
+                            "Currently only supporting same top_p"
+                            "for all sequences in batch, "
+                            "falling back to first sequence's top_p (%s)",
+                            top_pk_sampling_params['top_p'])
+
+        if self.compat_sampling:
+            tt_sampling_params = None
+        else:
+
+            tt_sampling_params = TTSamplingParams(
+                temperature=top_pk_sampling_params["temperature"],
+                top_k=top_pk_sampling_params["top_k"],
+                top_p=top_pk_sampling_params["top_p"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -449,10 +498,31 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
 
-        return TTModelInput(input_tokens, input_positions, prompt_lens,
-                            seq_groups_list, block_tables, unpadded_batch_size,
-                            tt_sampling_params, multi_modal_kwargs,
-                            cross_block_tables)
+        if self.compat_sampling:
+            seq_lens, query_lens = self._compute_seq_lens_and_query_lens(seq_group_metadata_list, is_prompt)
+            generators = self.get_generators(finished_requests_ids)
+            sampling_metadata = SamplingMetadata.prepare(
+                seq_group_metadata_list,
+                seq_lens,
+                query_lens,
+                "cpu",
+                pin_memory=False,
+                generators=generators
+            )
+        else:
+            sampling_metadata = None
+
+        return TTModelInput(input_tokens=input_tokens,
+                            input_positions=input_positions,
+                            prompt_lens=prompt_lens,
+                            seq_groups=seq_groups_list,
+                            block_tables=block_tables,
+                            unpadded_batch_size=unpadded_batch_size,
+                            tt_sampling_params=tt_sampling_params,
+                            sampling_params_list=sampling_params_list,
+                            sampling_metadata=sampling_metadata,
+                            multi_modal_kwargs=multi_modal_kwargs,
+                            cross_block_tables=cross_block_tables)
 
     @torch.no_grad()
     def execute_model(
@@ -476,6 +546,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert num_steps == 1, "Num steps must be 1 for prefill"
         # always true if not using multi-step
         if model_input.is_first_multi_step:
+            # This is a queue of torch tensor with step outputs - full sampler outputs for compat mode, ttnn tensors in flight for async_torch_proc, or torch tensors otherwise.
+            # If we do async output processing, the queue is consumed by _send_prev_step_async_out, except the last step
+            # If not, we consume the whole queue after executing the last step.
             self.cached_step_outputs = []
             if is_decode:
                 self.cached_read_events = []
@@ -491,6 +564,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
                 if (i < num_steps - 1 and not self.sample_on_device_mode):
+                    if self.compat_sampling:
+                        # For now, this will only get called if we explicitly enable compat sampling
+                        # Most cases where we want to use compat sampling are not compatible with multistep
+                        next_token_ids = self._get_next_token_ids_from_sampler_output(next_token_ids)
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
                     if new_input_tokens.shape[
@@ -526,19 +603,23 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.is_last_step:  # always true if not using multi-step
             num_outputs = len(self.cached_step_outputs)
             if use_async_out_proc:
+                # The queue should be getting consumed by _send_prev_step_async_out
                 # the last step should have 1 output unless we have
                 # scheduled less than self.scheduler_config.num_lookahead_slots
                 # + 1 steps in which case there will be 0 outputs
                 assert num_outputs <= 1, (
                     "Last step should have at most one output")
             for i in range(num_outputs):
-                next_token_ids = self.cached_step_outputs.pop(0)
-                if is_decode and self.async_torch_proc:
-                    next_token_ids = self._complete_torch_async_proc(next_token_ids)
-                # TODO: sync read back from device
-                # once model can keep executing steps on device
-                sampler_output = self._make_sampler_output(
-                    next_token_ids, model_input.seq_groups)
+                if self.compat_sampling:
+                    sampler_output = self.cached_step_outputs.pop(0)
+                else:
+                    next_token_ids = self.cached_step_outputs.pop(0)
+                    if is_decode and self.async_torch_proc:
+                        next_token_ids = self._complete_torch_async_proc(next_token_ids)
+                    # TODO: sync read back from device
+                    # once model can keep executing steps on device
+                    sampler_output = self._make_sampler_output(
+                        next_token_ids, model_input.seq_groups)
                 sampler_outputs.append(sampler_output)
 
         return sampler_outputs
@@ -590,13 +671,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         if step_idx > 0:
-            next_token_ids = self.cached_step_outputs.pop(0)
-            if self.async_torch_proc:
-                next_token_ids = self._complete_torch_async_proc(next_token_ids)
-            # TODO: sync read back from device
-            # once model can keep executing steps on device
-            sampler_output = self._make_sampler_output(next_token_ids,
-                                                       model_input.seq_groups)
+            step_output = self.cached_step_outputs.pop(0)
+            if self.compat_sampling:
+                sampler_output = step_output
+            else:
+                next_token_ids = step_output
+                if self.async_torch_proc:
+                    next_token_ids = self._complete_torch_async_proc(next_token_ids)
+                # TODO: sync read back from device
+                # once model can keep executing steps on device
+                sampler_output = self._make_sampler_output(next_token_ids,
+                                                        model_input.seq_groups)
             self._send_async_out(sampler_output,
                                  model_input.async_callback,
                                  is_first_step_output=(step_idx == 1))
@@ -689,7 +774,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # the logits are not guaranteed to be for the whole sequence,
                 # usually only last token.
                 tt_out = outputs
-        else:
+        else: #decode
             if self.model_config.is_encoder_decoder:
                 assert self.cached_req_data
 
@@ -785,30 +870,43 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.dp_kv_cache and not self.async_torch_proc:
                 tt_out = tt_out[perm_table_tensor]
 
-        # Note: for other devices, vLLM applies
-        # vllm.model_executor.layers.logits_processor::LogitsProcessor::
-        # _apply_logits_processors
-        # on logits, we don't use this
-        # Note: for other devices, vLLM applies
-        # vllm.model_executor.layers.sampler::Sampler for sampling tokens,
-        # we don't use this
-        if not self.sample_on_device_mode or (
-                self.sample_on_device_mode == "decode_only" and not is_decode):
-            next_logits = tt_out[:model_input.unpadded_batch_size,
-                                 -1, :]  # unpadded batch, vocab of last token
-            next_token_ids = self._sample_tokens(
-                next_logits, model_input.tt_sampling_params)
-        else:  # sample on device
-            if self.async_torch_proc:
-                # do not slice as this may be mid-transfer to host
-                next_token_ids = tt_out
-            else:
-                next_token_ids = tt_out[:model_input.unpadded_batch_size]
-        if is_decode and self.async_torch_proc:
-            # async torch proc only works in decode
-            return tt_out, read_event
+        if self.compat_sampling:
+            tt_logits = tt_out[:model_input.unpadded_batch_size, -1, :]  # [unpadded batch, vocab]
+            #This is coincidentally the same shape as the logits we would get from a regular vllm model,
+            # assuming we have no prompt logprobs, and one sequence per group.
+
+            # Apply logits processing (including structured output filtering!)
+            filtered_logits = self.logits_processor(
+                lm_head=None,  # Ignored in our subclass
+                hidden_states=tt_logits,  # Pass pre-computed logits
+                sampling_metadata=model_input.sampling_metadata
+            )
+
+            # Sample tokens using standard vLLM sampler
+            sampler_output = self.sampler(
+                logits=filtered_logits,
+                sampling_metadata=model_input.sampling_metadata
+            )
+
+            return sampler_output
         else:
-            return next_token_ids
+            if not self.sample_on_device_mode or (
+                    self.sample_on_device_mode == "decode_only" and not is_decode):
+                next_logits = tt_out[:model_input.unpadded_batch_size,
+                                    -1, :]  # unpadded batch, vocab of last token
+                next_token_ids = self._sample_tokens(
+                    next_logits, model_input.tt_sampling_params)
+            else:  # sample on device
+                if self.async_torch_proc:
+                    # do not slice as this may be mid-transfer to host
+                    next_token_ids = tt_out
+                else:
+                    next_token_ids = tt_out[:model_input.unpadded_batch_size]
+            if is_decode and self.async_torch_proc:
+                # async torch proc only works in decode
+                return tt_out, read_event
+            else:
+                return next_token_ids
 
     def _sample_tokens(self, logits, tt_sampling_params: TTSamplingParams):
         if tt_sampling_params.temperature == 0:  # greedy decoding
@@ -819,3 +917,36 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 p=tt_sampling_params.top_p,
                 k=tt_sampling_params.top_k,
                 temperature=tt_sampling_params.temperature)
+
+    @staticmethod
+    def _compute_seq_lens_and_query_lens(seq_group_metadata_list, is_prompt):
+        """Compute seq_lens and query_lens needed for SamplingMetadata
+
+        This is needed for the compat sampling mode, because regular vllm models process flattened batches.
+        seq_len means how many tokens are in the sequence in total,
+        query lens means how many tokens are newly being processed,
+        and are contained in the output logits.
+        """
+        seq_lens = []
+        query_lens = []
+        for seq_group_metadata in seq_group_metadata_list:
+            for seq_id, seq_data in seq_group_metadata.seq_data.items():
+                if is_prompt:
+                    seq_len = seq_data.get_len()
+                    query_len = seq_len
+                else:
+                    seq_len = seq_data.get_len()
+                    query_len = 1
+
+                seq_lens.append(seq_len)
+                query_lens.append(query_len)
+
+        return seq_lens, query_lens        
+
+    def _get_next_token_ids_from_sampler_output(self, sampler_output: SamplerOutput) -> torch.Tensor:
+        """Extract next token IDs from sampler output."""
+        next_token_ids = []
+        for seq_group_output in sampler_output.outputs:
+            for seq_output in seq_group_output.samples:
+                next_token_ids.append(seq_output.output_token)
+        return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
