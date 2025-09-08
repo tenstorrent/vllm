@@ -411,7 +411,10 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def __del__(self):
         # Delete model runner first in case there are model arifacts
-        del self.model_runner
+        try:
+            del self.model_runner
+        except AttributeError:
+            pass #attributes may be already torn down when destructor is called
 
         if self.mesh_device:
             close_mesh_device(self.mesh_device,
