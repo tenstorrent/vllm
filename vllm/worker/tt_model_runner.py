@@ -534,16 +534,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for i in range(num_outputs):
                 next_token_ids = self.cached_step_outputs.pop(0)
                 if is_decode and self.async_torch_proc:
-                    read_events = self.cached_read_events.pop(0)
-                    for event in read_events:
-                        ttnn.event_synchronize(event)
-                    next_token_ids = self.model.process_decode_output_host(
-                        next_token_ids,
-                        is_tokens=(self.sample_on_device_mode is not None))
-                    if self.dp_kv_cache:
-                        # permute the tt_out
-                        next_token_ids = next_token_ids[
-                            self.perm_table_tensor.pop(0)]
+                    next_token_ids = self._complete_torch_async_proc(next_token_ids)
                 # TODO: sync read back from device
                 # once model can keep executing steps on device
                 sampler_output = self._make_sampler_output(
@@ -551,6 +542,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_outputs.append(sampler_output)
 
         return sampler_outputs
+
+    def _complete_torch_async_proc(self, next_token_ids):
+        read_events = self.cached_read_events.pop(0)
+        for event in read_events:
+            ttnn.event_synchronize(event)
+        next_token_ids = self.model.process_decode_output_host(
+            next_token_ids,
+            is_tokens=(self.sample_on_device_mode is not None))
+        if self.dp_kv_cache:
+            # permute the tt_out
+            next_token_ids = next_token_ids[
+                self.perm_table_tensor.pop(0)]
+        return next_token_ids
 
     def _send_async_out(self, sampler_output, async_callback,
                         is_first_step_output):
@@ -588,16 +592,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if step_idx > 0:
             next_token_ids = self.cached_step_outputs.pop(0)
             if self.async_torch_proc:
-                read_events = self.cached_read_events.pop(0)
-                for event in read_events:
-                    ttnn.event_synchronize(event)
-                next_token_ids = self.model.process_decode_output_host(
-                    next_token_ids,
-                    is_tokens=(self.sample_on_device_mode is not None))
-                if self.dp_kv_cache:
-                    # permute the tt_out
-                    next_token_ids = next_token_ids[self.perm_table_tensor.pop(
-                        0)]
+                next_token_ids = self._complete_torch_async_proc(next_token_ids)
             # TODO: sync read back from device
             # once model can keep executing steps on device
             sampler_output = self._make_sampler_output(next_token_ids,
