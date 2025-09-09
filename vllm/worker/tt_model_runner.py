@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union, cast
 
 import torch
 import torch.nn as nn
@@ -933,6 +933,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                   and not is_decode):
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
                 # unpadded batch, vocab of last token
+                assert model_input.tt_sampling_params is not None
                 next_token_ids = self._sample_tokens(
                     next_logits, model_input.tt_sampling_params)
             else:  # sample on device
