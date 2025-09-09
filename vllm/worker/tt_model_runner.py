@@ -48,6 +48,7 @@ class TTModelInput(ModelRunnerInputBase):
     unpadded_batch_size: int
     tt_sampling_params: Optional[TTSamplingParams]
     sampling_params_list: Optional[List[Any]]
+    compat_sampling_used: bool
     sampling_metadata: Optional["SamplingMetadata"]
     multi_modal_kwargs: Dict[str, Any]
     cross_block_tables: torch.Tensor
@@ -66,6 +67,7 @@ class TTModelInput(ModelRunnerInputBase):
             "unpadded_batch_size": self.unpadded_batch_size,
             "tt_sampling_params": self.tt_sampling_params,
             "sampling_params_list": self.sampling_params_list,
+            "compat_sampling_used": self.compat_sampling_used,
             "sampling_metadata": self.sampling_metadata,
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "cross_block_tables": self.cross_block_tables,
@@ -159,14 +161,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
 
-        self.compat_sampling = False
+        self.compat_sampling_possible = True if (self.sample_on_device_mode is None) else False
+        self.always_compat_sampling = False
         if override_tt_config is not None and "compat_sampling" in override_tt_config:
-            logger.info("Compatibility sampling mode enabled")
-            self.compat_sampling = override_tt_config["compat_sampling"]
-            assert self.compat_sampling in [True, False], "compat_sampling must be a boolean"
-        if self.compat_sampling:
-            if self.sample_on_device_mode is not None:
-                raise ValueError("Compatibility sampling mode only works with sample_on_device_mode=None")
+            logger.info("Compatibility sampling mode enabled for all requests")
+            self.always_compat_sampling = override_tt_config["compat_sampling"]
+            assert self.always_compat_sampling in [True, False], "compat_sampling must be a boolean"
+        if self.always_compat_sampling and not self.compat_sampling_possible:
+            raise ValueError("Compatibility sampling mode only works with sample_on_device_mode=None")
         
 
     def load_model(self) -> None:
@@ -210,7 +212,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 ]  # Only used for multi-step execution
                 self.perm_table_tensor: List[torch.Tensor] = []
         
-        if self.compat_sampling:
+        if self.compat_sampling_possible:
             vocab_size = self.model_config.get_vocab_size()
             self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
             #TODO we are banking on having our logits shaped correctly, as if they came froma regular vllm model
@@ -226,6 +228,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         tensor_dict: Dict[str, Any],
     ) -> TTModelInput:
         return TTModelInput.from_broadcasted_tensor_dict(tensor_dict, )
+
+    @staticmethod
+    def compat_sampling_required(sampling_params) -> bool:
+        # unfortunately we cannot validate in platforms/tt.py, as we dont know if compat sampling is enabled
+        # this means we crash instead of gently returning an error
+        return (sampling_params.presence_penalty != 0.0
+                or sampling_params.frequency_penalty != 0.0
+                or sampling_params.repetition_penalty != 1.0
+                or sampling_params.min_p != 0.0
+                or (sampling_params.bad_words != None and len(sampling_params.bad_words) > 0)
+                or sampling_params.logprobs != None
+                or sampling_params.prompt_logprobs != None
+                or sampling_params.logits_processors != None
+                or sampling_params.truncate_prompt_tokens != None
+                or sampling_params.guided_decoding != None
+                or sampling_params.logit_bias != None
+                or sampling_params.allowed_token_ids != None)
+
 
     def prepare_model_input(
             self,
@@ -261,6 +281,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for req_id in finished_requests_ids:
                 finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
                 del self.req_id_to_seq_id[req_id]
+
+        compat_sampling_used = False
+        if self.always_compat_sampling:
+            compat_sampling_used = True
+        else:
+            for seq_group_metadata in seq_group_metadata_list:
+                sampling_params = seq_group_metadata.sampling_params
+                if self.compat_sampling_required(sampling_params):
+                    if not self.compat_sampling_possible:
+                        raise ValueError("Sampling params beyond temperature, top_k, top_p require compatibility sampling mode"
+                                        " which is only available with sample_on_device_mode=None")
+                    compat_sampling_used = True
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -317,27 +349,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 cross_block_tables_list.append(cross_block_table)
 
             sampling_params = seq_group_metadata.sampling_params
-            if self.compat_sampling:
+            if compat_sampling_used:
                 sampling_params_list.append(sampling_params)
             else:
-                # unfortunately we cannot validate in platforms/tt.py, as we dont know if compat sampling is enabled
-                # this means we crash instead of gently returning an error
-                if (sampling_params.presence_penalty != 0.0
-                    or sampling_params.frequency_penalty != 0.0
-                    or sampling_params.repetition_penalty != 1.0
-                    or sampling_params.min_p != 0.0
-                    or sampling_params.bad_words != None
-                    or sampling_params.logprobs != None
-                    or sampling_params.prompt_logprobs != None
-                    or sampling_params.logits_processors != None
-                    or sampling_params.truncate_prompt_tokens != None
-                    or sampling_params.guided_decoding != None
-                    or sampling_params.logit_bias != None
-                    or sampling_params.allowed_token_ids != None):
-                    assert False, "Sampling params beyond temperature, top_k, top_p require enabling compatibility sampling mode " \
-                                   r'Pass --override_tt_config "{\"compat_sampling\": true}" to enable compatibility sampling mode.'
-
-
                 # TODO: Add support for different sampling params in the same batch
                 if len(top_pk_sampling_params) == 0:
                     top_pk_sampling_params[
@@ -365,10 +379,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             "falling back to first sequence's top_p (%s)",
                             top_pk_sampling_params['top_p'])
 
-        if self.compat_sampling:
+        if compat_sampling_used:
             tt_sampling_params = None
         else:
-
             tt_sampling_params = TTSamplingParams(
                 temperature=top_pk_sampling_params["temperature"],
                 top_k=top_pk_sampling_params["top_k"],
@@ -498,7 +511,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
 
-        if self.compat_sampling:
+        if compat_sampling_used:
             seq_lens, query_lens = self._compute_seq_lens_and_query_lens(seq_group_metadata_list, is_prompt)
             generators = self.get_generators(finished_requests_ids)
             sampling_metadata = SamplingMetadata.prepare(
@@ -520,6 +533,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             unpadded_batch_size=unpadded_batch_size,
                             tt_sampling_params=tt_sampling_params,
                             sampling_params_list=sampling_params_list,
+                            compat_sampling_used=compat_sampling_used,
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
                             cross_block_tables=cross_block_tables)
@@ -564,7 +578,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
                 if (i < num_steps - 1 and not self.sample_on_device_mode):
-                    if self.compat_sampling:
+                    if model_input.compat_sampling_used:
                         # For now, this will only get called if we explicitly enable compat sampling
                         # Most cases where we want to use compat sampling are not compatible with multistep
                         next_token_ids = self._get_next_token_ids_from_sampler_output(next_token_ids)
@@ -610,7 +624,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 assert num_outputs <= 1, (
                     "Last step should have at most one output")
             for i in range(num_outputs):
-                if self.compat_sampling:
+                if model_input.compat_sampling_used:
                     sampler_output = self.cached_step_outputs.pop(0)
                 else:
                     next_token_ids = self.cached_step_outputs.pop(0)
@@ -672,7 +686,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         if step_idx > 0:
             step_output = self.cached_step_outputs.pop(0)
-            if self.compat_sampling:
+            if model_input.compat_sampling_used:
                 sampler_output = step_output
             else:
                 next_token_ids = step_output
@@ -870,7 +884,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.dp_kv_cache and not self.async_torch_proc:
                 tt_out = tt_out[perm_table_tensor]
 
-        if self.compat_sampling:
+        if model_input.compat_sampling_used:
             tt_logits = tt_out[:model_input.unpadded_batch_size, -1, :]  # [unpadded batch, vocab]
             #This is coincidentally the same shape as the logits we would get from a regular vllm model,
             # assuming we have no prompt logprobs, and one sequence per group.
