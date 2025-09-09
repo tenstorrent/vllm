@@ -12,9 +12,9 @@ from transformers import TopPLogitsWarper
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.model_executor.models import supports_multimodal
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
@@ -161,15 +161,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
 
-        self.compat_sampling_possible = True if (self.sample_on_device_mode is None) else False
+        self.compat_sampling_possible = True if (self.sample_on_device_mode
+                                                 is None) else False
         self.always_compat_sampling = False
         if override_tt_config is not None and "compat_sampling" in override_tt_config:
             logger.info("Compatibility sampling mode enabled for all requests")
             self.always_compat_sampling = override_tt_config["compat_sampling"]
-            assert self.always_compat_sampling in [True, False], "compat_sampling must be a boolean"
+            assert self.always_compat_sampling in [
+                True, False
+            ], "compat_sampling must be a boolean"
         if self.always_compat_sampling and not self.compat_sampling_possible:
-            raise ValueError("Compatibility sampling mode only works with sample_on_device_mode=None")
-        
+            raise ValueError(
+                "Compatibility sampling mode only works with sample_on_device_mode=None"
+            )
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -211,10 +215,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.cached_read_events: List[List[Any]] = [
                 ]  # Only used for multi-step execution
                 self.perm_table_tensor: List[torch.Tensor] = []
-        
+
         if self.compat_sampling_possible:
             vocab_size = self.model_config.get_vocab_size()
-            self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
+            self.logits_processor = LogitsProcessor(vocab_size,
+                                                    logits_as_input=True)
             #TODO we are banking on having our logits shaped correctly, as if they came froma regular vllm model
             # and then got trimmed by the logitsprocessor. If we add prompt_logprobs or something,
             # we need to subclass logitsprocessor and do the prune_hidden_states but on logits.
@@ -237,7 +242,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 or sampling_params.frequency_penalty != 0.0
                 or sampling_params.repetition_penalty != 1.0
                 or sampling_params.min_p != 0.0
-                or (sampling_params.bad_words != None and len(sampling_params.bad_words) > 0)
+                or (sampling_params.bad_words != None
+                    and len(sampling_params.bad_words) > 0)
                 or sampling_params.logprobs != None
                 or sampling_params.prompt_logprobs != None
                 or sampling_params.logits_processors != None
@@ -245,7 +251,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 or sampling_params.guided_decoding != None
                 or sampling_params.logit_bias != None
                 or sampling_params.allowed_token_ids != None)
-
 
     def prepare_model_input(
             self,
@@ -290,8 +295,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampling_params = seq_group_metadata.sampling_params
                 if self.compat_sampling_required(sampling_params):
                     if not self.compat_sampling_possible:
-                        raise ValueError("Sampling params beyond temperature, top_k, top_p require compatibility sampling mode"
-                                        " which is only available with sample_on_device_mode=None")
+                        raise ValueError(
+                            "Sampling params beyond temperature, top_k, top_p require compatibility sampling mode"
+                            " which is only available with sample_on_device_mode=None"
+                        )
                     compat_sampling_used = True
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -366,13 +373,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             "sequences in batch, falling back to first sequence's "
                             "temperature (%s)",
                             top_pk_sampling_params['temperature'])
-                    if top_pk_sampling_params["top_k"] != sampling_params.top_k:
+                    if top_pk_sampling_params[
+                            "top_k"] != sampling_params.top_k:
                         logger.warning(
                             "Currently only supporting same top_k"
                             "for all sequences in batch, "
                             "falling back to first sequence's top_k (%s)",
                             top_pk_sampling_params['top_k'])
-                    if top_pk_sampling_params["top_p"] != sampling_params.top_p:
+                    if top_pk_sampling_params[
+                            "top_p"] != sampling_params.top_p:
                         logger.warning(
                             "Currently only supporting same top_p"
                             "for all sequences in batch, "
@@ -512,7 +521,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 del self.seq_groups_to_batch_slot[req]
 
         if compat_sampling_used:
-            seq_lens, query_lens = self._compute_seq_lens_and_query_lens(seq_group_metadata_list, is_prompt)
+            seq_lens, query_lens = self._compute_seq_lens_and_query_lens(
+                seq_group_metadata_list, is_prompt)
             generators = self.get_generators(finished_requests_ids)
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list,
@@ -520,8 +530,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 query_lens,
                 "cpu",
                 pin_memory=False,
-                generators=generators
-            )
+                generators=generators)
         else:
             sampling_metadata = None
 
@@ -581,7 +590,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     if model_input.compat_sampling_used:
                         # For now, this will only get called if we explicitly enable compat sampling
                         # Most cases where we want to use compat sampling are not compatible with multistep
-                        next_token_ids = self._get_next_token_ids_from_sampler_output(next_token_ids)
+                        next_token_ids = self._get_next_token_ids_from_sampler_output(
+                            next_token_ids)
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
                     if new_input_tokens.shape[
@@ -629,7 +639,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 else:
                     next_token_ids = self.cached_step_outputs.pop(0)
                     if is_decode and self.async_torch_proc:
-                        next_token_ids = self._complete_torch_async_proc(next_token_ids)
+                        next_token_ids = self._complete_torch_async_proc(
+                            next_token_ids)
                     # TODO: sync read back from device
                     # once model can keep executing steps on device
                     sampler_output = self._make_sampler_output(
@@ -643,12 +654,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         for event in read_events:
             ttnn.event_synchronize(event)
         next_token_ids = self.model.process_decode_output_host(
-            next_token_ids,
-            is_tokens=(self.sample_on_device_mode is not None))
+            next_token_ids, is_tokens=(self.sample_on_device_mode is not None))
         if self.dp_kv_cache:
             # permute the tt_out
-            next_token_ids = next_token_ids[
-                self.perm_table_tensor.pop(0)]
+            next_token_ids = next_token_ids[self.perm_table_tensor.pop(0)]
         return next_token_ids
 
     def _send_async_out(self, sampler_output, async_callback,
@@ -691,11 +700,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             else:
                 next_token_ids = step_output
                 if self.async_torch_proc:
-                    next_token_ids = self._complete_torch_async_proc(next_token_ids)
+                    next_token_ids = self._complete_torch_async_proc(
+                        next_token_ids)
                 # TODO: sync read back from device
                 # once model can keep executing steps on device
-                sampler_output = self._make_sampler_output(next_token_ids,
-                                                        model_input.seq_groups)
+                sampler_output = self._make_sampler_output(
+                    next_token_ids, model_input.seq_groups)
             self._send_async_out(sampler_output,
                                  model_input.async_callback,
                                  is_first_step_output=(step_idx == 1))
@@ -788,7 +798,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # the logits are not guaranteed to be for the whole sequence,
                 # usually only last token.
                 tt_out = outputs
-        else: #decode
+        else:  #decode
             if self.model_config.is_encoder_decoder:
                 assert self.cached_req_data
 
@@ -885,7 +895,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = tt_out[perm_table_tensor]
 
         if model_input.compat_sampling_used:
-            tt_logits = tt_out[:model_input.unpadded_batch_size, -1, :]  # [unpadded batch, vocab]
+            tt_logits = tt_out[:model_input.unpadded_batch_size,
+                               -1, :]  # [unpadded batch, vocab]
             #This is coincidentally the same shape as the logits we would get from a regular vllm model,
             # assuming we have no prompt logprobs, and one sequence per group.
 
@@ -893,21 +904,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             filtered_logits = self.logits_processor(
                 lm_head=None,  # Ignored in our subclass
                 hidden_states=tt_logits,  # Pass pre-computed logits
-                sampling_metadata=model_input.sampling_metadata
-            )
+                sampling_metadata=model_input.sampling_metadata)
 
             # Sample tokens using standard vLLM sampler
             sampler_output = self.sampler(
                 logits=filtered_logits,
-                sampling_metadata=model_input.sampling_metadata
-            )
+                sampling_metadata=model_input.sampling_metadata)
 
             return sampler_output
         else:
-            if not self.sample_on_device_mode or (
-                    self.sample_on_device_mode == "decode_only" and not is_decode):
+            if not self.sample_on_device_mode or (self.sample_on_device_mode
+                                                  == "decode_only"
+                                                  and not is_decode):
                 next_logits = tt_out[:model_input.unpadded_batch_size,
-                                    -1, :]  # unpadded batch, vocab of last token
+                                     -1, :]  # unpadded batch, vocab of last token
                 next_token_ids = self._sample_tokens(
                     next_logits, model_input.tt_sampling_params)
             else:  # sample on device
@@ -955,9 +965,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 seq_lens.append(seq_len)
                 query_lens.append(query_len)
 
-        return seq_lens, query_lens        
+        return seq_lens, query_lens
 
-    def _get_next_token_ids_from_sampler_output(self, sampler_output: SamplerOutput) -> torch.Tensor:
+    def _get_next_token_ids_from_sampler_output(
+            self, sampler_output: SamplerOutput) -> torch.Tensor:
         """Extract next token IDs from sampler output."""
         next_token_ids = []
         for seq_group_output in sampler_output.outputs:

@@ -414,7 +414,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         try:
             del self.model_runner
         except AttributeError:
-            pass #attributes may be already torn down when destructor is called
+            pass  #attributes may be already torn down when destructor is called
 
         if self.mesh_device:
             close_mesh_device(self.mesh_device,
