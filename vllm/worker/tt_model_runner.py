@@ -161,19 +161,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
 
-        self.compat_sampling_possible = True if (self.sample_on_device_mode
-                                                 is None) else False
+        self.compat_sampling_possible = (self.sample_on_device_mode is None)
         self.always_compat_sampling = False
-        if override_tt_config is not None and "compat_sampling" in override_tt_config:
-            logger.info("Compatibility sampling mode enabled for all requests")
+        if override_tt_config is not None \
+            and "compat_sampling" in override_tt_config:
+            logger.info("Compatibility sampling mode"
+                        "enabled for all requests")
             self.always_compat_sampling = override_tt_config["compat_sampling"]
             assert self.always_compat_sampling in [
                 True, False
             ], "compat_sampling must be a boolean"
         if self.always_compat_sampling and not self.compat_sampling_possible:
-            raise ValueError(
-                "Compatibility sampling mode only works with sample_on_device_mode=None"
-            )
+            raise ValueError("Compatibility sampling mode only works with"
+                             "sample_on_device_mode=None")
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -220,9 +220,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             vocab_size = self.model_config.get_vocab_size()
             self.logits_processor = LogitsProcessor(vocab_size,
                                                     logits_as_input=True)
-            #TODO we are banking on having our logits shaped correctly, as if they came froma regular vllm model
-            # and then got trimmed by the logitsprocessor. If we add prompt_logprobs or something,
-            # we need to subclass logitsprocessor and do the prune_hidden_states but on logits.
+            #TODO we are banking on having our logits shaped correctly,
+            # as if they came froma regular vllm model
+            # and then got trimmed by the logitsprocessor.
+            # If we add prompt_logprobs or something,
+            # we need to subclass logitsprocessor
+            # and do the prune_hidden_states but on logits.
             self.sampler = get_sampler()
 
     def get_model(self) -> nn.Module:
@@ -236,21 +239,22 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
-        # unfortunately we cannot validate in platforms/tt.py, as we dont know if compat sampling is enabled
+        # unfortunately we cannot validate in platforms/tt.py,
+        # as we dont know if compat sampling is enabled
         # this means we crash instead of gently returning an error
         return (sampling_params.presence_penalty != 0.0
                 or sampling_params.frequency_penalty != 0.0
                 or sampling_params.repetition_penalty != 1.0
                 or sampling_params.min_p != 0.0
-                or (sampling_params.bad_words != None
+                or (sampling_params.bad_words is not None
                     and len(sampling_params.bad_words) > 0)
-                or sampling_params.logprobs != None
-                or sampling_params.prompt_logprobs != None
-                or sampling_params.logits_processors != None
-                or sampling_params.truncate_prompt_tokens != None
-                or sampling_params.guided_decoding != None
-                or sampling_params.logit_bias != None
-                or sampling_params.allowed_token_ids != None)
+                or sampling_params.logprobs is not None
+                or sampling_params.prompt_logprobs is not None
+                or sampling_params.logits_processors is not None
+                or sampling_params.truncate_prompt_tokens is not None
+                or sampling_params.guided_decoding is not None
+                or sampling_params.logit_bias is not None
+                or sampling_params.allowed_token_ids is not None)
 
     def prepare_model_input(
             self,
@@ -296,9 +300,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if self.compat_sampling_required(sampling_params):
                     if not self.compat_sampling_possible:
                         raise ValueError(
-                            "Sampling params beyond temperature, top_k, top_p require compatibility sampling mode"
-                            " which is only available with sample_on_device_mode=None"
-                        )
+                            "Sampling params beyond temperature, "
+                            "top_k, top_p require compatibility sampling mode"
+                            " which is only available with"
+                            "sample_on_device_mode=None")
                     compat_sampling_used = True
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -359,7 +364,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if compat_sampling_used:
                 sampling_params_list.append(sampling_params)
             else:
-                # TODO: Add support for different sampling params in the same batch
+                # TODO: Add support for different sampling
+                # params in the same batch
                 if len(top_pk_sampling_params) == 0:
                     top_pk_sampling_params[
                         "temperature"] = sampling_params.temperature
@@ -369,9 +375,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     if (top_pk_sampling_params["temperature"]
                             != sampling_params.temperature):
                         logger.warning(
-                            "Currently only supporting same temperature for all "
-                            "sequences in batch, falling back to first sequence's "
-                            "temperature (%s)",
+                            "Currently only supporting same temperature for"
+                            "all sequences in batch, falling back to first "
+                            "sequence's temperature (%s)",
                             top_pk_sampling_params['temperature'])
                     if top_pk_sampling_params[
                             "top_k"] != sampling_params.top_k:
@@ -569,8 +575,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert num_steps == 1, "Num steps must be 1 for prefill"
         # always true if not using multi-step
         if model_input.is_first_multi_step:
-            # This is a queue of torch tensor with step outputs - full sampler outputs for compat mode, ttnn tensors in flight for async_torch_proc, or torch tensors otherwise.
-            # If we do async output processing, the queue is consumed by _send_prev_step_async_out, except the last step
+            # This is a queue of torch tensor with step outputs
+            # - full sampler outputs for compat mode,
+            # ttnn tensors in flight for async_torch_proc,
+            # or torch tensors otherwise.
+            # If we do async output processing,
+            # the queue is consumed by _send_prev_step_async_out,
+            # except the last step
             # If not, we consume the whole queue after executing the last step.
             self.cached_step_outputs = []
             if is_decode:
@@ -588,9 +599,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.cached_step_outputs.append(next_token_ids)
                 if (i < num_steps - 1 and not self.sample_on_device_mode):
                     if model_input.compat_sampling_used:
-                        # For now, this will only get called if we explicitly enable compat sampling
-                        # Most cases where we want to use compat sampling are not compatible with multistep
-                        next_token_ids = self._get_next_token_ids_from_sampler_output(
+                        # For now, this will only get called
+                        # if we explicitly enable compat sampling
+                        # Most cases where we want to use compat sampling
+                        # are not compatible with multistep
+                        next_token_ids = self._get_next_token_ids_from_sampler_output(  #noqa: E501
                             next_token_ids)
                     # Prepare the inputs for the next step
                     new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
@@ -627,7 +640,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.is_last_step:  # always true if not using multi-step
             num_outputs = len(self.cached_step_outputs)
             if use_async_out_proc:
-                # The queue should be getting consumed by _send_prev_step_async_out
+                # The queue should be getting consumed by
+                # _send_prev_step_async_out
                 # the last step should have 1 output unless we have
                 # scheduled less than self.scheduler_config.num_lookahead_slots
                 # + 1 steps in which case there will be 0 outputs
@@ -897,7 +911,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.compat_sampling_used:
             tt_logits = tt_out[:model_input.unpadded_batch_size,
                                -1, :]  # [unpadded batch, vocab]
-            #This is coincidentally the same shape as the logits we would get from a regular vllm model,
+            #This is coincidentally the same shape as the logits
+            # we would get from a regular vllm model,
             # assuming we have no prompt logprobs, and one sequence per group.
 
             # Apply logits processing (including structured output filtering!)
@@ -916,8 +931,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if not self.sample_on_device_mode or (self.sample_on_device_mode
                                                   == "decode_only"
                                                   and not is_decode):
-                next_logits = tt_out[:model_input.unpadded_batch_size,
-                                     -1, :]  # unpadded batch, vocab of last token
+                next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
+                # unpadded batch, vocab of last token
                 next_token_ids = self._sample_tokens(
                     next_logits, model_input.tt_sampling_params)
             else:  # sample on device
@@ -946,7 +961,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     def _compute_seq_lens_and_query_lens(seq_group_metadata_list, is_prompt):
         """Compute seq_lens and query_lens needed for SamplingMetadata
 
-        This is needed for the compat sampling mode, because regular vllm models process flattened batches.
+        This is needed for the compat sampling mode,
+        because regular vllm models process flattened batches.
         seq_len means how many tokens are in the sequence in total,
         query lens means how many tokens are newly being processed,
         and are contained in the output logits.
