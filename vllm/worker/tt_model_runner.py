@@ -175,6 +175,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             raise ValueError("Compatibility sampling mode only works with"
                              "sample_on_device_mode=None")
 
+        if self.compat_sampling_possible:
+            vocab_size = self.model_config.get_vocab_size()
+            self.logits_processor = LogitsProcessor(vocab_size,
+                                                    logits_as_input=True)
+            # We are relying on having our logits shaped correctly,
+            # as if they came from a regular vLLM model
+            # and then got trimmed by the LogitsProcessor.
+            # If we add prompt_logprobs or chunked prefill,
+            # we need to fully match the relevant parts of
+            # SamplingMetadata.selected_token_indices logic.
+            self.sampler = get_sampler()
+
     def load_model(self) -> None:
         # Note: using custom TT loader
         # instead of selecting from default vllm loaders
@@ -215,18 +227,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.cached_read_events: List[List[Any]] = [
                 ]  # Only used for multi-step execution
                 self.perm_table_tensor: List[torch.Tensor] = []
-
-        if self.compat_sampling_possible:
-            vocab_size = self.model_config.get_vocab_size()
-            self.logits_processor = LogitsProcessor(vocab_size,
-                                                    logits_as_input=True)
-            #TODO: we are relying on having our logits shaped correctly,
-            # as if they came from a regular vLLM model
-            # and then got trimmed by the LogitsProcessor.
-            # If we add prompt_logprobs,
-            # we need to subclass LogitsProcessor
-            # and do prune_hidden_states on the logits.
-            self.sampler = get_sampler()
 
     def get_model(self) -> nn.Module:
         return self.model
