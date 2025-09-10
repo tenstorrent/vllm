@@ -164,13 +164,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.compat_sampling_possible = (self.sample_on_device_mode is None)
         self.always_compat_sampling = False
         if override_tt_config is not None \
-            and "compat_sampling" in override_tt_config:
+            and "always_compat_sampling" in override_tt_config:
             logger.info("Compatibility sampling mode"
                         "enabled for all requests")
-            self.always_compat_sampling = override_tt_config["compat_sampling"]
+            self.always_compat_sampling = override_tt_config["always_compat_sampling"]
             assert self.always_compat_sampling in [
                 True, False
-            ], "compat_sampling must be a boolean"
+            ], "always_compat_sampling must be a boolean"
         if self.always_compat_sampling and not self.compat_sampling_possible:
             raise ValueError("Compatibility sampling mode only works with"
                              "sample_on_device_mode=None")
