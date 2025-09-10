@@ -145,20 +145,11 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
             "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.jpeg",
             "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.png",
         ]
-        prompt = {
-            "role": "user",
-            "content": []
-        }
+        prompt = {"role": "user", "content": []}
 
         for img_ref in img_refs:
-            prompt["content"].append({
-                "type": "image",
-                "image": img_ref
-            })
-        prompt["content"].append({
-            "type": "text",
-            "text": question
-        })
+            prompt["content"].append({"type": "image", "image": img_ref})
+        prompt["content"].append({"type": "text", "text": question})
 
         prompts = [[prompt]]
 
@@ -173,7 +164,8 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
 
         image_inputs = None
         if "Qwen2.5-VL" in model:
-            assert multi_image == False, "Multi-image inputs not supported yet for Qwen2.5-VL"
+            assert not multi_image, (
+                "Multi-image inputs not supported yet for Qwen2.5-VL")
             # Lazy import only when needed
             from qwen_vl_utils import process_vision_info
             image_inputs, video_inputs = process_vision_info(prompt)
@@ -297,6 +289,7 @@ def run_inference(
         disable_async_output_proc=False,
         multi_modal=False,
         multi_image=False,
+        mm_processor_kwargs=None,
         test_increasing_seq_lens=False,
         override_tt_config=None,
         max_model_len=None,
@@ -333,6 +326,14 @@ def run_inference(
     except json.JSONDecodeError as err:
         raise ValueError(
             f"Invalid JSON string for override_tt_config: {err}") from err
+
+    try:
+        if mm_processor_kwargs:
+            engine_kw_args["mm_processor_kwargs"] = json.loads(
+                mm_processor_kwargs)
+    except json.JSONDecodeError as err:
+        raise ValueError(
+            f"Invalid JSON string for mm_processor_kwargs: {err}") from err
 
     # Generation args
     ignore_eos = measure_perf
@@ -614,6 +615,10 @@ if __name__ == "__main__":
                         type=int,
                         default=None,
                         help="Max num batched tokens")
+    parser.add_argument("--mm_processor_kwargs",
+                        type=str,
+                        default=None,
+                        help="Multi-modal processor kwargs")
 
     args = parser.parse_args()
 
@@ -631,6 +636,7 @@ if __name__ == "__main__":
         disable_async_output_proc=args.disable_async_output_proc,
         multi_modal=args.multi_modal,
         multi_image=args.multi_image,
+        mm_processor_kwargs=args.mm_processor_kwargs,
         test_increasing_seq_lens=args.test_increasing_seq_lens,
         override_tt_config=args.override_tt_config,
         max_model_len=args.max_model_len,
