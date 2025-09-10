@@ -220,12 +220,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             vocab_size = self.model_config.get_vocab_size()
             self.logits_processor = LogitsProcessor(vocab_size,
                                                     logits_as_input=True)
-            #TODO we are banking on having our logits shaped correctly,
-            # as if they came froma regular vllm model
-            # and then got trimmed by the logitsprocessor.
-            # If we add prompt_logprobs or something,
-            # we need to subclass logitsprocessor
-            # and do the prune_hidden_states but on logits.
+            #TODO: we are relying on having our logits shaped correctly,
+            # as if they came from a regular vLLM model
+            # and then got trimmed by the LogitsProcessor.
+            # If we add prompt_logprobs,
+            # we need to subclass LogitsProcessor
+            # and do prune_hidden_states on the logits.
             self.sampler = get_sampler()
 
     def get_model(self) -> nn.Module:
