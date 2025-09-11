@@ -356,8 +356,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             top_pk_sampling_params['top_p'])
 
         if compat_sampling_used:
+            seq_lens, query_lens = self._compute_seq_lens_and_query_lens(
+                seq_group_metadata_list, is_prompt)
+            generators = self.get_generators(finished_requests_ids)
+            sampling_metadata = SamplingMetadata.prepare(
+                seq_group_metadata_list,
+                seq_lens,
+                query_lens,
+                "cpu",
+                pin_memory=False,
+                generators=generators)
             tt_sampling_params = None
         else:
+            sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
                 temperature=top_pk_sampling_params["temperature"],
                 top_k=top_pk_sampling_params["top_k"],
@@ -486,20 +497,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 empty_batch_slot = self.seq_groups_to_batch_slot[req]
                 self.empty_slots.append(empty_batch_slot)
                 del self.seq_groups_to_batch_slot[req]
-
-        if compat_sampling_used:
-            seq_lens, query_lens = self._compute_seq_lens_and_query_lens(
-                seq_group_metadata_list, is_prompt)
-            generators = self.get_generators(finished_requests_ids)
-            sampling_metadata = SamplingMetadata.prepare(
-                seq_group_metadata_list,
-                seq_lens,
-                query_lens,
-                "cpu",
-                pin_memory=False,
-                generators=generators)
-        else:
-            sampling_metadata = None
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
