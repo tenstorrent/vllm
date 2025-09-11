@@ -893,8 +893,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if not self.sample_on_device_mode or (self.sample_on_device_mode
                                                   == "decode_only"
                                                   and not is_decode):
+                # unpadded batch, vocab of last token                                  
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
-                # unpadded batch, vocab of last token
                 assert model_input.tt_sampling_params is not None
                 next_token_ids = self._sample_tokens(
                     next_logits, model_input.tt_sampling_params)
