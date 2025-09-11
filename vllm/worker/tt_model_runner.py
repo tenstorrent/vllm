@@ -239,7 +239,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         input_tokens_list: List[int] = []
         input_positions_list: List[int] = []
-        prompt_lens_list: List[int] = []
+        seq_lens: List[int] = []
         block_tables_list: List[List[int]] = []
         seq_groups_list: List[int] = []
         sampling_params_list = []
@@ -281,13 +281,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
 
+            seq_lens.append(seq_data.get_len())
+
             if is_prompt:
                 # tokens
                 prompt_tokens = seq_data.get_token_ids()
                 input_tokens_list.append(prompt_tokens)
-
-                # prompt lengths
-                prompt_lens_list.append(len(prompt_tokens))
             else:
                 # tokens
                 generation_token = seq_data.get_last_token_id()
@@ -356,8 +355,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             top_pk_sampling_params['top_p'])
 
         if compat_sampling_used:
-            seq_lens, query_lens = self._compute_seq_lens_and_query_lens(
-                seq_group_metadata_list, is_prompt)
+            # seq_lens means how many tokens are in the sequence in total,
+            # query lens means how many tokens are newly being processed,
+            # and are contained in the output logits.
+            if is_prompt:
+                query_lens = [x for x in seq_lens]
+            else:
+                query_lens = [1 for x in seq_lens]
             generators = self.get_generators(finished_requests_ids)
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list,
@@ -406,7 +410,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                 device="cpu",
                                                 pad=0)
             input_positions = 0
-            prompt_lens = prompt_lens_list
+            prompt_lens = seq_lens
         else:
             input_tokens = torch.tensor(input_tokens_list,
                                         dtype=torch.int32,
@@ -599,10 +603,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             num_outputs = len(self.cached_step_outputs)
             if use_async_out_proc:
                 # The queue should be getting consumed by
-                # _send_prev_step_async_out
-                # the last step should have 1 output unless we have
+                # _send_prev_step_async_out/
+                # The last step should have 1 output unless we have
                 # scheduled less than self.scheduler_config.num_lookahead_slots
-                # + 1 steps in which case there will be 0 outputs
+                # + 1 steps in which case there will be 0 outputs.
                 assert num_outputs <= 1, (
                     "Last step should have at most one output")
             for i in range(num_outputs):
@@ -916,31 +920,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 k=tt_sampling_params.top_k,
                 temperature=tt_sampling_params.temperature)
 
-    @staticmethod
-    def _compute_seq_lens_and_query_lens(seq_group_metadata_list, is_prompt):
-        """Compute seq_lens and query_lens needed for SamplingMetadata
-
-        This is needed for the compat sampling mode,
-        because regular vllm models process flattened batches.
-        seq_len means how many tokens are in the sequence in total,
-        query lens means how many tokens are newly being processed,
-        and are contained in the output logits.
-        """
-        seq_lens = []
-        query_lens = []
-        for seq_group_metadata in seq_group_metadata_list:
-            for seq_id, seq_data in seq_group_metadata.seq_data.items():
-                if is_prompt:
-                    seq_len = seq_data.get_len()
-                    query_len = seq_len
-                else:
-                    seq_len = seq_data.get_len()
-                    query_len = 1
-
-                seq_lens.append(seq_len)
-                query_lens.append(query_len)
-
-        return seq_lens, query_lens
 
     def _get_next_token_ids_from_sampler_output(
             self, sampler_output: SamplerOutput) -> torch.Tensor:
