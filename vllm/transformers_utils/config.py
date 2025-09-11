@@ -164,7 +164,12 @@ def file_exists(
 # In offline mode the result can be a false negative
 def file_or_path_exists(model: Union[str, Path], config_name: str,
                         revision: Optional[str]) -> bool:
+    print("DEBUGG")
+    print("model", model)
+    print("config_name", config_name)
+    print("revision", revision)
     if (local_path := Path(model)).exists():
+        print("local_path exists", local_path)
         return (local_path / config_name).is_file()
 
     # Offline mode support: Check if config file is cached already
@@ -173,6 +178,7 @@ def file_or_path_exists(model: Union[str, Path], config_name: str,
                                              revision=revision)
     if isinstance(cached_filepath, str):
         # The config file exists in cache- we can continue trying to load
+        print("cached_filepath exists", cached_filepath)
         return True
 
     # NB: file_exists will only check for the existence of the config file on
