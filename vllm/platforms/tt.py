@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+
+# We set class attributes dynamically,
+# but we don't want defaults
+# we'd rather crash than be wrong silently.
+# mypy: disable_error_code="attr-defined"
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -17,6 +22,7 @@ else:
     PoolingParams = None
 
 logger = init_logger(__name__)
+
 
 class TTPlatform(Platform):
     _enum = PlatformEnum.TT
@@ -56,8 +62,7 @@ class TTPlatform(Platform):
         override_tt_config = vllm_config.model_config.override_tt_config
         if (override_tt_config is not None
                 and "sample_on_device_mode" in override_tt_config):
-            sample_on_device_mode = override_tt_config[
-                "sample_on_device_mode"]
+            sample_on_device_mode = override_tt_config["sample_on_device_mode"]
             assert sample_on_device_mode in [
                 "all", "decode_only"
             ], f"Invalid sample_on_device_mode: {sample_on_device_mode}"
@@ -76,15 +81,16 @@ class TTPlatform(Platform):
         if override_tt_config is not None \
             and "always_compat_sampling" in override_tt_config:
             logger.info("Compatibility sampling mode enabled for all requests")
-            always_compat_sampling = override_tt_config["always_compat_sampling"]
-            assert always_compat_sampling in [True, False
-                ], "always_compat_sampling must be a boolean"
+            always_compat_sampling = override_tt_config[
+                "always_compat_sampling"]
+            assert always_compat_sampling in [
+                True, False
+            ], "always_compat_sampling must be a boolean"
         cls.always_compat_sampling = always_compat_sampling
 
         if cls.always_compat_sampling and not cls.compat_sampling_possible:
             raise ValueError("Compatibility sampling mode only works with"
                              "sample_on_device_mode=None")
-
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
@@ -111,7 +117,8 @@ class TTPlatform(Platform):
                 raise ValueError(
                     f"Currently not supporting prompt_logprobs on "
                     f"{cls.device_name}")
-            if cls.compat_sampling_required(params) and not cls.compat_sampling_possible:
+            if cls.compat_sampling_required(
+                    params) and not cls.compat_sampling_possible:
                 raise ValueError(
                     "Sampling params beyond temperature, "
                     "top_k, top_p require compatibility sampling mode"

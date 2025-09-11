@@ -17,11 +17,11 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.model_executor.models import supports_multimodal
+from vllm.platforms.tt import TTPlatform
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
                            Logprob, SequenceGroupMetadata, SequenceOutput)
 from vllm.utils import make_tensor_with_pad
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
-from vllm.platforms.tt import TTPlatform
 
 logger = init_logger(__name__)
 
@@ -120,7 +120,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
 
-        # Because of multiprocessing, the config-dependent 
+        # Because of multiprocessing, the config-dependent
         # class attributes might not have been set in this process,
         # so we need to call this again.
         TTPlatform.check_and_update_config(vllm_config)
@@ -132,7 +132,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # whether to use ttnn tracing for model execution
         self.trace_mode = trace_mode
-        self.sample_on_device_mode = TTPlatform.sample_on_device_mode 
+        self.sample_on_device_mode = TTPlatform.sample_on_device_mode
         logger.info(
             "TTModelRunner: trace_mode=%s, sample_on_device_mode=%s",
             self.trace_mode,
@@ -893,7 +893,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if not self.sample_on_device_mode or (self.sample_on_device_mode
                                                   == "decode_only"
                                                   and not is_decode):
-                # unpadded batch, vocab of last token                                  
+                # unpadded batch, vocab of last token
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
                 assert model_input.tt_sampling_params is not None
                 next_token_ids = self._sample_tokens(
@@ -919,7 +919,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 p=tt_sampling_params.top_p,
                 k=tt_sampling_params.top_k,
                 temperature=tt_sampling_params.temperature)
-
 
     def _get_next_token_ids_from_sampler_output(
             self, sampler_output: SamplerOutput) -> torch.Tensor:

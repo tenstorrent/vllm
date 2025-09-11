@@ -418,7 +418,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
             if self.mesh_device:
                 close_mesh_device(self.mesh_device,
-                                self.model_config.override_tt_config)
+                                  self.model_config.override_tt_config)
                 del self.mesh_device
 
         if hasattr(super(), '__del__'):
