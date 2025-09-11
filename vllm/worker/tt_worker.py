@@ -416,10 +416,10 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             # attributes may be already torn down when destructor is called
             del self.model_runner
 
-        if self.mesh_device:
-            close_mesh_device(self.mesh_device,
-                              self.model_config.override_tt_config)
-            del self.mesh_device
+            if self.mesh_device:
+                close_mesh_device(self.mesh_device,
+                                self.model_config.override_tt_config)
+                del self.mesh_device
 
         if hasattr(super(), '__del__'):
             super().__del__()  # type: ignore
