@@ -21,6 +21,7 @@ from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
                            Logprob, SequenceGroupMetadata, SequenceOutput)
 from vllm.utils import make_tensor_with_pad
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
+from vllm.platforms.tt import TTPlatform
 
 logger = init_logger(__name__)
 
@@ -119,6 +120,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
 
+        # Because of multiprocessing, the config-dependent 
+        # class attributes might not have been set in this process,
+        # so we need to call this again.
+        TTPlatform.check_and_update_config(vllm_config)
+
         # Currently, TT worker doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
 
@@ -126,16 +132,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # whether to use ttnn tracing for model execution
         self.trace_mode = trace_mode
-        override_tt_config = self.model_config.override_tt_config
-        if (override_tt_config is not None
-                and "sample_on_device_mode" in override_tt_config):
-            self.sample_on_device_mode = override_tt_config[
-                "sample_on_device_mode"]
-            assert self.sample_on_device_mode in [
-                "all", "decode_only"
-            ], f"Invalid sample_on_device_mode: {self.sample_on_device_mode}"
-        else:
-            self.sample_on_device_mode = None  # whether to sample on device
+        self.sample_on_device_mode = TTPlatform.sample_on_device_mode 
         logger.info(
             "TTModelRunner: trace_mode=%s, sample_on_device_mode=%s",
             self.trace_mode,
@@ -161,21 +158,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
 
-        self.compat_sampling_possible = (self.sample_on_device_mode is None)
-        self.always_compat_sampling = False
-        if override_tt_config is not None \
-            and "always_compat_sampling" in override_tt_config:
-            logger.info("Compatibility sampling mode"
-                        "enabled for all requests")
-            self.always_compat_sampling = override_tt_config["always_compat_sampling"]
-            assert self.always_compat_sampling in [
-                True, False
-            ], "always_compat_sampling must be a boolean"
-        if self.always_compat_sampling and not self.compat_sampling_possible:
-            raise ValueError("Compatibility sampling mode only works with"
-                             "sample_on_device_mode=None")
-
-        if self.compat_sampling_possible:
+        if TTPlatform.compat_sampling_possible:
             vocab_size = self.model_config.get_vocab_size()
             self.logits_processor = LogitsProcessor(vocab_size,
                                                     logits_as_input=True)
@@ -237,25 +220,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     ) -> TTModelInput:
         return TTModelInput.from_broadcasted_tensor_dict(tensor_dict, )
 
-    @staticmethod
-    def compat_sampling_required(sampling_params) -> bool:
-        # unfortunately we cannot validate in platforms/tt.py,
-        # as we dont know if compat sampling is enabled
-        # this means we crash instead of gently returning an error
-        return (sampling_params.presence_penalty != 0.0
-                or sampling_params.frequency_penalty != 0.0
-                or sampling_params.repetition_penalty != 1.0
-                or sampling_params.min_p != 0.0
-                or (sampling_params.bad_words is not None
-                    and len(sampling_params.bad_words) > 0)
-                or sampling_params.logprobs is not None
-                or sampling_params.prompt_logprobs is not None
-                or sampling_params.logits_processors is not None
-                or sampling_params.truncate_prompt_tokens is not None
-                or sampling_params.guided_decoding is not None
-                or sampling_params.logit_bias is not None
-                or sampling_params.allowed_token_ids is not None)
-
     def prepare_model_input(
             self,
             seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -291,20 +255,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
                 del self.req_id_to_seq_id[req_id]
 
+        # Compat sampling is off by default, and enabled only on request
+        # or if any of the requests in the batch require it
         compat_sampling_used = False
-        if self.always_compat_sampling:
+        if TTPlatform.always_compat_sampling:
             compat_sampling_used = True
         else:
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
-                if self.compat_sampling_required(sampling_params):
-                    if not self.compat_sampling_possible:
-                        raise ValueError(
-                            "Sampling params beyond temperature, "
-                            "top_k, top_p require compatibility sampling mode"
-                            " which is only available with"
-                            "sample_on_device_mode=None")
+                if TTPlatform.compat_sampling_required(sampling_params):
                     compat_sampling_used = True
+                    break
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
