@@ -2,10 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-# We set class attributes dynamically,
-# but we don't want defaults
-# we'd rather crash than be wrong silently.
-# mypy: disable_error_code="attr-defined"
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
