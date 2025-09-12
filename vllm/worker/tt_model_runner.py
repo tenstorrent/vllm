@@ -606,7 +606,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             num_outputs = len(self.cached_step_outputs)
             if use_async_out_proc:
                 # The queue should be getting consumed by
-                # _send_prev_step_async_out/
+                # _send_prev_step_async_out.
                 # The last step should have 1 output unless we have
                 # scheduled less than self.scheduler_config.num_lookahead_slots
                 # + 1 steps in which case there will be 0 outputs.
