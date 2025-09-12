@@ -196,16 +196,31 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         appended to.
         """
         # TODO: Add proper implementation which runs profiling on TT devices
+        data_parallel = 1
+        if (self.model_config.override_tt_config
+                and "data_parallel" in self.model_config.override_tt_config):
+            data_parallel = self.model_config.override_tt_config[
+                "data_parallel"]
+
+        is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
+        num_devices_per_model = (self.device_config.device.get_num_devices() //
+                                 data_parallel)
+
         if (("Llama-3.1-8B" in self.model_config.model
-             or "Mistral-7B" in self.model_config.model)
-                and self.device_config.device.get_num_devices() == 1
-                and "wormhole_b0" in ttnn.get_arch_name()
-            ):  # Llama8B on N150 and Mistral7B on N150
+             or "Mistral-7B" in self.model_config.model
+             or "gemma-3-4b" in self.model_config.model)
+                and num_devices_per_model == 1 and is_wormhole):
+            # Llama8B, Mistral7B, and gemma3-4b on N150
+            max_tokens_all_users = 65536
+        elif (("DeepSeek-R1-Distill-Qwen-14B" in self.model_config.model
+               or "Qwen2.5-14B" in self.model_config.model)
+              and num_devices_per_model == 2 and is_wormhole):
+            # Qwen2.5-14B on N300
             max_tokens_all_users = 65536
         elif ("Llama-3.2-90B" in self.model_config.model
-              and self.device_config.device.get_num_devices() == 8
-              and "wormhole_b0" in ttnn.get_arch_name()):  # Llama90B on WH T3K
-            max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
+              and num_devices_per_model == 8 and is_wormhole):
+            # Llama90B on WH T3K
+            max_tokens_all_users = 65536
         else:
             # Note: includes num vision tokens for multi-modal
             max_tokens_all_users = 131072
@@ -489,6 +504,9 @@ def device_params_from_override_tt_config(override_tt_config, trace_mode):
 
     if override_tt_config and "worker_l1_size" in override_tt_config:
         device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
+
+    if override_tt_config and "l1_small_size" in override_tt_config:
+        device_params["l1_small_size"] = override_tt_config["l1_small_size"]
 
     return device_params
 
