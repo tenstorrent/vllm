@@ -120,13 +120,16 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
 
     if not multi_image:
         # Example data
+        # [INFO] Qwen-VL support NO mixture of text-image and text-only inputs
         questions = [
             "Describe this image.",
-            "What is the capital of France?",
+            "Is this a cat?"
+            if "Qwen2.5-VL" in model else "What is the capital of France?",
         ]
         img_refs = [
             "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-            None,
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.png"
+            if "Qwen2.5-VL" in model else None,
         ]
         # Build chat-style prompts
         prompts = [{
