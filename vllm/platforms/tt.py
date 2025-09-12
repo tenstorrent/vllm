@@ -73,8 +73,8 @@ class TTPlatform(Platform):
         # It is off by default, and enabled only on request
         # or if any of the requests in the batch require it.
         # For now, it is only supported with host-side sampling.
-        cls.compat_sampling_possible = (sample_on_device_mode
-                                        is None)  # type: ignore[attr-defined]
+        cls.compat_sampling_possible = (  # type: ignore[attr-defined]
+            sample_on_device_mode is None)
 
         always_compat_sampling = False
         if override_tt_config is not None \
