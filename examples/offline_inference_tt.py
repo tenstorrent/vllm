@@ -120,24 +120,36 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
 
     if not multi_image:
         # Example data
-        questions = ["Describe this image.", "What is the capital of France?"]
+        questions = [
+            "Describe this image.",
+            "What is the capital of France?",
+        ]
         img_refs = [
             "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
             None,
         ]
         # Build chat-style prompts
-        prompts = [
+        prompts = [{
             [
                 {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": img_ref},
-                        {"type": "text", "text": question},
-                    ],
-                }
-            ]
-            for img_ref, question in zip(img_refs, questions)
-        ]
+                    "type": "image",
+                    "image": img_ref
+                },
+                {
+                    "type": "text",
+                    "text": question
+                },
+            ],
+        }] if img_ref is not None else [{
+            "role":
+            "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": question
+                },
+            ],
+        }] for img_ref, question in zip(img_refs, questions)]
     else:
         # Example data
         question = "Compare these images."
@@ -172,7 +184,7 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
 
             image_inputs, video_inputs = process_vision_info(prompt)
             assert video_inputs is None, "Video inputs not supported yet"
-            image_inputs = image_inputs[0]
+            image_inputs = image_inputs[0] if image_inputs else None
         elif "gemma-3" in model:
             image_inputs = [
                 ctnt["image"]
