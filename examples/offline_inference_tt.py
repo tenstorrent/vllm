@@ -170,9 +170,17 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
             # Lazy import only when needed
             from qwen_vl_utils import process_vision_info
 
-            image_inputs, video_inputs = process_vision_info(prompt)
-            assert video_inputs is None, "Video inputs not supported yet"
-            image_inputs = image_inputs[0]
+            if any(
+                ("image" in ctnt and ctnt["image"])
+                or ("video" in ctnt and ctnt["video"])
+                for entry in prompt
+                for ctnt in entry["content"]
+            ):
+                image_inputs, video_inputs = process_vision_info(prompt)
+                assert video_inputs is None, "Video inputs not supported yet"
+                image_inputs = image_inputs[0]
+            else:
+                image_inputs = None
         elif "gemma-3" in model:
             image_inputs = [
                 ctnt["image"]
