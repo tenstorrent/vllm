@@ -146,6 +146,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 "a model cannot be encoder-decoder and request-specific rope")
             # seq_id -> cached_req_data
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
+            self.previous_seq_ids: List[int] = []
 
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keep "rope_deltas" between prompt and decoding phases.
@@ -694,6 +695,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             rot_mats[1][i:i + 1],
                         )
                     }
+                self.previous_seq_ids = model_input.seq_groups
             else:
                 tt_out = outputs  # [batch_size, seq_len, vocab_size]
         else:
@@ -732,12 +734,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     decode_full_text_row_masked_out_mask
                 }
             elif self.request_specific_rope:
-                enc_dec_kwargs = {
-                    "rot_mats_all_users": [
-                        self.cached_req_data[seq_id]["rot_mats"]
-                        for seq_id in model_input.seq_groups
-                    ]
-                }
+                if any(seq_id != self.previous_seq_ids[i] for i, seq_id in enumerate(model_input.seq_groups)):
+                    enc_dec_kwargs = {
+                        "rot_mats_all_users": [
+                            self.cached_req_data[seq_id]["rot_mats"]
+                            for seq_id in model_input.seq_groups
+                        ]
+                    }
+                else:
+                    enc_dec_kwargs = {
+                        "rot_mats_all_users": None
+                    }
             else:
                 enc_dec_kwargs = {}
 
