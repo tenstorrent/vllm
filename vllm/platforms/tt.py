@@ -123,7 +123,8 @@ class TTPlatform(Platform):
                     "Sampling params beyond temperature, "
                     "top_k, top_p require compatibility sampling mode"
                     " which is only available with"
-                    "sample_on_device_mode=None")
+                    "sample_on_device_mode=None. "
+                    f"Supplied params: {params}")
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
