@@ -66,14 +66,15 @@ class TTPlatform(Platform):
             ], f"Invalid sample_on_device_mode: {sample_on_device_mode}"
         else:
             sample_on_device_mode = None
-        cls.sample_on_device_mode = sample_on_device_mode
+        cls.sample_on_device_mode = sample_on_device_mode  # type: ignore[attr-defined]
 
         # Compat sampling uses the full vLLM sampling pipeline,
         # with logit processors and sampler, instead of our custom sampling.
         # It is off by default, and enabled only on request
         # or if any of the requests in the batch require it.
         # For now, it is only supported with host-side sampling.
-        cls.compat_sampling_possible = (sample_on_device_mode is None)
+        cls.compat_sampling_possible = (sample_on_device_mode
+                                        is None)  # type: ignore[attr-defined]
 
         always_compat_sampling = False
         if override_tt_config is not None \
@@ -84,9 +85,9 @@ class TTPlatform(Platform):
             assert always_compat_sampling in [
                 True, False
             ], "always_compat_sampling must be a boolean"
-        cls.always_compat_sampling = always_compat_sampling
+        cls.always_compat_sampling = always_compat_sampling  # type: ignore[attr-defined]
 
-        if cls.always_compat_sampling and not cls.compat_sampling_possible:
+        if cls.always_compat_sampling and not cls.compat_sampling_possible:  # type: ignore[attr-defined]
             raise ValueError("Compatibility sampling mode only works with"
                              "sample_on_device_mode=None")
 
@@ -116,7 +117,8 @@ class TTPlatform(Platform):
                     f"Currently not supporting prompt_logprobs on "
                     f"{cls.device_name}")
             if cls.compat_sampling_required(
-                    params) and not cls.compat_sampling_possible:
+                    params
+            ) and not cls.compat_sampling_possible:  # type: ignore[attr-defined]
                 raise ValueError(
                     "Sampling params beyond temperature, "
                     "top_k, top_p require compatibility sampling mode"
