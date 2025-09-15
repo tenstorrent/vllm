@@ -120,39 +120,38 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
 
     if not multi_image:
         # Example data
-        # [INFO] Qwen-VL support NO mixture of text-image and text-only inputs
         questions = [
             "Describe this image.",
-            "Is this a cat?"
-            if "Qwen2.5-VL" in model else "What is the capital of France?",
+            "What is the capital of France?",
         ]
         img_refs = [
             "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.png"
-            if "Qwen2.5-VL" in model else None,
+            None,
         ]
+        if "Qwen2.5-VL" in model:
+            # [INFO] Qwen-VL currently do not support supports NO mixture of
+            # text-image and text-only inputs
+            img_refs = [
+                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+            ]
+            questions = [
+                "Describe this image.",
+                "Is there a cat?",
+            ]
         # Build chat-style prompts
-        prompts = [{
+        prompts = [
             [
                 {
-                    "type": "image",
-                    "image": img_ref
-                },
-                {
-                    "type": "text",
-                    "text": question
-                },
-            ],
-        }] if img_ref is not None else [{
-            "role":
-            "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": question
-                },
-            ],
-        }] for img_ref, question in zip(img_refs, questions)]
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img_ref},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ]
+            for img_ref, question in zip(img_refs, questions)
+        ]
     else:
         # Example data
         question = "Compare these images."
