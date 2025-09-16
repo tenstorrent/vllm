@@ -129,7 +129,7 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
             None,
         ]
         if "Qwen2.5-VL" in model:
-            # [INFO] Qwen-VL currently do not support supports NO mixture of
+            # [INFO] Qwen-VL currently does not support a mixture of
             # text-image and text-only inputs
             img_refs = [
                 "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
