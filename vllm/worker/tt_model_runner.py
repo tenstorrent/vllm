@@ -486,6 +486,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
 
             # check for preempted requests
+            logger.debug(f"prev_seq_groups_list, {prev_seq_groups_list}")
+            logger.debug(f"seq_groups_list, {seq_groups_list}")
+            logger.debug(f"finished_requests_seq_ids, {finished_requests_seq_ids}")
             if seq_groups_list != prev_seq_groups_list and not is_prompt:
                 finished_requests_seq_ids_current = [
                     seq_id for seq_id in prev_seq_groups_list
@@ -493,12 +496,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 ]
             else:
                 finished_requests_seq_ids_current = []
-
+            logger.debug(f"finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")
             # check for any remaining finished requests
             for seq_id in finished_requests_seq_ids:
                 if seq_id not in finished_requests_seq_ids_current:
                     finished_requests_seq_ids_current.append(seq_id)
-
+            logger.debug(f"UPDATED finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")   
+            logger.debug(f"self.seq_groups_to_batch_slot, {self.seq_groups_to_batch_slot}")
             # update the empty slots
             for req in finished_requests_seq_ids_current:
                 empty_batch_slot = self.seq_groups_to_batch_slot[req]
@@ -731,8 +735,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # update the batch slot table
                 recently_filled_slots = self.empty_slots[:model_input.
                                                          unpadded_batch_size]
+                logger.debug(f"recently_filled_slots, {recently_filled_slots}, {model_input.unpadded_batch_size}")
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
+
+                logger.debug(f"seq_groups_to_batch_slot, {seq_groups_to_batch_slot}") 
 
                 for s in model_input.seq_groups:
                     self.seq_groups_to_batch_slot[
