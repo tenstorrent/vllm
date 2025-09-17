@@ -171,6 +171,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # SamplingMetadata.selected_token_indices logic.
             self.sampler = get_sampler()
 
+        self.cleanup_counter = 0
+        self.cleanup_interval = 1000  # Clean up every 1000 requests
+
     def load_model(self) -> None:
         # Note: using custom TT loader
         # instead of selecting from default vllm loaders
@@ -250,13 +253,19 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
+        # Track which sequence IDs need their slots freed
+        finished_requests_seq_ids = []
         if self.dp_kv_cache and finished_requests_ids is not None:
-            # Delete finished requests from req_id_to_seq_id
-            finished_requests_seq_ids = []
+            # Collect sequence IDs for finished requests before deleting them
             for req_id in finished_requests_ids:
-                # only delete if the request was added in the first place 
-                if req_id in self.req_id_to_seq_id.keys():
-                    finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
+                if req_id in self.req_id_to_seq_id:
+                    seq_id = self.req_id_to_seq_id[req_id]
+                    finished_requests_seq_ids.append(seq_id)
+                    print(f"Request {req_id} -> seq_id {seq_id} marked for slot cleanup")
+            
+            # Now delete finished requests from req_id_to_seq_id
+            for req_id in finished_requests_ids:
+                if req_id in self.req_id_to_seq_id:
                     print(f"deleting from self.req_id_to_seq_id, {self.req_id_to_seq_id}")
                     del self.req_id_to_seq_id[req_id]
 
@@ -282,7 +291,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.dp_kv_cache:
                 # Add new request id to req_id_to_seq_id
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
-                print(f"adding to self.req_id_to_seq_id, {self.req_id_to_seq_id}")
+                print(f"Mapping request {seq_group_metadata.request_id} -> seq_id {seq_id}")
+                print(f"Current req_id_to_seq_id mapping: {self.req_id_to_seq_id}")
 
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
@@ -387,15 +397,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
-        if ((self.model_config.is_encoder_decoder
-             or self.request_specific_rope) and not is_prompt
-                and self.cached_req_data):
+        # Clean up cached_req_data for all finished sequences (both prompt and decode)
+        if self.cached_req_data:
             seq_ids_to_del = []
             for seq_id in self.cached_req_data:
                 if seq_id not in seq_groups_list:
                     seq_ids_to_del.append(seq_id)
             for seq_id in seq_ids_to_del:
                 del self.cached_req_data[seq_id]
+                print(f"Cleaned up cached_req_data for seq_id {seq_id}")
 
         # Convert lists to tensors and add padding
 
@@ -491,11 +501,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             print(f"prev_seq_groups_list, {prev_seq_groups_list}")
             print(f"seq_groups_list, {seq_groups_list}")
             print(f"finished_requests_seq_ids, {finished_requests_seq_ids}")
-            if seq_groups_list != prev_seq_groups_list and not is_prompt:
+            # Detect preempted/aborted requests by comparing previous and current seq groups
+            # This needs to happen for both prompts and decodes
+            if seq_groups_list != prev_seq_groups_list:
                 finished_requests_seq_ids_current = [
                     seq_id for seq_id in prev_seq_groups_list
                     if seq_id not in seq_groups_list
                 ]
+                if finished_requests_seq_ids_current:
+                    print(f"Detected {len(finished_requests_seq_ids_current)} preempted/aborted sequences: {finished_requests_seq_ids_current}")
+                    # Also clean up cached_req_data for these sequences
+                    if hasattr(self, 'cached_req_data') and self.cached_req_data:
+                        for seq_id in finished_requests_seq_ids_current:
+                            if seq_id in self.cached_req_data:
+                                del self.cached_req_data[seq_id]
+                                print(f"Cleaned up cached_req_data for preempted seq_id {seq_id}")
             else:
                 finished_requests_seq_ids_current = []
             print(f"finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")
@@ -506,13 +526,34 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             print(f"UPDATED finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")   
             print(f"self.seq_groups_to_batch_slot, {self.seq_groups_to_batch_slot}")
             # update the empty slots
-            for req in finished_requests_seq_ids_current:
-                if req in self.seq_groups_to_batch_slot.keys():
-                    empty_batch_slot = self.seq_groups_to_batch_slot[req]
+            for seq_id in finished_requests_seq_ids_current:
+                if seq_id in self.seq_groups_to_batch_slot:
+                    empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
                     self.empty_slots.append(empty_batch_slot)
-                    del self.seq_groups_to_batch_slot[req]
+                    del self.seq_groups_to_batch_slot[seq_id]
+                    print(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
                 else:
-                    print(f"req {req} not in self.seq_groups_to_batch_slot.keys()")
+                    print(f"WARNING: seq_id {seq_id} not in seq_groups_to_batch_slot (keys: {list(self.seq_groups_to_batch_slot.keys())})")
+            
+            # Sort empty_slots to maintain consistency
+            self.empty_slots.sort()
+            print(f"Empty slots after cleanup: {self.empty_slots}")
+            print(f"Active mappings - req_id_to_seq_id: {len(self.req_id_to_seq_id)}, seq_groups_to_batch_slot: {len(self.seq_groups_to_batch_slot)}")
+            
+            # Defensive check: warn if req_id_to_seq_id is growing too large
+            if len(self.req_id_to_seq_id) > self.scheduler_config.max_num_seqs * 2:
+                logger.warning(f"req_id_to_seq_id has {len(self.req_id_to_seq_id)} entries, which seems excessive. "
+                              f"This might indicate a memory leak.")
+            
+            # Periodic cleanup to prevent unbounded growth
+            self.cleanup_counter += 1
+            if self.cleanup_counter % self.cleanup_interval == 0:
+                # Log statistics
+                cached_req_data_size = len(self.cached_req_data) if hasattr(self, 'cached_req_data') and self.cached_req_data else 0
+                logger.info(f"Periodic cleanup #{self.cleanup_counter // self.cleanup_interval}: "
+                           f"req_id_to_seq_id size: {len(self.req_id_to_seq_id)}, "
+                           f"cached_req_data size: {cached_req_data_size}, "
+                           f"seq_groups_to_batch_slot size: {len(self.seq_groups_to_batch_slot)}")
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -741,14 +782,26 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 recently_filled_slots = self.empty_slots[:model_input.
                                                          unpadded_batch_size]
                 print(f"recently_filled_slots, {recently_filled_slots}, {model_input.unpadded_batch_size}")
+                
+                # Add defensive check
+                if len(recently_filled_slots) < len(model_input.seq_groups):
+                    logger.error(f"Not enough empty slots: need {len(model_input.seq_groups)}, "
+                                f"but only have {len(recently_filled_slots)} available")
+                    logger.error(f"Current slot assignments: {self.seq_groups_to_batch_slot}")
+                    logger.error(f"Empty slots: {self.empty_slots}")
+                    logger.error(f"Seq groups to allocate: {model_input.seq_groups}")
+                    raise RuntimeError(f"Insufficient empty slots for new sequences. "
+                                      f"This may indicate slots from canceled requests were not properly freed.")
+                
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
 
                 print(f"seq_groups_to_batch_slot before, {self.seq_groups_to_batch_slot}") 
 
                 for s in model_input.seq_groups:
-                    self.seq_groups_to_batch_slot[
-                        s] = recently_filled_slots.pop(0)
+                    allocated_slot = recently_filled_slots.pop(0)
+                    self.seq_groups_to_batch_slot[s] = allocated_slot
+                    print(f"Allocated slot {allocated_slot} to seq_group {s}")
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
