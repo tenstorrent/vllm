@@ -211,10 +211,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
             # Add a lock-like mechanism for atomic operations (using a simple flag)
             self._slot_allocation_in_progress = False
-            # Track cleanup statistics for monitoring
-            self._cleanup_counter = 0
-            self._allocation_counter = 0
-            self._last_state_validation = 0
             # Real lock to ensure thread/process safety within this worker
             self._slot_lock = threading.Lock()
             if self.async_torch_proc:
@@ -942,19 +938,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 logger.warning("Slot allocation already in progress, skipping cleanup")
                 return
             
-            self._cleanup_counter += 1
-            
-            # Periodic state validation every 100 cleanups to catch corruption early
-            if self._cleanup_counter % 100 == 0:
-                try:
-                    self._validate_state_consistency()
-                    self._last_state_validation = self._cleanup_counter
-                    logger.info(f"State validation passed at cleanup #{self._cleanup_counter}")
-                except Exception as e:
-                    logger.error(f"State validation failed at cleanup #{self._cleanup_counter}: {e}")
-                    # Attempt recovery
-                    self._attempt_state_recovery()
-            
             self._slot_allocation_in_progress = True
             try:
                 prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
@@ -1018,7 +1001,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 raise RuntimeError("Slot allocation already in progress - this indicates a concurrency issue")
             
             self._slot_allocation_in_progress = True
-            self._allocation_counter += 1
             
             try:
                 # Validate we have enough slots before making any changes
@@ -1074,16 +1056,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 logger.debug(f"seq_groups_to_batch_slot after allocation: {self.seq_groups_to_batch_slot}")
                 logger.debug(f"empty_slots after allocation: {self.empty_slots}")
                 
-                # Log statistics periodically for monitoring
-                if self._allocation_counter % 1000 == 0:
-                    stats = self._get_slot_statistics()
-                    logger.info(f"Slot allocation milestone #{self._allocation_counter}: {stats}")
-                    
-                    # Alert if req_id_to_seq_id is growing too large (potential memory leak)
-                    if stats["req_id_mappings"] > self.scheduler_config.max_num_seqs * 2:
-                        logger.warning(f"req_id_to_seq_id has {stats['req_id_mappings']} entries, "
-                                     f"which is more than 2x max_num_seqs ({self.scheduler_config.max_num_seqs}). "
-                                     f"This may indicate a memory leak.")
+                # Minimal: skip periodic stats to keep implementation lean
             
             finally:
                 self._slot_allocation_in_progress = False
@@ -1112,78 +1085,3 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if invalid_slots:
             logger.error(f"Invalid slot assignments: {invalid_slots}")
             raise RuntimeError(f"Invalid slot assignments detected: {invalid_slots}")
-
-    def _validate_state_consistency(self) -> None:
-        """Validate internal state consistency for debugging."""
-        if not self.dp_kv_cache:
-            return
-            
-        # Check that all allocated slots are within valid range
-        for seq_id, slot in self.seq_groups_to_batch_slot.items():
-            if slot < 0 or slot >= self.scheduler_config.max_num_seqs:
-                logger.error(f"Invalid slot {slot} for seq_id {seq_id}")
-                
-        # Check that empty_slots don't overlap with allocated slots
-        allocated_slots = set(self.seq_groups_to_batch_slot.values())
-        empty_slots_set = set(self.empty_slots)
-        overlap = allocated_slots.intersection(empty_slots_set)
-        if overlap:
-            logger.error(f"Slot overlap detected: {overlap}")
-            logger.error(f"Allocated slots: {allocated_slots}")
-            logger.error(f"Empty slots: {empty_slots_set}")
-            
-        # Check that all slots are accounted for
-        all_slots = allocated_slots.union(empty_slots_set)
-        expected_slots = set(range(self.scheduler_config.max_num_seqs))
-        if all_slots != expected_slots:
-            missing = expected_slots - all_slots
-            extra = all_slots - expected_slots
-            if missing:
-                logger.error(f"Missing slots: {missing}")
-            if extra:
-                logger.error(f"Extra slots: {extra}")
-
-    def _attempt_state_recovery(self) -> None:
-        """Attempt to recover from corrupted slot state."""
-        logger.warning("Attempting slot state recovery...")
-        
-        try:
-            # Get all currently allocated slots
-            allocated_slots = set(self.seq_groups_to_batch_slot.values())
-            
-            # Rebuild empty_slots from scratch
-            all_slots = set(range(self.scheduler_config.max_num_seqs))
-            correct_empty_slots = sorted(list(all_slots - allocated_slots))
-            
-            old_empty_count = len(self.empty_slots)
-            self.empty_slots = correct_empty_slots
-            new_empty_count = len(self.empty_slots)
-            
-            logger.warning(f"State recovery: rebuilt empty_slots from {old_empty_count} to {new_empty_count} slots")
-            logger.warning(f"Allocated slots: {len(allocated_slots)}, Empty slots: {new_empty_count}")
-            
-            # Validate the recovery worked
-            self._validate_state_consistency()
-            logger.info("State recovery successful")
-            
-        except Exception as e:
-            logger.error(f"State recovery failed: {e}")
-            # Last resort: reset everything (will cause some requests to fail)
-            logger.error("Performing emergency state reset")
-            self.seq_groups_to_batch_slot.clear()
-            self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
-            self.req_id_to_seq_id.clear()
-            if hasattr(self, 'cached_req_data'):
-                self.cached_req_data.clear()
-
-    def _get_slot_statistics(self) -> Dict[str, int]:
-        """Get current slot allocation statistics for monitoring."""
-        return {
-            "allocated_slots": len(self.seq_groups_to_batch_slot),
-            "empty_slots": len(self.empty_slots),
-            "req_id_mappings": len(self.req_id_to_seq_id),
-            "cached_req_data": len(self.cached_req_data) if hasattr(self, 'cached_req_data') and self.cached_req_data else 0,
-            "cleanup_count": self._cleanup_counter,
-            "allocation_count": self._allocation_counter,
-            "last_validation": self._last_state_validation
-        }
