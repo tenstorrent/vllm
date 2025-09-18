@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
@@ -57,6 +58,12 @@ class TTModelInput(ModelRunnerInputBase):
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
+    # For mixed batch support
+    mixed_batch_mode: bool = False
+    prefill_seq_indices: Optional[List[int]] = None
+    decode_seq_indices: Optional[List[int]] = None
+    prefill_metadata_list: Optional[List[Any]] = None
+    decode_metadata_list: Optional[List[Any]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -113,6 +120,193 @@ def top_pk_logits_efficient(logits,
 
 
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
+
+    def _execute_mixed_batch(
+        self,
+        model_input: TTModelInput,
+        kv_caches: List[torch.Tensor],
+        num_steps: int = 1,
+    ) -> Optional[List[SamplerOutput]]:
+        """Handle mixed batches by processing prefill sequences first, then decode sequences."""
+        logger.info("Processing mixed batch: prefill sequences first, then decode sequences")
+        
+        # Phase 1: Process prefill sequences
+        if model_input.prefill_metadata_list:
+            logger.info(f"Phase 1: Processing {len(model_input.prefill_metadata_list)} prefill sequences")
+            
+            # For sequences that were incorrectly marked as decode but need prefill,
+            # we need to fix their is_prompt flag
+            corrected_prefill_metadata = []
+            for metadata in model_input.prefill_metadata_list:
+                if not metadata.is_prompt:
+                    # This sequence was marked as decode but needs prefill
+                    # Create a copy with is_prompt=True
+                    corrected_metadata = copy.deepcopy(metadata)
+                    corrected_metadata.is_prompt = True
+                    corrected_prefill_metadata.append(corrected_metadata)
+                    logger.debug(f"Corrected is_prompt flag for sequence {list(metadata.seq_data.keys())[0]}")
+                else:
+                    corrected_prefill_metadata.append(metadata)
+            
+            # Create a prefill-only model input
+            prefill_input = self.prepare_model_input(
+                corrected_prefill_metadata,
+                virtual_engine=0,  # TODO: get from original input
+                finished_requests_ids=None
+            )
+            
+            # Execute prefill
+            prefill_outputs = []
+            if prefill_input.unpadded_batch_size > 0:
+                prefill_result = self._execute_model_single_step(
+                    prefill_input,
+                    kv_caches,
+                    is_decode=False,
+                    use_async_out_proc=False,
+                    step_idx=0
+                )
+                # Convert prefill results to SamplerOutput format
+                # For prefill, we get the last token that can be used to start decode
+                if prefill_input.compat_sampling_used:
+                    prefill_outputs = prefill_result  # Already in SamplerOutput format list
+                else:
+                    # prefill_result contains next_token_ids for each sequence
+                    # We need to convert these to SamplerOutput format
+                    prefill_outputs = []
+                    # Handle both tensor and list formats
+                    if isinstance(prefill_result, torch.Tensor):
+                        token_ids = prefill_result.tolist()
+                    else:
+                        token_ids = prefill_result
+                        
+                    for i, seq_id in enumerate(prefill_input.seq_groups):
+                        # Get the metadata for this sequence
+                        metadata = model_input.prefill_metadata_list[i]
+                        seq_group = metadata.seq_group
+                        
+                        # Create outputs for each sequence in the group
+                        outputs = []
+                        for j, seq in enumerate(seq_group.get_seqs()):
+                            if i < len(token_ids):
+                                next_token_id = int(token_ids[i])
+                            else:
+                                # Should not happen, but handle gracefully
+                                logger.warning(f"Missing token ID for prefill sequence {i}")
+                                next_token_id = 0
+                                
+                            outputs.append(CompletionSequenceGroupOutput(
+                                samples=[SequenceOutput(
+                                    parent_seq_id=seq.seq_id,
+                                    output_token=next_token_id,
+                                    logprobs={},  # Empty for now
+                                )],
+                                prompt_logprobs=None,
+                            ))
+                        
+                        prefill_outputs.append(SamplerOutput(
+                            outputs=outputs,
+                            sampled_token_probs=None,
+                            sampled_token_ids=None,
+                            logprobs=None,
+                            hidden_states=None,
+                            prefill_hidden_states=None,
+                            finished=False
+                        ))
+        else:
+            prefill_outputs = []
+        
+        # Phase 2: Process decode sequences
+        if model_input.decode_metadata_list:
+            logger.info(f"Phase 2: Processing {len(model_input.decode_metadata_list)} decode sequences")
+            # Create a decode-only model input
+            decode_input = self.prepare_model_input(
+                model_input.decode_metadata_list,
+                virtual_engine=0,  # TODO: get from original input
+                finished_requests_ids=None
+            )
+            
+            # Execute decode
+            decode_outputs = []
+            if decode_input.unpadded_batch_size > 0:
+                for step in range(num_steps):
+                    step_output = self._execute_model_single_step(
+                        decode_input,
+                        kv_caches,
+                        is_decode=True,
+                        use_async_out_proc=model_input.async_callback is not None,
+                        step_idx=step
+                    )
+                    if decode_input.compat_sampling_used:
+                        # For compat sampling, outputs are already SamplerOutput objects
+                        if isinstance(step_output, list):
+                            decode_outputs.extend(step_output)
+                        else:
+                            decode_outputs.append(step_output)
+                    else:
+                        # For non-compat sampling, we need to convert token IDs to SamplerOutput
+                        if step == num_steps - 1:  # Only process outputs on last step
+                            # Handle both tensor and list formats
+                            if isinstance(step_output, torch.Tensor):
+                                token_ids = step_output.tolist()
+                            else:
+                                token_ids = step_output
+                                
+                            for i, seq_id in enumerate(decode_input.seq_groups):
+                                # Get metadata from the stored decode_metadata_list
+                                metadata = model_input.decode_metadata_list[i]
+                                seq_group = metadata.seq_group
+                                
+                                # Create outputs for each sequence in the group
+                                outputs = []
+                                for j, seq in enumerate(seq_group.get_seqs()):
+                                    if i < len(token_ids):
+                                        next_token_id = int(token_ids[i])
+                                    else:
+                                        logger.warning(f"Missing token ID for decode sequence {i}")
+                                        next_token_id = 0
+                                        
+                                    outputs.append(CompletionSequenceGroupOutput(
+                                        samples=[SequenceOutput(
+                                            parent_seq_id=seq.seq_id,
+                                            output_token=next_token_id,
+                                            logprobs={},
+                                        )],
+                                        prompt_logprobs=None,
+                                    ))
+                                
+                                decode_outputs.append(SamplerOutput(
+                                    outputs=outputs,
+                                    sampled_token_probs=None,
+                                    sampled_token_ids=None,
+                                    logprobs=None,
+                                    hidden_states=None,
+                                    prefill_hidden_states=None,
+                                    finished=False
+                                ))
+        else:
+            decode_outputs = []
+        
+        # Combine outputs in the original order
+        # We need to reconstruct the outputs in the same order as the input sequences
+        combined_outputs = [None] * model_input.unpadded_batch_size
+        
+        # Place prefill outputs
+        if model_input.prefill_seq_indices:
+            for i, idx in enumerate(model_input.prefill_seq_indices):
+                if i < len(prefill_outputs):
+                    combined_outputs[idx] = prefill_outputs[i]
+        
+        # Place decode outputs
+        if model_input.decode_seq_indices:
+            for i, idx in enumerate(model_input.decode_seq_indices):
+                if i < len(decode_outputs):
+                    combined_outputs[idx] = decode_outputs[i]
+        
+        # Filter out None values (shouldn't happen in normal operation)
+        combined_outputs = [o for o in combined_outputs if o is not None]
+        
+        logger.info(f"Mixed batch processing complete: {len(combined_outputs)} total outputs")
+        return combined_outputs
 
     def __init__(
         self,
@@ -173,6 +367,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         self.cleanup_counter = 0
         self.cleanup_interval = 1000  # Clean up every 1000 requests
+        
+        # Track first decode for each sequence to reduce verbose logging
+        self.first_decode_logged: set = set()
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -231,13 +428,70 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             virtual_engine: int = 0,
             finished_requests_ids: Optional[List[str]] = None) -> TTModelInput:
 
-        # NOTE: We assume that all sequences in the group are all prompts or
-        # all decodes.
-        is_prompt = seq_group_metadata_list[
-            0].is_prompt  # prefill if True, otherwise decode
-        assert all(
-            x.is_prompt == is_prompt for x in seq_group_metadata_list
-        ), "Currently only supporting all prefills or all decodes in seq group"
+        # Extract sequence IDs early to check slot allocation
+        seq_ids_in_batch = []
+        for sgm in seq_group_metadata_list:
+            seq_ids = list(sgm.seq_data.keys())
+            assert len(seq_ids) == 1, "Currently only supporting one sequence per request group"
+            seq_ids_in_batch.append(seq_ids[0])
+        
+        # Check if we have a mixed batch
+        # This can happen in two ways:
+        # 1. Some sequences are marked as prompt, others as decode
+        # 2. All sequences are marked as decode, but some don't have allocated slots (new sequences)
+        has_explicit_prefill = any(x.is_prompt for x in seq_group_metadata_list)
+        has_decode = any(not x.is_prompt for x in seq_group_metadata_list)
+        
+        # Check for sequences without allocated slots (indicates they need prefill)
+        new_sequence_indices = []
+        if self.dp_kv_cache and not has_explicit_prefill:
+            # Only check for new sequences if we don't already have explicit prefills
+            for idx, seq_id in enumerate(seq_ids_in_batch):
+                if seq_id not in self.seq_groups_to_batch_slot:
+                    new_sequence_indices.append(idx)
+        
+        # Determine if this is a mixed batch
+        mixed_batch = has_explicit_prefill and has_decode
+        if not mixed_batch and new_sequence_indices:
+            # We have new sequences in what appears to be a decode-only batch
+            # This means the scheduler didn't properly mark them as prefill
+            mixed_batch = True
+            logger.info(f"Detected {len(new_sequence_indices)} new sequences in decode batch that need prefill")
+        
+        # Track which sequences are prefill vs decode
+        prefill_seq_indices = []
+        decode_seq_indices = []
+        
+        if mixed_batch:
+            # Separate prefill and decode sequences
+            for idx, sgm in enumerate(seq_group_metadata_list):
+                # A sequence needs prefill if:
+                # 1. It's explicitly marked as prompt, OR
+                # 2. It doesn't have an allocated slot (new sequence)
+                if sgm.is_prompt or (idx in new_sequence_indices):
+                    prefill_seq_indices.append(idx)
+                else:
+                    decode_seq_indices.append(idx)
+            
+            prefill_count = len(prefill_seq_indices)
+            decode_count = len(decode_seq_indices)
+            logger.info(f"Mixed batch detected: {prefill_count} prefill, {decode_count} decode sequences.")
+            # We'll handle mixed batches specially to ensure prefill sequences
+            # are processed before decode sequences
+            mixed_batch_mode = True
+            # Store the original metadata lists for later use
+            prefill_metadata_list = [seq_group_metadata_list[i] for i in prefill_seq_indices]
+            decode_metadata_list = [seq_group_metadata_list[i] for i in decode_seq_indices]
+            # For mixed batches, we'll process as decode to build the combined input
+            # but the actual execution will be split
+            is_prompt = False
+        else:
+            # Not a mixed batch - either all prefill or all decode
+            mixed_batch_mode = False
+            prefill_metadata_list = None
+            decode_metadata_list = None
+            # For backward compatibility, use the first sequence's state as default
+            is_prompt = seq_group_metadata_list[0].is_prompt
 
         unpadded_batch_size = len(seq_group_metadata_list)
         assert unpadded_batch_size > 0
@@ -261,12 +515,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if req_id in self.req_id_to_seq_id:
                     seq_id = self.req_id_to_seq_id[req_id]
                     finished_requests_seq_ids.append(seq_id)
-                    print(f"Request {req_id} -> seq_id {seq_id} marked for slot cleanup")
             
             # Now delete finished requests from req_id_to_seq_id
             for req_id in finished_requests_ids:
                 if req_id in self.req_id_to_seq_id:
-                    print(f"deleting from self.req_id_to_seq_id, {self.req_id_to_seq_id}")
                     del self.req_id_to_seq_id[req_id]
 
         # Compat sampling is off by default, and enabled only on request
@@ -281,18 +533,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     compat_sampling_used = True
                     break
 
-        for seq_group_metadata in seq_group_metadata_list:
-            seq_ids = list(seq_group_metadata.seq_data.keys())
-            assert len(
-                seq_ids
-            ) == 1, "Currently only supporting one sequence per request group"
-            seq_id = seq_ids[0]
+        for idx, seq_group_metadata in enumerate(seq_group_metadata_list):
+            # We already extracted seq_ids earlier
+            seq_id = seq_ids_in_batch[idx]
             seq_groups_list.append(seq_id)
             if self.dp_kv_cache:
                 # Add new request id to req_id_to_seq_id
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
-                print(f"Mapping request {seq_group_metadata.request_id} -> seq_id {seq_id}")
-                print(f"Current req_id_to_seq_id mapping: {self.req_id_to_seq_id}")
+                # Reduce logging verbosity
 
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
@@ -398,14 +646,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
         # Clean up cached_req_data for all finished sequences (both prompt and decode)
-        if self.cached_req_data:
+        if hasattr(self, 'cached_req_data') and self.cached_req_data:
             seq_ids_to_del = []
             for seq_id in self.cached_req_data:
                 if seq_id not in seq_groups_list:
                     seq_ids_to_del.append(seq_id)
             for seq_id in seq_ids_to_del:
                 del self.cached_req_data[seq_id]
-                print(f"Cleaned up cached_req_data for seq_id {seq_id}")
+                # Also clean up from first_decode_logged set
+                self.first_decode_logged.discard(seq_id)
+                logger.debug(f"Cleaned up cached_req_data for seq_id {seq_id}")
 
         # Convert lists to tensors and add padding
 
@@ -428,6 +678,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             input_positions = 0
             prompt_lens = seq_lens
         else:
+            # Normal decode path
             input_tokens = torch.tensor(input_tokens_list,
                                         dtype=torch.int32,
                                         device="cpu").view(-1, 1)
@@ -494,13 +745,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
-        print("self.dp_kv_cache", self.dp_kv_cache)
+        # Determine if this is the first decode for any sequence in the batch
+        first_decode_in_batch = not is_prompt and any(seq_id not in self.first_decode_logged for seq_id in seq_groups_list)
+        
+        
         if self.dp_kv_cache:
             prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
             # check for preempted requests
-            print(f"prev_seq_groups_list, {prev_seq_groups_list}")
-            print(f"seq_groups_list, {seq_groups_list}")
-            print(f"finished_requests_seq_ids, {finished_requests_seq_ids}")
+            if first_decode_in_batch:
+                logger.debug(f"prev_seq_groups_list, {prev_seq_groups_list}")
+                logger.debug(f"seq_groups_list, {seq_groups_list}")
+                logger.debug(f"finished_requests_seq_ids, {finished_requests_seq_ids}")
             # Detect preempted/aborted requests by comparing previous and current seq groups
             # This needs to happen for both prompts and decodes
             if seq_groups_list != prev_seq_groups_list:
@@ -509,39 +764,69 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     if seq_id not in seq_groups_list
                 ]
                 if finished_requests_seq_ids_current:
-                    print(f"Detected {len(finished_requests_seq_ids_current)} preempted/aborted sequences: {finished_requests_seq_ids_current}")
+                    logger.debug(f"Detected {len(finished_requests_seq_ids_current)} preempted/aborted sequences: {finished_requests_seq_ids_current}")
                     # Also clean up cached_req_data for these sequences
                     if hasattr(self, 'cached_req_data') and self.cached_req_data:
                         for seq_id in finished_requests_seq_ids_current:
                             if seq_id in self.cached_req_data:
                                 del self.cached_req_data[seq_id]
-                                print(f"Cleaned up cached_req_data for preempted seq_id {seq_id}")
+                                # Also clean up from first_decode_logged set
+                                self.first_decode_logged.discard(seq_id)
+                                if first_decode_in_batch:
+                                                logger.debug(f"Cleaned up cached_req_data for preempted seq_id {seq_id}")
             else:
                 finished_requests_seq_ids_current = []
-            print(f"finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")
+            
+            if first_decode_in_batch:
+                logger.debug(f"finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")
             # check for any remaining finished requests
             for seq_id in finished_requests_seq_ids:
                 if seq_id not in finished_requests_seq_ids_current:
                     finished_requests_seq_ids_current.append(seq_id)
-            print(f"UPDATED finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")   
-            print(f"self.seq_groups_to_batch_slot, {self.seq_groups_to_batch_slot}")
+            if first_decode_in_batch:
+                logger.debug(f"UPDATED finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")   
+                logger.debug(f"self.seq_groups_to_batch_slot, {self.seq_groups_to_batch_slot}")
             # update the empty slots
             for seq_id in finished_requests_seq_ids_current:
                 if seq_id in self.seq_groups_to_batch_slot:
                     empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
                     self.empty_slots.append(empty_batch_slot)
                     del self.seq_groups_to_batch_slot[seq_id]
-                    print(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
+                    if first_decode_in_batch:
+                        logger.debug(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
                 else:
-                    print(f"WARNING: seq_id {seq_id} not in seq_groups_to_batch_slot (keys: {list(self.seq_groups_to_batch_slot.keys())})")
+                    if first_decode_in_batch:
+                        logger.debug(f"WARNING: seq_id {seq_id} not in seq_groups_to_batch_slot (keys: {list(self.seq_groups_to_batch_slot.keys())})")
+                
+                # Clean up from first_decode_logged set to prevent memory leaks
+                self.first_decode_logged.discard(seq_id)
             
             # Sort empty_slots to maintain consistency
             self.empty_slots.sort()
-            print(f"Empty slots after cleanup: {self.empty_slots}")
-            print(f"Active mappings - req_id_to_seq_id: {len(self.req_id_to_seq_id)}, seq_groups_to_batch_slot: {len(self.seq_groups_to_batch_slot)}")
+            if first_decode_in_batch:
+                logger.debug(f"Empty slots after cleanup: {self.empty_slots}")
+                logger.debug(f"Active mappings - req_id_to_seq_id: {len(self.req_id_to_seq_id)}, seq_groups_to_batch_slot: {len(self.seq_groups_to_batch_slot)}")
+            
+            # After cleanup, check for sequences that need slots but don't have them
+            # This should not happen anymore since we detect mixed batches properly
+            if not is_prompt and not mixed_batch_mode:
+                unallocated_seqs = []
+                allocated_seqs = []
+                for seq_id in seq_groups_list:
+                    if seq_id not in self.seq_groups_to_batch_slot:
+                        unallocated_seqs.append(seq_id)
+                    else:
+                        allocated_seqs.append(seq_id)
+                
+                if unallocated_seqs:
+                    # This shouldn't happen with proper mixed batch detection
+                    logger.warning(f"Found {len(unallocated_seqs)} sequences without slots in decode batch: {unallocated_seqs}")
+                    logger.warning(f"This indicates the mixed batch detection may have missed these sequences")
+                    logger.debug(f"Current slot allocations: {self.seq_groups_to_batch_slot}")
+                    logger.debug(f"Available empty slots: {len(self.empty_slots)}")
             
             # Defensive check: warn if req_id_to_seq_id is growing too large
-            if len(self.req_id_to_seq_id) > self.scheduler_config.max_num_seqs * 2:
+            if len(self.req_id_to_seq_id) > self.scheduler_config.max_num_seqs * 4:
                 logger.warning(f"req_id_to_seq_id has {len(self.req_id_to_seq_id)} entries, which seems excessive. "
                               f"This might indicate a memory leak.")
             
@@ -553,7 +838,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 logger.info(f"Periodic cleanup #{self.cleanup_counter // self.cleanup_interval}: "
                            f"req_id_to_seq_id size: {len(self.req_id_to_seq_id)}, "
                            f"cached_req_data size: {cached_req_data_size}, "
-                           f"seq_groups_to_batch_slot size: {len(self.seq_groups_to_batch_slot)}")
+                           f"seq_groups_to_batch_slot size: {len(self.seq_groups_to_batch_slot)}, "
+                           f"first_decode_logged size: {len(self.first_decode_logged)}")
+        
+        # Mark sequences in decode batches as having been logged for first decode
+        if not is_prompt:
+            for seq_id in seq_groups_list:
+                self.first_decode_logged.add(seq_id)
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -566,7 +857,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             compat_sampling_used=compat_sampling_used,
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
-                            cross_block_tables=cross_block_tables)
+                            cross_block_tables=cross_block_tables,
+                            mixed_batch_mode=mixed_batch_mode,
+                            prefill_seq_indices=prefill_seq_indices if mixed_batch else None,
+                            decode_seq_indices=decode_seq_indices if mixed_batch else None,
+                            prefill_metadata_list=prefill_metadata_list,
+                            decode_metadata_list=decode_metadata_list)
 
     @torch.no_grad()
     def execute_model(
@@ -577,6 +873,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         num_steps: int = 1,
     ) -> Optional[List[SamplerOutput]]:
         is_decode = model_input.prompt_lens is None
+        
+        # Check if we have a mixed batch that needs special handling
+        # Mixed batches occur when the scheduler placed both prefill and decode sequences together
+        mixed_batch_mode = getattr(model_input, 'mixed_batch_mode', False)
+        if mixed_batch_mode and hasattr(model_input, 'prefill_seq_indices') and model_input.prefill_seq_indices:
+            # Process mixed batch in two phases: prefill first, then decode
+            return self._execute_mixed_batch(model_input, kv_caches, num_steps)
 
         # Note on async_out_proc + multi-step: for gpu/tpu, the N steps are
         # enqueued on device and the last step will trigger the output
@@ -749,6 +1052,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                    is_decode,
                                    use_async_out_proc=False,
                                    step_idx=0):
+        # With proper mixed batch detection, sequences should have slots allocated during prefill
+        # This check is here as a safety net only
+        if self.dp_kv_cache and is_decode:
+            missing_slots = []
+            for seq_group in model_input.seq_groups:
+                if seq_group not in self.seq_groups_to_batch_slot:
+                    missing_slots.append(seq_group)
+            
+            if missing_slots:
+                # This indicates a bug in mixed batch detection or scheduling
+                logger.error(f"CRITICAL: {len(missing_slots)} sequences don't have allocated slots in decode: {missing_slots}")
+                logger.error(f"Current slot allocations: {self.seq_groups_to_batch_slot}")
+                logger.error(f"Available empty slots: {self.empty_slots} (count: {len(self.empty_slots)})")
+                raise RuntimeError(
+                    f"Sequences {missing_slots} don't have allocated slots for decode. "
+                    f"This indicates a bug in mixed batch detection or the scheduler. "
+                    f"New sequences should have been processed through prefill first.")
+        
         execute_model_kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
@@ -781,7 +1102,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # update the batch slot table
                 recently_filled_slots = self.empty_slots[:model_input.
                                                          unpadded_batch_size]
-                print(f"recently_filled_slots, {recently_filled_slots}, {model_input.unpadded_batch_size}")
+                # Only log during prefill (is_prompt=True)
+                logger.debug(f"recently_filled_slots, {recently_filled_slots}, {model_input.unpadded_batch_size}")
                 
                 # Add defensive check
                 if len(recently_filled_slots) < len(model_input.seq_groups):
@@ -796,12 +1118,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
 
-                print(f"seq_groups_to_batch_slot before, {self.seq_groups_to_batch_slot}") 
+                logger.debug(f"seq_groups_to_batch_slot before, {self.seq_groups_to_batch_slot}") 
 
                 for s in model_input.seq_groups:
                     allocated_slot = recently_filled_slots.pop(0)
                     self.seq_groups_to_batch_slot[s] = allocated_slot
-                    print(f"Allocated slot {allocated_slot} to seq_group {s}")
+                    logger.debug(f"Allocated slot {allocated_slot} to seq_group {s}")
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
@@ -888,6 +1210,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
+                # Note: Slot allocation for new sequences in mixed batches is now handled
+                # at the beginning of _execute_model_single_step
+                
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
                 perm_table_tensor = torch.as_tensor(
