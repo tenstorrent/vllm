@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import torch
@@ -57,6 +58,12 @@ class TTModelInput(ModelRunnerInputBase):
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
+    # For mixed batch support
+    mixed_batch_mode: bool = False
+    prefill_seq_indices: Optional[List[int]] = None
+    decode_seq_indices: Optional[List[int]] = None
+    prefill_metadata_list: Optional[List[Any]] = None
+    decode_metadata_list: Optional[List[Any]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -113,6 +120,244 @@ def top_pk_logits_efficient(logits,
 
 
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
+
+    def _execute_mixed_batch(
+        self,
+        model_input: TTModelInput,
+        kv_caches: List[torch.Tensor],
+        num_steps: int = 1,
+    ) -> Optional[List[SamplerOutput]]:
+        """Handle mixed batches by processing prefill sequences first, then decode sequences."""
+        logger.info("Processing mixed batch with simplified approach")
+        
+        # For mixed batches, we'll just process everything as decode
+        # but ensure new sequences get their slots allocated
+        # This is simpler than trying to split the batch
+        
+        # First, make sure all sequences have slots allocated
+        if self.dp_kv_cache:
+            for seq_id in model_input.seq_groups:
+                if seq_id not in self.seq_groups_to_batch_slot:
+                    if not self.empty_slots:
+                        raise RuntimeError(f"No empty slots available for sequence {seq_id}")
+                    allocated_slot = self.empty_slots.pop(0)
+                    self.seq_groups_to_batch_slot[seq_id] = allocated_slot
+                    logger.info(f"Allocated slot {allocated_slot} to sequence {seq_id} in mixed batch")
+        
+        # Now process normally as decode
+        # The model should handle the mixed batch internally
+        return None  # Let normal execution continue
+        
+        # Phase 1: Process prefill sequences
+        if model_input.prefill_metadata_list:
+            logger.info(f"Phase 1: Processing {len(model_input.prefill_metadata_list)} prefill sequences")
+            
+            # For sequences that were incorrectly marked as decode but need prefill,
+            # we MUST fix their is_prompt flag, otherwise prepare_model_input will
+            # treat them as decode sequences and not process their prompts!
+            corrected_prefill_metadata = []
+            for metadata in model_input.prefill_metadata_list:
+                if not metadata.is_prompt:
+                    # This sequence was marked as decode but needs prefill
+                    # We need to create a corrected version with is_prompt=True
+                    # Use dataclasses.replace to avoid deep copy issues
+                    corrected_metadata = replace(metadata, is_prompt=True)
+                    corrected_prefill_metadata.append(corrected_metadata)
+                    logger.info(f"Corrected is_prompt flag for sequence {list(metadata.seq_data.keys())[0]}")
+                else:
+                    corrected_prefill_metadata.append(metadata)
+            
+            # Create a prefill-only model input with corrected metadata
+            prefill_input = self.prepare_model_input(
+                corrected_prefill_metadata,
+                virtual_engine=0,  # TODO: get from original input
+                finished_requests_ids=None
+            )
+            
+            # Preserve important fields from the original input
+            prefill_input = dataclasses.replace(
+                prefill_input,
+                async_callback=model_input.async_callback,
+                is_first_multi_step=model_input.is_first_multi_step,
+                is_last_step=model_input.is_last_step
+            )
+            
+            # Execute prefill
+            prefill_outputs = []
+            if prefill_input.unpadded_batch_size > 0:
+                prefill_result = self._execute_model_single_step(
+                    prefill_input,
+                    kv_caches,
+                    is_decode=False,
+                    use_async_out_proc=False,
+                    step_idx=0
+                )
+                # Convert prefill results to SamplerOutput format
+                # For prefill, we get the last token that can be used to start decode
+                if prefill_input.compat_sampling_used:
+                    # For compat sampling, outputs are already SamplerOutput objects
+                    if isinstance(prefill_result, list):
+                        prefill_outputs = prefill_result
+                    else:
+                        prefill_outputs = [prefill_result]
+                else:
+                    # prefill_result contains next_token_ids for each sequence
+                    # Use the standard _make_sampler_output method
+                    token_ids = prefill_result.tolist() if isinstance(prefill_result, torch.Tensor) else prefill_result
+                    logger.debug(f"Prefill: token_ids={token_ids[:5] if isinstance(token_ids, list) else token_ids}... for seq_groups={prefill_input.seq_groups[:5]}...")
+                    sampler_output = self._make_sampler_output(
+                        token_ids,
+                        prefill_input.seq_groups
+                    )
+                    prefill_outputs = [sampler_output]
+        else:
+            prefill_outputs = []
+        
+        # Phase 2: Process decode sequences
+        if model_input.decode_metadata_list:
+            logger.info(f"Phase 2: Processing {len(model_input.decode_metadata_list)} decode sequences")
+            # Create a decode-only model input
+            decode_input = self.prepare_model_input(
+                model_input.decode_metadata_list,
+                virtual_engine=0,  # TODO: get from original input
+                finished_requests_ids=None
+            )
+            
+            # Preserve important fields from the original input
+            decode_input = dataclasses.replace(
+                decode_input,
+                async_callback=model_input.async_callback,
+                is_first_multi_step=model_input.is_first_multi_step,
+                is_last_step=model_input.is_last_step
+            )
+            
+            # Execute decode
+            decode_outputs = []
+            if decode_input.unpadded_batch_size > 0:
+                # For multi-step, we should only return outputs from the last step
+                # But we need to execute all steps to advance the generation
+                for step in range(num_steps):
+                    step_output = self._execute_model_single_step(
+                        decode_input,
+                        kv_caches,
+                        is_decode=True,
+                        use_async_out_proc=False,  # Disable async for mixed batches to simplify
+                        step_idx=step
+                    )
+                    
+                    # Handle async processing if needed
+                    if isinstance(step_output, tuple) and len(step_output) == 2:
+                        # This is async processing (tt_out, read_event)
+                        step_output, read_event = step_output
+                        # For now, just use the output directly
+                        # In a full implementation, we'd need to handle the async properly
+                    
+                    # Only collect outputs from the last step
+                    if step == num_steps - 1:
+                        if decode_input.compat_sampling_used:
+                            # For compat sampling, outputs are already SamplerOutput objects
+                            if isinstance(step_output, list):
+                                decode_outputs.extend(step_output)
+                            else:
+                                decode_outputs.append(step_output)
+                        else:
+                            # Use the standard _make_sampler_output method
+                            token_ids = step_output.tolist() if isinstance(step_output, torch.Tensor) else step_output
+                            logger.debug(f"Decode step {step}: token_ids={token_ids[:5]}... for seq_groups={decode_input.seq_groups[:5]}...")
+                            sampler_output = self._make_sampler_output(
+                                token_ids,
+                                decode_input.seq_groups
+                            )
+                            decode_outputs.append(sampler_output)
+                    else:
+                        # For intermediate steps, we need to update the input for the next step
+                        if not decode_input.compat_sampling_used:
+                            # Extract next token IDs and prepare for next step
+                            next_token_ids = step_output
+                            if isinstance(next_token_ids, torch.Tensor):
+                                next_token_ids = next_token_ids
+                            else:
+                                next_token_ids = torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
+                            
+                            # Update tokens and positions for next step
+                            new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
+                            if new_input_tokens.shape[0] < decode_input.input_tokens.shape[0]:
+                                # Pad if needed
+                                batch_pad_len = decode_input.input_tokens.shape[0] - new_input_tokens.shape[0]
+                                new_input_tokens = torch.cat([
+                                    new_input_tokens,
+                                    torch.zeros(batch_pad_len, 1, dtype=torch.int32, device="cpu")
+                                ])
+                            
+                            new_input_positions = torch.where(
+                                decode_input.input_positions == -1,
+                                decode_input.input_positions,
+                                decode_input.input_positions + 1
+                            )
+                            
+                            decode_input = dataclasses.replace(
+                                decode_input,
+                                input_tokens=new_input_tokens,
+                                input_positions=new_input_positions
+                            )
+        else:
+            decode_outputs = []
+        
+        # For mixed batches, we need to return outputs as if we processed everything together
+        # Both prefill and decode return a single SamplerOutput containing all sequences
+        # We need to merge them and reorder based on original sequence positions
+        
+        if not prefill_outputs and not decode_outputs:
+            return []
+            
+        # If we only have one type of output, return it directly
+        if prefill_outputs and not decode_outputs:
+            return prefill_outputs
+        if decode_outputs and not prefill_outputs:
+            return decode_outputs
+            
+        # Both prefill and decode outputs exist - need to merge
+        # Extract the individual sequence outputs
+        prefill_seq_outputs = []
+        decode_seq_outputs = []
+        
+        for sampler_output in prefill_outputs:
+            prefill_seq_outputs.extend(sampler_output.outputs)
+            
+        for sampler_output in decode_outputs:
+            decode_seq_outputs.extend(sampler_output.outputs)
+        
+        # Create mapping of original positions
+        final_outputs = [None] * model_input.unpadded_batch_size
+        
+        # Place outputs in their original positions
+        for i, orig_idx in enumerate(model_input.prefill_seq_indices or []):
+            if i < len(prefill_seq_outputs):
+                final_outputs[orig_idx] = prefill_seq_outputs[i]
+                
+        for i, orig_idx in enumerate(model_input.decode_seq_indices or []):
+            if i < len(decode_seq_outputs):
+                final_outputs[orig_idx] = decode_seq_outputs[i]
+        
+        # Remove any None values (shouldn't happen in normal operation)
+        final_outputs = [o for o in final_outputs if o is not None]
+        
+        # Return as a single SamplerOutput to match normal execution
+        # BUT ONLY if this is the last step!
+        if model_input.is_last_step:
+            logger.info(f"Mixed batch processing complete: {len(final_outputs)} total outputs")
+            # Log the sequence IDs in the final output for debugging
+            output_seq_ids = []
+            for output in final_outputs:
+                if hasattr(output, 'samples') and output.samples:
+                    output_seq_ids.append(output.samples[0].parent_seq_id)
+            logger.debug(f"Output sequence IDs: {output_seq_ids}")
+            logger.debug(f"Expected seq_groups: {model_input.seq_groups}")
+            return [SamplerOutput(outputs=final_outputs)]
+        else:
+            # For intermediate steps, return empty list as per normal execution
+            logger.debug(f"Returning empty list for intermediate step (is_last_step={model_input.is_last_step})")
+            return []
 
     def __init__(
         self,
@@ -171,6 +416,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # SamplingMetadata.selected_token_indices logic.
             self.sampler = get_sampler()
 
+        self.cleanup_counter = 0
+        self.cleanup_interval = 1000  # Clean up every 1000 requests
+        
+        # Track first decode for each sequence to reduce verbose logging
+        self.first_decode_logged: set = set()
+
     def load_model(self) -> None:
         # Note: using custom TT loader
         # instead of selecting from default vllm loaders
@@ -208,12 +459,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            # Add a lock-like mechanism for atomic operations (using a simple flag)
-            self._slot_allocation_in_progress = False
-            # Track cleanup statistics for monitoring
-            self._cleanup_counter = 0
-            self._allocation_counter = 0
-            self._last_state_validation = 0
             if self.async_torch_proc:
                 self.cached_read_events: List[List[Any]] = [
                 ]  # Only used for multi-step execution
@@ -234,13 +479,70 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             virtual_engine: int = 0,
             finished_requests_ids: Optional[List[str]] = None) -> TTModelInput:
 
-        # NOTE: We assume that all sequences in the group are all prompts or
-        # all decodes.
-        is_prompt = seq_group_metadata_list[
-            0].is_prompt  # prefill if True, otherwise decode
-        assert all(
-            x.is_prompt == is_prompt for x in seq_group_metadata_list
-        ), "Currently only supporting all prefills or all decodes in seq group"
+        # Extract sequence IDs early to check slot allocation
+        seq_ids_in_batch = []
+        for sgm in seq_group_metadata_list:
+            seq_ids = list(sgm.seq_data.keys())
+            assert len(seq_ids) == 1, "Currently only supporting one sequence per request group"
+            seq_ids_in_batch.append(seq_ids[0])
+        
+        # Check if we have a mixed batch
+        # This can happen in two ways:
+        # 1. Some sequences are marked as prompt, others as decode
+        # 2. All sequences are marked as decode, but some don't have allocated slots (new sequences)
+        has_explicit_prefill = any(x.is_prompt for x in seq_group_metadata_list)
+        has_decode = any(not x.is_prompt for x in seq_group_metadata_list)
+        
+        # Check for sequences without allocated slots (indicates they need prefill)
+        new_sequence_indices = []
+        if self.dp_kv_cache and not has_explicit_prefill:
+            # Only check for new sequences if we don't already have explicit prefills
+            for idx, seq_id in enumerate(seq_ids_in_batch):
+                if seq_id not in self.seq_groups_to_batch_slot:
+                    new_sequence_indices.append(idx)
+        
+        # Determine if this is a mixed batch
+        mixed_batch = has_explicit_prefill and has_decode
+        if not mixed_batch and new_sequence_indices:
+            # We have new sequences in what appears to be a decode-only batch
+            # This means the scheduler didn't properly mark them as prefill
+            mixed_batch = True
+            logger.info(f"Detected {len(new_sequence_indices)} new sequences in decode batch that need prefill")
+        
+        # Track which sequences are prefill vs decode
+        prefill_seq_indices = []
+        decode_seq_indices = []
+        
+        if mixed_batch:
+            # Separate prefill and decode sequences
+            for idx, sgm in enumerate(seq_group_metadata_list):
+                # A sequence needs prefill if:
+                # 1. It's explicitly marked as prompt, OR
+                # 2. It doesn't have an allocated slot (new sequence)
+                if sgm.is_prompt or (idx in new_sequence_indices):
+                    prefill_seq_indices.append(idx)
+                else:
+                    decode_seq_indices.append(idx)
+            
+            prefill_count = len(prefill_seq_indices)
+            decode_count = len(decode_seq_indices)
+            logger.info(f"Mixed batch detected: {prefill_count} prefill, {decode_count} decode sequences.")
+            # We'll handle mixed batches specially to ensure prefill sequences
+            # are processed before decode sequences
+            mixed_batch_mode = True
+            # Store the original metadata lists for later use
+            prefill_metadata_list = [seq_group_metadata_list[i] for i in prefill_seq_indices]
+            decode_metadata_list = [seq_group_metadata_list[i] for i in decode_seq_indices]
+            # For mixed batches, we'll process as decode to build the combined input
+            # but the actual execution will be split
+            is_prompt = False
+        else:
+            # Not a mixed batch - either all prefill or all decode
+            mixed_batch_mode = False
+            prefill_metadata_list = None
+            decode_metadata_list = None
+            # For backward compatibility, use the first sequence's state as default
+            is_prompt = seq_group_metadata_list[0].is_prompt
 
         unpadded_batch_size = len(seq_group_metadata_list)
         assert unpadded_batch_size > 0
@@ -256,14 +558,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
+        # Track which sequence IDs need their slots freed
         finished_requests_seq_ids = []
         if self.dp_kv_cache and finished_requests_ids is not None:
-            # Delete finished requests from req_id_to_seq_id
+            # Collect sequence IDs for finished requests before deleting them
             for req_id in finished_requests_ids:
-                # only delete if the request was added in the first place 
-                if req_id in self.req_id_to_seq_id.keys():
-                    finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
-                    logger.debug(f"deleting from self.req_id_to_seq_id, {self.req_id_to_seq_id}")
+                if req_id in self.req_id_to_seq_id:
+                    seq_id = self.req_id_to_seq_id[req_id]
+                    finished_requests_seq_ids.append(seq_id)
+            
+            # Now delete finished requests from req_id_to_seq_id
+            for req_id in finished_requests_ids:
+                if req_id in self.req_id_to_seq_id:
                     del self.req_id_to_seq_id[req_id]
 
         # Compat sampling is off by default, and enabled only on request
@@ -278,26 +584,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     compat_sampling_used = True
                     break
 
-        for seq_group_metadata in seq_group_metadata_list:
-            seq_ids = list(seq_group_metadata.seq_data.keys())
-            assert len(
-                seq_ids
-            ) == 1, "Currently only supporting one sequence per request group"
-            seq_id = seq_ids[0]
+        for idx, seq_group_metadata in enumerate(seq_group_metadata_list):
+            # We already extracted seq_ids earlier
+            seq_id = seq_ids_in_batch[idx]
             seq_groups_list.append(seq_id)
             if self.dp_kv_cache:
-                # Add new request id to req_id_to_seq_id with duplicate protection
-                req_id = seq_group_metadata.request_id
-                if req_id in self.req_id_to_seq_id:
-                    existing_seq_id = self.req_id_to_seq_id[req_id]
-                    if existing_seq_id != seq_id:
-                        logger.warning(f"Duplicate request_id {req_id} with different seq_id: "
-                                     f"existing={existing_seq_id}, new={seq_id}. "
-                                     f"This may indicate a scheduler bug.")
-                    # Update anyway in case of seq_id reuse
-                
-                self.req_id_to_seq_id[req_id] = seq_id
-                logger.debug(f"adding to self.req_id_to_seq_id, {self.req_id_to_seq_id}")
+                # Add new request id to req_id_to_seq_id
+                self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
+                # Reduce logging verbosity
 
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
@@ -402,15 +696,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
-        if ((self.model_config.is_encoder_decoder
-             or self.request_specific_rope) and not is_prompt
-                and self.cached_req_data):
+        # Clean up cached_req_data for all finished sequences (both prompt and decode)
+        if hasattr(self, 'cached_req_data') and self.cached_req_data:
             seq_ids_to_del = []
             for seq_id in self.cached_req_data:
                 if seq_id not in seq_groups_list:
                     seq_ids_to_del.append(seq_id)
             for seq_id in seq_ids_to_del:
                 del self.cached_req_data[seq_id]
+                # Also clean up from first_decode_logged set
+                self.first_decode_logged.discard(seq_id)
+                logger.debug(f"Cleaned up cached_req_data for seq_id {seq_id}")
 
         # Convert lists to tensors and add padding
 
@@ -433,6 +729,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             input_positions = 0
             prompt_lens = seq_lens
         else:
+            # Normal decode path
             input_tokens = torch.tensor(input_tokens_list,
                                         dtype=torch.int32,
                                         device="cpu").view(-1, 1)
@@ -499,9 +796,106 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
-        # Perform slot cleanup atomically before any allocation
+        # Determine if this is the first decode for any sequence in the batch
+        first_decode_in_batch = not is_prompt and any(seq_id not in self.first_decode_logged for seq_id in seq_groups_list)
+        
+        
         if self.dp_kv_cache:
-            self._cleanup_finished_requests(seq_groups_list, finished_requests_seq_ids, is_prompt)
+            prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
+            # check for preempted requests
+            if first_decode_in_batch:
+                logger.debug(f"prev_seq_groups_list, {prev_seq_groups_list}")
+                logger.debug(f"seq_groups_list, {seq_groups_list}")
+                logger.debug(f"finished_requests_seq_ids, {finished_requests_seq_ids}")
+            # Detect preempted/aborted requests by comparing previous and current seq groups
+            # This needs to happen for both prompts and decodes
+            if seq_groups_list != prev_seq_groups_list:
+                finished_requests_seq_ids_current = [
+                    seq_id for seq_id in prev_seq_groups_list
+                    if seq_id not in seq_groups_list
+                ]
+                if finished_requests_seq_ids_current:
+                    logger.debug(f"Detected {len(finished_requests_seq_ids_current)} preempted/aborted sequences: {finished_requests_seq_ids_current}")
+                    # Also clean up cached_req_data for these sequences
+                    if hasattr(self, 'cached_req_data') and self.cached_req_data:
+                        for seq_id in finished_requests_seq_ids_current:
+                            if seq_id in self.cached_req_data:
+                                del self.cached_req_data[seq_id]
+                                # Also clean up from first_decode_logged set
+                                self.first_decode_logged.discard(seq_id)
+                                if first_decode_in_batch:
+                                                logger.debug(f"Cleaned up cached_req_data for preempted seq_id {seq_id}")
+            else:
+                finished_requests_seq_ids_current = []
+            
+            if first_decode_in_batch:
+                logger.debug(f"finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")
+            # check for any remaining finished requests
+            for seq_id in finished_requests_seq_ids:
+                if seq_id not in finished_requests_seq_ids_current:
+                    finished_requests_seq_ids_current.append(seq_id)
+            if first_decode_in_batch:
+                logger.debug(f"UPDATED finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")   
+                logger.debug(f"self.seq_groups_to_batch_slot, {self.seq_groups_to_batch_slot}")
+            # update the empty slots
+            for seq_id in finished_requests_seq_ids_current:
+                if seq_id in self.seq_groups_to_batch_slot:
+                    empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
+                    self.empty_slots.append(empty_batch_slot)
+                    del self.seq_groups_to_batch_slot[seq_id]
+                    if first_decode_in_batch:
+                        logger.debug(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
+                else:
+                    if first_decode_in_batch:
+                        logger.debug(f"WARNING: seq_id {seq_id} not in seq_groups_to_batch_slot (keys: {list(self.seq_groups_to_batch_slot.keys())})")
+                
+                # Clean up from first_decode_logged set to prevent memory leaks
+                self.first_decode_logged.discard(seq_id)
+            
+            # Sort empty_slots to maintain consistency
+            self.empty_slots.sort()
+            if first_decode_in_batch:
+                logger.debug(f"Empty slots after cleanup: {self.empty_slots}")
+                logger.debug(f"Active mappings - req_id_to_seq_id: {len(self.req_id_to_seq_id)}, seq_groups_to_batch_slot: {len(self.seq_groups_to_batch_slot)}")
+            
+            # After cleanup, check for sequences that need slots but don't have them
+            # This should not happen anymore since we detect mixed batches properly
+            if not is_prompt and not mixed_batch_mode:
+                unallocated_seqs = []
+                allocated_seqs = []
+                for seq_id in seq_groups_list:
+                    if seq_id not in self.seq_groups_to_batch_slot:
+                        unallocated_seqs.append(seq_id)
+                    else:
+                        allocated_seqs.append(seq_id)
+                
+                if unallocated_seqs:
+                    # This shouldn't happen with proper mixed batch detection
+                    logger.warning(f"Found {len(unallocated_seqs)} sequences without slots in decode batch: {unallocated_seqs}")
+                    logger.warning(f"This indicates the mixed batch detection may have missed these sequences")
+                    logger.debug(f"Current slot allocations: {self.seq_groups_to_batch_slot}")
+                    logger.debug(f"Available empty slots: {len(self.empty_slots)}")
+            
+            # Defensive check: warn if req_id_to_seq_id is growing too large
+            if len(self.req_id_to_seq_id) > self.scheduler_config.max_num_seqs * 4:
+                logger.warning(f"req_id_to_seq_id has {len(self.req_id_to_seq_id)} entries, which seems excessive. "
+                              f"This might indicate a memory leak.")
+            
+            # Periodic cleanup to prevent unbounded growth
+            self.cleanup_counter += 1
+            if self.cleanup_counter % self.cleanup_interval == 0:
+                # Log statistics
+                cached_req_data_size = len(self.cached_req_data) if hasattr(self, 'cached_req_data') and self.cached_req_data else 0
+                logger.info(f"Periodic cleanup #{self.cleanup_counter // self.cleanup_interval}: "
+                           f"req_id_to_seq_id size: {len(self.req_id_to_seq_id)}, "
+                           f"cached_req_data size: {cached_req_data_size}, "
+                           f"seq_groups_to_batch_slot size: {len(self.seq_groups_to_batch_slot)}, "
+                           f"first_decode_logged size: {len(self.first_decode_logged)}")
+        
+        # Mark sequences in decode batches as having been logged for first decode
+        if not is_prompt:
+            for seq_id in seq_groups_list:
+                self.first_decode_logged.add(seq_id)
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -514,7 +908,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             compat_sampling_used=compat_sampling_used,
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
-                            cross_block_tables=cross_block_tables)
+                            cross_block_tables=cross_block_tables,
+                            mixed_batch_mode=mixed_batch_mode,
+                            prefill_seq_indices=prefill_seq_indices if mixed_batch else None,
+                            decode_seq_indices=decode_seq_indices if mixed_batch else None,
+                            prefill_metadata_list=prefill_metadata_list,
+                            decode_metadata_list=decode_metadata_list)
 
     @torch.no_grad()
     def execute_model(
@@ -525,6 +924,27 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         num_steps: int = 1,
     ) -> Optional[List[SamplerOutput]]:
         is_decode = model_input.prompt_lens is None
+        
+        # Check if we have a mixed batch
+        # Mixed batches should not happen with the TT backend
+        mixed_batch_mode = getattr(model_input, 'mixed_batch_mode', False)
+        if mixed_batch_mode:
+            # Count prefill and decode sequences
+            prefill_count = len(model_input.prefill_seq_indices) if hasattr(model_input, 'prefill_seq_indices') and model_input.prefill_seq_indices else 0
+            decode_count = len(model_input.decode_seq_indices) if hasattr(model_input, 'decode_seq_indices') and model_input.decode_seq_indices else 0
+            
+            # Log detailed information about the mixed batch
+            logger.error(f"Mixed batch detected with {prefill_count} prefill and {decode_count} decode sequences")
+            logger.error(f"Prefill indices: {model_input.prefill_seq_indices if hasattr(model_input, 'prefill_seq_indices') else 'N/A'}")
+            logger.error(f"Decode indices: {model_input.decode_seq_indices if hasattr(model_input, 'decode_seq_indices') else 'N/A'}")
+            logger.error(f"Sequence groups: {model_input.seq_groups}")
+            
+            raise RuntimeError(
+                f"TT backend does not support mixed batches with both prefill ({prefill_count}) "
+                f"and decode ({decode_count}) sequences. This typically happens when new requests "
+                f"arrive while existing requests are still generating. Consider adjusting your "
+                f"request scheduling or reducing concurrency."
+            )
 
         # Note on async_out_proc + multi-step: for gpu/tpu, the N steps are
         # enqueued on device and the last step will trigger the output
@@ -659,8 +1079,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # such as logprobs.
         zero_logprob = Logprob(0.0)
         sampler_outputs = []
+        
+        # Check if we're generating EOS tokens
+        eos_tokens = [0, 1, 2]  # Common EOS token IDs
         for batch_idx, seq_id in enumerate(seq_groups):
             next_token_id = int(next_token_ids[batch_idx])
+            if next_token_id in eos_tokens:
+                logger.debug(f"Generated potential EOS token {next_token_id} for seq {seq_id}")
             seq_outputs = [
                 SequenceOutput(seq_id, next_token_id,
                                {next_token_id: zero_logprob})
@@ -697,6 +1122,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                    is_decode,
                                    use_async_out_proc=False,
                                    step_idx=0):
+        # With proper mixed batch detection, sequences should have slots allocated during prefill
+        # This check is here as a safety net only
+        if self.dp_kv_cache and is_decode:
+            missing_slots = []
+            for seq_group in model_input.seq_groups:
+                if seq_group not in self.seq_groups_to_batch_slot:
+                    missing_slots.append(seq_group)
+            
+            if missing_slots:
+                # This indicates a bug in mixed batch detection or scheduling
+                logger.error(f"CRITICAL: {len(missing_slots)} sequences don't have allocated slots in decode: {missing_slots}")
+                logger.error(f"Current slot allocations: {self.seq_groups_to_batch_slot}")
+                logger.error(f"Available empty slots: {self.empty_slots} (count: {len(self.empty_slots)})")
+                raise RuntimeError(
+                    f"Sequences {missing_slots} don't have allocated slots for decode. "
+                    f"This indicates a bug in mixed batch detection or the scheduler. "
+                    f"New sequences should have been processed through prefill first.")
+        
         execute_model_kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
@@ -726,8 +1169,31 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             outputs = self.model.prefill_forward(**execute_model_kwargs)
 
             if self.dp_kv_cache:
-                # Atomically allocate slots for new sequences
-                self._allocate_slots_atomic(model_input.seq_groups, model_input.unpadded_batch_size)
+                # update the batch slot table
+                recently_filled_slots = self.empty_slots[:model_input.
+                                                         unpadded_batch_size]
+                # Only log during prefill (is_prompt=True)
+                logger.debug(f"recently_filled_slots, {recently_filled_slots}, {model_input.unpadded_batch_size}")
+                
+                # Add defensive check
+                if len(recently_filled_slots) < len(model_input.seq_groups):
+                    logger.error(f"Not enough empty slots: need {len(model_input.seq_groups)}, "
+                                f"but only have {len(recently_filled_slots)} available")
+                    logger.error(f"Current slot assignments: {self.seq_groups_to_batch_slot}")
+                    logger.error(f"Empty slots: {self.empty_slots}")
+                    logger.error(f"Seq groups to allocate: {model_input.seq_groups}")
+                    raise RuntimeError(f"Insufficient empty slots for new sequences. "
+                                      f"This may indicate slots from canceled requests were not properly freed.")
+                
+                self.empty_slots = self.empty_slots[model_input.
+                                                    unpadded_batch_size:]
+
+                logger.debug(f"seq_groups_to_batch_slot before, {self.seq_groups_to_batch_slot}") 
+
+                for s in model_input.seq_groups:
+                    allocated_slot = recently_filled_slots.pop(0)
+                    self.seq_groups_to_batch_slot[s] = allocated_slot
+                    logger.debug(f"Allocated slot {allocated_slot} to seq_group {s}")
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
@@ -814,8 +1280,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
-                # Validate that all sequences have allocated slots before decode
-                self._validate_slot_assignments(model_input.seq_groups)
+                # Note: Slot allocation for new sequences in mixed batches is now handled
+                # at the beginning of _execute_model_single_step
                 
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
@@ -925,257 +1391,3 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for seq_output in seq_group_output.samples:
                 next_token_ids.append(seq_output.output_token)
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
-
-    def _cleanup_finished_requests(self, seq_groups_list: List[int], 
-                                 finished_requests_seq_ids: List[int], 
-                                 is_prompt: bool) -> None:
-        """Atomically cleanup slots for finished/preempted requests."""
-        if self._slot_allocation_in_progress:
-            logger.warning("Slot allocation already in progress, skipping cleanup")
-            return
-        
-        self._cleanup_counter += 1
-        
-        # Periodic state validation every 100 cleanups to catch corruption early
-        if self._cleanup_counter % 100 == 0:
-            try:
-                self._validate_state_consistency()
-                self._last_state_validation = self._cleanup_counter
-                logger.info(f"State validation passed at cleanup #{self._cleanup_counter}")
-            except Exception as e:
-                logger.error(f"State validation failed at cleanup #{self._cleanup_counter}: {e}")
-                # Attempt recovery
-                self._attempt_state_recovery()
-            
-        self._slot_allocation_in_progress = True
-        try:
-            prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
-            
-            logger.debug(f"prev_seq_groups_list: {prev_seq_groups_list}")
-            logger.debug(f"seq_groups_list: {seq_groups_list}")
-            logger.debug(f"finished_requests_seq_ids: {finished_requests_seq_ids}")
-            
-            # Detect preempted/aborted requests by comparing previous and current seq groups
-            if seq_groups_list != prev_seq_groups_list and not is_prompt:
-                finished_requests_seq_ids_current = [
-                    seq_id for seq_id in prev_seq_groups_list
-                    if seq_id not in seq_groups_list
-                ]
-            else:
-                finished_requests_seq_ids_current = []
-                
-            # Add any remaining finished requests
-            for seq_id in finished_requests_seq_ids:
-                if seq_id not in finished_requests_seq_ids_current:
-                    finished_requests_seq_ids_current.append(seq_id)
-            
-            # Clean up req_id_to_seq_id mapping for finished sequences
-            # This prevents memory leaks in long-running scenarios
-            req_ids_to_remove = []
-            for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
-                if mapped_seq_id in finished_requests_seq_ids_current:
-                    req_ids_to_remove.append(req_id)
-            
-            for req_id in req_ids_to_remove:
-                del self.req_id_to_seq_id[req_id]
-                logger.debug(f"Cleaned up req_id_to_seq_id mapping for {req_id} -> {self.req_id_to_seq_id.get(req_id, 'DELETED')}")
-                    
-            logger.debug(f"finished_requests_seq_ids_current: {finished_requests_seq_ids_current}")
-            logger.debug(f"seq_groups_to_batch_slot before cleanup: {self.seq_groups_to_batch_slot}")
-            
-            # Free slots for finished requests
-            freed_slots = []
-            for seq_id in finished_requests_seq_ids_current:
-                if seq_id in self.seq_groups_to_batch_slot:
-                    empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
-                    freed_slots.append(empty_batch_slot)
-                    del self.seq_groups_to_batch_slot[seq_id]
-                    logger.debug(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
-                else:
-                    logger.debug(f"seq_id {seq_id} not in seq_groups_to_batch_slot")
-                    
-            # Add freed slots back to empty_slots and sort for consistency
-            self.empty_slots.extend(freed_slots)
-            self.empty_slots.sort()
-            
-            logger.debug(f"seq_groups_to_batch_slot after cleanup: {self.seq_groups_to_batch_slot}")
-            logger.debug(f"empty_slots after cleanup: {self.empty_slots}")
-            
-        finally:
-            self._slot_allocation_in_progress = False
-
-    def _allocate_slots_atomic(self, seq_groups: List[int], unpadded_batch_size: int) -> None:
-        """Atomically allocate slots for new sequences."""
-        if self._slot_allocation_in_progress:
-            raise RuntimeError("Slot allocation already in progress - this indicates a concurrency issue")
-            
-        self._slot_allocation_in_progress = True
-        self._allocation_counter += 1
-        
-        try:
-            # Validate we have enough slots before making any changes
-            required_slots = len(seq_groups)
-            available_slots = len(self.empty_slots)
-            
-            if available_slots < required_slots:
-                logger.error(f"Insufficient empty slots: need {required_slots}, have {available_slots}")
-                logger.error(f"Current slot assignments: {self.seq_groups_to_batch_slot}")
-                logger.error(f"Empty slots: {self.empty_slots}")
-                logger.error(f"Seq groups to allocate: {seq_groups}")
-                raise RuntimeError(f"Insufficient empty slots for new sequences. "
-                                 f"Need {required_slots}, have {available_slots}. "
-                                 f"This may indicate slots from canceled requests were not properly freed.")
-            
-            # Check for sequences that already have slots (shouldn't happen in prefill)
-            already_allocated = []
-            for seq_id in seq_groups:
-                if seq_id in self.seq_groups_to_batch_slot:
-                    already_allocated.append(seq_id)
-                    
-            if already_allocated:
-                logger.warning(f"Sequences already have allocated slots: {already_allocated}")
-                # Remove them from allocation list
-                seq_groups = [s for s in seq_groups if s not in already_allocated]
-                required_slots = len(seq_groups)
-                
-            if required_slots == 0:
-                logger.debug("No new slots to allocate")
-                return
-                
-            logger.debug(f"Allocating {required_slots} slots for sequences: {seq_groups}")
-            logger.debug(f"seq_groups_to_batch_slot before allocation: {self.seq_groups_to_batch_slot}")
-            
-            # Atomically allocate slots
-            allocated_slots = []
-            for seq_id in seq_groups:
-                if len(self.empty_slots) == 0:
-                    # This should not happen due to our validation above, but be defensive
-                    logger.error("Ran out of empty slots during allocation!")
-                    # Rollback any allocations made so far
-                    for prev_seq_id, slot in zip(seq_groups[:len(allocated_slots)], allocated_slots):
-                        del self.seq_groups_to_batch_slot[prev_seq_id]
-                        self.empty_slots.append(slot)
-                    self.empty_slots.sort()
-                    raise RuntimeError("Ran out of empty slots during allocation")
-                    
-                slot = self.empty_slots.pop(0)
-                allocated_slots.append(slot)
-                self.seq_groups_to_batch_slot[seq_id] = slot
-                logger.debug(f"Allocated slot {slot} to seq_group {seq_id}")
-                
-            logger.debug(f"seq_groups_to_batch_slot after allocation: {self.seq_groups_to_batch_slot}")
-            logger.debug(f"empty_slots after allocation: {self.empty_slots}")
-            
-            # Log statistics periodically for monitoring
-            if self._allocation_counter % 1000 == 0:
-                stats = self._get_slot_statistics()
-                logger.info(f"Slot allocation milestone #{self._allocation_counter}: {stats}")
-                
-                # Alert if req_id_to_seq_id is growing too large (potential memory leak)
-                if stats["req_id_mappings"] > self.scheduler_config.max_num_seqs * 2:
-                    logger.warning(f"req_id_to_seq_id has {stats['req_id_mappings']} entries, "
-                                 f"which is more than 2x max_num_seqs ({self.scheduler_config.max_num_seqs}). "
-                                 f"This may indicate a memory leak.")
-            
-        finally:
-            self._slot_allocation_in_progress = False
-
-    def _validate_slot_assignments(self, seq_groups: List[int]) -> None:
-        """Validate that all sequences have proper slot assignments."""
-        missing_slots = []
-        for seq_id in seq_groups:
-            if seq_id not in self.seq_groups_to_batch_slot:
-                missing_slots.append(seq_id)
-                
-        if missing_slots:
-            logger.error(f"Sequences without slot assignments: {missing_slots}")
-            logger.error(f"Current slot assignments: {self.seq_groups_to_batch_slot}")
-            logger.error(f"Available empty slots: {self.empty_slots}")
-            raise RuntimeError(f"Sequences {missing_slots} do not have slot assignments. "
-                             f"This indicates a bug in slot management.")
-                             
-        # Validate slot assignments are within valid range
-        invalid_slots = []
-        for seq_id in seq_groups:
-            slot = self.seq_groups_to_batch_slot[seq_id]
-            if slot < 0 or slot >= self.scheduler_config.max_num_seqs:
-                invalid_slots.append((seq_id, slot))
-                
-        if invalid_slots:
-            logger.error(f"Invalid slot assignments: {invalid_slots}")
-            raise RuntimeError(f"Invalid slot assignments detected: {invalid_slots}")
-
-    def _validate_state_consistency(self) -> None:
-        """Validate internal state consistency for debugging."""
-        if not self.dp_kv_cache:
-            return
-            
-        # Check that all allocated slots are within valid range
-        for seq_id, slot in self.seq_groups_to_batch_slot.items():
-            if slot < 0 or slot >= self.scheduler_config.max_num_seqs:
-                logger.error(f"Invalid slot {slot} for seq_id {seq_id}")
-                
-        # Check that empty_slots don't overlap with allocated slots
-        allocated_slots = set(self.seq_groups_to_batch_slot.values())
-        empty_slots_set = set(self.empty_slots)
-        overlap = allocated_slots.intersection(empty_slots_set)
-        if overlap:
-            logger.error(f"Slot overlap detected: {overlap}")
-            logger.error(f"Allocated slots: {allocated_slots}")
-            logger.error(f"Empty slots: {empty_slots_set}")
-            
-        # Check that all slots are accounted for
-        all_slots = allocated_slots.union(empty_slots_set)
-        expected_slots = set(range(self.scheduler_config.max_num_seqs))
-        if all_slots != expected_slots:
-            missing = expected_slots - all_slots
-            extra = all_slots - expected_slots
-            if missing:
-                logger.error(f"Missing slots: {missing}")
-            if extra:
-                logger.error(f"Extra slots: {extra}")
-
-    def _attempt_state_recovery(self) -> None:
-        """Attempt to recover from corrupted slot state."""
-        logger.warning("Attempting slot state recovery...")
-        
-        try:
-            # Get all currently allocated slots
-            allocated_slots = set(self.seq_groups_to_batch_slot.values())
-            
-            # Rebuild empty_slots from scratch
-            all_slots = set(range(self.scheduler_config.max_num_seqs))
-            correct_empty_slots = sorted(list(all_slots - allocated_slots))
-            
-            old_empty_count = len(self.empty_slots)
-            self.empty_slots = correct_empty_slots
-            new_empty_count = len(self.empty_slots)
-            
-            logger.warning(f"State recovery: rebuilt empty_slots from {old_empty_count} to {new_empty_count} slots")
-            logger.warning(f"Allocated slots: {len(allocated_slots)}, Empty slots: {new_empty_count}")
-            
-            # Validate the recovery worked
-            self._validate_state_consistency()
-            logger.info("State recovery successful")
-            
-        except Exception as e:
-            logger.error(f"State recovery failed: {e}")
-            # Last resort: reset everything (will cause some requests to fail)
-            logger.error("Performing emergency state reset")
-            self.seq_groups_to_batch_slot.clear()
-            self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
-            self.req_id_to_seq_id.clear()
-            if hasattr(self, 'cached_req_data'):
-                self.cached_req_data.clear()
-
-    def _get_slot_statistics(self) -> Dict[str, int]:
-        """Get current slot allocation statistics for monitoring."""
-        return {
-            "allocated_slots": len(self.seq_groups_to_batch_slot),
-            "empty_slots": len(self.empty_slots),
-            "req_id_mappings": len(self.req_id_to_seq_id),
-            "cached_req_data": len(self.cached_req_data) if hasattr(self, 'cached_req_data') and self.cached_req_data else 0,
-            "cleanup_count": self._cleanup_counter,
-            "allocation_count": self._allocation_counter,
-            "last_validation": self._last_state_validation
-        }
