@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import ttnn
 from transformers import TopPLogitsWarper
-import threading
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
@@ -209,10 +208,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            # Add a lock-like mechanism for atomic operations (using a simple flag)
+            # Concurrency guard flag; no explicit threading lock is used.
             self._slot_allocation_in_progress = False
-            # Real lock to ensure thread/process safety within this worker
-            self._slot_lock = threading.Lock()
             if self.async_torch_proc:
                 self.cached_read_events: List[List[Any]] = [
                 ]  # Only used for multi-step execution
@@ -933,133 +930,131 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                  finished_requests_seq_ids: List[int], 
                                  is_prompt: bool) -> None:
         """Atomically cleanup slots for finished/preempted requests."""
-        with self._slot_lock:
-            if self._slot_allocation_in_progress:
-                logger.warning("Slot allocation already in progress, skipping cleanup")
-                return
+        if self._slot_allocation_in_progress:
+            logger.warning("Slot allocation already in progress, skipping cleanup")
+            return
+        
+        self._slot_allocation_in_progress = True
+        try:
+            prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
             
-            self._slot_allocation_in_progress = True
-            try:
-                prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
-                
-                logger.debug(f"prev_seq_groups_list: {prev_seq_groups_list}")
-                logger.debug(f"seq_groups_list: {seq_groups_list}")
-                logger.debug(f"finished_requests_seq_ids: {finished_requests_seq_ids}")
-                
-                # Detect preempted/aborted requests using set difference (order-agnostic) during decode
-                if not is_prompt:
-                    prev_set = set(prev_seq_groups_list)
-                    current_set = set(seq_groups_list)
-                    finished_requests_seq_ids_current = list(prev_set - current_set)
+            logger.debug(f"prev_seq_groups_list: {prev_seq_groups_list}")
+            logger.debug(f"seq_groups_list: {seq_groups_list}")
+            logger.debug(f"finished_requests_seq_ids: {finished_requests_seq_ids}")
+            
+            # Detect preempted/aborted requests using set difference (order-agnostic) during decode
+            if not is_prompt:
+                prev_set = set(prev_seq_groups_list)
+                current_set = set(seq_groups_list)
+                finished_requests_seq_ids_current = list(prev_set - current_set)
+            else:
+                finished_requests_seq_ids_current = []
+            
+            # Add any remaining finished requests
+            for seq_id in finished_requests_seq_ids:
+                if seq_id not in finished_requests_seq_ids_current:
+                    finished_requests_seq_ids_current.append(seq_id)
+            
+            # Clean up req_id_to_seq_id mapping for finished sequences
+            # This prevents memory leaks in long-running scenarios
+            req_ids_to_remove = []
+            for req_id, mapped_seq_id in list(self.req_id_to_seq_id.items()):
+                if mapped_seq_id in finished_requests_seq_ids_current:
+                    req_ids_to_remove.append(req_id)
+            
+            for req_id in req_ids_to_remove:
+                del self.req_id_to_seq_id[req_id]
+                logger.debug(f"Cleaned up req_id_to_seq_id mapping for {req_id} -> {self.req_id_to_seq_id.get(req_id, 'DELETED')}")
+            
+            logger.debug(f"finished_requests_seq_ids_current: {finished_requests_seq_ids_current}")
+            logger.debug(f"seq_groups_to_batch_slot before cleanup: {self.seq_groups_to_batch_slot}")
+            
+            # Free slots for finished requests
+            freed_slots = []
+            for seq_id in finished_requests_seq_ids_current:
+                if seq_id in self.seq_groups_to_batch_slot:
+                    empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
+                    freed_slots.append(empty_batch_slot)
+                    del self.seq_groups_to_batch_slot[seq_id]
+                    logger.debug(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
                 else:
-                    finished_requests_seq_ids_current = []
-                
-                # Add any remaining finished requests
-                for seq_id in finished_requests_seq_ids:
-                    if seq_id not in finished_requests_seq_ids_current:
-                        finished_requests_seq_ids_current.append(seq_id)
-                
-                # Clean up req_id_to_seq_id mapping for finished sequences
-                # This prevents memory leaks in long-running scenarios
-                req_ids_to_remove = []
-                for req_id, mapped_seq_id in list(self.req_id_to_seq_id.items()):
-                    if mapped_seq_id in finished_requests_seq_ids_current:
-                        req_ids_to_remove.append(req_id)
-                
-                for req_id in req_ids_to_remove:
-                    del self.req_id_to_seq_id[req_id]
-                    logger.debug(f"Cleaned up req_id_to_seq_id mapping for {req_id} -> {self.req_id_to_seq_id.get(req_id, 'DELETED')}")
-                
-                logger.debug(f"finished_requests_seq_ids_current: {finished_requests_seq_ids_current}")
-                logger.debug(f"seq_groups_to_batch_slot before cleanup: {self.seq_groups_to_batch_slot}")
-                
-                # Free slots for finished requests
-                freed_slots = []
-                for seq_id in finished_requests_seq_ids_current:
-                    if seq_id in self.seq_groups_to_batch_slot:
-                        empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
-                        freed_slots.append(empty_batch_slot)
-                        del self.seq_groups_to_batch_slot[seq_id]
-                        logger.debug(f"Freed slot {empty_batch_slot} from seq_id {seq_id}")
-                    else:
-                        logger.debug(f"seq_id {seq_id} not in seq_groups_to_batch_slot")
-                
-                # Add freed slots back to empty_slots and sort for consistency
-                self.empty_slots.extend(freed_slots)
-                self.empty_slots.sort()
-                
-                logger.debug(f"seq_groups_to_batch_slot after cleanup: {self.seq_groups_to_batch_slot}")
-                logger.debug(f"empty_slots after cleanup: {self.empty_slots}")
+                    logger.debug(f"seq_id {seq_id} not in seq_groups_to_batch_slot")
             
-            finally:
-                self._slot_allocation_in_progress = False
+            # Add freed slots back to empty_slots and sort for consistency
+            self.empty_slots.extend(freed_slots)
+            self.empty_slots.sort()
+            
+            logger.debug(f"seq_groups_to_batch_slot after cleanup: {self.seq_groups_to_batch_slot}")
+            logger.debug(f"empty_slots after cleanup: {self.empty_slots}")
+        
+        finally:
+            self._slot_allocation_in_progress = False
 
     def _allocate_slots_atomic(self, seq_groups: List[int], unpadded_batch_size: int) -> None:
         """Atomically allocate slots for new sequences."""
-        with self._slot_lock:
-            if self._slot_allocation_in_progress:
-                raise RuntimeError("Slot allocation already in progress - this indicates a concurrency issue")
+        if self._slot_allocation_in_progress:
+            raise RuntimeError("Slot allocation already in progress - this indicates a concurrency issue")
+        
+        self._slot_allocation_in_progress = True
+        
+        try:
+            # Validate we have enough slots before making any changes
+            required_slots = len(seq_groups)
+            available_slots = len(self.empty_slots)
             
-            self._slot_allocation_in_progress = True
+            if available_slots < required_slots:
+                logger.error(f"Insufficient empty slots: need {required_slots}, have {available_slots}")
+                logger.error(f"Current slot assignments: {self.seq_groups_to_batch_slot}")
+                logger.error(f"Empty slots: {self.empty_slots}")
+                logger.error(f"Seq groups to allocate: {seq_groups}")
+                raise RuntimeError(f"Insufficient empty slots for new sequences. "
+                                 f"Need {required_slots}, have {available_slots}. "
+                                 f"This may indicate slots from canceled requests were not properly freed.")
             
-            try:
-                # Validate we have enough slots before making any changes
+            # Check for sequences that already have slots (shouldn't happen in prefill)
+            already_allocated = []
+            for seq_id in seq_groups:
+                if seq_id in self.seq_groups_to_batch_slot:
+                    already_allocated.append(seq_id)
+                    
+            if already_allocated:
+                logger.warning(f"Sequences already have allocated slots: {already_allocated}")
+                # Remove them from allocation list
+                seq_groups = [s for s in seq_groups if s not in already_allocated]
                 required_slots = len(seq_groups)
-                available_slots = len(self.empty_slots)
                 
-                if available_slots < required_slots:
-                    logger.error(f"Insufficient empty slots: need {required_slots}, have {available_slots}")
-                    logger.error(f"Current slot assignments: {self.seq_groups_to_batch_slot}")
-                    logger.error(f"Empty slots: {self.empty_slots}")
-                    logger.error(f"Seq groups to allocate: {seq_groups}")
-                    raise RuntimeError(f"Insufficient empty slots for new sequences. "
-                                     f"Need {required_slots}, have {available_slots}. "
-                                     f"This may indicate slots from canceled requests were not properly freed.")
-                
-                # Check for sequences that already have slots (shouldn't happen in prefill)
-                already_allocated = []
-                for seq_id in seq_groups:
-                    if seq_id in self.seq_groups_to_batch_slot:
-                        already_allocated.append(seq_id)
-                        
-                if already_allocated:
-                    logger.warning(f"Sequences already have allocated slots: {already_allocated}")
-                    # Remove them from allocation list
-                    seq_groups = [s for s in seq_groups if s not in already_allocated]
-                    required_slots = len(seq_groups)
-                    
-                if required_slots == 0:
-                    logger.debug("No new slots to allocate")
-                    return
-                
-                logger.debug(f"Allocating {required_slots} slots for sequences: {seq_groups}")
-                logger.debug(f"seq_groups_to_batch_slot before allocation: {self.seq_groups_to_batch_slot}")
-                
-                # Atomically allocate slots
-                allocated_slots = []
-                for seq_id in seq_groups:
-                    if len(self.empty_slots) == 0:
-                        # This should not happen due to our validation above, but be defensive
-                        logger.error("Ran out of empty slots during allocation!")
-                        # Rollback any allocations made so far
-                        for prev_seq_id, slot in zip(seq_groups[:len(allocated_slots)], allocated_slots):
-                            del self.seq_groups_to_batch_slot[prev_seq_id]
-                            self.empty_slots.append(slot)
-                        self.empty_slots.sort()
-                        raise RuntimeError("Ran out of empty slots during allocation")
-                    
-                    slot = self.empty_slots.pop(0)
-                    allocated_slots.append(slot)
-                    self.seq_groups_to_batch_slot[seq_id] = slot
-                    logger.debug(f"Allocated slot {slot} to seq_group {seq_id}")
-                
-                logger.debug(f"seq_groups_to_batch_slot after allocation: {self.seq_groups_to_batch_slot}")
-                logger.debug(f"empty_slots after allocation: {self.empty_slots}")
-                
-                # Minimal: skip periodic stats to keep implementation lean
+            if required_slots == 0:
+                logger.debug("No new slots to allocate")
+                return
             
-            finally:
-                self._slot_allocation_in_progress = False
+            logger.debug(f"Allocating {required_slots} slots for sequences: {seq_groups}")
+            logger.debug(f"seq_groups_to_batch_slot before allocation: {self.seq_groups_to_batch_slot}")
+            
+            # Allocate slots
+            allocated_slots = []
+            for seq_id in seq_groups:
+                if len(self.empty_slots) == 0:
+                    # This should not happen due to our validation above, but be defensive
+                    logger.error("Ran out of empty slots during allocation!")
+                    # Rollback any allocations made so far
+                    for prev_seq_id, slot in zip(seq_groups[:len(allocated_slots)], allocated_slots):
+                        del self.seq_groups_to_batch_slot[prev_seq_id]
+                        self.empty_slots.append(slot)
+                    self.empty_slots.sort()
+                    raise RuntimeError("Ran out of empty slots during allocation")
+                
+                slot = self.empty_slots.pop(0)
+                allocated_slots.append(slot)
+                self.seq_groups_to_batch_slot[seq_id] = slot
+                logger.debug(f"Allocated slot {slot} to seq_group {seq_id}")
+            
+            logger.debug(f"seq_groups_to_batch_slot after allocation: {self.seq_groups_to_batch_slot}")
+            logger.debug(f"empty_slots after allocation: {self.empty_slots}")
+            
+            # Minimal: skip periodic stats to keep implementation lean
+        
+        finally:
+            self._slot_allocation_in_progress = False
 
     def _validate_slot_assignments(self, seq_groups: List[int]) -> None:
         """Validate that all sequences have proper slot assignments."""
