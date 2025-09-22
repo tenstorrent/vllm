@@ -7,6 +7,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.inputs import ProcessorInputs, PromptType
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 
 from .interface import Platform, PlatformEnum
@@ -18,6 +19,8 @@ else:
     ModelConfig = None
     VllmConfig = None
     PoolingParams = None
+
+logger = init_logger(__name__)
 
 
 class TTPlatform(Platform):
@@ -54,14 +57,67 @@ class TTPlatform(Platform):
             else:
                 parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
 
-    @classmethod
-    def is_pin_memory_available(cls):
-        return False
+        # Setting attributes on the class level is kind of hacky, but
+        # it's the only way to make validate_request depend on vllm_config
+        # This is needed to catch incompatible requests early enough
+        # to return an error instead of crashing.
+        # TODO move this to tt_model_runner when request validation
+        # stops depending on vllm_config
+        override_tt_config = vllm_config.model_config.override_tt_config
+        if (override_tt_config is not None
+                and "sample_on_device_mode" in override_tt_config):
+            sample_on_device_mode = override_tt_config["sample_on_device_mode"]
+            assert sample_on_device_mode in [
+                "all", "decode_only"
+            ], f"Invalid sample_on_device_mode: {sample_on_device_mode}"
+        else:
+            sample_on_device_mode = None
+        cls.sample_on_device_mode = sample_on_device_mode  # type: ignore[attr-defined]
+
+        # Compat sampling uses the full vLLM sampling pipeline,
+        # with logit processors and sampler, instead of our custom sampling.
+        # It is off by default, and enabled only on request
+        # or if any of the requests in the batch require it.
+        # For now, it is only supported with host-side sampling.
+        cls.compat_sampling_possible = (  # type: ignore[attr-defined]
+            sample_on_device_mode is None)
+
+        if cls.compat_sampling_possible and envs.VLLM_USE_V1:
+            cls.compat_sampling_possible = False
+            logger.warning(
+                "Disabling compatibility sampling as it's not yet support for "
+                "V1 TT backend")
+
+        always_compat_sampling = False
+        if override_tt_config is not None \
+            and "always_compat_sampling" in override_tt_config:
+            always_compat_sampling = override_tt_config[
+                "always_compat_sampling"]
+            assert always_compat_sampling in [
+                True, False
+            ], "always_compat_sampling must be a boolean"
+            if always_compat_sampling:
+                if envs.VLLM_USE_V1:
+                    raise ValueError(
+                        "always_compat_sampling is not yet supported for "
+                        "V1 TT backend")
+                logger.info(
+                    "Compatibility sampling mode enabled for all requests")
+        cls.always_compat_sampling = always_compat_sampling  # type: ignore[attr-defined]
+
+        if cls.always_compat_sampling and not cls.compat_sampling_possible:  # type: ignore[attr-defined]
+            raise ValueError("Compatibility sampling mode only works with"
+                             "sample_on_device_mode=None")
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
         # V1 support on TT is experimental
         return True
+
+    @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        # The sampling code tries to use pinned memory in case we're using GPUs.
+        return False
 
     @classmethod
     def validate_request(
@@ -79,14 +135,32 @@ class TTPlatform(Platform):
             if params.best_of is not None:
                 raise ValueError(
                     f"Currently not supporting best_of on {cls.device_name}")
-            if params.logprobs is not None:
-                raise ValueError(
-                    f"Currently not supporting logprobs on {cls.device_name}")
             if params.prompt_logprobs is not None:
                 raise ValueError(
                     f"Currently not supporting prompt_logprobs on "
                     f"{cls.device_name}")
-            if params.guided_decoding is not None:
+            if cls.compat_sampling_required(
+                    params
+            ) and not cls.compat_sampling_possible:  # type: ignore[attr-defined]
                 raise ValueError(
-                    f"Currently not supporting guided decoding on "
-                    f"{cls.device_name}")
+                    "Sampling params beyond temperature, "
+                    "top_k, top_p require compatibility sampling mode"
+                    " which is only available with"
+                    "sample_on_device_mode=None. "
+                    f"Supplied params: {params}")
+
+    @staticmethod
+    def compat_sampling_required(sampling_params) -> bool:
+        return (sampling_params.presence_penalty != 0.0
+                or sampling_params.frequency_penalty != 0.0
+                or sampling_params.repetition_penalty != 1.0
+                or sampling_params.min_p != 0.0
+                or (sampling_params.bad_words is not None
+                    and len(sampling_params.bad_words) > 0)
+                or sampling_params.logprobs is not None
+                or sampling_params.prompt_logprobs is not None
+                or sampling_params.logits_processors is not None
+                or sampling_params.truncate_prompt_tokens is not None
+                or sampling_params.guided_decoding is not None
+                or sampling_params.logit_bias is not None
+                or sampling_params.allowed_token_ids is not None)

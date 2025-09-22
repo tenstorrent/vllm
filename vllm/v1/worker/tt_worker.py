@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import suppress
 from typing import TYPE_CHECKING, Optional
 
 from vllm.config import VllmConfig
@@ -150,12 +151,14 @@ class TTWorker(WorkerBase):
 
     def __del__(self):
         # Delete model runner first in case there are model arifacts
-        del self.model_runner
+        with suppress(AttributeError):
+            # attributes may be already torn down when destructor is called
+            del self.model_runner
 
-        if self.mesh_device:
-            close_mesh_device(self.mesh_device,
-                              self.model_config.override_tt_config)
-            del self.mesh_device
+            if self.mesh_device:
+                close_mesh_device(self.mesh_device,
+                                  self.model_config.override_tt_config)
+                del self.mesh_device
 
         if hasattr(super(), '__del__'):
             super().__del__()  # type: ignore

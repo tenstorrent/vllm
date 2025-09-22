@@ -5,6 +5,7 @@ import dataclasses
 import math
 import os
 import time
+from contextlib import suppress
 from typing import List, Optional, Tuple, cast
 
 import torch
@@ -367,12 +368,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def __del__(self):
         # Delete model runner first in case there are model arifacts
-        del self.model_runner
+        with suppress(AttributeError):
+            # attributes may be already torn down when destructor is called
+            del self.model_runner
 
-        if self.mesh_device:
-            close_mesh_device(self.mesh_device,
-                              self.model_config.override_tt_config)
-            del self.mesh_device
+            if self.mesh_device:
+                close_mesh_device(self.mesh_device,
+                                  self.model_config.override_tt_config)
+                del self.mesh_device
 
         if hasattr(super(), '__del__'):
             super().__del__()  # type: ignore
@@ -390,15 +393,29 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
-    if (("Llama-3.1-8B" in model_config.model
-         or "Mistral-7B" in model_config.model)
-            and device_config.device.get_num_devices() == 1 and "wormhole_b0"
-            in ttnn.get_arch_name()):  # Llama8B on N150 and Mistral7B on N150
+    data_parallel = 1
+    if (model_config.override_tt_config
+            and "data_parallel" in model_config.override_tt_config):
+        data_parallel = model_config.override_tt_config["data_parallel"]
+
+    is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
+    num_devices_per_model = (device_config.device.get_num_devices() //
+                             data_parallel)
+
+    if (("Llama-3.1-8B" in model_config.model or "Mistral-7B"
+         in model_config.model or "gemma-3-4b" in model_config.model)
+            and num_devices_per_model == 1 and is_wormhole):
+        # Llama8B, Mistral7B, and gemma3-4b on N150
         max_tokens_all_users = 65536
-    elif ("Llama-3.2-90B" in model_config.model
-          and device_config.device.get_num_devices() == 8
-          and "wormhole_b0" in ttnn.get_arch_name()):  # Llama90B on WH T3K
-        max_tokens_all_users = 65536  # [INFO] avoid OOM for Llama-3.2-90B
+    elif (("DeepSeek-R1-Distill-Qwen-14B" in model_config.model
+           or "Qwen2.5-14B" in model_config.model)
+          and num_devices_per_model == 2 and is_wormhole):
+        # Qwen2.5-14B on N300
+        max_tokens_all_users = 65536
+    elif ("Llama-3.2-90B" in model_config.model and num_devices_per_model == 8
+          and is_wormhole):
+        # Llama90B on WH T3K
+        max_tokens_all_users = 65536
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
@@ -510,6 +527,9 @@ def device_params_from_override_tt_config(override_tt_config, trace_mode):
     if override_tt_config and "worker_l1_size" in override_tt_config:
         device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
 
+    if override_tt_config and "l1_small_size" in override_tt_config:
+        device_params["l1_small_size"] = override_tt_config["l1_small_size"]
+
     return device_params
 
 
@@ -525,6 +545,7 @@ def open_mesh_device(override_tt_config, trace_mode):
         "N150x4": (1, 4),
         "P150x4": (1, 4),
         "T3K": (1, 8),
+        "P150x8": (1, 8),
         "TG": (8, 4)
     }
     mesh_device_env = os.environ.get("MESH_DEVICE")

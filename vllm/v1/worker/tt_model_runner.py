@@ -9,6 +9,7 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
+from vllm.platforms.tt import TTPlatform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -46,6 +47,11 @@ class TTModelRunner:
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
 
+        # Because of multiprocessing, the config-dependent
+        # class attributes might not have been set in this process,
+        # so we need to call this again.
+        TTPlatform.check_and_update_config(vllm_config)
+
         # Currently, TT model runner doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
 
@@ -53,19 +59,11 @@ class TTModelRunner:
         self.trace_mode = trace_mode
 
         # Whether to sample on device
-        override_tt_config = self.model_config.override_tt_config
-        sample_key = "sample_on_device_mode"
-        self.sample_on_device_mode = None
-        if (override_tt_config and sample_key in override_tt_config):
-            assert override_tt_config[sample_key] in [
-                "all", "decode_only"
-            ], f"Invalid {sample_key}: {self.sample_on_device_mode}"
-            self.sample_on_device_mode = override_tt_config[sample_key]
+        self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
         logger.info(
-            "TTModelRunner: trace_mode=%s, %s=%s",
+            "TTModelRunner: trace_mode=%s, sample_on_device_mode=%s",
             self.trace_mode,
-            sample_key,
             self.sample_on_device_mode,
         )
 

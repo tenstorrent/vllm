@@ -13,7 +13,8 @@ logger = init_logger(__name__)
 
 class TTModelLoader(BaseModelLoader):
 
-    def load_model(self, vllm_config: VllmConfig, model_config: ModelConfig):
+    def load_model(self, vllm_config: VllmConfig,
+                   model_config: ModelConfig) -> nn.Module:
         """Load a model with the given configurations."""
 
         device_config = vllm_config.device_config
