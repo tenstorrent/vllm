@@ -153,9 +153,14 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
-        # whether to use ttnn tracing for model execution,
-        # TODO: make this configurable
+        # Whether to use ttnn tracing for model execution
+        override_tt_config = self.model_config.override_tt_config
+        trace_key = "trace_mode"
         self.trace_mode = True
+        if override_tt_config and trace_key in override_tt_config:
+            assert override_tt_config[trace_key] in [True, False], \
+                f"Invalid {trace_key}: {override_tt_config[trace_key]}"
+            self.trace_mode = override_tt_config[trace_key]
 
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=vllm_config,
