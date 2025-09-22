@@ -55,6 +55,14 @@ class TTModelRunner:
         # Currently, TT model runner doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
 
+        if self.model_config.is_encoder_decoder:
+            raise NotImplementedError(
+                "Encoder-decoder models are not yet supported in V1 TT backend"
+            )
+        elif self.model_config.is_multimodal_model:
+            raise NotImplementedError(
+                "Multimodal models are not yet supported in V1 TT backend")
+
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
 
@@ -343,17 +351,26 @@ class TTModelRunner:
             top_p=top_p[0],
         )
 
-        # TODO: Add multi-modal support
-        multi_modal_kwargs: dict[str, Any] = {}
-        # TODO: Add support for encoder-decoder models
-        cross_block_tables = None
+        assert not TTPlatform.compat_sampling_possible, (
+            "Compatibility sampling is not yet supported in V1 TT backend")
+        sampling_params_list: list[Any] = []
+        compat_sampling_used = False
+        sampling_metadata = None
 
-        seq_groups_list = None  # TODO: maybe remove
-
-        return TTModelInput(input_tokens, input_positions, prompt_lens,
-                            seq_groups_list, block_tables, num_reqs,
-                            tt_sampling_params, multi_modal_kwargs,
-                            cross_block_tables)
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=prompt_lens,
+            seq_groups=None,  # Not used in V1
+            block_tables=block_tables,
+            unpadded_batch_size=num_reqs,
+            tt_sampling_params=tt_sampling_params,
+            sampling_params_list=sampling_params_list,
+            compat_sampling_used=compat_sampling_used,
+            sampling_metadata=sampling_metadata,
+            multi_modal_kwargs={},  # Not yet supported in V1
+            cross_block_tables=None  # Not yet supported in V1
+        )
 
     @torch.no_grad()
     def execute_model(

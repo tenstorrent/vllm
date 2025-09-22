@@ -86,7 +86,7 @@ class TTPlatform(Platform):
             cls.compat_sampling_possible = False
             logger.warning(
                 "Disabling compatibility sampling as it's not yet support for "
-                "V1 TT backend")
+                "V1 TT backend.")
 
         always_compat_sampling = False
         if override_tt_config is not None \
@@ -100,7 +100,7 @@ class TTPlatform(Platform):
                 if envs.VLLM_USE_V1:
                     raise ValueError(
                         "always_compat_sampling is not yet supported for "
-                        "V1 TT backend")
+                        "V1 TT backend.")
                 logger.info(
                     "Compatibility sampling mode enabled for all requests")
         cls.always_compat_sampling = always_compat_sampling  # type: ignore[attr-defined]
