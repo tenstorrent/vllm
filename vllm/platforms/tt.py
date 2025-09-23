@@ -54,6 +54,8 @@ class TTPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             if envs.VLLM_USE_V1:
                 parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm.v1.core.sched.ascend_scheduler.AscendScheduler")
             else:
                 parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
 
@@ -82,8 +84,8 @@ class TTPlatform(Platform):
         cls.compat_sampling_possible = (  # type: ignore[attr-defined]
             sample_on_device_mode is None)
 
-        if cls.compat_sampling_possible and envs.VLLM_USE_V1:
-            cls.compat_sampling_possible = False
+        if cls.compat_sampling_possible and envs.VLLM_USE_V1:  # type: ignore[attr-defined]
+            cls.compat_sampling_possible = False  # type: ignore[attr-defined]
             logger.warning(
                 "Disabling compatibility sampling as it's not yet support for "
                 "V1 TT backend.")
