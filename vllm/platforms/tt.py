@@ -113,8 +113,22 @@ class TTPlatform(Platform):
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
-        # V1 support on TT is experimental
-        return True
+        # V1 support on TT is experimental.
+        # Allow users to opt in, but give a warning.
+        if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
+            if model_config.is_encoder_decoder:
+                raise ValueError(
+                    "VLLM_USE_V1=1 was set but encoder-decoder models aren't "
+                    "yet supported in V1 for TT")
+            elif model_config.is_multimodal_model:
+                raise ValueError(
+                    "VLLM_USE_V1=1 was set but multimodal models aren't "
+                    "yet supported in V1 for TT")
+            logger.warning(
+                "Enabling V1 since VLLM_USE_V1=1, however V1 is still "
+                "experimental for TT backend.")
+            return envs.VLLM_USE_V1
+        return False
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

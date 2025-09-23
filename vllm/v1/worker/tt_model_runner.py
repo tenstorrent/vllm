@@ -55,14 +55,6 @@ class TTModelRunner:
         # Currently, TT model runner doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
 
-        if self.model_config.is_encoder_decoder:
-            raise NotImplementedError(
-                "Encoder-decoder models are not yet supported in V1 TT backend"
-            )
-        elif self.model_config.is_multimodal_model:
-            raise NotImplementedError(
-                "Multimodal models are not yet supported in V1 TT backend")
-
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
 
