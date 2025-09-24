@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
