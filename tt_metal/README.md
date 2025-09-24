@@ -72,14 +72,18 @@ To measure performance (Llama70B on QuietBox) for a single batch of 32 prompts (
 MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 ```
 
+> **⚠️ Enabling V1 Backend**: Experimental V1 support has been added for text-only models. This can be enabled by setting `VLLM_USE_V1=1` and `--num_scheduler_steps 1`, though it may still have limitations compared to the default V0 backend. To disable multiprocessing in V1 (to step through code or make scheduling deterministic), set `VLLM_ENABLE_V1_MULTIPROCESSING=0`.
+
 **Note 1**: Custom TT options can be set using `--override_tt_config` with a json string, e.g. `--override_tt_config '{"sample_on_device_mode": "all"}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters are:
 - `sample_on_device_mode`: ["all", "decode_only"]
+- `trace_mode`: [true, false]
 - `trace_region_size`: [default: 25000000]
 - `worker_l1_size`
 - `l1_small_size`
 - `fabric_config`: ["DISABLED", "FABRIC_1D", "FABRIC_2D", "CUSTOM"]
 - `dispatch_core_axis`: ["row", "col"]
 - `data_parallel`: [default: 1]
+- `always_compat_sampling`: [true, false], default: false (If true, use vLLM's full LogitProcessor+Sampler pipeline instead of custom sampling even when not required by the batch)
 
 **Note 2 (Llama70B)**: To run Llama70B on Galaxy, set `MESH_DEVICE=TG`.
 
@@ -88,7 +92,7 @@ MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 - `"llama2_70b"` for the old Llama implementation
 
 **Note 4 (Other Models)**: By default, the inference example will run with Llama-3.1-70B. To run with other Llama models, or Qwen-2.5, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, `T3K`, or `TG`) and one of the following:
-- Llama-3.1-8B: `--model "meta-llama/Llama-3.1-8B"`
+- Llama-3.1-8B: `--model "meta-llama/Llama-3.1-8B"` (Note that on N150, `--max_model_len 65536` must be set for this model, see the [tt_transformers demo](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers) for details about the max context length)
 - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
 - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
 - Qwen-2.5-7B: `--model "Qwen/Qwen2.5-7B"` (currently only supported on N300)
