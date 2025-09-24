@@ -147,6 +147,7 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d
 ## Compatibility sampling mode, guided decoding, structured outputs
 
 Sampling parameters beyond `temperature`, `top_k`, `top_p` require the compatibility sampling mode which is only available with `sample_on_device_mode=None`.
+To use these, do not pass `--override_tt_config '{"sample_on_device_mode": "all"}'` even when running with `TT_LLAMA_TEXT_VER="llama3_70b_galaxy"`.
 
 Some parameters, such as guided_decoding / strucured outputs require additionally setting `num_scheduler_steps=1`.
 
