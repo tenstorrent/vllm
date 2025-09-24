@@ -417,7 +417,6 @@ class _ModelRegistry:
 
     def _try_load_model_cls(self,
                             model_arch: str) -> Optional[Type[nn.Module]]:
-        # logger.info(f"Self.models: {self.models}")
         if model_arch not in self.models:
             return None
 
@@ -467,9 +466,7 @@ class _ModelRegistry:
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
-            logger.info(f"Resolving model class for architecture: {arch}")
             model_cls = self._try_load_model_cls(arch)
-            logger.info(f"Model class: {model_cls}")
             if model_cls is not None:
                 return (model_cls, arch)
 
