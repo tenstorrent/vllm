@@ -5,6 +5,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -182,6 +183,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # we need to fully match the relevant parts of
             # SamplingMetadata.selected_token_indices logic.
             self.sampler = get_sampler()
+
+        # llama-galaxy uses sampling_params=None to mean greedy decoding,
+        # so we need to pass an explicit flag if we want host sampling
+        # this is why we need to know which codebase we are using
+        llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
+        self.is_llama_galaxy = (llama_text_version == "llama3_70b_galaxy")
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -725,6 +732,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.sample_on_device_mode == "decode_only" and is_decode):
             execute_model_kwargs[
                 "sampling_params"] = model_input.tt_sampling_params
+        elif self.is_llama_galaxy:
+            # llama-galaxy uses sampling_params=None to mean greedy decoding,
+            # so we need to pass an explicit flag if we want host sampling
+            execute_model_kwargs["return_logits"] = True
+            execute_model_kwargs["reset_inputs"] = True
 
         if model_input.cross_block_tables is not None:
             execute_model_kwargs[
