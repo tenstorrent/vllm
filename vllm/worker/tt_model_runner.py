@@ -736,7 +736,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # llama-galaxy uses sampling_params=None to mean greedy decoding,
             # so we need to pass an explicit flag if we want host sampling
             execute_model_kwargs["return_logits"] = True
-            execute_model_kwargs["reset_inputs"] = True
+            if is_decode:
+                execute_model_kwargs["reset_inputs"] = True
 
         if model_input.cross_block_tables is not None:
             execute_model_kwargs[
