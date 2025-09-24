@@ -63,7 +63,7 @@ class AvgTracker:
 
 class GlobalStatLogger(StatLoggerBase):
     """GlobalStatLogger is used in LLMEngine to track stats across the entire 
-    generation (until manually reset)"""
+    generation (until manually reset) """
 
     def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
         self.engine_index = engine_index

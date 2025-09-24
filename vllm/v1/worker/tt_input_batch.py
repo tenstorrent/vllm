@@ -126,7 +126,7 @@ class InputBatch:
         """Move non-empty requests down into lower, empty indices.
         
         Args:
-          empty_req_indices: empty batch indices, sorted descending.
+            empty_req_indices: empty batch indices, sorted descending.
         """
         num_reqs = self.num_reqs
         if num_reqs == 0:

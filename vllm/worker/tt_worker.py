@@ -372,7 +372,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     ## Destructor (used to close devices)
 
     def __del__(self):
-        # Delete model runner first in case there are model arifacts
+        # Delete model runner first in case there are model artifacts
         with suppress(AttributeError):
             # attributes may be already torn down when destructor is called
             del self.model_runner
