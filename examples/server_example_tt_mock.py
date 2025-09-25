@@ -13,6 +13,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+# CRITICAL: Mock ttnn BEFORE any vLLM imports to ensure platform detection works
+# Mock ttnn module functions that might be called
+class MockTTNN:
+    @staticmethod
+    def get_arch_name():
+        return "wormhole_b0"
+    
+    @staticmethod
+    def event_synchronize(event):
+        mock_event_synchronize(event)
+    
+    @staticmethod
+    def get_device_ids():
+        return [0, 1]  # Mock 2 devices
+    
+    @staticmethod
+    def open_mesh_device(*args, **kwargs):
+        return MockTTDevice(num_devices=2)
+    
+    @staticmethod
+    def close_mesh_device(*args, **kwargs):
+        pass
+    
+    @staticmethod
+    def ReadDeviceProfiler(*args, **kwargs):
+        pass
+    
+    @staticmethod
+    def set_fabric_config(*args, **kwargs):
+        pass
+    
+    # Mock ttnn enums and classes
+    class DispatchCoreAxis:
+        ROW = "row"
+        COL = "col"
+    
+    class DispatchCoreConfig:
+        def __init__(self, axis=None):
+            self.axis = axis
+    
+    class FabricConfig:
+        DISABLED = "disabled"
+        FABRIC_1D = "fabric_1d"
+        FABRIC_1D_RING = "fabric_1d_ring"
+        FABRIC_2D = "fabric_2d"
+        CUSTOM = "custom"
+    
+    class MeshShape:
+        def __init__(self, *args):
+            self.shape = args
+    
+    class cluster:
+        class ClusterType:
+            GALAXY = "galaxy"
+        
+        @staticmethod
+        def get_cluster_type():
+            return MockTTNN.cluster.ClusterType.GALAXY
+
+# Install the early mock BEFORE vLLM imports
+sys.modules['ttnn'] = MockTTNN()
+print("Early ttnn mock installed for platform detection!")
+
 from vllm import ModelRegistry
 
 
@@ -151,63 +214,7 @@ def mock_event_synchronize(event):
     pass
 
 
-# Mock ttnn module functions that might be called
-class MockTTNN:
-    @staticmethod
-    def get_arch_name():
-        return "wormhole_b0"
-    
-    @staticmethod
-    def event_synchronize(event):
-        mock_event_synchronize(event)
-    
-    @staticmethod
-    def get_device_ids():
-        return [0, 1]  # Mock 2 devices
-    
-    @staticmethod
-    def open_mesh_device(*args, **kwargs):
-        return MockTTDevice(num_devices=2)
-    
-    @staticmethod
-    def close_mesh_device(*args, **kwargs):
-        pass
-    
-    @staticmethod
-    def ReadDeviceProfiler(*args, **kwargs):
-        pass
-    
-    @staticmethod
-    def set_fabric_config(*args, **kwargs):
-        pass
-    
-    # Mock ttnn enums and classes
-    class DispatchCoreAxis:
-        ROW = "row"
-        COL = "col"
-    
-    class DispatchCoreConfig:
-        def __init__(self, axis=None):
-            self.axis = axis
-    
-    class FabricConfig:
-        DISABLED = "disabled"
-        FABRIC_1D = "fabric_1d"
-        FABRIC_1D_RING = "fabric_1d_ring"
-        FABRIC_2D = "fabric_2d"
-        CUSTOM = "custom"
-    
-    class MeshShape:
-        def __init__(self, *args):
-            self.shape = args
-    
-    class cluster:
-        class ClusterType:
-            GALAXY = "galaxy"
-        
-        @staticmethod
-        def get_cluster_type():
-            return MockTTNN.cluster.ClusterType.GALAXY
+
 
 
 def register_mock_tt_models():
@@ -271,14 +278,9 @@ def check_tt_model_supported(model_name: str):
     return True
 
 
-def setup_comprehensive_tt_mocks():
-    """Set up comprehensive mocking that works across processes."""
+def setup_tt_mocks():
+    """Set up mocking that works across processes."""
     
-    # Create a comprehensive mock ttnn module
-    mock_ttnn = MockTTNN()
-    
-    # Mock ttnn and all related modules BEFORE any imports
-    sys.modules['ttnn'] = mock_ttnn
     
     # Create a sitecustomize.py file that will be imported by Python automatically
     # This ensures our mocks are loaded in child processes
@@ -635,7 +637,7 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
     # Also set up mocking in the current process
     import builtins
     original_import = builtins.__import__
-    
+    mock_ttnn = MockTTNN()
     def mock_import(name, *args, **kwargs):
         if name == 'ttnn':
             return mock_ttnn
@@ -679,11 +681,6 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
     return [cleanup]
 
 
-def setup_tt_mocks():
-    """Wrapper for backward compatibility."""
-    return setup_comprehensive_tt_mocks()
-
-
 def main():
     parser = argparse.ArgumentParser(description="Mock TT vLLM Server")
     parser.add_argument(
@@ -715,6 +712,33 @@ def main():
     os.environ['TT_METAL_DEVICE_DISABLE'] = '1'
     os.environ['TTNN_DEVICE_DISABLE'] = '1'
     os.environ['VLLM_TARGET_DEVICE'] = 'tt'  # Force TT device selection
+    
+    # Optional: Force V0 or V1 engine (comment out to use default)
+    # os.environ['VLLM_USE_V1'] = '0'  # Force V0 (uses vllm.worker.tt_worker.TTWorker)
+    # os.environ['VLLM_USE_V1'] = '1'  # Force V1 (uses vllm.v1.worker.tt_worker.TTWorker)
+    
+    # Verify platform detection is working
+    try:
+        from vllm.platforms import current_platform
+        print(f"MOCK DEBUG: Detected platform: {current_platform}")
+        print(f"MOCK DEBUG: Platform type: {current_platform.device_type}")
+        if hasattr(current_platform, '_enum'):
+            print(f"MOCK DEBUG: Platform enum: {current_platform._enum}")
+    except Exception as e:
+        print(f"MOCK DEBUG: Error checking platform: {e}")
+    
+    # Check which vLLM version will be used
+    import vllm.envs as envs
+    use_v1 = getattr(envs, 'VLLM_USE_V1', None)
+    if use_v1 is None:
+        print("MOCK DEBUG: VLLM_USE_V1 not set - will use default selection")
+    else:
+        version = "V1" if use_v1 else "V0"
+        print(f"MOCK DEBUG: VLLM_USE_V1={use_v1} - will use vLLM {version}")
+        if use_v1:
+            print("MOCK DEBUG: Will use vllm.v1.worker.tt_worker.TTWorker")
+        else:
+            print("MOCK DEBUG: Will use vllm.worker.tt_worker.TTWorker")
     
     # Set up comprehensive TT mocking BEFORE any vLLM imports
     patches = setup_tt_mocks()
