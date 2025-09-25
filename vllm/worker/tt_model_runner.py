@@ -27,7 +27,6 @@ from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
 
 logger = init_logger(__name__)
 
-
 @dataclass(frozen=True)
 class TTSamplingParams:
     """
@@ -266,8 +265,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Delete finished requests from req_id_to_seq_id
             finished_requests_seq_ids = []
             for req_id in finished_requests_ids:
-                finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
-                del self.req_id_to_seq_id[req_id]
+                # only delete if the request was added in the first place 
+                if req_id in self.req_id_to_seq_id.keys():
+                    finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
+                    print(f"deleting from self.req_id_to_seq_id, {self.req_id_to_seq_id}")
+                    del self.req_id_to_seq_id[req_id]
 
         # Compat sampling is off by default, and enabled only on request
         # or if any of the requests in the batch require it
@@ -291,6 +293,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.dp_kv_cache:
                 # Add new request id to req_id_to_seq_id
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
+                print(f"adding to self.req_id_to_seq_id, {self.req_id_to_seq_id}")
 
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
@@ -492,11 +495,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ],
                                                    dim=1)
-
+        print("self.dp_kv_cache", self.dp_kv_cache)
         if self.dp_kv_cache:
             prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
-
             # check for preempted requests
+            print(f"prev_seq_groups_list, {prev_seq_groups_list}")
+            print(f"seq_groups_list, {seq_groups_list}")
+            print(f"finished_requests_seq_ids, {finished_requests_seq_ids}")
             if seq_groups_list != prev_seq_groups_list and not is_prompt:
                 finished_requests_seq_ids_current = [
                     seq_id for seq_id in prev_seq_groups_list
@@ -504,17 +509,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 ]
             else:
                 finished_requests_seq_ids_current = []
-
+            print(f"finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")
             # check for any remaining finished requests
             for seq_id in finished_requests_seq_ids:
                 if seq_id not in finished_requests_seq_ids_current:
                     finished_requests_seq_ids_current.append(seq_id)
-
+            print(f"UPDATED finished_requests_seq_ids_current, {finished_requests_seq_ids_current}")   
+            print(f"self.seq_groups_to_batch_slot, {self.seq_groups_to_batch_slot}")
             # update the empty slots
             for req in finished_requests_seq_ids_current:
-                empty_batch_slot = self.seq_groups_to_batch_slot[req]
-                self.empty_slots.append(empty_batch_slot)
-                del self.seq_groups_to_batch_slot[req]
+                if req in self.seq_groups_to_batch_slot.keys():
+                    empty_batch_slot = self.seq_groups_to_batch_slot[req]
+                    self.empty_slots.append(empty_batch_slot)
+                    del self.seq_groups_to_batch_slot[req]
+                else:
+                    print(f"req {req} not in self.seq_groups_to_batch_slot.keys()")
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -742,8 +751,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # update the batch slot table
                 recently_filled_slots = self.empty_slots[:model_input.
                                                          unpadded_batch_size]
+                print(f"recently_filled_slots, {recently_filled_slots}, {model_input.unpadded_batch_size}")
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
+
+                print(f"seq_groups_to_batch_slot before, {self.seq_groups_to_batch_slot}") 
 
                 for s in model_input.seq_groups:
                     self.seq_groups_to_batch_slot[
