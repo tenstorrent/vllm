@@ -76,6 +76,12 @@ class TTPlatform(Platform):
             sample_on_device_mode = None
         cls.sample_on_device_mode = sample_on_device_mode  # type: ignore[attr-defined]
 
+        if (override_tt_config is not None and "non_greedy_decoding_on_device" in override_tt_config):
+            non_greedy_decoding_on_device = override_tt_config["non_greedy_decoding_on_device"]
+        else:
+            non_greedy_decoding_on_device = False
+        cls.non_greedy_decoding_on_device = non_greedy_decoding_on_device
+
         # Compat sampling uses the full vLLM sampling pipeline,
         # with logit processors and sampler, instead of our custom sampling.
         # It is off by default, and enabled only on request
@@ -164,6 +170,15 @@ class TTPlatform(Platform):
                     " which is only available with"
                     "sample_on_device_mode=None. "
                     f"Supplied params: {params}")
+            if (cls.requires_non_greedy_decoding(params)
+                and not cls.compat_sampling_possible
+                and not cls.non_greedy_decoding_on_device):
+                raise ValueError("Non-greedy decoding is not supported by this model implementation. "
+                                 f"Supplied params: {params}")
+
+    @staticmethod
+    def requires_non_greedy_decoding(sampling_params: SamplingParams) -> bool:
+        return sampling_params.temperature > 0.0
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:

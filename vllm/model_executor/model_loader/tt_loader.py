@@ -7,6 +7,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
+from vllm.platforms.tt import TTPlatform
 
 logger = init_logger(__name__)
 
@@ -27,6 +28,14 @@ class TTModelLoader(BaseModelLoader):
             arch_names[i] = "TT" + arch_names[i]
 
         model_class, _ = get_model_architecture(model_config)
+
+        # infer if non-greedy decoding is supported on device
+        # based on model implementation, and update platform
+        # TODO: this should come from the class itself as an attribute
+        if model_class.__module__.startswith("models.tt_transformers.tt.generator_vllm"):
+            new_override_tt_config = {**model_config.override_tt_config, "non_greedy_decoding_on_device": False}
+            vllm_config.model_config.override_tt_config = new_override_tt_config
+            TTPlatform.check_and_update_config(vllm_config)
 
         data_parallel = 1
         if (model_config.override_tt_config
