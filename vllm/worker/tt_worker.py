@@ -421,6 +421,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
           and is_wormhole):
         # Llama90B on WH T3K
         max_tokens_all_users = 65536
+    elif ("gemma-3-27b" in model_config.model):
+        max_tokens_all_users = 32768
+        return math.ceil(max_tokens_all_users / cache_config.block_size)
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
