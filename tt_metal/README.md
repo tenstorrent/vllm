@@ -151,7 +151,7 @@ To use these, do not pass `--override_tt_config '{"sample_on_device_mode": "all"
 
 Some parameters, such as guided_decoding / strucured outputs require additionally setting `num_scheduler_steps=1`.
 
-Be aware both of these settings will incur performance penalties.
+Be aware that both of these settings will incur performance penalties.
 
 The compatibility sampling pathway is selected per batch when any request in the batch requires it. It can also be force-enabled for testing purposes with `--override_tt_config '{"always_compat_sampling": true}'`
 
