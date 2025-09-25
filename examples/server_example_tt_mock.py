@@ -88,14 +88,10 @@ class MockTTModel(nn.Module):
         # Simulate some processing time
         time.sleep(0.001)  # 1ms delay to simulate computation
         
-        if sampling_params is not None:
-            # Return token IDs directly (sampling on device)
-            return torch.randint(0, self.vocab_size, (batch_size,), 
-                               dtype=torch.long, generator=self.generator)
-        else:
-            # Return logits for host-side sampling
-            return torch.randn(batch_size, max_seq_len, self.vocab_size, 
-                             generator=self.generator)
+        # Always return logits for prefill
+        # The sampling_params just indicates whether sampling will be done on device later
+        return torch.randn(batch_size, max_seq_len, self.vocab_size, 
+                         generator=self.generator)
     
     def decode_forward(self, tokens: torch.Tensor, page_table: torch.Tensor,
                       kv_cache: List[List[torch.Tensor]], start_pos: torch.Tensor,
@@ -114,14 +110,10 @@ class MockTTModel(nn.Module):
         # Simulate some processing time
         time.sleep(0.001)  # 1ms delay to simulate computation
         
-        if sampling_params is not None:
-            # Return token IDs directly (sampling on device)
-            return torch.randint(0, self.vocab_size, (batch_size,), 
-                               dtype=torch.long, generator=self.generator)
-        else:
-            # Return logits for host-side sampling (last token only for decode)
-            return torch.randn(batch_size, 1, self.vocab_size, 
-                             generator=self.generator)
+        # Always return logits for decode (last token only for decode)
+        # The sampling_params just indicates whether sampling will be done on device later
+        return torch.randn(batch_size, 1, self.vocab_size, 
+                         generator=self.generator)
     
     def read_decode_output(self, tt_out: torch.Tensor, 
                           async_read: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
@@ -137,11 +129,16 @@ class MockTTModel(nn.Module):
                                   is_tokens: bool = False) -> torch.Tensor:
         """Mock processing decode output on host."""
         if is_tokens:
-            # Already token IDs
-            return tt_out
+            # When is_tokens=True, we should convert logits to token IDs
+            # (this simulates on-device sampling)
+            if tt_out.dim() >= 2:  # If we have logits
+                return torch.argmax(tt_out, dim=-1).squeeze(-1)
+            else:
+                # Already token IDs
+                return tt_out
         else:
-            # Convert logits to token IDs
-            return torch.argmax(tt_out, dim=-1).squeeze(-1)
+            # Keep as logits for host-side sampling
+            return tt_out
 
 
 class MockReadEvent:
@@ -377,14 +374,10 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
             # Simulate some processing time
             time.sleep(0.001)  # 1ms delay to simulate computation
             
-            if sampling_params is not None:
-                # Return token IDs directly (sampling on device)
-                return torch.randint(0, self.vocab_size, (batch_size,), 
-                                   dtype=torch.long, generator=self.generator)
-            else:
-                # Return logits for host-side sampling
-                return torch.randn(batch_size, max_seq_len, self.vocab_size, 
-                                 generator=self.generator)
+            # Always return logits for prefill
+            # The sampling_params just indicates whether sampling will be done on device later
+            return torch.randn(batch_size, max_seq_len, self.vocab_size, 
+                             generator=self.generator)
         
         def decode_forward(self, tokens: torch.Tensor, page_table: torch.Tensor,
                           kv_cache: List[List[torch.Tensor]], start_pos: torch.Tensor,
@@ -403,14 +396,10 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
             # Simulate some processing time
             time.sleep(0.001)  # 1ms delay to simulate computation
             
-            if sampling_params is not None:
-                # Return token IDs directly (sampling on device)
-                return torch.randint(0, self.vocab_size, (batch_size,), 
-                                   dtype=torch.long, generator=self.generator)
-            else:
-                # Return logits for host-side sampling (last token only for decode)
-                return torch.randn(batch_size, 1, self.vocab_size, 
-                                 generator=self.generator)
+            # Always return logits for decode (last token only for decode)
+            # The sampling_params just indicates whether sampling will be done on device later
+            return torch.randn(batch_size, 1, self.vocab_size, 
+                             generator=self.generator)
         
         def read_decode_output(self, tt_out: torch.Tensor, 
                               async_read: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
@@ -426,11 +415,16 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
                                       is_tokens: bool = False) -> torch.Tensor:
             \"\"\"Mock processing decode output on host.\"\"\"
             if is_tokens:
-                # Already token IDs
-                return tt_out
+                # When is_tokens=True, we should convert logits to token IDs
+                # (this simulates on-device sampling)
+                if tt_out.dim() >= 2:  # If we have logits
+                    return torch.argmax(tt_out, dim=-1).squeeze(-1)
+                else:
+                    # Already token IDs
+                    return tt_out
             else:
-                # Convert logits to token IDs
-                return torch.argmax(tt_out, dim=-1).squeeze(-1)
+                # Keep as logits for host-side sampling
+                return tt_out
 
     class MockTTNN:
         @staticmethod
