@@ -520,57 +520,49 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
     sys.modules['models.tt_transformers.tt'] = type('MockModule', (), {{}})()
     sys.modules['models.tt_transformers.tt.generator_vllm'] = MockTTModelModule()
 
-    # Register mock models with vLLM - mimic offline_inference_tt.py pattern
-    def register_mock_models():
-        try:
-            from vllm import ModelRegistry
-            
-            # Register models exactly like offline_inference_tt.py does
-            # Llama3.1/3.2 - Text
-            ModelRegistry.register_model(\"TTLlamaForCausalLM\", 
-                                        \"models.tt_transformers.tt.generator_vllm:LlamaForCausalLM\")
-            
-            # Llama3.2 - Vision  
-            ModelRegistry.register_model(\"TTMllamaForConditionalGeneration\",
-                                        \"models.tt_transformers.tt.generator_vllm:MllamaForConditionalGeneration\")
-            
-            # Qwen2.5 - Text
-            ModelRegistry.register_model(\"TTQwen2ForCausalLM\", 
-                                        \"models.tt_transformers.tt.generator_vllm:QwenForCausalLM\")
-            ModelRegistry.register_model(\"TTQwen3ForCausalLM\", 
-                                        \"models.tt_transformers.tt.generator_vllm:QwenForCausalLM\")
-            
-            # Mistral
-            ModelRegistry.register_model(\"TTMistralForCausalLM\",
-                                        \"models.tt_transformers.tt.generator_vllm:MistralForCausalLM\")
-            
-            # Gemma
-            ModelRegistry.register_model(\"TTGemmaForCausalLM\",
-                                        \"models.tt_transformers.tt.generator_vllm:GemmaForCausalLM\")
-            ModelRegistry.register_model(\"TTGemma2ForCausalLM\", 
-                                        \"models.tt_transformers.tt.generator_vllm:Gemma2ForCausalLM\")
-            
-            # Gemma3
-            ModelRegistry.register_model(\"TTGemma3ForConditionalGeneration\",
-                                        \"models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration\")
-            
-            print(\"Mock: TT models registered successfully (child process, mimicking offline_inference_tt.py pattern)!\")
-                
-        except ImportError as e:
-            print(f\"Mock: Could not register models in child process: {{e}}\")
-    
-    # Try to register models immediately
-    register_mock_models()
-    
-    # Debug: Check if models are registered
+    # Register mock models with vLLM immediately at module level
+    # This ensures they're available in all processes
     try:
         from vllm import ModelRegistry
+        
+        # Register models exactly like offline_inference_tt.py does
+        # Llama3.1/3.2 - Text
+        ModelRegistry.register_model(\"TTLlamaForCausalLM\", 
+                                    \"models.tt_transformers.tt.generator_vllm:LlamaForCausalLM\")
+        
+        # Llama3.2 - Vision  
+        ModelRegistry.register_model(\"TTMllamaForConditionalGeneration\",
+                                    \"models.tt_transformers.tt.generator_vllm:MllamaForConditionalGeneration\")
+        
+        # Qwen2.5 - Text
+        ModelRegistry.register_model(\"TTQwen2ForCausalLM\", 
+                                    \"models.tt_transformers.tt.generator_vllm:QwenForCausalLM\")
+        ModelRegistry.register_model(\"TTQwen3ForCausalLM\", 
+                                    \"models.tt_transformers.tt.generator_vllm:QwenForCausalLM\")
+        
+        # Mistral
+        ModelRegistry.register_model(\"TTMistralForCausalLM\",
+                                    \"models.tt_transformers.tt.generator_vllm:MistralForCausalLM\")
+        
+        # Gemma
+        ModelRegistry.register_model(\"TTGemmaForCausalLM\",
+                                    \"models.tt_transformers.tt.generator_vllm:GemmaForCausalLM\")
+        ModelRegistry.register_model(\"TTGemma2ForCausalLM\", 
+                                    \"models.tt_transformers.tt.generator_vllm:Gemma2ForCausalLM\")
+        
+        # Gemma3
+        ModelRegistry.register_model(\"TTGemma3ForConditionalGeneration\",
+                                    \"models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration\")
+        
+        print(\"Mock: TT models registered successfully at module level!\")
+        
+        # Debug: Check if models are registered
         supported_archs = ModelRegistry.get_supported_archs()
-        print(f\"Mock: Currently supported architectures: {{sorted(list(supported_archs))}}\")
         tt_models = [arch for arch in supported_archs if arch.startswith('TT')]
-        print(f\"Mock: TT models registered: {{tt_models}}\")
-    except Exception as e:
-        print(f\"Mock: Could not check registered models: {{e}}\")
+        print(f\"Mock: TT models available: {{tt_models}}\")
+        
+    except ImportError as e:
+        print(f\"Mock: Could not register models at module level: {{e}}\")
 
     # Hook into the import system to patch TT modules when they're loaded
     import builtins
@@ -589,11 +581,6 @@ if os.environ.get('VLLM_TT_MOCK_MODE') == '1':
                 print(f"Mock: Intercepted failed TT import: {{name}}")
                 return MagicMock()
             raise e
-        
-        # Register models when vLLM ModelRegistry is imported
-        if name == 'vllm' or (name.startswith('vllm.') and 'registry' in name):
-            print(f\"Mock: Detected vLLM import: {{name}}, registering models...\")
-            register_mock_models()
         
         # Patch specific vLLM TT modules after they're imported
         if name == 'vllm.worker.tt_worker':
@@ -739,7 +726,7 @@ def main():
     patches = setup_tt_mocks()
     
     try:
-        # Register mock TT models
+        # Register mock TT models in parent process (like offline_inference_tt.py does)
         register_mock_tt_models()
         
         # Mock the TT model check
@@ -777,7 +764,9 @@ def main():
             except Exception as e:
                 print(f"Warning: Error during cleanup: {e}")
 
+# Set up mocks and register models at module level (like offline_inference_tt.py)
 patches = setup_tt_mocks()
+register_mock_tt_models()
 
 if __name__ == "__main__":
     main()
