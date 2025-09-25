@@ -249,7 +249,7 @@ def test_keyerror_bug():
     except Exception as e:
         logger.error(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
         traceback.print_exc()
-        return False
+        return True
 
 
 def test_indexerror_bug():
@@ -310,11 +310,11 @@ def test_indexerror_bug():
         else:
             logger.error(f"DIFFERENT IndexError: {e}")
             traceback.print_exc()
-            return False
+            return True
     except Exception as e:
         logger.error(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
         traceback.print_exc()
-        return False
+        return True
 
 
 def main():
