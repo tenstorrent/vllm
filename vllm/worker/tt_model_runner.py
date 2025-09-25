@@ -113,6 +113,17 @@ def top_pk_logits_efficient(logits,
         return token
 
 
+def sample_tokens(logits, tt_sampling_params: TTSamplingParams):
+    if tt_sampling_params.temperature == 0:  # greedy decoding
+        return torch.argmax(logits, dim=-1)
+    else:  # top-k top-p sampling
+        return top_pk_logits_efficient(
+            logits,
+            p=tt_sampling_params.top_p,
+            k=tt_sampling_params.top_k,
+            temperature=tt_sampling_params.temperature)
+
+
 class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def __init__(
@@ -771,7 +782,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             # sin: [1, 1, seq_len, head_dim]
                             rot_mats[1][i:i + 1],
                         ),
-                        "updated": False
+                        "updated":
+                        False
                     }
                 self.previous_seq_ids = model_input.seq_groups
             else:
@@ -827,9 +839,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     for seq_id in model_input.seq_groups:
                         self.cached_req_data[seq_id]['updated'] = True
                 else:
-                    enc_dec_kwargs = {
-                        "rot_mats_all_users": None
-                    }
+                    enc_dec_kwargs = {"rot_mats_all_users": None}
+                self.previous_seq_ids = model_input.seq_groups
             else:
                 enc_dec_kwargs = {}
 
