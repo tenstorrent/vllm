@@ -825,7 +825,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     decode_full_text_row_masked_out_mask
                 }
             elif self.request_specific_rope:
-                if any(seq_id not in self.previous_seq_ids for seq_id in model_input.seq_groups):
+                if any(seq_id not in self.previous_seq_ids 
+                       for seq_id in model_input.seq_groups):
                     enc_dec_kwargs = {
                         "rot_mats_all_users": [
                             self.cached_req_data[seq_id]["rot_mats"]
@@ -833,9 +834,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         ]
                     }
                 else:
-                    enc_dec_kwargs = {
-                        "rot_mats_all_users": None
-                    }
+                    enc_dec_kwargs = {"rot_mats_all_users": None}
                 self.previous_seq_ids = set(model_input.seq_groups)
             else:
                 enc_dec_kwargs = {}
