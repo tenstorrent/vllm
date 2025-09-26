@@ -281,6 +281,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     compat_sampling_used = True
                     break
 
+        if compat_sampling_used:
+            logger.info("USING COMPAT SAMPLING" + "="*100)
+        else:
+            logger.info("USING CUSTOM SAMPLING" + "="*100)
+
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
             assert len(
