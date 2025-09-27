@@ -502,35 +502,27 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                    dim=1)
 
         if self.dp_kv_cache:
-            prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
-
-            # Detect preempted/aborted requests using set difference (order-agnostic)
-            prev_set = set(prev_seq_groups_list)
-            current_set = set(seq_groups_list)
-            finished_requests_seq_ids_current = list(prev_set - current_set)
-
-            # Add any remaining finished requests
-            for seq_id in finished_requests_seq_ids:
-                if seq_id not in finished_requests_seq_ids_current:
-                    finished_requests_seq_ids_current.append(seq_id)
-
-            # Atomically cleanup finished/preempted requests
-            for seq_id in finished_requests_seq_ids_current:
-                if seq_id in self.seq_groups_to_batch_slot:
-                    empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
-                    # Only add to empty_slots if not already present (prevent duplicates)
-                    if empty_batch_slot not in self.empty_slots:
-                        self.empty_slots.append(empty_batch_slot)
-                    del self.seq_groups_to_batch_slot[seq_id]
-                
-                # Clean up req_id_to_seq_id mapping for preempted requests
-                req_ids_to_remove = []
-                for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
-                    if mapped_seq_id == seq_id:
-                        req_ids_to_remove.append(req_id)
-                
-                for req_id in req_ids_to_remove:
-                    del self.req_id_to_seq_id[req_id]
+            # Only cleanup sequences that are explicitly finished via finished_requests_ids
+            # Do NOT cleanup sequences just because they're not in the current batch,
+            # as they may appear in future batches (mixed prefill/decode scenarios)
+            if finished_requests_ids:
+                for seq_id in finished_requests_seq_ids:
+                    if seq_id in self.seq_groups_to_batch_slot:
+                        empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
+                        # Only add to empty_slots if not already present (prevent duplicates)
+                        if empty_batch_slot not in self.empty_slots:
+                            self.empty_slots.append(empty_batch_slot)
+                        del self.seq_groups_to_batch_slot[seq_id]
+                        logger.debug(f"Cleaned up slot {empty_batch_slot} for finished sequence {seq_id}")
+                    
+                    # Clean up req_id_to_seq_id mapping for finished requests
+                    req_ids_to_remove = []
+                    for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
+                        if mapped_seq_id == seq_id:
+                            req_ids_to_remove.append(req_id)
+                    
+                    for req_id in req_ids_to_remove:
+                        del self.req_id_to_seq_id[req_id]
             
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
