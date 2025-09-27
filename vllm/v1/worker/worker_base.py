@@ -63,3 +63,19 @@ class WorkerBase(WorkerBaseV0):
     def check_health(self) -> None:
         """Basic health check (override for device-specific checks)."""
         return
+
+    # Generic DP-gather hooks (optional; default no-op)
+    def supports_dp_gather_execute(self) -> bool:
+        return False
+
+    def build_dp_model_input(self, scheduler_output):
+        return None
+
+    def get_dp_input_mode(self, dp_model_input: object) -> str:
+        return ""
+
+    def concat_and_execute_dp(self, inputs: list):
+        raise NotImplementedError
+
+    def apply_dp_execution_result(self, result) -> object:
+        raise NotImplementedError

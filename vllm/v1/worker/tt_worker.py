@@ -143,9 +143,58 @@ class TTWorker(WorkerBase):
         output = self.model_runner.execute_model(scheduler_output)
         return output
 
+    def execute_with_model_input(self, model_input) -> ModelRunnerOutput:
+        """
+        Execute on the driver with a prebuilt TTModelInput. Non-driver workers
+        should never call this.
+        """
+        assert self.is_driver_worker, "execute_with_model_input must run on driver"
+        return self.model_runner.execute_with_model_input(model_input)
+
+    def execute_dummy_batch(self) -> None:
+        """No-op dummy batch for TT non-driver workers."""
+        return
+
+    # Helpers used by EngineCore for DP gather execution
+    def build_tt_model_input(self, scheduler_output: "SchedulerOutput"):
+        return self.model_runner.build_model_input(scheduler_output)
+
+    def apply_sampled_token_ids(
+            self, sampled_token_ids: list[list[int]]) -> ModelRunnerOutput:
+        return self.model_runner.apply_sampled_token_ids(sampled_token_ids)
+
+    def concat_and_execute(self, inputs: list) -> ModelRunnerOutput:
+        """Concatenate multiple TTModelInput batches and execute once.
+        This runs only on the driver worker.
+        """
+        assert self.is_driver_worker, "concat_and_execute must run on driver"
+        merged = self.model_runner.concat_model_inputs(inputs)
+        return self.model_runner.execute_with_model_input(merged)
+
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return
+
+    # ---- DP gather generic hooks ----
+    def supports_dp_gather_execute(self) -> bool:
+        return True
+
+    def build_dp_model_input(self, scheduler_output):
+        return self.build_tt_model_input(scheduler_output)
+
+    def get_dp_input_mode(self, dp_model_input: object) -> str:
+        if dp_model_input is None:
+            return ""
+        # TTModelInput: prefill if prompt_lens is not None
+        return "prefill" if getattr(dp_model_input, "prompt_lens",
+                                    None) is not None else "decode"
+
+    def concat_and_execute_dp(self, inputs: list):
+        return self.concat_and_execute(inputs)
+
+    def apply_dp_execution_result(self, result) -> ModelRunnerOutput:
+        # result is sampled_token_ids: list[list[int]]
+        return self.apply_sampled_token_ids(result)
 
     ## Destructor (used to close devices)
 

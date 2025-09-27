@@ -423,6 +423,127 @@ class TTModelRunner:
         output = self._generate_runner_output(sampled_token_ids)
         return output
 
+    def build_model_input(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> Optional[TTModelInput]:
+        """
+        Update internal state with the scheduler output and build
+        TTModelInput without executing the model.
+        Returns None if there is no scheduled work in this step.
+        """
+        # Update cached state
+        self._update_states(scheduler_output)
+        if not scheduler_output.total_num_scheduled_tokens:
+            return None
+
+        # Prepare model inputs only
+        model_input = self._prepare_model_inputs(scheduler_output)
+        return model_input
+
+    @torch.no_grad()
+    def execute_with_model_input(
+        self,
+        model_input: TTModelInput,
+    ) -> ModelRunnerOutput:
+        """
+        Execute the model using a prebuilt TTModelInput. This does not
+        update internal cached states and assumes the runner's caches
+        and input batch tensors are already in a consistent state.
+        """
+        is_decode = model_input.prompt_lens is None
+        execute_model_kwargs = {
+            "tokens": model_input.input_tokens,
+            "page_table": model_input.block_tables,
+            "kv_cache": self.kv_caches,
+            **(model_input.multi_modal_kwargs or {}),
+        }
+        if not is_decode:
+            execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
+        else:
+            execute_model_kwargs["start_pos"] = model_input.input_positions
+        if self.sample_on_device_mode == "all" or (
+                self.sample_on_device_mode == "decode_only" and is_decode):
+            execute_model_kwargs[
+                "sampling_params"] = model_input.tt_sampling_params
+
+        # Execute model
+        if not is_decode:
+            outputs = self.model.prefill_forward(**execute_model_kwargs)
+            tt_out = outputs  # [batch_size, seq_len, vocab_size]
+        else:
+            # TODO: Add encoder-decoder support
+            enc_dec_kwargs: dict[str, Any] = {}
+            tt_out = self.model.decode_forward(**execute_model_kwargs,
+                                               **enc_dec_kwargs,
+                                               enable_trace=self.trace_mode,
+                                               read_from_device=True)
+
+        batch_size = model_input.unpadded_batch_size
+        if not self.sample_on_device_mode or (
+                self.sample_on_device_mode == "decode_only" and not is_decode):
+            next_logits = tt_out[:batch_size,
+                                 -1, :]  # unpadded batch, vocab of last token
+            next_token_ids = sample_tokens(next_logits,
+                                           model_input.tt_sampling_params)
+        else:
+            next_token_ids = tt_out
+
+        sampled_token_ids = [[int(next_token_ids[i])]
+                             for i in range(batch_size)]
+        output = self._generate_runner_output(sampled_token_ids)
+        return output
+
+    def apply_sampled_token_ids(
+            self, sampled_token_ids: list[list[int]]) -> ModelRunnerOutput:
+        """
+        Apply sampled token ids to the internal caches and return a
+        ModelRunnerOutput. This is useful for non-driver ranks to update
+        state after receiving results from a remote execution.
+        """
+        return self._generate_runner_output(sampled_token_ids)
+
+    @staticmethod
+    def concat_model_inputs(inputs: list[TTModelInput]) -> TTModelInput:
+        """
+        Concatenate multiple TTModelInput batches into a single batch.
+        Assumes all inputs are either prefill or decode (homogeneous).
+        """
+        assert inputs, "No inputs to concatenate"
+        is_decode = inputs[0].prompt_lens is None
+
+        # Concatenate tokens/positions and block tables
+        if is_decode:
+            input_tokens = torch.cat([mi.input_tokens for mi in inputs], dim=0)
+            input_positions = torch.cat([mi.input_positions for mi in inputs],
+                                        dim=0)
+            prompt_lens = None
+        else:
+            input_tokens = torch.cat([mi.input_tokens for mi in inputs], dim=0)
+            input_positions = 0
+            prompt_lens = torch.cat([mi.prompt_lens for mi in inputs],
+                                    dim=0)  # type: ignore
+
+        block_tables = torch.cat([mi.block_tables for mi in inputs], dim=0)
+
+        # Use first sampling params and metadata (TT currently supports same)
+        base = inputs[0]
+        batch_size = sum(mi.unpadded_batch_size for mi in inputs)
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=prompt_lens,
+            seq_groups=None,
+            block_tables=block_tables,
+            unpadded_batch_size=batch_size,
+            tt_sampling_params=base.tt_sampling_params,
+            sampling_params_list=base.sampling_params_list,
+            compat_sampling_used=base.compat_sampling_used,
+            sampling_metadata=base.sampling_metadata,
+            multi_modal_kwargs=base.multi_modal_kwargs,
+            cross_block_tables=base.cross_block_tables,
+        )
+
     def _generate_runner_output(self, sampled_token_ids: list[list[int]]):
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.

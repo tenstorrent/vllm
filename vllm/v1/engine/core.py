@@ -15,6 +15,8 @@ from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
+import torch
+import torch.distributed as dist
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -236,6 +238,7 @@ class EngineCore:
 
     def execute_model(self, scheduler_output: SchedulerOutput):
         try:
+            # Placeholder for TT DP-gather hook: execute locally for now.
             return self.model_executor.execute_model(scheduler_output)
         except Exception as err:
             # We do not want to catch BaseException here since we're only
@@ -1047,6 +1050,103 @@ class DPEngineCoreProc(EngineCoreProc):
         else:
             logger.info("Distributed environment reinitialized for DP rank %s",
                         self.dp_rank)
+
+    def execute_model(self, scheduler_output: SchedulerOutput):
+        # Generic DP gather: if workers support dp-gather, DP0 gathers homogeneous inputs and executes
+        try:
+            if (getattr(self, "dp_group", None) is not None
+                    and dist.is_initialized()):
+                # Query capability from driver worker
+                caps = self.model_executor.collective_rpc(
+                    "supports_dp_gather_execute")
+                if caps and caps[0]:
+                    return self._execute_model_dp_gather(scheduler_output)
+        except Exception:
+            # Fallback to normal path on any TT gather failure
+            pass
+        return super().execute_model(scheduler_output)
+
+    def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
+        group = self.dp_group
+        rank = dist.get_rank(group=group)
+        world = dist.get_world_size(group=group)
+
+        # Build local dp model input (or None) on the driver worker
+        local_input_list = self.model_executor.collective_rpc(
+            "build_dp_model_input", args=(scheduler_output, ))
+        local_input = local_input_list[0]
+
+        # DP0 selects mode based on its local batch via worker hook
+        if rank == 0:
+            mode = self.model_executor.collective_rpc("get_dp_input_mode",
+                                                      args=(local_input, ))[0]
+            # default to decode if empty string
+            mode_flag = 1 if mode == "prefill" else 0
+            mode_tensor = torch.tensor([mode_flag], dtype=torch.int64)
+        else:
+            mode_tensor = torch.tensor([0], dtype=torch.int64)
+        dist.broadcast(mode_tensor, src=0, group=group)
+        mode_flag = int(mode_tensor.item())  # 1=prefill, 0=decode
+
+        # Keep only matching mode locally using worker hook
+        if local_input is not None:
+            my_mode = self.model_executor.collective_rpc(
+                "get_dp_input_mode", args=(local_input, ))[0]
+            if (mode_flag == 1 and my_mode != "prefill") or \
+               (mode_flag == 0 and my_mode != "decode"):
+                local_input = None
+
+        # Gather python-serializable inputs
+        gathered = [None for _ in range(world)]
+        dist.all_gather_object(gathered, local_input, group=group)
+
+        # DP0: concat and execute once using worker hook
+        if rank == 0:
+            sizes: list[int] = []
+            inputs = []
+            for obj in gathered:
+                if obj is None:
+                    sizes.append(0)
+                else:
+                    # rely on worker to understand input object
+                    sizes.append(getattr(obj, "unpadded_batch_size", 0))
+                    inputs.append(obj)
+
+            if any(sz > 0 for sz in sizes):
+                result = self.model_executor.collective_rpc(
+                    "concat_and_execute_dp", args=(inputs, ))[0]
+                all_ids = result.sampled_token_ids if hasattr(
+                    result, "sampled_token_ids") else result
+            else:
+                all_ids = []
+
+            # Split per rank
+            per_rank: list[list[list[int]]] = []
+            idx = 0
+            for sz in sizes:
+                if sz == 0:
+                    per_rank.append([])
+                else:
+                    per_rank.append(all_ids[idx:idx + sz])
+                    idx += sz
+        else:
+            per_rank = None
+
+        # Broadcast results to all ranks as an object list
+        if rank == 0:
+            obj_list = per_rank
+        else:
+            obj_list = [None for _ in range(world)]  # type: ignore
+        dist.broadcast_object_list(obj_list, src=0, group=group)
+
+        my_ids = obj_list[rank]
+        if my_ids is None:
+            my_ids = []
+
+        # Apply locally and return output
+        out_list = self.model_executor.collective_rpc(
+            "apply_dp_execution_result", args=(my_ids, ))
+        return out_list[0]
 
 
 class DPEngineCoreActor(DPEngineCoreProc):
