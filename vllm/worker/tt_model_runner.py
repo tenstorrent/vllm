@@ -266,8 +266,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Delete finished requests from req_id_to_seq_id
             finished_requests_seq_ids = []
             for req_id in finished_requests_ids:
-                finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
-                del self.req_id_to_seq_id[req_id]
+                # Only delete if the request was added in the first place
+                if req_id in self.req_id_to_seq_id:
+                    finished_requests_seq_ids.append(self.req_id_to_seq_id[req_id])
+                    del self.req_id_to_seq_id[req_id]
 
         # Compat sampling is off by default, and enabled only on request
         # or if any of the requests in the batch require it
@@ -494,27 +496,26 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                    dim=1)
 
         if self.dp_kv_cache:
-            prev_seq_groups_list = list(self.seq_groups_to_batch_slot.keys())
+            # Only cleanup sequences that are explicitly finished via finished_requests_ids
+            # Do not cleanup sequences just because they're not in the current batch,
+            # as they may appear in future batches (mixed prefill/decode scenarios)
+            if finished_requests_ids:
+                for seq_id in finished_requests_seq_ids:
+                    if seq_id in self.seq_groups_to_batch_slot:
+                        empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
+                        # Only add to empty_slots if not already present (prevent duplicates)
+                        if empty_batch_slot not in self.empty_slots:
+                            self.empty_slots.append(empty_batch_slot)
+                        del self.seq_groups_to_batch_slot[seq_id]
 
-            # check for preempted requests
-            if seq_groups_list != prev_seq_groups_list and not is_prompt:
-                finished_requests_seq_ids_current = [
-                    seq_id for seq_id in prev_seq_groups_list
-                    if seq_id not in seq_groups_list
-                ]
-            else:
-                finished_requests_seq_ids_current = []
+                    # Clean up req_id_to_seq_id mapping for finished requests
+                    req_ids_to_remove = []
+                    for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
+                        if mapped_seq_id == seq_id:
+                            req_ids_to_remove.append(req_id)
 
-            # check for any remaining finished requests
-            for seq_id in finished_requests_seq_ids:
-                if seq_id not in finished_requests_seq_ids_current:
-                    finished_requests_seq_ids_current.append(seq_id)
-
-            # update the empty slots
-            for req in finished_requests_seq_ids_current:
-                empty_batch_slot = self.seq_groups_to_batch_slot[req]
-                self.empty_slots.append(empty_batch_slot)
-                del self.seq_groups_to_batch_slot[req]
+                    for req_id in req_ids_to_remove:
+                        del self.req_id_to_seq_id[req_id]
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -744,10 +745,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                          unpadded_batch_size]
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
-
-                for s in model_input.seq_groups:
+                # iterate through recently_filled_slots slice
+                # avoid unnecessary mutation to the temporary slice list
+                for i, s in enumerate(model_input.seq_groups):
                     self.seq_groups_to_batch_slot[
-                        s] = recently_filled_slots.pop(0)
+                        s] = recently_filled_slots[i]
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
