@@ -836,6 +836,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
+                # Ensure all sequences have valid slot assignments
+                # If a sequence doesn't have a slot, assign one from empty_slots
+                for s in model_input.seq_groups:
+                    if s not in self.seq_groups_to_batch_slot:
+                        if not self.empty_slots:
+                            logger.error(f"No empty slots available for sequence {s}")
+                            raise RuntimeError(f"No empty slots available for sequence {s}")
+                        slot = self.empty_slots.pop(0)
+                        self.seq_groups_to_batch_slot[s] = slot
+                        logger.warning(f"Assigned emergency slot {slot} to sequence {s} during decode")
+
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
                 perm_table_tensor = torch.as_tensor(
