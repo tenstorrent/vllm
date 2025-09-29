@@ -757,7 +757,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                          unpadded_batch_size]
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
-
+                # iterate through recently_filled_slots slice
+                # avoid unnecessary mutation to the temporary slice list
                 for i, s in enumerate(model_input.seq_groups):
                     if s in self.seq_groups_to_batch_slot:
                         logger.warning(f"Sequence {s} already has slot {self.seq_groups_to_batch_slot[s]}, overwriting with {recently_filled_slots[i]}")
