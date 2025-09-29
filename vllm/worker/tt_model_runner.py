@@ -535,7 +535,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if orphaned_sequences:
                 logger.warning(f"SLOT_DEBUG: Detected {len(orphaned_sequences)} orphaned sequences: {orphaned_sequences}")
                 logger.warning(f"SLOT_DEBUG: These sequences have slots but are not in current batch")
-                logger.warning(f"SLOT_DEBUG: This may indicate missing finished_requests_ids from upstream components")
                 
                 # CLEANUP: If we have many orphaned sequences and few empty slots,
                 # we need to clean them up to prevent prefill failures
@@ -819,9 +818,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                          unpadded_batch_size]
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
-                logger.debug(f"SLOT_DEBUG: prefill phase - allocated slots {recently_filled_slots}")
-                logger.debug(f"SLOT_DEBUG: prefill phase - remaining empty_slots (len={len(self.empty_slots)})={self.empty_slots}")
-                
+
                 # SAFETY CHECK: Ensure we have enough slots for all sequences
                 if len(recently_filled_slots) != len(model_input.seq_groups):
                     logger.error(f"SLOT_DEBUG: MISMATCH - allocated {len(recently_filled_slots)} slots for {len(model_input.seq_groups)} sequences")
