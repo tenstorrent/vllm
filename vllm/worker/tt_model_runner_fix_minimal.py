@@ -514,16 +514,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             self.empty_slots.append(empty_batch_slot)
                         del self.seq_groups_to_batch_slot[seq_id]
                         logger.debug(f"Cleaned up slot {empty_batch_slot} for finished sequence {seq_id}")
-                    
+
                     # Clean up req_id_to_seq_id mapping for finished requests
                     req_ids_to_remove = []
                     for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
                         if mapped_seq_id == seq_id:
                             req_ids_to_remove.append(req_id)
-                    
+
                     for req_id in req_ids_to_remove:
                         del self.req_id_to_seq_id[req_id]
-            
+
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
                             prompt_lens=prompt_lens,
@@ -747,11 +747,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             outputs = self.model.prefill_forward(**execute_model_kwargs)
 
             if self.dp_kv_cache:
-                # Validate we have enough empty slots
-                if len(self.empty_slots) < model_input.unpadded_batch_size:
-                    logger.error(f"Not enough empty slots: need {model_input.unpadded_batch_size}, have {len(self.empty_slots)}")
-                    raise RuntimeError(f"Not enough empty slots for prefill batch")
-                
                 # update the batch slot table
                 recently_filled_slots = self.empty_slots[:model_input.
                                                          unpadded_batch_size]
@@ -760,11 +755,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # iterate through recently_filled_slots slice
                 # avoid unnecessary mutation to the temporary slice list
                 for i, s in enumerate(model_input.seq_groups):
-                    if s in self.seq_groups_to_batch_slot:
-                        logger.warning(f"Sequence {s} already has slot {self.seq_groups_to_batch_slot[s]}, overwriting with {recently_filled_slots[i]}")
                     self.seq_groups_to_batch_slot[
                         s] = recently_filled_slots[i]
-                    logger.debug(f"Assigned slot {recently_filled_slots[i]} to sequence {s} during prefill")
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
@@ -851,17 +843,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
-                # Ensure all sequences have valid slot assignments
-                # If a sequence doesn't have a slot, assign one from empty_slots
-                for s in model_input.seq_groups:
-                    if s not in self.seq_groups_to_batch_slot:
-                        if not self.empty_slots:
-                            logger.error(f"No empty slots available for sequence {s}")
-                            raise RuntimeError(f"No empty slots available for sequence {s}")
-                        slot = self.empty_slots.pop(0)
-                        self.seq_groups_to_batch_slot[s] = slot
-                        logger.warning(f"Assigned emergency slot {slot} to sequence {s} during decode")
-                
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
                 perm_table_tensor = torch.as_tensor(
