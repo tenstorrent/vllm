@@ -3,7 +3,7 @@
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
 import torch
 import torch.nn as nn
@@ -164,6 +164,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 "a model cannot be encoder-decoder and request-specific rope")
             # seq_id -> cached_req_data
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
+            self.previous_seq_ids: Set[int] = set()
 
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keep "rope_deltas" between prompt and decoding phases.
@@ -789,7 +790,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         if seq_id not in current_active_seqs:
                             orphaned_seqs.append(seq_id)
                     
-                    logger.error(f"SLOT_DEBUG: Force-cleaning {len(orphaned_seqs)} orphaned sequences: {orphaned_seqs}")
+                    logger.warning(f"SLOT_DEBUG: Force-cleaning {len(orphaned_seqs)} orphaned sequences: {orphaned_seqs}")
                     for seq_id in orphaned_seqs:
                         slot = self.seq_groups_to_batch_slot[seq_id]
                         if slot not in self.empty_slots:
@@ -808,10 +809,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         raise RuntimeError(f"Insufficient empty slots for prefill: need {model_input.unpadded_batch_size}, have {len(self.empty_slots)}")
                 
                 slots_to_allocate = self.empty_slots[:model_input.unpadded_batch_size]
-                logger.debug(f"SLOT_DEBUG: prefill phase - allocating slots {slots_to_allocate}")
-                
-                execute_model_kwargs[
-                    "empty_slots"] = slots_to_allocate
+                execute_model_kwargs["empty_slots"] = slots_to_allocate
 
             outputs = self.model.prefill_forward(**execute_model_kwargs)
 
@@ -836,11 +834,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         logger.error(f"SLOT_DEBUG: INDEX ERROR - trying to access slot {i} but only have {len(recently_filled_slots)} slots")
                         raise IndexError(f"Slot index {i} out of range for {len(recently_filled_slots)} allocated slots")
                     
-                    self.seq_groups_to_batch_slot[
-                        s] = recently_filled_slots[i]
-                    logger.debug(f"SLOT_DEBUG: prefill phase - assigned slot {recently_filled_slots[i]} to seq {s}")
-                
-                logger.debug(f"SLOT_DEBUG: prefill phase - final seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
+                    self.seq_groups_to_batch_slot[s] = recently_filled_slots[i]
 
             if self.model_config.is_encoder_decoder:
                 # Save encoder-decoder data for use in subsequent decode steps
@@ -917,20 +911,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     decode_full_text_row_masked_out_mask
                 }
             elif self.request_specific_rope:
-                enc_dec_kwargs = {
-                    "rot_mats_all_users": [
-                        self.cached_req_data[seq_id]["rot_mats"]
-                        for seq_id in model_input.seq_groups
-                    ]
-                }
+                if any(seq_id not in self.previous_seq_ids
+                       for seq_id in model_input.seq_groups):
+                    enc_dec_kwargs = {
+                        "rot_mats_all_users": [
+                            self.cached_req_data[seq_id]["rot_mats"]
+                            for seq_id in model_input.seq_groups
+                        ]
+                    }
+                else:
+                    enc_dec_kwargs = {"rot_mats_all_users": None}
+                self.previous_seq_ids = set(model_input.seq_groups)
             else:
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
-                logger.debug(f"SLOT_DEBUG: decode phase - seq_groups={model_input.seq_groups}")
-                logger.debug(f"SLOT_DEBUG: decode phase - seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
-                logger.debug(f"SLOT_DEBUG: decode phase - empty_slots (len={len(self.empty_slots)})={self.empty_slots}")
-                
                 # Defensive cleanup: recover orphaned slots before processing
                 current_active_seqs = set(model_input.seq_groups)
                 orphaned_seqs = []
@@ -970,10 +965,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 current_total = len(active_slots) + len(self.empty_slots)
                 
                 if current_total != expected_size:
-                    logger.error(f"SLOT_DEBUG: Size mismatch detected - expected {expected_size}, got {current_total}")
-                    logger.error(f"SLOT_DEBUG: active_slots (len={len(active_slots)})={active_slots}")
-                    logger.error(f"SLOT_DEBUG: empty_slots (len={len(self.empty_slots)})={self.empty_slots}")
-                    logger.error(f"SLOT_DEBUG: seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
+                    logger.warning(f"SLOT_DEBUG: Size mismatch detected - expected {expected_size}, got {current_total}")
+                    logger.warning(f"SLOT_DEBUG: active_slots (len={len(active_slots)})={active_slots}")
+                    logger.warning(f"SLOT_DEBUG: empty_slots (len={len(self.empty_slots)})={self.empty_slots}")
+                    logger.warning(f"SLOT_DEBUG: seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
                     
                     # Find missing or duplicate slots
                     all_slots_set = set(active_slots) | set(self.empty_slots)
@@ -995,7 +990,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     
                     # Check for duplicates in empty_slots
                     if len(self.empty_slots) != len(set(self.empty_slots)):
-                        logger.error(f"SLOT_DEBUG: Duplicate slots in empty_slots detected")
+                        logger.warning(f"SLOT_DEBUG: Duplicate slots in empty_slots detected")
                         self.empty_slots = list(dict.fromkeys(self.empty_slots))  # Remove duplicates while preserving order
                         logger.warning(f"SLOT_DEBUG: Removed duplicates from empty_slots")
                     
@@ -1011,10 +1006,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # Final size check with graceful handling
                 actual_size = perm_table_tensor.shape[0]
                 if actual_size != expected_size:
-                    logger.error(f"SLOT_DEBUG: CRITICAL - Still have size mismatch after recovery!")
-                    logger.error(f"SLOT_DEBUG: expected_size={expected_size}, actual_size={actual_size}")
-                    logger.error(f"SLOT_DEBUG: This indicates a fundamental slot management bug")
-                    logger.error(f"SLOT_DEBUG: perm_table_tensor={perm_table_tensor.tolist()}")
+                    logger.warning(f"SLOT_DEBUG: Still have size mismatch after recovery!")
+                    logger.warning(f"SLOT_DEBUG: expected_size={expected_size}, actual_size={actual_size}")
+                    logger.warning(f"SLOT_DEBUG: This indicates a fundamental slot management bug")
+                    logger.warning(f"SLOT_DEBUG: perm_table_tensor={perm_table_tensor.tolist()}")
                     
                     # Last resort: create a valid permutation table
                     if actual_size < expected_size:
@@ -1025,11 +1020,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             active_slots + self.empty_slots + padding,
                             dtype=torch.long,
                         )
-                        logger.error(f"SLOT_DEBUG: Emergency padding with {padding}")
+                        logger.warning(f"SLOT_DEBUG: Emergency padding with {padding}")
                     else:
                         # Truncate to expected size
                         perm_table_tensor = perm_table_tensor[:expected_size]
-                        logger.error(f"SLOT_DEBUG: Emergency truncation to size {expected_size}")
+                        logger.warning(f"SLOT_DEBUG: Emergency truncation to size {expected_size}")
                 
                 # This should now always pass, but keep as final safety check
                 assert perm_table_tensor.shape[0] == self.scheduler_config.max_num_seqs, \
