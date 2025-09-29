@@ -849,15 +849,38 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
+                active_slots = [self.seq_groups_to_batch_slot[s] for s in model_input.seq_groups]
                 perm_table_tensor = torch.as_tensor(
-                    [
-                        self.seq_groups_to_batch_slot[s]
-                        for s in model_input.seq_groups
-                    ] + self.empty_slots,
+                    active_slots + self.empty_slots,
                     dtype=torch.long,
                 )
                 if self.async_torch_proc:
                     self.perm_table_tensor.append(perm_table_tensor)
+
+                # Debug assertion failure only when it would fail
+                expected_size = self.scheduler_config.max_num_seqs
+                actual_size = perm_table_tensor.shape[0]
+                
+                if actual_size != expected_size:
+                    logger.error(f"ASSERTION DEBUG: expected_size={expected_size}, actual_size={actual_size}")
+                    logger.error(f"ASSERTION DEBUG: len(model_input.seq_groups)={len(model_input.seq_groups)}")
+                    logger.error(f"ASSERTION DEBUG: len(self.empty_slots)={len(self.empty_slots)}")
+                    logger.error(f"ASSERTION DEBUG: model_input.seq_groups={model_input.seq_groups}")
+                    logger.error(f"ASSERTION DEBUG: active_slots={active_slots}")
+                    logger.error(f"ASSERTION DEBUG: self.empty_slots={self.empty_slots}")
+                    logger.error(f"ASSERTION DEBUG: self.seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
+                    logger.error(f"ASSERTION DEBUG: perm_table_tensor={perm_table_tensor.tolist()}")
+                    
+                    # Check for duplicates
+                    all_slots = active_slots + self.empty_slots
+                    unique_slots = list(set(all_slots))
+                    if len(all_slots) != len(unique_slots):
+                        logger.error(f"ASSERTION DEBUG: DUPLICATE SLOTS DETECTED!")
+                        logger.error(f"ASSERTION DEBUG: all_slots length={len(all_slots)}, unique length={len(unique_slots)}")
+                        from collections import Counter
+                        slot_counts = Counter(all_slots)
+                        duplicates = {slot: count for slot, count in slot_counts.items() if count > 1}
+                        logger.error(f"ASSERTION DEBUG: duplicate slots={duplicates}")
 
                 assert perm_table_tensor.shape[
                     0] == self.scheduler_config.max_num_seqs
