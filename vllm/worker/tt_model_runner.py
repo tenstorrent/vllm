@@ -1,34 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# BUG FIX SUMMARY:
-# This file contains fixes for a critical slot management bug in the TT (Tenstorrent) backend
-# that causes AssertionError when creating permutation tables for DP (Data Parallel) KV cache.
-#
-# ROOT CAUSE:
-# The bug occurs when sequences finish but their request IDs are not properly reported
-# in ExecuteModelRequest.finished_requests_ids. This leaves slots "orphaned" - they remain
-# allocated in seq_groups_to_batch_slot but are not returned to empty_slots, causing
-# the permutation table size to be incorrect (len(active_slots) + len(empty_slots) != max_num_seqs).
-#
-# UPSTREAM ISSUE:
-# The real fix requires ensuring that ExecuteModelRequest.finished_requests_ids is properly
-# populated by the scheduler/engine when requests complete. The flow is:
-# 1. Scheduler detects finished requests
-# 2. ExecuteModelRequest.finished_requests_ids should contain those request IDs
-# 3. WorkerBase._get_driver_input_and_broadcast calls prepare_model_input with finished_requests_ids
-# 4. TTModelRunner.prepare_model_input should clean up slots for finished requests
-#
-# DEFENSIVE FIXES IMPLEMENTED:
-# 1. Comprehensive debug logging to track slot lifecycle
-# 2. Defensive cleanup mechanism to detect and recover orphaned slots
-# 3. Graceful recovery logic instead of hard assertion failure
-# 4. Size validation and automatic slot recovery
-#
-# The defensive fixes ensure the system continues to operate even when upstream components
-# fail to properly report finished requests, but the root cause should be addressed in
-# the scheduler/engine layer.
-
 import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Type, Union
@@ -524,24 +496,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                    dim=1)
 
         if self.dp_kv_cache:
-            # Debug logging for slot management
-            logger.debug(f"SLOT_DEBUG: prepare_model_input called with finished_requests_ids={finished_requests_ids}")
-            logger.debug(f"SLOT_DEBUG: current seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
-            logger.debug(f"SLOT_DEBUG: current empty_slots (len={len(self.empty_slots)})={self.empty_slots}")
-            logger.debug(f"SLOT_DEBUG: current seq_groups in batch={[sgm.seq_data.keys() for sgm in seq_group_metadata_list]}")
-            
             # Only cleanup sequences that are explicitly finished via finished_requests_ids
             # Do not cleanup sequences just because they're not in the current batch,
             # as they may appear in future batches (mixed prefill/decode scenarios)
             if finished_requests_ids:
-                logger.debug(f"SLOT_DEBUG: Processing {len(finished_requests_ids)} finished requests")
                 for seq_id in finished_requests_seq_ids:
                     if seq_id in self.seq_groups_to_batch_slot:
                         empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
                         # Only add to empty_slots if not already present (prevent duplicates)
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
-                            logger.debug(f"SLOT_DEBUG: Returned slot {empty_batch_slot} from finished seq {seq_id}")
                         else:
                             logger.warning(f"SLOT_DEBUG: Slot {empty_batch_slot} from seq {seq_id} already in empty_slots")
                         del self.seq_groups_to_batch_slot[seq_id]
@@ -556,11 +520,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
                     for req_id in req_ids_to_remove:
                         del self.req_id_to_seq_id[req_id]
-                        logger.debug(f"SLOT_DEBUG: Removed req_id mapping {req_id} -> {seq_id}")
-            else:
-                logger.debug(f"SLOT_DEBUG: No finished_requests_ids provided")
-                
-                # Defensive cleanup: detect and recover orphaned slots
+
+            # Defensive cleanup: detect and recover orphaned slots
             current_active_seqs = set()
             for sgm in seq_group_metadata_list:
                 current_active_seqs.update(sgm.seq_data.keys())
@@ -575,7 +536,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 logger.warning(f"SLOT_DEBUG: These sequences have slots but are not in current batch")
                 logger.warning(f"SLOT_DEBUG: This may indicate missing finished_requests_ids from upstream components")
                 
-                # AGGRESSIVE CLEANUP: If we have many orphaned sequences and few empty slots,
+                # CLEANUP: If we have many orphaned sequences and few empty slots,
                 # we need to clean them up to prevent prefill failures
                 total_sequences_in_batch = sum(len(sgm.seq_data.keys()) for sgm in seq_group_metadata_list)
                 if len(self.empty_slots) < total_sequences_in_batch and len(orphaned_sequences) > 0:
@@ -597,41 +558,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             
                 logger.debug(f"SLOT_DEBUG: After cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}")
                 logger.debug(f"SLOT_DEBUG: After cleanup - seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}")
-                
-                # UPSTREAM FIX NEEDED:
-                # If orphaned_sequences is consistently non-empty, it indicates that
-                # ExecuteModelRequest.finished_requests_ids is not being properly populated
-                # by the scheduler/engine. The fix should ensure that when sequences complete,
-                # their request IDs are included in finished_requests_ids.
-                # 
-                # Potential locations to investigate:
-                # - vllm/engine/llm_engine.py: Request completion detection
-                # - vllm/core/scheduler.py: Scheduler request lifecycle management
-                # - Request state transitions and cleanup logic
-                #
-# CRITICAL ISSUE OBSERVED:
-# The system is trying to prefill 31 sequences with only 1 empty slot available.
-# This suggests that 31 previous sequences finished but were never cleaned up,
-# indicating a severe upstream bug in request lifecycle management.
-#
-# ANALYSIS OF THE STACK TRACE:
-# - 31 orphaned sequences detected: [1, 22, 44, 66, 87, ...]
-# - Only 1 empty slot available: [20]
-# - Trying to prefill 31 new sequences: [489, 490, 491, ...]
-# - IndexError occurs when trying to access recently_filled_slots[i] for i > 0
-#
-# ROOT CAUSE:
-# The scheduler is sending batches of new requests without properly cleaning up
-# finished requests. The finished_requests_ids=[] indicates that the upstream
-# components are not reporting request completions, causing slot leakage.
-#
-# IMMEDIATE FIX:
-# Added aggressive slot recovery in prepare_model_input when insufficient slots
-# are detected, and comprehensive validation in prefill to prevent IndexError.
-#
-# LONG-TERM FIX NEEDED:
-# The scheduler/engine must properly track and report finished requests in
-# ExecuteModelRequest.finished_requests_ids to prevent slot exhaustion.
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -849,16 +775,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         if not is_decode:
             if self.dp_kv_cache:
-                logger.debug(f"SLOT_DEBUG: prefill phase - seq_groups={model_input.seq_groups}")
-                logger.debug(f"SLOT_DEBUG: prefill phase - unpadded_batch_size={model_input.unpadded_batch_size}")
-                logger.debug(f"SLOT_DEBUG: prefill phase - empty_slots before allocation (len={len(self.empty_slots)})={self.empty_slots}")
-                
-                # CRITICAL BUG FIX: Check if we have enough empty slots for prefill
+
+                # Check if we have enough empty slots for prefill
                 if len(self.empty_slots) < model_input.unpadded_batch_size:
-                    logger.error(f"SLOT_DEBUG: CRITICAL - Insufficient empty slots for prefill!")
-                    logger.error(f"SLOT_DEBUG: Need {model_input.unpadded_batch_size} slots, have {len(self.empty_slots)}")
-                    logger.error(f"SLOT_DEBUG: This indicates a fundamental slot management failure")
-                    logger.error(f"SLOT_DEBUG: Current seq_groups_to_batch_slot: {self.seq_groups_to_batch_slot}")
+                    logger.warning(f"SLOT_DEBUG: WARNING - Insufficient empty slots for prefill! Attempting to clean up orphaned slots...")
+                    logger.warning(f"SLOT_DEBUG: Need {model_input.unpadded_batch_size} slots, have {len(self.empty_slots)}")
+                    logger.warning(f"SLOT_DEBUG: Current seq_groups_to_batch_slot: {self.seq_groups_to_batch_slot}")
                     
                     # Emergency recovery: force cleanup of all orphaned slots
                     current_active_seqs = set(model_input.seq_groups)
