@@ -135,8 +135,9 @@ class TTModelRunner:
             self.parallel_config, LayerBlockType.attention)
 
         # Allocate KV cache tensors.
-        self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape, dtype,
-                                                      num_layers)
+        self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape,
+                                                      dtype,
+                                                      num_layers=1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the 

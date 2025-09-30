@@ -28,6 +28,12 @@ class TTPlatform(Platform):
     device_name: str = "tt"
     device_type: str = "tt"
 
+    # Require DP ranks to gather a homogeneous batch to a single driver
+    # before executing (used by core.py to gate DP-gather behavior).
+    @classmethod
+    def requires_gathered_batch_dp(cls) -> bool:
+        return True
+
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return True

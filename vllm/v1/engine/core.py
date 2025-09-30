@@ -259,6 +259,7 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        logger.info(f"has requests: {self.scheduler.has_requests()}")
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
@@ -640,11 +641,29 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.engines_running and not self.scheduler.has_requests():
-            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
-                logger.debug("EngineCore waiting for work.")
-                waited = True
-            req = self.input_queue.get()
-            self._handle_client_request(*req)
+            from vllm.platforms import current_platform
+            requires_gather = current_platform.requires_gathered_batch_dp()
+            if requires_gather:
+                # Non-blocking input polling so idle ranks can progress
+                try:
+                    req = self.input_queue.get_nowait()
+                    self._handle_client_request(*req)
+                    waited = True
+                except queue.Empty:
+                    break
+            else:
+                if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
+                    logger.debug("EngineCore waiting for work.")
+                    waited = True
+                req = self.input_queue.get()
+                self._handle_client_request(*req)
+            # # Non-blocking input polling so idle ranks can progress to engine step
+            # try:
+            #     req = self.input_queue.get_nowait()
+            #     self._handle_client_request(*req)
+            #     waited = True
+            # except queue.Empty:
+            #     break
 
         if waited:
             logger.debug("EngineCore loop active.")
@@ -962,9 +981,11 @@ class DPEngineCoreProc(EngineCoreProc):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
+            logger.info("waiting for work")
             self._process_input_queue()
 
             # 2) Step the engine core.
+            logger.info("processing engine step")
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
@@ -1052,24 +1073,40 @@ class DPEngineCoreProc(EngineCoreProc):
                         self.dp_rank)
 
     def execute_model(self, scheduler_output: SchedulerOutput):
-        # Generic DP gather: if workers support dp-gather, DP0 gathers homogeneous inputs and executes
+        # Generic DP gather: if platform requires it and workers support it,
+        # DP0 gathers homogeneous inputs and executes
         try:
-            if (getattr(self, "dp_group", None) is not None
-                    and dist.is_initialized()):
-                # Query capability from driver worker
+            if getattr(self, "dp_group", None) is not None:
+                from vllm.platforms import current_platform
+                requires_gather = current_platform.requires_gathered_batch_dp()
                 caps = self.model_executor.collective_rpc(
                     "supports_dp_gather_execute")
-                if caps and caps[0]:
+                if requires_gather and caps and caps[0]:
                     return self._execute_model_dp_gather(scheduler_output)
-        except Exception:
-            # Fallback to normal path on any TT gather failure
-            pass
-        return super().execute_model(scheduler_output)
+            return super().execute_model(scheduler_output)
+        except Exception as err:
+            # We do not want to catch BaseException here since we're only
+            # interested in dumping info when the exception is due to an
+            # error from execute_model itself.
+
+            # NOTE: This method is exception-free
+            dump_engine_exception(self.vllm_config, scheduler_output,
+                                  self.scheduler.make_stats())
+            raise err
 
     def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
         group = self.dp_group
-        rank = dist.get_rank(group=group)
-        world = dist.get_world_size(group=group)
+        rank = self.dp_rank
+        world = self.vllm_config.parallel_config.data_parallel_size
+
+        DEBUG_DPG = os.environ.get("VLLM_TT_DP_DEBUG") == "1"
+
+        def dlog(msg: str, *a: object) -> None:
+            if DEBUG_DPG:
+                logger.info("dp_gather r%d: " + msg, self.dp_rank, *a)
+
+        dlog("enter_gather tokens=%d",
+             scheduler_output.total_num_scheduled_tokens)
 
         # Build local dp model input (or None) on the driver worker
         local_input_list = self.model_executor.collective_rpc(
@@ -1077,16 +1114,18 @@ class DPEngineCoreProc(EngineCoreProc):
         local_input = local_input_list[0]
 
         # DP0 selects mode based on its local batch via worker hook
+        dlog("before_mode_allreduce local_input=%s",
+             "Y" if local_input is not None else "N")
         if rank == 0:
             mode = self.model_executor.collective_rpc("get_dp_input_mode",
                                                       args=(local_input, ))[0]
-            # default to decode if empty string
-            mode_flag = 1 if mode == "prefill" else 0
-            mode_tensor = torch.tensor([mode_flag], dtype=torch.int64)
+            mode_val = 1 if mode == "prefill" else 0
         else:
-            mode_tensor = torch.tensor([0], dtype=torch.int64)
-        dist.broadcast(mode_tensor, src=0, group=group)
+            mode_val = 0
+        mode_tensor = torch.tensor([mode_val], dtype=torch.int64)
+        dist.all_reduce(mode_tensor, op=dist.ReduceOp.MAX, group=group)
         mode_flag = int(mode_tensor.item())  # 1=prefill, 0=decode
+        dlog("after_mode_allreduce mode_flag=%d", mode_flag)
 
         # Keep only matching mode locally using worker hook
         if local_input is not None:
@@ -1099,6 +1138,13 @@ class DPEngineCoreProc(EngineCoreProc):
         # Gather python-serializable inputs
         gathered = [None for _ in range(world)]
         dist.all_gather_object(gathered, local_input, group=group)
+        dlog("after_inputs_gather")
+        if rank == 0:
+            sizes_dbg = [
+                0 if x is None else getattr(x, "unpadded_batch_size", 0)
+                for x in gathered
+            ]
+            dlog("gathered_sizes=%s", sizes_dbg)
 
         # DP0: concat and execute once using worker hook
         if rank == 0:
@@ -1129,24 +1175,55 @@ class DPEngineCoreProc(EngineCoreProc):
                 else:
                     per_rank.append(all_ids[idx:idx + sz])
                     idx += sz
+            dlog("split_counts=%s", [len(per_rank[i]) for i in range(world)])
         else:
             per_rank = None
 
-        # Broadcast results to all ranks as an object list
+        # Share results via gather of dicts (avoid broadcast on stateless dp)
         if rank == 0:
-            obj_list = per_rank
+            send_obj = {i: per_rank[i] for i in range(world)}
         else:
-            obj_list = [None for _ in range(world)]  # type: ignore
-        dist.broadcast_object_list(obj_list, src=0, group=group)
-
-        my_ids = obj_list[rank]
-        if my_ids is None:
-            my_ids = []
+            send_obj = {}
+        gathered = [None for _ in range(world)]
+        dist.all_gather_object(gathered, send_obj, group=group)
+        merged = next((d for d in gathered if d), {})
+        my_ids = merged.get(rank, [])
+        dlog("after_results_gather my_ids_len=%d", len(my_ids))
 
         # Apply locally and return output
         out_list = self.model_executor.collective_rpc(
             "apply_dp_execution_result", args=(my_ids, ))
         return out_list[0]
+
+    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """DP-aware step: even idle ranks participate in DP-gather.
+
+        When the platform requires gathered-batch DP and workers support
+        DP gather-execute, ensure every rank enters execute_model each
+        iteration, passing None for scheduler_output on idle ranks.
+        """
+        from vllm.platforms import current_platform
+        requires_gather = current_platform().requires_gathered_batch_dp()
+        if requires_gather:
+            caps = self.model_executor.collective_rpc(
+                "supports_dp_gather_execute")
+            if caps and caps[0]:
+                # If there are no local requests, don't early-return; pass None
+                if not self.scheduler.has_requests():
+                    model_output = self.execute_model(
+                        None)  # type: ignore[arg-type]
+                    # No local outputs to update; return no-op with executed flag
+                    return ({}, False)
+                # Normal case: schedule, then execute via DP-gather
+                scheduler_output = self.scheduler.schedule()
+                model_output = self.execute_model(scheduler_output)
+                engine_core_outputs = self.scheduler.update_from_output(
+                    scheduler_output, model_output)  # type: ignore
+                return (engine_core_outputs,
+                        scheduler_output.total_num_scheduled_tokens > 0)
+
+        # Fallback to default behavior
+        return super().step()
 
 
 class DPEngineCoreActor(DPEngineCoreProc):

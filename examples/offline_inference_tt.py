@@ -339,6 +339,7 @@ def run_inference(
         "log_global_stats": measure_perf,
         "num_scheduler_steps": num_scheduler_steps,
         "disable_async_output_proc": disable_async_output_proc,
+        "data_parallel_size": 2,
     }
 
     try:

@@ -12,7 +12,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.tt_model_runner import TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm.worker.tt_worker import (close_mesh_device,
+from vllm.worker.tt_worker import (close_mesh_device, get_mesh_grid,
                                    get_num_available_blocks_tt,
                                    open_mesh_device)
 
@@ -48,10 +48,16 @@ class TTWorker(WorkerBase):
             self.trace_mode = override_tt_config[trace_key]
 
     def init_device(self) -> None:
-        self.mesh_device = open_mesh_device(
-            self.model_config.override_tt_config, self.trace_mode)
-        self.device_config.device = self.mesh_device
-
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        if dp_rank == 0:
+            self.mesh_device = open_mesh_device(
+                self.model_config.override_tt_config, self.trace_mode)
+            self.device_config.device = self.mesh_device
+            self.device_config.num_devices = self.mesh_device.get_num_devices()
+        else:
+            mesh_grid = get_mesh_grid()
+            self.mesh_device = None
+            self.device_config.num_devices = mesh_grid[0] * mesh_grid[1]
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -60,7 +66,9 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        self.model_runner.load_model()
+        # Only DP rank 0 loads the model
+        if self.vllm_config.parallel_config.data_parallel_rank == 0:
+            self.model_runner.load_model()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -123,6 +131,9 @@ class TTWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate TT KV cache with the specified kv_cache_config."""
+        # Only DP rank 0 allocates KV cache
+        if self.vllm_config.parallel_config.data_parallel_rank != 0:
+            return
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def initialize_cache(self, num_gpu_blocks: int,
