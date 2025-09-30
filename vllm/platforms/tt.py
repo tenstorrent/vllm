@@ -65,6 +65,23 @@ class TTPlatform(Platform):
         # to return an error instead of crashing.
         # TODO move this to tt_model_runner when request validation
         # stops depending on vllm_config
+
+        # must perform local import to get around circular import
+        from vllm.model_executor.model_loader.utils import get_model_architecture
+        # For TT models, prepend "TT" to the architecture name,
+        # e.g. "TTLlamaForCausalLM"
+        arch_names = vllm_config.model_config.hf_config.architectures
+        for i in range(len(arch_names)):
+            if not arch_names[i].startswith("TT"):
+                arch_names[i] = "TT" + arch_names[i]
+
+        # infer if non-greedy decoding is supported on-device
+        # based on model implementation, and update platform
+        # TODO: this should come from the class itself as an attribute
+        model_class, _ = get_model_architecture(vllm_config.model_config)
+        if model_class.__module__.startswith("models.tt_transformers.tt.generator_vllm"):
+            cls.non_greedy_decoding_on_device = False
+
         override_tt_config = vllm_config.model_config.override_tt_config
         if (override_tt_config is not None
                 and "sample_on_device_mode" in override_tt_config):
@@ -75,12 +92,6 @@ class TTPlatform(Platform):
         else:
             sample_on_device_mode = None
         cls.sample_on_device_mode = sample_on_device_mode  # type: ignore[attr-defined]
-
-        if (override_tt_config is not None and "non_greedy_decoding_on_device" in override_tt_config):
-            non_greedy_decoding_on_device = override_tt_config["non_greedy_decoding_on_device"]
-        else:
-            non_greedy_decoding_on_device = False
-        cls.non_greedy_decoding_on_device = non_greedy_decoding_on_device
 
         # Compat sampling uses the full vLLM sampling pipeline,
         # with logit processors and sampler, instead of our custom sampling.
@@ -170,15 +181,11 @@ class TTPlatform(Platform):
                     " which is only available with"
                     "sample_on_device_mode=None. "
                     f"Supplied params: {params}")
-            if (cls.requires_non_greedy_decoding(params)
+            if (params.temperature > 0.0
                 and not cls.compat_sampling_possible
                 and not cls.non_greedy_decoding_on_device):
                 raise ValueError("Non-greedy decoding is not supported by this model implementation. "
                                  f"Supplied params: {params}")
-
-    @staticmethod
-    def requires_non_greedy_decoding(sampling_params: SamplingParams) -> bool:
-        return sampling_params.temperature > 0.0
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
