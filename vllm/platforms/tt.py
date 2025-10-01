@@ -185,7 +185,7 @@ class TTPlatform(Platform):
             if (params.temperature > 0.0
                 and cls.sample_on_device_mode is not None
                 and not cls.non_greedy_decoding_on_device):
-                raise ValueError("Non-greedy decoding is not supported by this model implementation. "
+                raise ValueError("Non-greedy decoding on-device is not supported by this model implementation. "
                                  f"Supplied params: {params}")
 
     @staticmethod
