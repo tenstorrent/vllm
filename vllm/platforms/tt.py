@@ -125,6 +125,7 @@ class TTPlatform(Platform):
         # based on model implementation, and update platform
         model_class, _ = get_model_architecture(vllm_config.model_config)
         # TODO: this should come from the class itself as an attribute
+        cls.non_greedy_decoding_on_device = True
         if model_class.__module__.startswith("models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = False
 
