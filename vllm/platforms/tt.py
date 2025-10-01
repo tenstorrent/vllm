@@ -59,19 +59,19 @@ class TTPlatform(Platform):
             else:
                 parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
 
-        # Setting attributes on the class level is kind of hacky, but
-        # it's the only way to make validate_request depend on vllm_config
-        # This is needed to catch incompatible requests early enough
-        # to return an error instead of crashing.
-        # TODO move this to tt_model_runner when request validation
-        # stops depending on vllm_config
-
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
         arch_names = vllm_config.model_config.hf_config.architectures
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+
+        # Setting attributes on the class level is kind of hacky, but
+        # it's the only way to make validate_request depend on vllm_config
+        # This is needed to catch incompatible requests early enough
+        # to return an error instead of crashing.
+        # TODO move this to tt_model_runner when request validation
+        # stops depending on vllm_config
 
         override_tt_config = vllm_config.model_config.override_tt_config
         if (override_tt_config is not None
@@ -129,7 +129,7 @@ class TTPlatform(Platform):
         cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
         if model_class.__module__.startswith(
             "models.tt_transformers.tt.generator_vllm"):
-            cls.non_greedy_decoding_on_device = False
+            cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
@@ -186,7 +186,7 @@ class TTPlatform(Platform):
                     f"Supplied params: {params}")
             if (params.temperature > 0.0
                     and cls.sample_on_device_mode is not None
-                    and not cls.non_greedy_decoding_on_device):
+                    and not cls.non_greedy_decoding_on_device):  # type: ignore[attr-defined]
                 raise ValueError(
                     "Non-greedy decoding on-device is not supported by this model implementation. "
                     f"Supplied params: {params}")
