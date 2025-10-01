@@ -185,10 +185,10 @@ class TTPlatform(Platform):
                     " which is only available with"
                     "sample_on_device_mode=None. "
                     f"Supplied params: {params}")
-            if (params.temperature > 0.0
-                    and cls.sample_on_device_mode is not None
-                    and not cls.non_greedy_decoding_on_device
-                ):  # type: ignore[attr-defined]
+            sample_mode = cls.sample_on_device_mode  # type: ignore[attr-defined]
+            non_greedy = cls.non_greedy_decoding_on_device  # type: ignore[attr-defined]
+            if (params.temperature > 0.0 and sample_mode is not None
+                    and not non_greedy):
                 raise ValueError(
                     "Non-greedy decoding on-device is not supported by this "
                     f"model implementation. Supplied params: {params}")
