@@ -120,13 +120,15 @@ class TTPlatform(Platform):
                              "sample_on_device_mode=None")
 
         # must perform local import to get around circular import
-        from vllm.model_executor.model_loader.utils import get_model_architecture
+        from vllm.model_executor.model_loader.utils import (
+            get_model_architecture)
         # infer if non-greedy decoding is supported on-device
         # based on model implementation, and update platform
         model_class, _ = get_model_architecture(vllm_config.model_config)
         # TODO: this should come from the class itself as an attribute
-        cls.non_greedy_decoding_on_device = True
-        if model_class.__module__.startswith("models.tt_transformers.tt.generator_vllm"):
+        cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
+        if model_class.__module__.startswith(
+            "models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = False
 
     @classmethod
@@ -183,10 +185,11 @@ class TTPlatform(Platform):
                     "sample_on_device_mode=None. "
                     f"Supplied params: {params}")
             if (params.temperature > 0.0
-                and cls.sample_on_device_mode is not None
-                and not cls.non_greedy_decoding_on_device):
-                raise ValueError("Non-greedy decoding on-device is not supported by this model implementation. "
-                                 f"Supplied params: {params}")
+                    and cls.sample_on_device_mode is not None
+                    and not cls.non_greedy_decoding_on_device):
+                raise ValueError(
+                    "Non-greedy decoding on-device is not supported by this model implementation. "
+                    f"Supplied params: {params}")
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
