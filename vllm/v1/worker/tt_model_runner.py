@@ -442,58 +442,58 @@ class TTModelRunner:
         model_input = self._prepare_model_inputs(scheduler_output)
         return model_input
 
-    @torch.no_grad()
-    def execute_with_model_input(
-        self,
-        model_input: TTModelInput,
-    ) -> ModelRunnerOutput:
-        """
-        Execute the model using a prebuilt TTModelInput. This does not
-        update internal cached states and assumes the runner's caches
-        and input batch tensors are already in a consistent state.
-        """
-        is_decode = model_input.prompt_lens is None
-        execute_model_kwargs = {
-            "tokens": model_input.input_tokens,
-            "page_table": model_input.block_tables,
-            "kv_cache": self.kv_caches,
-            **(model_input.multi_modal_kwargs or {}),
-        }
-        if not is_decode:
-            execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
-        else:
-            execute_model_kwargs["start_pos"] = model_input.input_positions
-        if self.sample_on_device_mode == "all" or (
-                self.sample_on_device_mode == "decode_only" and is_decode):
-            execute_model_kwargs[
-                "sampling_params"] = model_input.tt_sampling_params
+    # @torch.no_grad()
+    # def execute_with_model_input(
+    #     self,
+    #     model_input: TTModelInput,
+    # ) -> ModelRunnerOutput:
+    #     """
+    #     Execute the model using a prebuilt TTModelInput. This does not
+    #     update internal cached states and assumes the runner's caches
+    #     and input batch tensors are already in a consistent state.
+    #     """
+    #     is_decode = model_input.prompt_lens is None
+    #     execute_model_kwargs = {
+    #         "tokens": model_input.input_tokens,
+    #         "page_table": model_input.block_tables,
+    #         "kv_cache": self.kv_caches,
+    #         **(model_input.multi_modal_kwargs or {}),
+    #     }
+    #     if not is_decode:
+    #         execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
+    #     else:
+    #         execute_model_kwargs["start_pos"] = model_input.input_positions
+    #     if self.sample_on_device_mode == "all" or (
+    #             self.sample_on_device_mode == "decode_only" and is_decode):
+    #         execute_model_kwargs[
+    #             "sampling_params"] = model_input.tt_sampling_params
 
-        # Execute model
-        if not is_decode:
-            outputs = self.model.prefill_forward(**execute_model_kwargs)
-            tt_out = outputs  # [batch_size, seq_len, vocab_size]
-        else:
-            # TODO: Add encoder-decoder support
-            enc_dec_kwargs: dict[str, Any] = {}
-            tt_out = self.model.decode_forward(**execute_model_kwargs,
-                                               **enc_dec_kwargs,
-                                               enable_trace=self.trace_mode,
-                                               read_from_device=True)
+    #     # Execute model
+    #     if not is_decode:
+    #         outputs = self.model.prefill_forward(**execute_model_kwargs)
+    #         tt_out = outputs  # [batch_size, seq_len, vocab_size]
+    #     else:
+    #         # TODO: Add encoder-decoder support
+    #         enc_dec_kwargs: dict[str, Any] = {}
+    #         tt_out = self.model.decode_forward(**execute_model_kwargs,
+    #                                            **enc_dec_kwargs,
+    #                                            enable_trace=self.trace_mode,
+    #                                            read_from_device=True)
 
-        batch_size = model_input.unpadded_batch_size
-        if not self.sample_on_device_mode or (
-                self.sample_on_device_mode == "decode_only" and not is_decode):
-            next_logits = tt_out[:batch_size,
-                                 -1, :]  # unpadded batch, vocab of last token
-            next_token_ids = sample_tokens(next_logits,
-                                           model_input.tt_sampling_params)
-        else:
-            next_token_ids = tt_out
+    #     batch_size = model_input.unpadded_batch_size
+    #     if not self.sample_on_device_mode or (
+    #             self.sample_on_device_mode == "decode_only" and not is_decode):
+    #         next_logits = tt_out[:batch_size,
+    #                              -1, :]  # unpadded batch, vocab of last token
+    #         next_token_ids = sample_tokens(next_logits,
+    #                                        model_input.tt_sampling_params)
+    #     else:
+    #         next_token_ids = tt_out
 
-        sampled_token_ids = [[int(next_token_ids[i])]
-                             for i in range(batch_size)]
-        output = self._generate_runner_output(sampled_token_ids)
-        return output
+    #     sampled_token_ids = [[int(next_token_ids[i])]
+    #                          for i in range(batch_size)]
+    #     output = self._generate_runner_output(sampled_token_ids)
+    #     return output
 
     def apply_sampled_token_ids(
             self, sampled_token_ids: list[list[int]]) -> ModelRunnerOutput:
@@ -504,39 +504,102 @@ class TTModelRunner:
         """
         return self._generate_runner_output(sampled_token_ids)
 
-    @staticmethod
-    def concat_model_inputs(inputs: list[TTModelInput]) -> TTModelInput:
+    def concat_model_inputs(
+            self, inputs: list[Optional["TTModelInput"]]) -> "TTModelInput":
         """
-        Concatenate multiple TTModelInput batches into a single batch.
-        Assumes all inputs are either prefill or decode (homogeneous).
+        Concatenate a DP-sized list of TTModelInput (some may be None) into
+        a single TTModelInput. For None slots, uses zeros for input_tokens and
+        block_tables and -1 for input_positions.
         """
         assert inputs, "No inputs to concatenate"
-        is_decode = inputs[0].prompt_lens is None
+        active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
+        if not active_inputs:
+            raise ValueError("All inputs are None; nothing to concatenate")
 
-        # Concatenate tokens/positions and block tables
+        is_decode = active_inputs[0].prompt_lens is None
+
+        # Determine per-slot batch sizes and max token width across slots.
+        # For block tables, assume each slot is already padded to the max
+        # number of blocks, so we do not pad widths further.
+        slot_sizes: list[int] = []
+        tok_widths: list[int] = []
+        for mi in inputs:
+            if mi is None:
+                slot_sizes.append(self.scheduler_config.max_num_seqs)
+            else:
+                slot_sizes.append(int(mi.input_tokens.shape[0]))
+                tok_widths.append(
+                    int(mi.input_tokens.shape[1] if mi.input_tokens.dim() >
+                        1 else 1))
+        max_tok_width = max(tok_widths) if tok_widths else 1
+        base_bt_width = int(active_inputs[0].block_tables.shape[1])
+
+        toks_segments: list[torch.Tensor] = []
+        bt_segments: list[torch.Tensor] = []
         if is_decode:
-            input_tokens = torch.cat([mi.input_tokens for mi in inputs], dim=0)
-            input_positions = torch.cat([mi.input_positions for mi in inputs],
-                                        dim=0)
+            pos_segments: list[torch.Tensor] = []
+        else:
+            pl_segments: list[torch.Tensor] = []
+
+        # Build segments and per-DP unpadded sizes
+        per_rank_unpadded: list[int] = []
+        for mi, seg_size in zip(inputs, slot_sizes):
+            if mi is None:
+                toks_segments.append(
+                    torch.zeros((seg_size, max_tok_width), dtype=torch.int32))
+                bt_segments.append(
+                    torch.zeros((seg_size, base_bt_width), dtype=torch.int32))
+                if is_decode:
+                    pos_segments.append(
+                        torch.full((seg_size, ), -1, dtype=torch.int32))
+                else:
+                    # Keep prompt_lens as numpy for prefill
+                    pl_segments.append(np.zeros((seg_size, ), dtype=np.int32))
+                per_rank_unpadded.append(0)
+            else:
+                # Right-pad tokens and block tables to max widths across slots
+                toks = mi.input_tokens
+                if toks.dim() == 1:
+                    toks = toks.view(-1, 1)
+                if toks.shape[1] < max_tok_width:
+                    pad_w = max_tok_width - toks.shape[1]
+                    toks = torch.cat([
+                        toks,
+                        torch.zeros((toks.shape[0], pad_w), dtype=toks.dtype)
+                    ],
+                                     dim=1)
+                toks_segments.append(toks)
+
+                bt_segments.append(mi.block_tables)
+                if is_decode:
+                    pos_segments.append(mi.input_positions)
+                else:
+                    assert mi.prompt_lens is not None
+                    # Ensure numpy type is preserved for prompt_lens
+                    pl_segments.append(
+                        np.asarray(mi.prompt_lens, dtype=np.int32))
+
+                cnt = int(mi.unpadded_batch_size)
+                per_rank_unpadded.append(cnt)
+
+        input_tokens = torch.cat(toks_segments, dim=0)
+        block_tables = torch.cat(bt_segments, dim=0)
+        if is_decode:
+            input_positions = torch.cat(pos_segments, dim=0)
             prompt_lens = None
         else:
-            input_tokens = torch.cat([mi.input_tokens for mi in inputs], dim=0)
             input_positions = 0
-            prompt_lens = torch.cat([mi.prompt_lens for mi in inputs],
-                                    dim=0)  # type: ignore
+            # Concatenate numpy arrays/lists while preserving numpy dtype
+            prompt_lens = np.concatenate(pl_segments, axis=0)
 
-        block_tables = torch.cat([mi.block_tables for mi in inputs], dim=0)
-
-        # Use first sampling params and metadata (TT currently supports same)
-        base = inputs[0]
-        batch_size = sum(mi.unpadded_batch_size for mi in inputs)
-        return TTModelInput(
+        base = active_inputs[0]
+        merged = TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
             seq_groups=None,
             block_tables=block_tables,
-            unpadded_batch_size=batch_size,
+            unpadded_batch_size=per_rank_unpadded,
             tt_sampling_params=base.tt_sampling_params,
             sampling_params_list=base.sampling_params_list,
             compat_sampling_used=base.compat_sampling_used,
@@ -544,6 +607,62 @@ class TTModelRunner:
             multi_modal_kwargs=base.multi_modal_kwargs,
             cross_block_tables=base.cross_block_tables,
         )
+        return merged
+
+    def execute_with_model_input(
+        self,
+        model_input: TTModelInput,
+    ) -> list[list[int]]:
+        """
+        Execute with a prebuilt input and return per-DP sampled ids without
+        mutating internal state. Used by DP0 to run merged batch.
+        """
+        is_decode = model_input.prompt_lens is None
+        kwargs = {
+            "tokens": model_input.input_tokens,
+            "page_table": model_input.block_tables,
+            "kv_cache": self.kv_caches,
+        }
+        if not is_decode:
+            kwargs["prompt_lens"] = model_input.prompt_lens
+        else:
+            kwargs["start_pos"] = model_input.input_positions
+        if self.sample_on_device_mode == "all" or (
+                self.sample_on_device_mode == "decode_only" and is_decode):
+            kwargs["sampling_params"] = model_input.tt_sampling_params
+
+        if not is_decode:
+            tt_out = self.model.prefill_forward(**kwargs)
+        else:
+            tt_out = self.model.decode_forward(**kwargs,
+                                               enable_trace=self.trace_mode,
+                                               read_from_device=True)
+
+        sizes = model_input.unpadded_batch_size
+        sizes_list = sizes if isinstance(sizes, list) else [sizes]
+        per_rank: list[list[int]] = []
+        stride = int(self.scheduler_config.max_num_seqs)
+        if (not self.sample_on_device_mode or
+            (self.sample_on_device_mode == "decode_only" and not is_decode)):
+            # Host-side sampling: sample separately for each DP segment at fixed stride
+            for i, sz in enumerate(sizes_list):
+                if sz <= 0:
+                    per_rank.append([])
+                    continue
+                start = i * stride
+                seg_logits = tt_out[start:start + sz, -1, :]
+                seg_tokens = sample_tokens(seg_logits,
+                                           model_input.tt_sampling_params)
+                per_rank.append([int(t) for t in seg_tokens])
+        else:
+            # On-device sampling already produced tokens per row; split at fixed stride
+            for i, sz in enumerate(sizes_list):
+                if sz <= 0:
+                    per_rank.append([])
+                else:
+                    start = i * stride
+                    per_rank.append([int(t) for t in tt_out[start:start + sz]])
+        return per_rank
 
     def _generate_runner_output(self, sampled_token_ids: list[list[int]]):
         # Cache the sampled tokens in the model runner, so that the scheduler

@@ -174,10 +174,8 @@ class TTWorker(WorkerBase):
             self, sampled_token_ids: list[list[int]]) -> ModelRunnerOutput:
         return self.model_runner.apply_sampled_token_ids(sampled_token_ids)
 
-    def concat_and_execute(self, inputs: list) -> ModelRunnerOutput:
-        """Concatenate multiple TTModelInput batches and execute once.
-        This runs only on the driver worker.
-        """
+    def concat_and_execute(self, inputs: list) -> list[list[int]]:
+        """Concatenate DP-sized inputs and execute once, returning per-DP ids."""
         assert self.is_driver_worker, "concat_and_execute must run on driver"
         merged = self.model_runner.concat_model_inputs(inputs)
         return self.model_runner.execute_with_model_input(merged)

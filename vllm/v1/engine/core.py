@@ -1105,21 +1105,25 @@ class DPEngineCoreProc(EngineCoreProc):
             if DEBUG_DPG:
                 logger.info("dp_gather r%d: " + msg, self.dp_rank, *a)
 
-        dlog("enter_gather tokens=%d",
-             scheduler_output.total_num_scheduled_tokens)
+        if scheduler_output is not None:
+            dlog("enter_gather tokens=%d",
+                 scheduler_output.total_num_scheduled_tokens)
 
-        # Build local dp model input (or None) on the driver worker
-        local_input_list = self.model_executor.collective_rpc(
-            "build_dp_model_input", args=(scheduler_output, ))
-        local_input = local_input_list[0]
+            # Build local dp model input (or None) on the driver worker
+            local_input_list = self.model_executor.collective_rpc(
+                "build_dp_model_input", args=(scheduler_output, ))
+            logger.info(f"local_input_list={local_input_list}")
+            local_input = local_input_list[0]
+        else:
+            local_input = None
 
-        # DP0 selects mode based on its local batch via worker hook
+        # Select mode across ranks: prefill if ANY rank is prefill, else decode
         dlog("before_mode_allreduce local_input=%s",
              "Y" if local_input is not None else "N")
-        if rank == 0:
-            mode = self.model_executor.collective_rpc("get_dp_input_mode",
-                                                      args=(local_input, ))[0]
-            mode_val = 1 if mode == "prefill" else 0
+        if local_input is not None:
+            my_mode = self.model_executor.collective_rpc(
+                "get_dp_input_mode", args=(local_input, ))[0]
+            mode_val = 1 if my_mode == "prefill" else 0
         else:
             mode_val = 0
         mode_tensor = torch.tensor([mode_val], dtype=torch.int64)
@@ -1148,33 +1152,22 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # DP0: concat and execute once using worker hook
         if rank == 0:
+            # Build per-rank presence and pass full DP-sized list (including None)
             sizes: list[int] = []
-            inputs = []
             for obj in gathered:
                 if obj is None:
                     sizes.append(0)
                 else:
-                    # rely on worker to understand input object
-                    sizes.append(getattr(obj, "unpadded_batch_size", 0))
-                    inputs.append(obj)
+                    sizes.append(int(getattr(obj, "unpadded_batch_size", 0)))
 
             if any(sz > 0 for sz in sizes):
                 result = self.model_executor.collective_rpc(
-                    "concat_and_execute_dp", args=(inputs, ))[0]
-                all_ids = result.sampled_token_ids if hasattr(
+                    "concat_and_execute_dp", args=(gathered, ))[0]
+                # Expect list[list[int]] per DP rank
+                per_rank = result.sampled_token_ids if hasattr(
                     result, "sampled_token_ids") else result
             else:
-                all_ids = []
-
-            # Split per rank
-            per_rank: list[list[list[int]]] = []
-            idx = 0
-            for sz in sizes:
-                if sz == 0:
-                    per_rank.append([])
-                else:
-                    per_rank.append(all_ids[idx:idx + sz])
-                    idx += sz
+                per_rank = [[] for _ in range(world)]
             dlog("split_counts=%s", [len(per_rank[i]) for i in range(world)])
         else:
             per_rank = None
@@ -1203,16 +1196,23 @@ class DPEngineCoreProc(EngineCoreProc):
         iteration, passing None for scheduler_output on idle ranks.
         """
         from vllm.platforms import current_platform
-        requires_gather = current_platform().requires_gathered_batch_dp()
+        requires_gather = current_platform.requires_gathered_batch_dp()
         if requires_gather:
             caps = self.model_executor.collective_rpc(
                 "supports_dp_gather_execute")
             if caps and caps[0]:
-                # If there are no local requests, don't early-return; pass None
-                if not self.scheduler.has_requests():
-                    model_output = self.execute_model(
-                        None)  # type: ignore[arg-type]
-                    # No local outputs to update; return no-op with executed flag
+                # Check if any rank has work this iteration
+                local_has = 1 if self.scheduler.has_requests() else 0
+                has_t = torch.tensor([local_has], dtype=torch.int32)
+                dist.all_reduce(has_t,
+                                op=dist.ReduceOp.SUM,
+                                group=self.dp_group)
+                if int(has_t.item()) == 0:
+                    # No work across all ranks: do not execute
+                    return ({}, False)
+                # If there are no local requests, still enter DP-gather; pass None
+                if local_has == 0:
+                    _ = self.execute_model(None)  # type: ignore[arg-type]
                     return ({}, False)
                 # Normal case: schedule, then execute via DP-gather
                 scheduler_output = self.scheduler.schedule()

@@ -48,7 +48,7 @@ class TTModelInput(ModelRunnerInputBase):
     prompt_lens: Optional[List[int]]
     seq_groups: List[int]
     block_tables: torch.Tensor
-    unpadded_batch_size: int
+    unpadded_batch_size: Union[int, List[int]]
     tt_sampling_params: Optional[TTSamplingParams]
     sampling_params_list: Optional[List[Any]]
     compat_sampling_used: bool
