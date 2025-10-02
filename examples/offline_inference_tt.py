@@ -537,6 +537,7 @@ def generate_tokens(
                 "Generated text "
                 f"({num_tokens_output} tokens): {generated_text!r}\n"
             )
+            breakpoint()
 
 
 async def generate_tokens_async(

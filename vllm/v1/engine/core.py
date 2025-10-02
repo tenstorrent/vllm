@@ -42,7 +42,7 @@ from vllm.v1.engine.utils import EngineHandshakeMetadata, EngineZmqAddresses
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
@@ -981,27 +981,36 @@ class DPEngineCoreProc(EngineCoreProc):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            logger.info("waiting for work")
+            # logger.info("waiting for work")
             self._process_input_queue()
 
             # 2) Step the engine core.
-            logger.info("processing engine step")
+            # logger.info("processing engine step")
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
             if not executed:
-                if not local_unfinished_reqs and not self.engines_running:
-                    # All engines are idle.
-                    continue
+                # logger.info(f"no executed, local_unfinished_reqs={local_unfinished_reqs}, engines_running={self.engines_running}")
+                # In gathered-DP mode, avoid early-continue to keep
+                # the global finish all-reduce aligned across ranks.
+                from vllm.platforms import current_platform
+                requires_gather = current_platform.requires_gathered_batch_dp()
+                if not requires_gather:
+                    if not local_unfinished_reqs and not self.engines_running:
+                        # All engines are idle.
+                        continue
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
                 self.execute_dummy_batch()
+                
+            # logger.info("check engines running")
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs)
+            # logger.info("engines running=%d", self.engines_running)
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
@@ -1018,12 +1027,16 @@ class DPEngineCoreProc(EngineCoreProc):
                 self.current_wave += 1
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
-        self.counter += 1
-        if self.counter != 32:
-            return True
-        self.counter = 0
+        # For gathered-DP platforms, run the finish-sync all-reduce every step
+        # so engines_running flips to False as soon as all ranks are idle.
+        from vllm.platforms import current_platform
+        requires_gather = current_platform.requires_gathered_batch_dp()
+        if not requires_gather:
+            # Optimization - only perform finish-sync every 32 steps.
+            self.counter += 1
+            if self.counter != 32:
+                return True
+            self.counter = 0
 
         return ParallelConfig.has_unfinished_dp(self.dp_group,
                                                 local_unfinished)
@@ -1100,48 +1113,65 @@ class DPEngineCoreProc(EngineCoreProc):
         world = self.vllm_config.parallel_config.data_parallel_size
 
         DEBUG_DPG = os.environ.get("VLLM_TT_DP_DEBUG") == "1"
+        STRICT_DPG = os.environ.get("VLLM_TT_DP_STRICT") == "1"
 
         def dlog(msg: str, *a: object) -> None:
             if DEBUG_DPG:
                 logger.info("dp_gather r%d: " + msg, self.dp_rank, *a)
 
+        def sync_point(name: str) -> None:
+            if STRICT_DPG:
+                dlog("barrier:%s:enter", name)
+                dist.barrier(group=group)
+                dlog("barrier:%s:exit", name)
+
+        # 0) Check if any rank has work this iteration (keep dtype consistent)
+        local_has = 1 if scheduler_output is not None else 0
+        has_t = torch.tensor([local_has], dtype=torch.int32)
+        sync_point("pre_has_work")
+        dist.all_reduce(has_t, op=dist.ReduceOp.SUM, group=group)
+        sync_point("post_has_work")
+        if int(has_t.item()) == 0:
+            # Nobody has work this iteration; align and return empty output
+            sync_point("no_work")
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
         if scheduler_output is not None:
             dlog("enter_gather tokens=%d",
                  scheduler_output.total_num_scheduled_tokens)
 
-            # Build local dp model input (or None) on the driver worker
-            local_input_list = self.model_executor.collective_rpc(
-                "build_dp_model_input", args=(scheduler_output, ))
-            logger.info(f"local_input_list={local_input_list}")
-            local_input = local_input_list[0]
-        else:
-            local_input = None
-
-        # Select mode across ranks: prefill if ANY rank is prefill, else decode
-        dlog("before_mode_allreduce local_input=%s",
-             "Y" if local_input is not None else "N")
-        if local_input is not None:
-            my_mode = self.model_executor.collective_rpc(
-                "get_dp_input_mode", args=(local_input, ))[0]
-            mode_val = 1 if my_mode == "prefill" else 0
-        else:
-            mode_val = 0
-        mode_tensor = torch.tensor([mode_val], dtype=torch.int64)
+        # Select mode across ranks EARLY using scheduler_output only to minimize
+        # time before the first collective.
+        # Local mode: 1=prefill if any new reqs scheduled, else 0=decode.
+        local_mode_val = 0
+        if scheduler_output is not None:
+            local_mode_val = 1 if len(
+                scheduler_output.scheduled_new_reqs) > 0 else 0
+        dlog("before_mode_allreduce local_mode_val=%d", local_mode_val)
+        mode_tensor = torch.tensor([local_mode_val], dtype=torch.int32)
+        sync_point("pre_mode")
         dist.all_reduce(mode_tensor, op=dist.ReduceOp.MAX, group=group)
+        sync_point("post_mode")
         mode_flag = int(mode_tensor.item())  # 1=prefill, 0=decode
         dlog("after_mode_allreduce mode_flag=%d", mode_flag)
 
-        # Keep only matching mode locally using worker hook
-        if local_input is not None:
-            my_mode = self.model_executor.collective_rpc(
-                "get_dp_input_mode", args=(local_input, ))[0]
-            if (mode_flag == 1 and my_mode != "prefill") or \
-               (mode_flag == 0 and my_mode != "decode"):
-                local_input = None
+        # Build local dp model input (or None) after mode consensus,
+        # and only for matching mode.
+        local_input = None
+        if scheduler_output is not None:
+            my_mode_val = 1 if len(
+                scheduler_output.scheduled_new_reqs) > 0 else 0
+            if (mode_flag == 1 and my_mode_val == 1) or (
+                    mode_flag == 0 and my_mode_val == 0):
+                local_input_list = self.model_executor.collective_rpc(
+                    "build_dp_model_input", args=(scheduler_output, ))
+                local_input = local_input_list[0]
 
         # Gather python-serializable inputs
         gathered = [None for _ in range(world)]
+        sync_point("pre_input_gather")
         dist.all_gather_object(gathered, local_input, group=group)
+        sync_point("post_input_gather")
         dlog("after_inputs_gather")
         if rank == 0:
             sizes_dbg = [
@@ -1163,11 +1193,12 @@ class DPEngineCoreProc(EngineCoreProc):
             if any(sz > 0 for sz in sizes):
                 result = self.model_executor.collective_rpc(
                     "concat_and_execute_dp", args=(gathered, ))[0]
-                # Expect list[list[int]] per DP rank
+                # Expect list[list[list[int]]] per DP rank
                 per_rank = result.sampled_token_ids if hasattr(
                     result, "sampled_token_ids") else result
             else:
                 per_rank = [[] for _ in range(world)]
+            # per_rank[i] is a list of [token] lists; count by number of users
             dlog("split_counts=%s", [len(per_rank[i]) for i in range(world)])
         else:
             per_rank = None
@@ -1178,7 +1209,9 @@ class DPEngineCoreProc(EngineCoreProc):
         else:
             send_obj = {}
         gathered = [None for _ in range(world)]
+        sync_point("pre_result_gather")
         dist.all_gather_object(gathered, send_obj, group=group)
+        sync_point("post_result_gather")
         merged = next((d for d in gathered if d), {})
         my_ids = merged.get(rank, [])
         dlog("after_results_gather my_ids_len=%d", len(my_ids))
@@ -1186,6 +1219,9 @@ class DPEngineCoreProc(EngineCoreProc):
         # Apply locally and return output
         out_list = self.model_executor.collective_rpc(
             "apply_dp_execution_result", args=(my_ids, ))
+        # Synchronize all ranks before next iteration to avoid collective
+        # ordering drift across steps.
+        sync_point("final")
         return out_list[0]
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
@@ -1201,21 +1237,26 @@ class DPEngineCoreProc(EngineCoreProc):
             caps = self.model_executor.collective_rpc(
                 "supports_dp_gather_execute")
             if caps and caps[0]:
-                # Check if any rank has work this iteration
-                local_has = 1 if self.scheduler.has_requests() else 0
-                has_t = torch.tensor([local_has], dtype=torch.int32)
-                dist.all_reduce(has_t,
-                                op=dist.ReduceOp.SUM,
-                                group=self.dp_group)
-                if int(has_t.item()) == 0:
-                    # No work across all ranks: do not execute
-                    return ({}, False)
-                # If there are no local requests, still enter DP-gather; pass None
-                if local_has == 0:
+                DEBUG_DPG = os.environ.get("VLLM_TT_DP_DEBUG") == "1"
+                STRICT_DPG = os.environ.get("VLLM_TT_DP_STRICT") == "1"
+                def dlog(msg: str, *a: object) -> None:
+                    if DEBUG_DPG:
+                        logger.info("dp_gather r%d: " + msg, self.dp_rank, *a)
+                if STRICT_DPG:
+                    dlog("barrier:pre_step:enter")
+                    dist.barrier(group=self.dp_group)
+                    dlog("barrier:pre_step:exit")
+                # Enter DP-gather every iteration, let execute_model
+                # handle global has-work sync to keep collectives ordered.
+                local_has = self.scheduler.has_requests()
+                dlog("step local_has=%d", 1 if local_has else 0)
+                if not local_has:
+                    dlog("step calling execute_model(None)")
                     _ = self.execute_model(None)  # type: ignore[arg-type]
                     return ({}, False)
-                # Normal case: schedule, then execute via DP-gather
                 scheduler_output = self.scheduler.schedule()
+                dlog("step calling execute_model(scheduler_output) tokens=%d",
+                     scheduler_output.total_num_scheduled_tokens)
                 model_output = self.execute_model(scheduler_output)
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)  # type: ignore

@@ -131,9 +131,6 @@ class TTWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate TT KV cache with the specified kv_cache_config."""
-        # Only DP rank 0 allocates KV cache
-        if self.vllm_config.parallel_config.data_parallel_rank != 0:
-            return
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def initialize_cache(self, num_gpu_blocks: int,
@@ -154,7 +151,7 @@ class TTWorker(WorkerBase):
         output = self.model_runner.execute_model(scheduler_output)
         return output
 
-    def execute_with_model_input(self, model_input) -> ModelRunnerOutput:
+    def execute_with_model_input(self, model_input) -> list[list[list[int]]]:
         """
         Execute on the driver with a prebuilt TTModelInput. Non-driver workers
         should never call this.
@@ -174,7 +171,7 @@ class TTWorker(WorkerBase):
             self, sampled_token_ids: list[list[int]]) -> ModelRunnerOutput:
         return self.model_runner.apply_sampled_token_ids(sampled_token_ids)
 
-    def concat_and_execute(self, inputs: list) -> list[list[int]]:
+    def concat_and_execute(self, inputs: list) -> list[list[list[int]]]:
         """Concatenate DP-sized inputs and execute once, returning per-DP ids."""
         assert self.is_driver_worker, "concat_and_execute must run on driver"
         merged = self.model_runner.concat_model_inputs(inputs)
@@ -202,7 +199,7 @@ class TTWorker(WorkerBase):
         return self.concat_and_execute(inputs)
 
     def apply_dp_execution_result(self, result) -> ModelRunnerOutput:
-        # result is sampled_token_ids: list[list[int]]
+        # result is sampled_token_ids: list[list[list[int]]]
         return self.apply_sampled_token_ids(result)
 
     ## Destructor (used to close devices)

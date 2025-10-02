@@ -115,6 +115,10 @@ class TTModelRunner:
             max_num_batched_tokens=max_num_batched_tokens,
             block_sizes=[kv_cache_spec.block_size],
         )
+        
+        # Only DP rank 0 allocates KV cache
+        if self.vllm_config.parallel_config.data_parallel_rank != 0:
+            return
 
         # Make the assumption that we are tensor parallel by
         # min(number of devices, number of KV heads).
@@ -612,7 +616,7 @@ class TTModelRunner:
     def execute_with_model_input(
         self,
         model_input: TTModelInput,
-    ) -> list[list[int]]:
+    ) -> list[list[list[int]]]:
         """
         Execute with a prebuilt input and return per-DP sampled ids without
         mutating internal state. Used by DP0 to run merged batch.
@@ -625,6 +629,15 @@ class TTModelRunner:
         }
         if not is_decode:
             kwargs["prompt_lens"] = model_input.prompt_lens
+            # Provide global unpadded user ids per DP segment for prefill
+            sizes = model_input.unpadded_batch_size
+            sizes_list = sizes if isinstance(sizes, list) else [int(sizes)]
+            stride = int(self.scheduler_config.max_num_seqs)
+            empty_slots = []
+            for dp_rank, sz in enumerate(sizes_list):
+                for i in range(int(sz)):
+                    empty_slots.append(dp_rank * stride + i)
+            kwargs["empty_slots"] = empty_slots
         else:
             kwargs["start_pos"] = model_input.input_positions
         if self.sample_on_device_mode == "all" or (
@@ -634,13 +647,14 @@ class TTModelRunner:
         if not is_decode:
             tt_out = self.model.prefill_forward(**kwargs)
         else:
+            logger.info(f"starting decode with {model_input.input_tokens.shape[0]} users")
             tt_out = self.model.decode_forward(**kwargs,
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
 
         sizes = model_input.unpadded_batch_size
         sizes_list = sizes if isinstance(sizes, list) else [sizes]
-        per_rank: list[list[int]] = []
+        per_rank: list[list[list[int]]] = []
         stride = int(self.scheduler_config.max_num_seqs)
         if (not self.sample_on_device_mode or
             (self.sample_on_device_mode == "decode_only" and not is_decode)):
@@ -653,7 +667,7 @@ class TTModelRunner:
                 seg_logits = tt_out[start:start + sz, -1, :]
                 seg_tokens = sample_tokens(seg_logits,
                                            model_input.tt_sampling_params)
-                per_rank.append([int(t) for t in seg_tokens])
+                per_rank.append([[int(t)] for t in seg_tokens])
         else:
             # On-device sampling already produced tokens per row; split at fixed stride
             for i, sz in enumerate(sizes_list):
@@ -661,7 +675,7 @@ class TTModelRunner:
                     per_rank.append([])
                 else:
                     start = i * stride
-                    per_rank.append([int(t) for t in tt_out[start:start + sz]])
+                    per_rank.append([[int(t)] for t in tt_out[start:start + sz]])
         return per_rank
 
     def _generate_runner_output(self, sampled_token_ids: list[list[int]]):
