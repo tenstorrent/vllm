@@ -115,7 +115,7 @@ class TTModelRunner:
             max_num_batched_tokens=max_num_batched_tokens,
             block_sizes=[kv_cache_spec.block_size],
         )
-        
+
         # Only DP rank 0 allocates KV cache
         if self.vllm_config.parallel_config.data_parallel_rank != 0:
             return
@@ -647,7 +647,7 @@ class TTModelRunner:
         if not is_decode:
             tt_out = self.model.prefill_forward(**kwargs)
         else:
-            logger.info(f"starting decode with {model_input.input_tokens.shape[0]} users")
+            # logger.info(f"starting decode with {model_input.input_tokens.shape[0]} users")
             tt_out = self.model.decode_forward(**kwargs,
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
@@ -675,7 +675,8 @@ class TTModelRunner:
                     per_rank.append([])
                 else:
                     start = i * stride
-                    per_rank.append([[int(t)] for t in tt_out[start:start + sz]])
+                    per_rank.append([[int(t)]
+                                     for t in tt_out[start:start + sz]])
         return per_rank
 
     def _generate_runner_output(self, sampled_token_ids: list[list[int]]):

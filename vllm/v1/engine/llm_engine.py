@@ -168,9 +168,9 @@ class LLMEngine:
 
     def has_unfinished_requests(self) -> bool:
         has_unfinished = self.output_processor.has_unfinished_requests()
-        logger.info(f"output processor has unfinished requests={has_unfinished}")
+        # logger.info(f"output processor has unfinished requests={has_unfinished}")
         if self.dp_group is None:
-            logger.info(f"dp group is None, checking dp engines running={self.engine_core.dp_engines_running()}")
+            # logger.info(f"dp group is None, checking dp engines running={self.engine_core.dp_engines_running()}")
             return has_unfinished or self.engine_core.dp_engines_running()
         return self.has_unfinished_requests_dp(has_unfinished)
 
@@ -245,9 +245,9 @@ class LLMEngine:
             return []
 
         # 1) Get EngineCoreOutput from the EngineCore.
-        logger.info(f"getting output")
+        # logger.info(f"getting output")
         outputs = self.engine_core.get_output()
-        logger.info(f"got output")
+        # logger.info(f"got output")
 
         # 2) Process EngineCoreOutputs.
         iteration_stats = IterationStats() if self.log_stats else None
@@ -255,15 +255,15 @@ class LLMEngine:
             outputs.outputs,
             engine_core_timestamp=outputs.timestamp,
             iteration_stats=iteration_stats)
-        
-        logger.info(f"outputs={processed_outputs}")
-        logger.info(f"has unfinished requests={self.has_unfinished_requests()}")
+
+        # logger.info(f"outputs={processed_outputs}")
+        # logger.info(f"has unfinished requests={self.has_unfinished_requests()}")
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
-        
-        logger.info(f"reqs to abort={processed_outputs.reqs_to_abort}")
-        logger.info("still has unfinished requests")
+
+        # logger.info(f"reqs to abort={processed_outputs.reqs_to_abort}")
+        # logger.info("still has unfinished requests")
 
         # 4) Record stats
         if self.stat_logger is not None:
@@ -273,7 +273,6 @@ class LLMEngine:
 
         if (self.log_stats and self.log_global_stats
                 and not self.has_unfinished_requests()):
-            breakpoint()
             assert isinstance(self.stat_logger, GlobalStatLogger)
             self.stat_logger.log_out()
             self.stat_logger.reset()

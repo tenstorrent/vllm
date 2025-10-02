@@ -514,7 +514,6 @@ class LLM:
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
-        breakpoint()
         return self.engine_class.validate_outputs(outputs, RequestOutput)
 
     def _get_modality_specific_lora_reqs(
@@ -1765,10 +1764,9 @@ class LLM:
                             pbar.update(1)
                         if pbar.n == num_requests:
                             pbar.refresh()
-            logger.info(f"has unfinished requests={self.llm_engine.has_unfinished_requests()}")
-                            
-        logger.info(f"exited llm loop")
-        breakpoint()
+            # logger.info(f"has unfinished requests={self.llm_engine.has_unfinished_requests()}")
+
+        logger.info("exited llm loop")
 
         if use_tqdm:
             pbar.close()

@@ -572,7 +572,9 @@ class SyncMPClient(MPClient):
         # If an exception arises in process_outputs_socket task,
         # it is forwarded to the outputs_queue so we can raise it
         # from this (run_output_handler) task to shut down the server.
+        # logger.info(f"getting output from queue")
         outputs = self.outputs_queue.get()
+        # logger.info(f"got output from queue")
         if isinstance(outputs, Exception):
             raise self._format_exception(outputs) from None
         if outputs.wave_complete is not None:

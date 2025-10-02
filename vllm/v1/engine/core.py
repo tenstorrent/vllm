@@ -42,7 +42,7 @@ from vllm.v1.engine.utils import EngineHandshakeMetadata, EngineZmqAddresses
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
@@ -682,6 +682,14 @@ class EngineCoreProc(EngineCore):
         for output in (outputs.items() if outputs else ()):
             self.output_queue.put_nowait(output)
 
+        # # In gathered-DP mode, some iterations intentionally produce no
+        # # per-batch outputs (idle ranks, or global no-work steps). Emit a
+        # # benign idle tick so the client can make progress without blocking.
+        # if not outputs:
+        #     from vllm.platforms import current_platform
+        #     if current_platform.requires_gathered_batch_dp():
+        #         self.output_queue.put_nowait((0, EngineCoreOutputs()))
+
         return model_executed
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
@@ -1004,7 +1012,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
                 self.execute_dummy_batch()
-                
+
             # logger.info("check engines running")
 
             # 3) All-reduce operation to determine global unfinished reqs.
@@ -1012,7 +1020,10 @@ class DPEngineCoreProc(EngineCoreProc):
                 local_unfinished_reqs)
             # logger.info("engines running=%d", self.engines_running)
 
+            # logger.info(f"engines running={self.engines_running}")
+
             if not self.engines_running:
+                # logger.info(f"dp rank:{self.dp_rank}, self.has_coordinator={self.has_coordinator}")
                 if self.dp_rank == 0 or not self.has_coordinator:
                     # Notify client that we are pausing the loop.
                     logger.debug("Wave %d finished, pausing engine loop.",
@@ -1024,6 +1035,18 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.output_queue.put_nowait(
                         (client_index,
                          EngineCoreOutputs(wave_complete=self.current_wave)))
+                    # Mirror to client only for gathered-DP path when
+                    # a coordinator is present, without altering regular path.
+                    if self.has_coordinator:
+                        from vllm.platforms import current_platform
+                        if current_platform.requires_gathered_batch_dp(
+                        ) and client_index == -1:
+                            self.output_queue.put_nowait(
+                                (0,
+                                 EngineCoreOutputs(
+                                     wave_complete=self.current_wave,
+                                     scheduler_stats=self.scheduler.make_stats(
+                                     ))))
                 self.current_wave += 1
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
@@ -1161,8 +1184,8 @@ class DPEngineCoreProc(EngineCoreProc):
         if scheduler_output is not None:
             my_mode_val = 1 if len(
                 scheduler_output.scheduled_new_reqs) > 0 else 0
-            if (mode_flag == 1 and my_mode_val == 1) or (
-                    mode_flag == 0 and my_mode_val == 0):
+            if (mode_flag == 1 and my_mode_val == 1) or (mode_flag == 0
+                                                         and my_mode_val == 0):
                 local_input_list = self.model_executor.collective_rpc(
                     "build_dp_model_input", args=(scheduler_output, ))
                 local_input = local_input_list[0]
@@ -1239,9 +1262,11 @@ class DPEngineCoreProc(EngineCoreProc):
             if caps and caps[0]:
                 DEBUG_DPG = os.environ.get("VLLM_TT_DP_DEBUG") == "1"
                 STRICT_DPG = os.environ.get("VLLM_TT_DP_STRICT") == "1"
+
                 def dlog(msg: str, *a: object) -> None:
                     if DEBUG_DPG:
                         logger.info("dp_gather r%d: " + msg, self.dp_rank, *a)
+
                 if STRICT_DPG:
                     dlog("barrier:pre_step:enter")
                     dist.barrier(group=self.dp_group)
