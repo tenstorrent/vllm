@@ -1202,6 +1202,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 for x in gathered
             ]
             dlog("gathered_sizes=%s", sizes_dbg)
+            logger.info(f"gathered_sizes={sizes_dbg}")
 
         # DP0: concat and execute once using worker hook
         if rank == 0:

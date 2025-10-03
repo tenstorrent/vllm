@@ -141,7 +141,7 @@ class TTModelRunner:
         # Allocate KV cache tensors.
         self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape,
                                                       dtype,
-                                                      num_layers=1)
+                                                      num_layers=num_layers)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the 
@@ -647,7 +647,6 @@ class TTModelRunner:
         if not is_decode:
             tt_out = self.model.prefill_forward(**kwargs)
         else:
-            # logger.info(f"starting decode with {model_input.input_tokens.shape[0]} users")
             tt_out = self.model.decode_forward(**kwargs,
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
