@@ -549,16 +549,17 @@ class TTModelRunner:
         per_rank_unpadded: list[int] = []
         for mi, seg_size in zip(inputs, slot_sizes):
             if mi is None:
-                toks_segments.append(
-                    torch.zeros((seg_size, max_tok_width), dtype=torch.int32))
-                bt_segments.append(
-                    torch.zeros((seg_size, base_bt_width), dtype=torch.int32))
+                # For decode, keep fixed stride by padding None slots.
+                # For prefill, skip None slots entirely (do not append rows).
                 if is_decode:
+                    toks_segments.append(
+                        torch.zeros((seg_size, max_tok_width),
+                                    dtype=torch.int32))
+                    bt_segments.append(
+                        torch.zeros((seg_size, base_bt_width),
+                                    dtype=torch.int32))
                     pos_segments.append(
                         torch.full((seg_size, ), -1, dtype=torch.int32))
-                else:
-                    # Keep prompt_lens as numpy for prefill
-                    pl_segments.append(np.zeros((seg_size, ), dtype=np.int32))
                 per_rank_unpadded.append(0)
             else:
                 # Right-pad tokens and block tables to max widths across slots
@@ -579,9 +580,7 @@ class TTModelRunner:
                     pos_segments.append(mi.input_positions)
                 else:
                     assert mi.prompt_lens is not None
-                    # Ensure numpy type is preserved for prompt_lens
-                    pl_segments.append(
-                        np.asarray(mi.prompt_lens, dtype=np.int32))
+                    pl_segments.append(mi.prompt_lens)
 
                 cnt = int(mi.unpadded_batch_size)
                 per_rank_unpadded.append(cnt)
@@ -594,6 +593,9 @@ class TTModelRunner:
         else:
             input_positions = 0
             # Concatenate numpy arrays/lists while preserving numpy dtype
+            # (pl_segments excludes None slots for prefill)
+            if not pl_segments:
+                assert False, "Received no prompt_lens for prefill"
             prompt_lens = np.concatenate(pl_segments, axis=0)
 
         base = active_inputs[0]

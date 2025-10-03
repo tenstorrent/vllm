@@ -328,6 +328,8 @@ def run_inference(
             f"currently only supports {supported_models} models"
         )
 
+    data_parallel_size = 2
+
     # LLM args
     engine_kw_args = {
         "model": model,
@@ -339,7 +341,7 @@ def run_inference(
         "log_global_stats": measure_perf,
         "num_scheduler_steps": num_scheduler_steps,
         "disable_async_output_proc": disable_async_output_proc,
-        "data_parallel_size": 2,
+        "data_parallel_size": data_parallel_size,
     }
 
     try:
@@ -413,7 +415,7 @@ def run_inference(
         if not multi_modal:
             prompts = [
                 {"prompt_token_ids": prompt_token_ids_user}
-                for _ in range(max_seqs_in_batch)
+                for _ in range(max_seqs_in_batch * data_parallel_size)
             ]
         else:
             if "Llama-3.2" in model:
