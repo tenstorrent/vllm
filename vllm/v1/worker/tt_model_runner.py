@@ -656,29 +656,54 @@ class TTModelRunner:
         sizes = model_input.unpadded_batch_size
         sizes_list = sizes if isinstance(sizes, list) else [sizes]
         per_rank: list[list[list[int]]] = []
-        # Split contiguously by cumulative sizes; tt_out rows == total inputs
-        offset = 0
-        if (not self.sample_on_device_mode or
-            (self.sample_on_device_mode == "decode_only" and not is_decode)):
-            # Host-side sampling: sample separately for each DP segment
-            for sz in sizes_list:
-                if sz <= 0:
-                    per_rank.append([])
-                    continue
-                seg_logits = tt_out[offset:offset + sz, -1, :]
-                seg_tokens = sample_tokens(seg_logits,
-                                           model_input.tt_sampling_params)
-                per_rank.append([[int(t)] for t in seg_tokens])
-                offset += sz
+        if is_decode:
+            # Fixed stride segments per rank for decode
+            stride = int(self.scheduler_config.max_num_seqs)
+            if (not self.sample_on_device_mode or
+                    (self.sample_on_device_mode == "decode_only"
+                     and not is_decode)):
+                # Host-side sampling per rank at fixed stride
+                for i, sz in enumerate(sizes_list):
+                    if sz <= 0:
+                        per_rank.append([])
+                        continue
+                    start = i * stride
+                    seg_logits = tt_out[start:start + sz, -1, :]
+                    seg_tokens = sample_tokens(seg_logits,
+                                               model_input.tt_sampling_params)
+                    per_rank.append([[int(t)] for t in seg_tokens])
+            else:
+                # On-device tokens; split at fixed stride
+                for i, sz in enumerate(sizes_list):
+                    if sz <= 0:
+                        per_rank.append([])
+                    else:
+                        start = i * stride
+                        per_rank.append([[int(t)]
+                                         for t in tt_out[start:start + sz]])
         else:
-            # On-device sampling already produced tokens per row; split contiguously
-            for sz in sizes_list:
-                if sz <= 0:
-                    per_rank.append([])
-                else:
-                    per_rank.append([[int(t)]
-                                     for t in tt_out[offset:offset + sz]])
+            # Prefill packed contiguously, None ranks skipped
+            offset = 0
+            if (not self.sample_on_device_mode or
+                    (self.sample_on_device_mode == "decode_only"
+                     and not is_decode)):
+                for sz in sizes_list:
+                    if sz <= 0:
+                        per_rank.append([])
+                        continue
+                    seg_logits = tt_out[offset:offset + sz, -1, :]
+                    seg_tokens = sample_tokens(seg_logits,
+                                               model_input.tt_sampling_params)
+                    per_rank.append([[int(t)] for t in seg_tokens])
                     offset += sz
+            else:
+                for sz in sizes_list:
+                    if sz <= 0:
+                        per_rank.append([])
+                    else:
+                        per_rank.append([[int(t)]
+                                         for t in tt_out[offset:offset + sz]])
+                        offset += sz
         return per_rank
 
     def _generate_runner_output(self, sampled_token_ids: list[list[int]]):
