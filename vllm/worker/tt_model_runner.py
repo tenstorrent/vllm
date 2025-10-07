@@ -257,6 +257,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for req_id in req_ids_to_remove:
                 del self.req_id_to_seq_id[req_id]
 
+        # sort empty_slots for consistency
+        self.empty_slots.sort()
+
     def prepare_model_input(
             self,
             seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -587,8 +590,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if recover_slots_flag:
                     self.recover_orphaned_slots(orphaned_sequences)
 
-                    # Sort empty_slots for consistency
-                    self.empty_slots.sort()
                 else:
                     logger.debug(
                         "SLOT_DEBUG: Sufficient slots available, deferring cleanup to decode phase"
@@ -988,6 +989,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
+                # Defensive cleanup: recover orphaned slots before processing
+                current_active_seqs = set(model_input.seq_groups)
+                orphaned_seqs = []
+
+                for seq_id in list(self.seq_groups_to_batch_slot.keys()):
+                    if seq_id not in current_active_seqs:
+                        orphaned_seqs.append(seq_id)
+
+                if orphaned_seqs:
+                    logger.warning(
+                        f"SLOT_DEBUG: Recovering {len(orphaned_seqs)} orphaned slots from sequences: {orphaned_seqs} during decode"
+                    )
+                    self.recover_orphaned_slots(orphaned_seqs)
+
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
                 active_slots = [
