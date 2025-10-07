@@ -235,6 +235,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     ) -> TTModelInput:
         return TTModelInput.from_broadcasted_tensor_dict(tensor_dict, )
 
+    def recover_orphaned_slots(self, orphaned_seq_ids: List[int]):
+        for seq_id in orphaned_seq_ids:
+            slot = self.seq_groups_to_batch_slot[seq_id]
+            if slot not in self.empty_slots:
+                self.empty_slots.append(slot)
+                logger.warning(
+                    f"SLOT_DEBUG: Recovered slot {slot} from orphaned seq {seq_id}"
+                )
+            else:
+                logger.warning(
+                    f"SLOT_DEBUG: Orphaned slot {slot} already in empty_slots, from seq {seq_id}"
+                )
+            del self.seq_groups_to_batch_slot[seq_id]
+            # Clean up req_id_to_seq_id mapping for orphaned sequences
+            for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
+                if mapped_seq_id == seq_id:
+                    del self.req_id_to_seq_id[req_id]
+
     def prepare_model_input(
             self,
             seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -559,15 +577,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     logger.warning(
                         f"SLOT_DEBUG: Performing aggressive cleanup of {len(orphaned_sequences)} orphaned sequences"
                     )
-
-                    for seq_id in orphaned_sequences:
-                        slot = self.seq_groups_to_batch_slot[seq_id]
-                        if slot not in self.empty_slots:
-                            self.empty_slots.append(slot)
-                            logger.warning(
-                                f"SLOT_DEBUG: Aggressively recovered slot {slot} from orphaned seq {seq_id}"
-                            )
-                        del self.seq_groups_to_batch_slot[seq_id]
+                    self.recover_orphaned_slots(orphaned_sequences)
 
                     # Sort empty_slots for consistency
                     self.empty_slots.sort()
@@ -825,14 +835,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     logger.warning(
                         f"SLOT_DEBUG: Force-cleaning {len(orphaned_seqs)} orphaned sequences: {orphaned_seqs}"
                     )
-                    for seq_id in orphaned_seqs:
-                        slot = self.seq_groups_to_batch_slot[seq_id]
-                        if slot not in self.empty_slots:
-                            self.empty_slots.append(slot)
-                            logger.warning(
-                                f"SLOT_DEBUG: Force-recovered slot {slot} from orphaned seq {seq_id}"
-                            )
-                        del self.seq_groups_to_batch_slot[seq_id]
+                    self.recover_orphaned_slots(orphaned_seqs)
 
                     # Sort empty_slots to maintain consistency
                     self.empty_slots.sort()
@@ -989,18 +992,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     logger.warning(
                         f"SLOT_DEBUG: Recovering {len(orphaned_seqs)} orphaned slots from sequences: {orphaned_seqs}"
                     )
-                    for seq_id in orphaned_seqs:
-                        slot = self.seq_groups_to_batch_slot[seq_id]
-                        if slot not in self.empty_slots:
-                            self.empty_slots.append(slot)
-                            logger.warning(
-                                f"SLOT_DEBUG: Recovered orphaned slot {slot} from sequence {seq_id}"
-                            )
-                        else:
-                            logger.warning(
-                                f"SLOT_DEBUG: Orphaned slot {slot} from seq {seq_id} already in empty_slots"
-                            )
-                        del self.seq_groups_to_batch_slot[seq_id]
+                    self.recover_orphaned_slots(orphaned_seqs)
 
                 # Ensure all sequences have valid slot assignments
                 # If a sequence doesn't have a slot, assign one from empty_slots
