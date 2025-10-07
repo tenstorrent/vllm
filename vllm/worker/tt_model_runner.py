@@ -249,9 +249,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 )
             del self.seq_groups_to_batch_slot[seq_id]
             # Clean up req_id_to_seq_id mapping for orphaned sequences
-            for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
-                if mapped_seq_id == seq_id:
-                    del self.req_id_to_seq_id[req_id]
+            req_ids_to_remove = [
+                req_id for req_id, mapped_seq_id 
+                in self.req_id_to_seq_id.items() 
+                if mapped_seq_id == seq_id
+            ]
+            for req_id in req_ids_to_remove:
+                del self.req_id_to_seq_id[req_id]
 
     def prepare_model_input(
             self,
