@@ -847,6 +847,46 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 f"SLOT_DEBUG: After recovery - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
             )
 
+    def _final_size_check(self, perm_table_tensor: torch.Tensor, active_slots: List[int]):
+        # Final size check with graceful handling
+        expected_size = self.scheduler_config.max_num_seqs
+        actual_size = perm_table_tensor.shape[0]
+        if actual_size != expected_size:
+            logger.warning(
+                "SLOT_DEBUG: Still have size mismatch after recovery!")
+            logger.warning(
+                f"SLOT_DEBUG: expected_size={expected_size}, actual_size={actual_size}"
+            )
+            logger.warning(
+                "SLOT_DEBUG: This indicates a fundamental slot management bug"
+            )
+            logger.warning(
+                f"SLOT_DEBUG: perm_table_tensor={perm_table_tensor.tolist()}"
+            )
+
+            # Last resort: create a valid permutation table
+            if actual_size < expected_size:
+                # Pad with missing indices
+                missing_count = expected_size - actual_size
+                padding = list(
+                    range(expected_size - missing_count,
+                            expected_size))
+                perm_table_tensor = torch.as_tensor(
+                    active_slots + self.empty_slots + padding,
+                    dtype=torch.long,
+                )
+                logger.warning(
+                    f"SLOT_DEBUG: Emergency padding with {padding}")
+            else:
+                # Truncate to expected size
+                perm_table_tensor = perm_table_tensor[:expected_size]
+                logger.warning(
+                    f"SLOT_DEBUG: Emergency truncation to size {expected_size}"
+                )
+        # This should now always pass, but keep as final safety check
+        assert perm_table_tensor.shape[0] == self.scheduler_config.max_num_seqs, \
+            f"Permutation table size {perm_table_tensor.shape[0]} != expected {self.scheduler_config.max_num_seqs}"
+
     def _execute_model_single_step(self,
                                    model_input: TTModelInput,
                                    kv_caches: List[torch.Tensor],
@@ -1088,44 +1128,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if self.async_torch_proc:
                     self.perm_table_tensor.append(perm_table_tensor)
 
-                # Final size check with graceful handling
-                actual_size = perm_table_tensor.shape[0]
-                if actual_size != expected_size:
-                    logger.warning(
-                        "SLOT_DEBUG: Still have size mismatch after recovery!")
-                    logger.warning(
-                        f"SLOT_DEBUG: expected_size={expected_size}, actual_size={actual_size}"
-                    )
-                    logger.warning(
-                        "SLOT_DEBUG: This indicates a fundamental slot management bug"
-                    )
-                    logger.warning(
-                        f"SLOT_DEBUG: perm_table_tensor={perm_table_tensor.tolist()}"
-                    )
-
-                    # Last resort: create a valid permutation table
-                    if actual_size < expected_size:
-                        # Pad with missing indices
-                        missing_count = expected_size - actual_size
-                        padding = list(
-                            range(expected_size - missing_count,
-                                  expected_size))
-                        perm_table_tensor = torch.as_tensor(
-                            active_slots + self.empty_slots + padding,
-                            dtype=torch.long,
-                        )
-                        logger.warning(
-                            f"SLOT_DEBUG: Emergency padding with {padding}")
-                    else:
-                        # Truncate to expected size
-                        perm_table_tensor = perm_table_tensor[:expected_size]
-                        logger.warning(
-                            f"SLOT_DEBUG: Emergency truncation to size {expected_size}"
-                        )
-
-                # This should now always pass, but keep as final safety check
-                assert perm_table_tensor.shape[0] == self.scheduler_config.max_num_seqs, \
-                    f"Permutation table size {perm_table_tensor.shape[0]} != expected {self.scheduler_config.max_num_seqs}"
+                self._final_size_check(perm_table_tensor, active_slots)
+                
                 # Calculate inverse_perm_indices:
                 # inverse_perm_indices[current_slot_idx] = new_idx
                 inverse_perm_indices = torch.empty_like(perm_table_tensor)
