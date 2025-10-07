@@ -556,12 +556,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if seq_id not in current_active_seqs:
                     orphaned_sequences.append(seq_id)
 
-            if orphaned_sequences:
+            if len(orphaned_sequences) > 0:
                 logger.warning(
                     f"SLOT_DEBUG: Detected {len(orphaned_sequences)} orphaned sequences: {orphaned_sequences}"
-                )
-                logger.warning(
-                    "SLOT_DEBUG: These sequences have slots but are not in current batch"
                 )
 
                 # CLEANUP: If we have many orphaned sequences and few empty slots,
@@ -569,21 +566,25 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 total_sequences_in_batch = sum(
                     len(sgm.seq_data.keys())
                     for sgm in seq_group_metadata_list)
-                if len(self.empty_slots) < total_sequences_in_batch and len(
-                        orphaned_sequences) > 0:
+                # use recover_slots_flag to use add logging to disambiguate
+                # between the cases requiring recovery
+                recover_slots_flag = False
+                if len(self.empty_slots) < total_sequences_in_batch:
                     logger.warning(
-                        f"SLOT_DEBUG: Insufficient slots ({len(self.empty_slots)}) for batch size ({total_sequences_in_batch})"
+                        f"SLOT_DEBUG: Insufficient empty_slots:={len(self.empty_slots)} for batch size:={total_sequences_in_batch}"
                     )
+                    recover_slots_flag = True
+                elif not is_prompt:
                     logger.warning(
-                        f"SLOT_DEBUG: Performing aggressive cleanup of {len(orphaned_sequences)} orphaned sequences"
+                        f"SLOT_DEBUG: is_prompt:={is_prompt}, recovering slots"
                     )
+                    recover_slots_flag = True
+                
+                if recover_slots_flag:
                     self.recover_orphaned_slots(orphaned_sequences)
 
                     # Sort empty_slots for consistency
                     self.empty_slots.sort()
-                    logger.warning(
-                        f"SLOT_DEBUG: After aggressive cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-                    )
                 else:
                     logger.debug(
                         "SLOT_DEBUG: Sufficient slots available, deferring cleanup to decode phase"
@@ -847,45 +848,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 f"SLOT_DEBUG: After recovery - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
             )
 
-    def _final_size_check(self, perm_table_tensor: torch.Tensor, active_slots: List[int]):
-        # Final size check with graceful handling
-        expected_size = self.scheduler_config.max_num_seqs
-        actual_size = perm_table_tensor.shape[0]
-        if actual_size != expected_size:
-            logger.warning(
-                "SLOT_DEBUG: Still have size mismatch after recovery!")
-            logger.warning(
-                f"SLOT_DEBUG: expected_size={expected_size}, actual_size={actual_size}"
-            )
-            logger.warning(
-                "SLOT_DEBUG: This indicates a fundamental slot management bug"
-            )
-            logger.warning(
-                f"SLOT_DEBUG: perm_table_tensor={perm_table_tensor.tolist()}"
-            )
-
-            # Last resort: create a valid permutation table
-            if actual_size < expected_size:
-                # Pad with missing indices
-                missing_count = expected_size - actual_size
-                padding = list(
-                    range(expected_size - missing_count,
-                            expected_size))
-                perm_table_tensor = torch.as_tensor(
-                    active_slots + self.empty_slots + padding,
-                    dtype=torch.long,
-                )
-                logger.warning(
-                    f"SLOT_DEBUG: Emergency padding with {padding}")
-            else:
-                # Truncate to expected size
-                perm_table_tensor = perm_table_tensor[:expected_size]
-                logger.warning(
-                    f"SLOT_DEBUG: Emergency truncation to size {expected_size}"
-                )
-        # This should now always pass, but keep as final safety check
-        assert perm_table_tensor.shape[0] == self.scheduler_config.max_num_seqs, \
-            f"Permutation table size {perm_table_tensor.shape[0]} != expected {self.scheduler_config.max_num_seqs}"
 
     def _execute_model_single_step(self,
                                    model_input: TTModelInput,
@@ -915,49 +877,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         if not is_decode:
             if self.dp_kv_cache:
-
-                # Check if we have enough empty slots for prefill
-                if len(self.empty_slots) < model_input.unpadded_batch_size:
-                    logger.warning(
-                        "SLOT_DEBUG: WARNING - Insufficient empty slots for prefill! Attempting to clean up orphaned slots..."
-                    )
-                    logger.warning(
-                        f"SLOT_DEBUG: Need {model_input.unpadded_batch_size} slots, have {len(self.empty_slots)}"
-                    )
-                    logger.warning(
-                        f"SLOT_DEBUG: Current seq_groups_to_batch_slot: {self.seq_groups_to_batch_slot}"
-                    )
-
-                    # Emergency recovery: force cleanup of all orphaned slots
-                    current_active_seqs = set(model_input.seq_groups)
-                    orphaned_seqs = []
-                    for seq_id in list(self.seq_groups_to_batch_slot.keys()):
-                        if seq_id not in current_active_seqs:
-                            orphaned_seqs.append(seq_id)
-
-                    logger.warning(
-                        f"SLOT_DEBUG: Force-cleaning {len(orphaned_seqs)} orphaned sequences: {orphaned_seqs}"
-                    )
-                    self.recover_orphaned_slots(orphaned_seqs)
-
-                    # Sort empty_slots to maintain consistency
-                    self.empty_slots.sort()
-                    logger.warning(
-                        f"SLOT_DEBUG: After force cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-                    )
-
-                    # Final check
-                    if len(self.empty_slots) < model_input.unpadded_batch_size:
-                        logger.error(
-                            "SLOT_DEBUG: FATAL - Still insufficient slots after force cleanup!"
-                        )
-                        logger.error(
-                            f"SLOT_DEBUG: Need {model_input.unpadded_batch_size}, have {len(self.empty_slots)}"
-                        )
-                        raise RuntimeError(
-                            f"Insufficient empty slots for prefill: need {model_input.unpadded_batch_size}, have {len(self.empty_slots)}"
-                        )
-
                 slots_to_allocate = self.empty_slots[:model_input.
                                                      unpadded_batch_size]
                 execute_model_kwargs["empty_slots"] = slots_to_allocate
@@ -971,26 +890,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.empty_slots = self.empty_slots[model_input.
                                                     unpadded_batch_size:]
 
-                # SAFETY CHECK: Ensure we have enough slots for all sequences
-                if len(recently_filled_slots) != len(model_input.seq_groups):
-                    logger.error(
-                        f"SLOT_DEBUG: MISMATCH - allocated {len(recently_filled_slots)} slots for {len(model_input.seq_groups)} sequences"
-                    )
-                    raise RuntimeError(
-                        f"Slot allocation mismatch: {len(recently_filled_slots)} slots for {len(model_input.seq_groups)} sequences"
-                    )
-
                 # iterate through recently_filled_slots slice
-                # avoid unnecessary mutation to the temporary slice list
                 for i, s in enumerate(model_input.seq_groups):
-                    if i >= len(recently_filled_slots):
-                        logger.error(
-                            f"SLOT_DEBUG: INDEX ERROR - trying to access slot {i} but only have {len(recently_filled_slots)} slots"
-                        )
-                        raise IndexError(
-                            f"Slot index {i} out of range for {len(recently_filled_slots)} allocated slots"
-                        )
-
                     self.seq_groups_to_batch_slot[s] = recently_filled_slots[i]
 
             if self.model_config.is_encoder_decoder:
@@ -1083,35 +984,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
-                # Defensive cleanup: recover orphaned slots before processing
-                current_active_seqs = set(model_input.seq_groups)
-                orphaned_seqs = []
-
-                for seq_id in list(self.seq_groups_to_batch_slot.keys()):
-                    if seq_id not in current_active_seqs:
-                        orphaned_seqs.append(seq_id)
-
-                if orphaned_seqs:
-                    logger.warning(
-                        f"SLOT_DEBUG: Recovering {len(orphaned_seqs)} orphaned slots from sequences: {orphaned_seqs}"
-                    )
-                    self.recover_orphaned_slots(orphaned_seqs)
-
-                # Ensure all sequences have valid slot assignments
-                # If a sequence doesn't have a slot, assign one from empty_slots
-                for s in model_input.seq_groups:
-                    if s not in self.seq_groups_to_batch_slot:
-                        if not self.empty_slots:
-                            logger.error(
-                                f"No empty slots available for sequence {s}")
-                            raise RuntimeError(
-                                f"No empty slots available for sequence {s}")
-                        slot = self.empty_slots.pop(0)
-                        self.seq_groups_to_batch_slot[s] = slot
-                        logger.warning(
-                            f"Assigned emergency slot {slot} to sequence {s} during decode"
-                        )
-
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
                 active_slots = [
@@ -1127,8 +999,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 )
                 if self.async_torch_proc:
                     self.perm_table_tensor.append(perm_table_tensor)
-
-                self._final_size_check(perm_table_tensor, active_slots)
                 
                 # Calculate inverse_perm_indices:
                 # inverse_perm_indices[current_slot_idx] = new_idx
