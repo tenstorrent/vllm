@@ -767,70 +767,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert model_input.async_callback is not None
             model_input.async_callback()
 
-    def _check_slot_consistency(self, active_slots: List[int]):
-        # Graceful recovery: ensure we have the right number of total slots
-        expected_size = self.scheduler_config.max_num_seqs
-        current_total = len(active_slots) + len(self.empty_slots)
-
-        if current_total != expected_size:
-            logger.warning(
-                f"SLOT_DEBUG: Size mismatch detected - expected {expected_size}, got {current_total}"
-            )
-            logger.warning(
-                f"SLOT_DEBUG: active_slots (len={len(active_slots)})={active_slots}"
-            )
-            logger.warning(
-                f"SLOT_DEBUG: empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-            )
-            logger.warning(
-                f"SLOT_DEBUG: seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}"
-            )
-
-            # Find missing or duplicate slots
-            all_slots_set = set(active_slots) | set(self.empty_slots)
-            expected_slots_set = set(range(expected_size))
-            missing_slots = expected_slots_set - all_slots_set
-            extra_slots = all_slots_set - expected_slots_set
-
-            if missing_slots:
-                logger.error(
-                    f"SLOT_DEBUG: Missing slots detected: {sorted(missing_slots)}"
-                )
-                # Add missing slots to empty_slots
-                self.empty_slots.extend(sorted(missing_slots))
-                logger.warning(
-                    f"SLOT_DEBUG: Added {len(missing_slots)} missing slots to empty_slots"
-                )
-
-            if extra_slots:
-                logger.error(
-                    f"SLOT_DEBUG: Extra slots detected: {sorted(extra_slots)}"
-                )
-                # Remove extra slots from empty_slots
-                self.empty_slots = [
-                    s for s in self.empty_slots if s in expected_slots_set
-                ]
-                logger.warning(
-                    "SLOT_DEBUG: Removed extra slots from empty_slots"
-                )
-
-            # Check for duplicates in empty_slots
-            if len(self.empty_slots) != len(set(self.empty_slots)):
-                logger.warning(
-                    "SLOT_DEBUG: Duplicate slots in empty_slots detected"
-                )
-                self.empty_slots = list(
-                    dict.fromkeys(self.empty_slots)
-                )  # Remove duplicates while preserving order
-                logger.warning(
-                    "SLOT_DEBUG: Removed duplicates from empty_slots"
-                )
-
-            logger.warning(
-                f"SLOT_DEBUG: After recovery - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-            )
-
-
     def _execute_model_single_step(self,
                                    model_input: TTModelInput,
                                    kv_caches: List[torch.Tensor],
@@ -972,8 +908,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self.seq_groups_to_batch_slot[s]
                     for s in model_input.seq_groups
                 ]
-
-                self._check_slot_consistency(active_slots)
 
                 perm_table_tensor = torch.as_tensor(
                     active_slots + self.empty_slots,
