@@ -3,6 +3,7 @@
 
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
@@ -22,11 +23,15 @@ class TTModelLoader(BaseModelLoader):
 
         model_class, _ = get_model_architecture(model_config)
 
-        data_parallel = 1
-        if (model_config.override_tt_config
-                and 'data_parallel' in model_config.override_tt_config):
-            data_parallel = model_config.override_tt_config['data_parallel']
-            logger.info("Overriding data_parallel to %d", data_parallel)
+        if envs.VLLM_USE_V1:
+            data_parallel = vllm_config.parallel_config.data_parallel_size
+        else:
+            data_parallel = 1
+            if (model_config.override_tt_config
+                    and 'data_parallel' in model_config.override_tt_config):
+                data_parallel = model_config.override_tt_config[
+                    'data_parallel']
+                logger.info("Overriding data_parallel to %d", data_parallel)
 
         model = model_class.initialize_vllm_model(
             model_config.hf_config,
