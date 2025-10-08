@@ -289,13 +289,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
 
-        # For DP KV cache: Build seq_groups_list FIRST before any cleanup
+        # create seq_groups_list before any cleanup to active batch slots
         for seq_group_metadata in seq_group_metadata_list:
-            seq_ids = list(seq_group_metadata.seq_data.keys())
-            assert len(seq_ids) == 1, (
+            _seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(_seq_ids) == 1, (
                 "Currently only supporting one sequence per request group")
-            seq_id = seq_ids[0]
-            seq_groups_list.append(seq_id)
+            seq_groups_list.append(_seq_ids[0])
 
         if self.dp_kv_cache and finished_requests_ids is not None:
             # Delete finished requests from req_id_to_seq_id
@@ -320,6 +319,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     break
 
         for seq_group_metadata in seq_group_metadata_list:
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            seq_id = seq_ids[0]
             if self.dp_kv_cache:
                 # Add new request id to req_id_to_seq_id
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
