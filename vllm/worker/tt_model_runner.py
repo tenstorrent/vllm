@@ -241,12 +241,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if slot not in self.empty_slots:
                 self.empty_slots.append(slot)
                 logger.warning(
-                    f"SLOT_DEBUG: Recovered slot {slot} from orphaned seq {seq_id}"
-                )
+                    "SLOT_DEBUG: Recovered slot %s from orphaned seq %s", slot,
+                    seq_id)
             else:
                 logger.warning(
-                    f"SLOT_DEBUG: Orphaned slot {slot} already in empty_slots, from seq {seq_id}"
-                )
+                    "SLOT_DEBUG: Orphaned slot %s already in "
+                    "empty_slots, from seq %s", slot, seq_id)
             del self.seq_groups_to_batch_slot[seq_id]
             # Clean up req_id_to_seq_id mapping for orphaned sequences
             req_ids_to_remove = [
@@ -530,27 +530,31 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if finished_requests_ids:
                 for seq_id in finished_requests_seq_ids:
                     if seq_id in self.seq_groups_to_batch_slot:
-                        empty_batch_slot = self.seq_groups_to_batch_slot[
-                            seq_id]
-                        # Only add to empty_slots if not already present (prevent duplicates)
+                        empty_batch_slot = (
+                            self.seq_groups_to_batch_slot[seq_id])
+                        # Only add to empty_slots if not already present
+                        # (prevent duplicates)
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
                         else:
                             logger.warning(
-                                f"SLOT_DEBUG: Slot {empty_batch_slot} from seq {seq_id} already in empty_slots"
-                            )
+                                "SLOT_DEBUG: Slot %s from seq %s already in "
+                                "empty_slots", empty_batch_slot, seq_id)
                         del self.seq_groups_to_batch_slot[seq_id]
                     else:
                         logger.warning(
-                            f"SLOT_DEBUG: Finished seq {seq_id} not found in seq_groups_to_batch_slot"
-                        )
+                            "SLOT_DEBUG: Finished seq %s not found in "
+                            "seq_groups_to_batch_slot", seq_id)
 
             # Clean up disappeared sequences (preempted/swapped out)
-            # ONLY during DECODE batches: all active sequences should be present,
-            # so any missing sequence is truly gone (preempted/swapped/finished).
-            # During PREFILL batches: NEVER clean up based on "not in batch" because
-            # we can't distinguish between active decode sequences and truly gone sequences.
-            # Only finished_requests_ids is a reliable signal for cleanup during prefill.
+            # ONLY during DECODE batches: all active sequences should be
+            # present, so any missing sequence is truly gone
+            # (preempted/swapped/finished).
+            # During PREFILL batches: NEVER clean up based on "not in
+            # batch" because we can't distinguish between active decode
+            # sequences and truly gone sequences.
+            # Only finished_requests_ids is a reliable signal for cleanup
+            # during prefill.
             if not is_prompt:
                 # Decode batch: clean up sequences not in this batch
                 orphaned_seq_ids = []
@@ -561,31 +565,33 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
                 if orphaned_seq_ids:
                     logger.info(
-                        f"SLOT_DEBUG: Detected {len(orphaned_seq_ids)} sequences "
-                        f"not in decode batch (preempted/swapped): {orphaned_seq_ids}"
-                    )
+                        "SLOT_DEBUG: Detected %s sequences not in decode "
+                        "batch (preempted/swapped): %s", len(orphaned_seq_ids),
+                        orphaned_seq_ids)
                     logger.info(
-                        f"SLOT_DEBUG: Before cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-                    )
+                        "SLOT_DEBUG: Before cleanup - empty_slots "
+                        "(len=%s)=%s", len(self.empty_slots), self.empty_slots)
                     # Free their slots immediately
                     self.recover_orphaned_slots(orphaned_seq_ids)
                     logger.info(
-                        f"SLOT_DEBUG: After cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-                    )
+                        "SLOT_DEBUG: After cleanup - empty_slots "
+                        "(len=%s)=%s", len(self.empty_slots), self.empty_slots)
                     logger.info(
-                        f"SLOT_DEBUG: After cleanup - seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}"
-                    )
+                        "SLOT_DEBUG: After cleanup - "
+                        "seq_groups_to_batch_slot=%s",
+                        self.seq_groups_to_batch_slot)
             elif is_prompt and len(self.empty_slots) < unpadded_batch_size:
-                # Prefill batch without enough slots: this is a scheduler bug
-                # Log an error but don't forcibly clean up - we can't safely determine
-                # which sequences are truly gone vs just not in this prefill batch
+                # Prefill batch without enough slots: this is a scheduler
+                # bug. Log an error but don't forcibly clean up - we can't
+                # safely determine which sequences are truly gone vs just
+                # not in this prefill batch
                 logger.error(
-                    f"SLOT_DEBUG: Prefill batch needs {unpadded_batch_size} slots "
-                    f"but only {len(self.empty_slots)} available. "
-                    f"This indicates a scheduler issue - sequences may not be properly freed. "
-                    f"Active slots: {len(self.seq_groups_to_batch_slot)}, "
-                    f"seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}"
-                )
+                    "SLOT_DEBUG: Prefill batch needs %s slots but only "
+                    "%s available. This indicates a scheduler issue - "
+                    "sequences may not be properly freed. Active slots: "
+                    "%s, seq_groups_to_batch_slot=%s", unpadded_batch_size,
+                    len(self.empty_slots), len(self.seq_groups_to_batch_slot),
+                    self.seq_groups_to_batch_slot)
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
