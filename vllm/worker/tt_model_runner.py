@@ -250,8 +250,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             del self.seq_groups_to_batch_slot[seq_id]
             # Clean up req_id_to_seq_id mapping for orphaned sequences
             req_ids_to_remove = [
-                req_id for req_id, mapped_seq_id 
-                in self.req_id_to_seq_id.items() 
+                req_id
+                for req_id, mapped_seq_id in self.req_id_to_seq_id.items()
                 if mapped_seq_id == seq_id
             ]
             for req_id in req_ids_to_remove:
@@ -288,17 +288,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
-        
-        # For DP KV cache: Build current batch seq_ids FIRST before any cleanup
-        current_batch_seq_ids: Set[int] = set()
-        if self.dp_kv_cache:
-            for seq_group_metadata in seq_group_metadata_list:
-                seq_ids = list(seq_group_metadata.seq_data.keys())
-                assert len(seq_ids) == 1, (
-                    "Currently only supporting one sequence per request group")
-                seq_id = seq_ids[0]
-                current_batch_seq_ids.add(seq_id)
-        
+
+        # For DP KV cache: Build seq_groups_list FIRST before any cleanup
+        for seq_group_metadata in seq_group_metadata_list:
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(seq_ids) == 1, (
+                "Currently only supporting one sequence per request group")
+            seq_id = seq_ids[0]
+            seq_groups_list.append(seq_id)
+
         if self.dp_kv_cache and finished_requests_ids is not None:
             # Delete finished requests from req_id_to_seq_id
             finished_requests_seq_ids = []
@@ -322,12 +320,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     break
 
         for seq_group_metadata in seq_group_metadata_list:
-            seq_ids = list(seq_group_metadata.seq_data.keys())
-            assert len(
-                seq_ids
-            ) == 1, "Currently only supporting one sequence per request group"
-            seq_id = seq_ids[0]
-            seq_groups_list.append(seq_id)
             if self.dp_kv_cache:
                 # Add new request id to req_id_to_seq_id
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
@@ -538,7 +530,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if finished_requests_ids:
                 for seq_id in finished_requests_seq_ids:
                     if seq_id in self.seq_groups_to_batch_slot:
-                        empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
+                        empty_batch_slot = self.seq_groups_to_batch_slot[
+                            seq_id]
                         # Only add to empty_slots if not already present (prevent duplicates)
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
@@ -561,6 +554,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if not is_prompt:
                 # Decode batch: clean up sequences not in this batch
                 orphaned_seq_ids = []
+                current_batch_seq_ids = set(seq_groups_list)
                 for seq_id in list(self.seq_groups_to_batch_slot.keys()):
                     if seq_id not in current_batch_seq_ids:
                         orphaned_seq_ids.append(seq_id)
@@ -929,7 +923,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 )
                 if self.async_torch_proc:
                     self.perm_table_tensor.append(perm_table_tensor)
-                
+
                 # Calculate inverse_perm_indices:
                 # inverse_perm_indices[current_slot_idx] = new_idx
                 inverse_perm_indices = torch.empty_like(perm_table_tensor)
