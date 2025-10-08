@@ -288,6 +288,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
+        
+        # For DP KV cache: Build current batch seq_ids FIRST before any cleanup
+        current_batch_seq_ids: Set[int] = set()
+        if self.dp_kv_cache:
+            for seq_group_metadata in seq_group_metadata_list:
+                seq_ids = list(seq_group_metadata.seq_data.keys())
+                assert len(seq_ids) == 1, (
+                    "Currently only supporting one sequence per request group")
+                seq_id = seq_ids[0]
+                current_batch_seq_ids.add(seq_id)
+        
         if self.dp_kv_cache and finished_requests_ids is not None:
             # Delete finished requests from req_id_to_seq_id
             finished_requests_seq_ids = []
@@ -523,14 +534,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                    dim=1)
 
         if self.dp_kv_cache:
-            # Only cleanup sequences that are explicitly finished via finished_requests_ids
-            # Do not cleanup sequences just because they're not in the current batch,
-            # as they may appear in future batches (mixed prefill/decode scenarios)
+            # Clean up finished requests
             if finished_requests_ids:
                 for seq_id in finished_requests_seq_ids:
                     if seq_id in self.seq_groups_to_batch_slot:
-                        empty_batch_slot = self.seq_groups_to_batch_slot[
-                            seq_id]
+                        empty_batch_slot = self.seq_groups_to_batch_slot[seq_id]
                         # Only add to empty_slots if not already present (prevent duplicates)
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
@@ -544,63 +552,32 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             f"SLOT_DEBUG: Finished seq {seq_id} not found in seq_groups_to_batch_slot"
                         )
 
-                    # Clean up req_id_to_seq_id mapping for finished requests
-                    req_ids_to_remove = []
-                    for req_id, mapped_seq_id in self.req_id_to_seq_id.items():
-                        if mapped_seq_id == seq_id:
-                            req_ids_to_remove.append(req_id)
+            # Clean up disappeared sequences (preempted/swapped out)
+            # Only do this for DECODE batches, since prefill batches won't contain
+            # running decode sequences, but those sequences are still active.
+            # In decode batches, all active sequences should be present.
+            if not is_prompt:
+                orphaned_seq_ids = []
+                for seq_id in list(self.seq_groups_to_batch_slot.keys()):
+                    if seq_id not in current_batch_seq_ids:
+                        orphaned_seq_ids.append(seq_id)
 
-                    for req_id in req_ids_to_remove:
-                        del self.req_id_to_seq_id[req_id]
-
-            # Defensive cleanup: detect and recover orphaned slots
-            current_active_seqs = set()
-            for sgm in seq_group_metadata_list:
-                current_active_seqs.update(sgm.seq_data.keys())
-
-            orphaned_sequences = []
-            for seq_id in list(self.seq_groups_to_batch_slot.keys()):
-                if seq_id not in current_active_seqs:
-                    orphaned_sequences.append(seq_id)
-
-            if len(orphaned_sequences) > 0:
-                logger.warning(
-                    f"SLOT_DEBUG: Detected {len(orphaned_sequences)} orphaned sequences: {orphaned_sequences}"
-                )
-
-                # CLEANUP: If we have many orphaned sequences and few empty slots,
-                # we need to clean them up to prevent prefill failures
-                total_sequences_in_batch = sum(
-                    len(sgm.seq_data.keys())
-                    for sgm in seq_group_metadata_list)
-                # use recover_slots_flag to use add logging to disambiguate
-                # between the cases requiring recovery
-                recover_slots_flag = False
-                if len(self.empty_slots) < total_sequences_in_batch:
-                    logger.warning(
-                        f"SLOT_DEBUG: Insufficient empty_slots:={len(self.empty_slots)} for batch size:={total_sequences_in_batch}"
+                if orphaned_seq_ids:
+                    logger.info(
+                        f"SLOT_DEBUG: Detected {len(orphaned_seq_ids)} sequences "
+                        f"not in decode batch (preempted/swapped): {orphaned_seq_ids}"
                     )
-                    recover_slots_flag = True
-                elif not is_prompt:
-                    logger.warning(
-                        f"SLOT_DEBUG: is_prompt:={is_prompt}, recovering slots"
+                    logger.info(
+                        f"SLOT_DEBUG: Before cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
                     )
-                    recover_slots_flag = True
-                
-                if recover_slots_flag:
-                    self.recover_orphaned_slots(orphaned_sequences)
-
-                else:
-                    logger.debug(
-                        "SLOT_DEBUG: Sufficient slots available, deferring cleanup to decode phase"
+                    # Free their slots immediately
+                    self.recover_orphaned_slots(orphaned_seq_ids)
+                    logger.info(
+                        f"SLOT_DEBUG: After cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
                     )
-
-                logger.debug(
-                    f"SLOT_DEBUG: After cleanup - empty_slots (len={len(self.empty_slots)})={self.empty_slots}"
-                )
-                logger.debug(
-                    f"SLOT_DEBUG: After cleanup - seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}"
-                )
+                    logger.info(
+                        f"SLOT_DEBUG: After cleanup - seq_groups_to_batch_slot={self.seq_groups_to_batch_slot}"
+                    )
 
         return TTModelInput(input_tokens=input_tokens,
                             input_positions=input_positions,
@@ -989,20 +966,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 enc_dec_kwargs = {}
 
             if self.dp_kv_cache:
-                # Defensive cleanup: recover orphaned slots before processing
-                current_active_seqs = set(model_input.seq_groups)
-                orphaned_seqs = []
-
-                for seq_id in list(self.seq_groups_to_batch_slot.keys()):
-                    if seq_id not in current_active_seqs:
-                        orphaned_seqs.append(seq_id)
-
-                if orphaned_seqs:
-                    logger.warning(
-                        f"SLOT_DEBUG: Recovering {len(orphaned_seqs)} orphaned slots from sequences: {orphaned_seqs} during decode"
-                    )
-                    self.recover_orphaned_slots(orphaned_seqs)
-
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
                 active_slots = [
