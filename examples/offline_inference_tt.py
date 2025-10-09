@@ -403,13 +403,6 @@ def run_inference(
                 raise ValueError(
                     f"Unsupported model for multi-modal inference test: {model}"
                 )
-        # Repeat prompts for DP size, and then for num_repeat_prompts
-        print(
-            f"Repeating prompts by (DP size {data_parallel_size} x "
-            f"num_repeat_prompts {num_repeat_prompts}) = "
-            f"{data_parallel_size * num_repeat_prompts}"
-        )
-        prompts = prompts * data_parallel_size
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))

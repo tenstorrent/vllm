@@ -552,7 +552,15 @@ class TTModelRunner:
             kwargs["start_pos"] = model_input.input_positions
         if self.sample_on_device_mode == "all" or (
                 self.sample_on_device_mode == "decode_only" and is_decode):
-            kwargs["sampling_params"] = model_input.tt_sampling_params
+            # Check that sampling params are the same for all DP ranks.
+            # TODO: Remove this restriction and concat sampling params in
+            # concat_model_inputs once models can support mixed params.
+            non_none_params = [
+                sp for sp in sampling_params_per_dp if sp is not None
+            ]
+            assert all(sp == non_none_params[0] for sp in non_none_params), (
+                "Sampling params must be the same for all active DP ranks")
+            kwargs["sampling_params"] = non_none_params[0]
 
         # Execute model
         if not is_decode:
