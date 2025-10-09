@@ -23,8 +23,10 @@ class TTModelLoader(BaseModelLoader):
 
         model_class, _ = get_model_architecture(model_config)
 
+        # Model receives max_batch_size as batch_size_per_dp * dp_size
         if envs.VLLM_USE_V1:
             data_parallel = vllm_config.parallel_config.data_parallel_size
+            max_batch_size = scheduler_config.max_num_seqs * data_parallel
         else:
             data_parallel = 1
             if (model_config.override_tt_config
@@ -32,11 +34,12 @@ class TTModelLoader(BaseModelLoader):
                 data_parallel = model_config.override_tt_config[
                     'data_parallel']
                 logger.info("Overriding data_parallel to %d", data_parallel)
+            max_batch_size = scheduler_config.max_num_seqs
 
         model = model_class.initialize_vllm_model(
             model_config.hf_config,
             device_config.device,
-            scheduler_config.max_num_seqs,
+            max_batch_size,
             max_seq_len=model_config.max_model_len,
             tt_data_parallel=data_parallel,
         )
