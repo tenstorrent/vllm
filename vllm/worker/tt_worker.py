@@ -555,7 +555,7 @@ def open_mesh_device(override_tt_config, trace_mode):
         "P150x4": (1, 4),
         "T3K": (1, 8),
         "P150x8": (1, 8),
-        "TG": (8, 4)
+        "TG": (4, 8)
     }
     mesh_device_env = os.environ.get("MESH_DEVICE")
     if mesh_device_env is not None:
@@ -581,6 +581,7 @@ def open_mesh_device(override_tt_config, trace_mode):
         dispatch_core_config=get_dispatch_core_config(override_tt_config),
         **device_params,
     )
+    mesh_device = mesh_device.create_submesh(ttnn.MeshShape(1,8))
     logger.info("multidevice with %d devices and grid %s is created",
                 mesh_device.get_num_devices(), mesh_grid)
     return mesh_device
