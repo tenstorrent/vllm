@@ -124,10 +124,11 @@ class TTModelRunner:
         # min(number of devices, number of KV heads).
         # TODO: move this into model.allocate_kv_cache.
         model_config = self.model_config
-        data_parallel = self.parallel_config.data_parallel_size
-        num_devices = self.device_config.num_devices // data_parallel
-        total_kv_heads = kv_cache_spec.num_kv_heads
-        num_kv_heads = total_kv_heads // min(num_devices, total_kv_heads)
+        # data_parallel = self.parallel_config.data_parallel_size
+        # num_devices = self.device_config.num_devices // data_parallel
+        # total_kv_heads = kv_cache_spec.num_kv_heads
+        # num_kv_heads = total_kv_heads // min(num_devices, total_kv_heads)
+        num_kv_heads = kv_cache_spec.num_kv_heads
 
         kv_cache_shape = (kv_cache_config.num_blocks, num_kv_heads,
                           kv_cache_spec.block_size, kv_cache_spec.head_size)

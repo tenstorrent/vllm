@@ -118,19 +118,18 @@ class TTCacheEngine:
         device_config: DeviceConfig,
     ) -> int:
         '''
-        Returns the number of KV heads per attention layer (per device). Makes 
-        the assumption that we are tensor parallel by min(number of devices, 
-        number of KV heads).
+        Returns the number of KV heads per attention layer.
         '''
-        data_parallel = 1
-        if (model_config.override_tt_config
-                and "data_parallel" in model_config.override_tt_config):
-            data_parallel = model_config.override_tt_config["data_parallel"]
-        num_devices = device_config.num_devices // data_parallel
+        # data_parallel = 1
+        # if (model_config.override_tt_config
+        #         and "data_parallel" in model_config.override_tt_config):
+        #     data_parallel = model_config.override_tt_config["data_parallel"]
+        # num_devices = device_config.num_devices // data_parallel
         num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         # TP = num_devices if num_devices < num_kv_heads
-        return num_kv_heads // min(num_devices, num_kv_heads)
+        # return num_kv_heads // min(num_devices, num_kv_heads)
+        return num_kv_heads
 
 
 class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
