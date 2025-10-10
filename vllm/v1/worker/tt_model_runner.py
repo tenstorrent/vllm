@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -380,7 +381,9 @@ class TTModelRunner:
         batch_size_per_dp = [
             mi.unpadded_batch_size if mi else 0 for mi in inputs
         ]
-        logger.debug("batch_size_per_dp=%s", batch_size_per_dp)
+        if os.environ.get("DP_GATHER_DEBUG") == "1":
+            logger.info("batch_size_per_dp=%s", batch_size_per_dp)
+
         sampling_params_per_dp = [
             mi.tt_sampling_params if mi else None for mi in inputs
         ]
