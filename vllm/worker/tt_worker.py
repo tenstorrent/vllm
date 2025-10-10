@@ -425,6 +425,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
           and is_wormhole):
         # Qwen2.5-VL-72B on WH T3K
         max_tokens_all_users = 65536
+    elif "gpt-oss" in model_config.model:
+        # gpt-oss on Galaxy and T3K
+        max_tokens_all_users = 1024
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
@@ -448,8 +451,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     if not envs.VLLM_USE_V1:
         # Add 1% to account for vLLM's watermark_blocks
-        num_tt_blocks = int(num_tt_blocks * 1.01)
-
+        num_tt_blocks = (int(num_tt_blocks * 1.01)//2) * 2
     return num_tt_blocks
 
 
@@ -555,13 +557,17 @@ def open_mesh_device(override_tt_config, trace_mode):
         "P150x4": (1, 4),
         "T3K": (1, 8),
         "P150x8": (1, 8),
-        "TG": (4, 8)
+        "TG": (8, 4)
     }
     mesh_device_env = os.environ.get("MESH_DEVICE")
     if mesh_device_env is not None:
-        assert mesh_device_env in mesh_grid_dict, (
-            f"Invalid MESH_DEVICE: {mesh_device_env}")
-        mesh_grid = mesh_grid_dict[mesh_device_env]
+        if isinstance(eval(mesh_device_env), tuple):
+            logger.debug(f"MESH_DEVICE is a tuple: {mesh_device_env}")
+            mesh_grid = eval(mesh_device_env)
+        else:
+            assert mesh_device_env in mesh_grid_dict, (
+                f"Invalid MESH_DEVICE: {mesh_device_env}")
+            mesh_grid = mesh_grid_dict[mesh_device_env]
     else:
         mesh_grid = (1, num_devices_available)
 
@@ -581,7 +587,6 @@ def open_mesh_device(override_tt_config, trace_mode):
         dispatch_core_config=get_dispatch_core_config(override_tt_config),
         **device_params,
     )
-    mesh_device = mesh_device.create_submesh(ttnn.MeshShape(1,8))
     logger.info("multidevice with %d devices and grid %s is created",
                 mesh_device.get_num_devices(), mesh_grid)
     return mesh_device

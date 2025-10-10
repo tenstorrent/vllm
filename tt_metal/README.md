@@ -91,13 +91,15 @@ MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 - `"llama3_70b_galaxy"` for the Llama TG implementation
 - `"llama2_70b"` for the old Llama implementation
 
-**Note 4 (Other Models)**: By default, the inference example will run with Llama-3.1-70B. To run with other Llama models, or Qwen-2.5, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, `T3K`, or `TG`) and one of the following:
+**Note 4 (Other Models)**: By default, the inference example will run with Llama-3.1-70B. To run with other Llama models, or Qwen-2.5, ensure that the apprioriate environment variables are set as per the [demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers), then set `MESH_DEVICE=<device>` (valid options for `<device>` are `N150`, `N300`, `T3K`, or `TG`) or the mesh_shape (eg, "(4,8)", "(4,4)") and one of the following:
 - Llama-3.1-8B: `--model "meta-llama/Llama-3.1-8B"` (Note that on N150, `--max_model_len 65536` must be set for this model, see the [tt_transformers demo](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers) for details about the max context length)
 - Llama-3.2-1B: `--model "meta-llama/Llama-3.2-1B"`
 - Llama-3.2-3B: `--model "meta-llama/Llama-3.2-3B"`
 - Qwen-2.5-7B: `--model "Qwen/Qwen2.5-7B"` (currently only supported on N300)
 - Qwen-2.5-72B: `--model "Qwen/Qwen2.5-72B"` (currently only supported on T3K)
 - DeepSeek-R1-Distill-Llama-70B: `--model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"`
+- GPT-OSS-20B: --model "openai/gpt-oss-20b"
+- GPT-OSS-120B: --model "openai/gpt-oss-120b"
 
 The command to run Llama70B on Galaxy is:
 
@@ -125,6 +127,7 @@ MESH_DEVICE=N300 python examples/offline_inference_tt.py --model "meta-llama/Lla
 > - To run the 32B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-32B"` and `--max_seqs_in_batch 32`.
 > - To run the 72B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, and `--override_tt_config '{"trace_region_size": 28467200}'`.
 > - To run the 27B gemma-3 model, set `MESH_DEVICE=T3K --model "google/gemma-3-27b-it" --max_seqs_in_batch 32 --override_tt_config '{"l1_small_size": 768, "fabric_config": "FABRIC_1D"} --multi_modal --multi_image --mm_processor_kwargs '{"use_fast": true, "do_convert_rgb": true}'`.
+> - To run the 20B gpt-oss model, set `MESH_DEVICE="(4,8)" python examples/offline_inference_tt.py --model "openai/gpt-oss-20b" --max_seqs_in_batch 1 --override_tt_config '{"fabric_config": "FABRIC_1D_RING"}'`.
 
 ## Running the server example
 
