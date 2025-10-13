@@ -350,13 +350,14 @@ class InputPreprocessor:
         lora_request: Optional[LoRARequest] = None,
         return_mm_hashes: bool = False,
     ) -> Union[TokenInputs, MultiModalInputs]:
+        prompt = parsed_content["prompt"]
         prompt_token_ids = parsed_content["prompt_token_ids"]
         token_type_ids = parsed_content.get("token_type_ids")
 
         inputs: Union[TokenInputs, MultiModalInputs]
         if multi_modal_data := parsed_content.get("multi_modal_data"):
             inputs = self._process_multimodal(
-                prompt_token_ids,
+                prompt,
                 multi_modal_data,
                 parsed_content.get("mm_processor_kwargs"),
                 tokenization_kwargs=tokenization_kwargs,

@@ -940,6 +940,7 @@ class OpenAIServing:
                 prompt_token_ids=request_prompt)
 
         engine_prompt = EngineTokensPrompt(
+            prompt=prompt_inputs["prompt"],
             prompt_token_ids=prompt_inputs["prompt_token_ids"])
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data

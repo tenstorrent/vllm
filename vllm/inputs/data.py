@@ -39,6 +39,9 @@ class TextPrompt(TypedDict):
 class TokensPrompt(TypedDict):
     """Schema for a tokenized prompt."""
 
+    prompt: str
+    """The original input text with applied chat template."""
+
     prompt_token_ids: list[int]
     """A list of token IDs to pass to the model."""
 
