@@ -138,7 +138,7 @@ class TTPlatform(Platform):
         # TODO: this should come from the class itself as an attribute
         if model_class.__module__.startswith(
                 "models.demos.llama3_70b_galaxy.tt.generator_vllm"):
-            cls.non_uniform_sampling = False  # type: ignore[attr-defined]
+            cls.non_uniform_sampling = True  # type: ignore[attr-defined]
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
