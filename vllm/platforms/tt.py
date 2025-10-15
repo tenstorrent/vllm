@@ -132,6 +132,14 @@ class TTPlatform(Platform):
                 "models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
 
+        # infer if non-uniform sampling is supported on-device
+        # based on model implementation, and update platform
+        cls.non_uniform_sampling = False  # type: ignore[attr-defined]
+        # TODO: this should come from the class itself as an attribute
+        if model_class.__module__.startswith(
+                "models.demos.llama3_70b_galaxy.tt.generator_vllm"):
+            cls.non_uniform_sampling = False  # type: ignore[attr-defined]
+
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
         # V1 support on TT is experimental.
