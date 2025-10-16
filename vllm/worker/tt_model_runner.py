@@ -33,9 +33,9 @@ class TTSamplingParams:
     """
     Used by TTModelInput.
     """
-    temperature: float | list[float]
-    top_k: int | list[int]
-    top_p: float | list[float]
+    temperature: Union[float, list[float]]
+    top_k: Union[int, list[int]]
+    top_p: Union[float, list[float]]
 
 
 @dataclass(frozen=True)
@@ -377,7 +377,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # initializing an empty list for each value on first iter
                 # fill values after first iter
                 for key in ["temperature", "top_k", "top_p"]:
-                    top_pk_sampling_params.setdefault(key, []).append(getattr(sampling_params, key))
+                    top_pk_sampling_params.setdefault(key, []).append(
+                        getattr(sampling_params, key))
             else:
                 # uniform sampling
                 if len(top_pk_sampling_params) == 0:
