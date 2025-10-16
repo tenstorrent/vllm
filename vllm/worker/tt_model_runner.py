@@ -427,19 +427,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             tt_sampling_params = None
         else:
             sampling_metadata = None
-            if TTPlatform.non_uniform_sampling:
-                # Desired total length
-                target_len = 32
-
-                # Default values
-                default_params = {'temperature': 0.0, 'top_p': 1.0, 'top_k': 0.0}
-
-                # Pad with copies of default_params
-                for key in ["temperature", "top_k", "top_p"]:
-                    values = top_pk_sampling_params[key]
-                    current_len = len(values)
-                    if current_len < target_len:
-                        values.extend([default_params[key]] * (target_len - current_len))
             tt_sampling_params = TTSamplingParams(
                 temperature=top_pk_sampling_params["temperature"],
                 top_k=top_pk_sampling_params["top_k"],
