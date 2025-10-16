@@ -371,7 +371,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             sampling_params = seq_group_metadata.sampling_params
             if compat_sampling_used:
                 sampling_params_list.append(sampling_params)
-            elif TTPlatform.non_uniform_sampling:
+            elif TTPlatform.non_greedy_decoding_on_device:
                 # non-uniform sampling
 
                 # initializing an empty list for each value on first iter
