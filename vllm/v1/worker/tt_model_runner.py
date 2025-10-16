@@ -10,6 +10,7 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
+from vllm.multimodal.inputs import MultiModalKwargs
 from vllm.platforms.tt import TTPlatform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType, cdiv
@@ -360,6 +361,21 @@ class TTModelRunner:
         compat_sampling_used = False
         sampling_metadata = None
 
+        # Gather multi-modal inputs from requests
+        multi_modal_kwargs_list: list[MultiModalKwargs] = []
+        if is_prompt:
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                req_id = new_req_data.req_id
+                req_state = self.requests[req_id]
+                # Collect all mm_inputs for this request
+                for mm_input in req_state.mm_inputs:
+                    if mm_input is not None:
+                        multi_modal_kwargs_list.append(mm_input)
+
+        # Batch the multi-modal inputs
+        multi_modal_kwargs = MultiModalKwargs.batch(
+            multi_modal_kwargs_list) if multi_modal_kwargs_list else {}
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -371,7 +387,7 @@ class TTModelRunner:
             sampling_params_list=sampling_params_list,
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
-            multi_modal_kwargs={},  # Not yet supported in V1
+            multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None  # Not yet supported in V1
         )
 
@@ -468,6 +484,18 @@ class TTModelRunner:
         compat_sampling_used = False
         sampling_metadata = None
 
+        # Gather multi-modal inputs from all DP ranks
+        multi_modal_kwargs_list: list[MultiModalKwargs] = []
+        for mi in inputs:
+            if (mi is not None
+                    and isinstance(mi.multi_modal_kwargs, MultiModalKwargs)):
+                multi_modal_kwargs_list.append(
+                    MultiModalKwargs(mi.multi_modal_kwargs))
+
+        # Batch the multi-modal inputs across DP ranks
+        multi_modal_kwargs = MultiModalKwargs.batch(
+            multi_modal_kwargs_list) if multi_modal_kwargs_list else {}
+
         merged = TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -479,7 +507,7 @@ class TTModelRunner:
             sampling_params_list=sampling_params_list,
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
-            multi_modal_kwargs={},  # Not yet supported in V1
+            multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None  # Not yet supported in V1
         )
         return merged
@@ -543,11 +571,17 @@ class TTModelRunner:
         if not isinstance(sampling_params_per_dp, list):
             sampling_params_per_dp = [sampling_params_per_dp]
 
+        # Convert multi-modal kwargs to device tensors if present
+        mm_kwargs = {}
+        if model_input.multi_modal_kwargs:
+            mm_kwargs = MultiModalKwargs.as_kwargs(
+                model_input.multi_modal_kwargs, device="cpu")
+
         kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
             "kv_cache": self.kv_caches,
-            **(model_input.multi_modal_kwargs or {}),
+            **mm_kwargs,
         }
         if not is_decode:
             kwargs["prompt_lens"] = model_input.prompt_lens
