@@ -513,6 +513,8 @@ class TTModelRunner:
     ) -> ModelRunnerOutput:
         ''' Execution path for non-DP case.
             Execute the model with the given scheduler output.'''
+        # In the DP case, this function is skipped!
+        # tt_worker.py directly calls execute_with_model_input
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
