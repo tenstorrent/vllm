@@ -77,6 +77,9 @@ class TTModelRunner:
         # the scheduler output.
         self.requests: dict[str, CachedRequestState] = {}
 
+        # Cache the arange needed for unpacking structured output bitmask
+        self.structured_output_arange = torch.arange(0, 32)
+
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(vllm_config=self.vllm_config,
@@ -360,6 +363,13 @@ class TTModelRunner:
         compat_sampling_used = False
         sampling_metadata = None
 
+        # If we're not using structured outputs,
+        # structured_output_request_ids is an empty dict
+        # and grammar_bitmask is None
+        # We wrap in single-element lists to maintain consistent dtype for DP case
+        grammar_bitmask = [scheduler_output.grammar_bitmask]
+        structured_output_request_ids = [scheduler_output.structured_output_request_ids]
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -372,7 +382,9 @@ class TTModelRunner:
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs={},  # Not yet supported in V1
-            cross_block_tables=None  # Not yet supported in V1
+            cross_block_tables=None,  # Not yet supported in V1
+            grammar_bitmask=grammar_bitmask,
+            structured_output_request_ids=structured_output_request_ids,
         )
 
     def concat_model_inputs(
@@ -468,6 +480,19 @@ class TTModelRunner:
         compat_sampling_used = False
         sampling_metadata = None
 
+        # Concatenate structured output information from all DP ranks
+        # Each rank may have different structured output data
+        grammar_bitmask_list = []
+        structured_output_request_ids_list = []
+        for mi in inputs:
+            if mi is None:
+                grammar_bitmask_list.append(None)
+                structured_output_request_ids_list.append(None)
+            else:
+                # The attributes are single-element lists if we've not done the concatenation yet
+                grammar_bitmask_list.extend(mi.grammar_bitmask)
+                structured_output_request_ids_list.extend(mi.structured_output_request_ids)
+
         merged = TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -480,7 +505,9 @@ class TTModelRunner:
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs={},  # Not yet supported in V1
-            cross_block_tables=None  # Not yet supported in V1
+            cross_block_tables=None,  # Not yet supported in V1
+            grammar_bitmask=grammar_bitmask_list,
+            structured_output_request_ids=structured_output_request_ids_list,
         )
         return merged
 
@@ -515,6 +542,8 @@ class TTModelRunner:
             Execute the model with the given scheduler output.'''
         # In the DP case, this function is skipped!
         # tt_worker.py directly calls execute_with_model_input
+        # With DP, the actual model pass happens on a batch
+        # produced by concatenating the inputs from all DP ranks.
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
@@ -587,6 +616,9 @@ class TTModelRunner:
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
 
+        # The model input we got here may come from concatenating multiple DP ranks.
+        # We need to split the data back before sampling.
+
         sampled_token_ids_per_dp: list[list[list[int]]] = []
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
@@ -597,9 +629,25 @@ class TTModelRunner:
                     or (self.sample_on_device_mode == "decode_only"
                         and not is_decode)):
                 logits = tt_out[start:start + sz, -1, :]
+                
+                grammar_bitmask = model_input.grammar_bitmask[dp_rank]
+                structured_output_request_ids = model_input.structured_output_request_ids[dp_rank]
+                
+                if (grammar_bitmask is not None and 
+                    structured_output_request_ids is not None):
+                    self.apply_grammar_bitmask(
+                        logits, 
+                        grammar_bitmask, 
+                        structured_output_request_ids
+                    )
+                
                 next_token_ids = sample_tokens(logits,
                                                sampling_params_per_dp[dp_rank])
             else:
+                # NOTE: Device-side sampling currently doesn't support structured
+                # outputs. Grammar constraints are only applied during host-side
+                # sampling above. For full structured output support, consider
+                # disabling device-side sampling when using structured outputs.
                 next_token_ids = tt_out[start:start + sz]
             sampled_token_ids_per_dp.append([[int(t)] for t in next_token_ids])
 
@@ -611,6 +659,41 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp
+
+    def apply_grammar_bitmask(
+        self,
+        logits: torch.Tensor,
+        grammar_bitmask: torch.Tensor,
+        structured_output_request_ids: dict[str, int],
+    ) -> None:
+        """Apply structured output grammar constraints to logits in-place"""
+        if grammar_bitmask is None or structured_output_request_ids is None:
+            return
+
+        # The scheduler knows the mapping from req_id to the index in the scheduler batch
+        # but the persistent batch may have a different ordering of requests.
+
+        # Get a mapping from persistent batch index to scheduler batch (and bitmask) index for structured output requests
+        struct_output_scheduler_to_persistent: dict[int, int] = {}
+        for req_id, batch_index in self.input_batch.req_id_to_index.items():
+            if req_id in structured_output_request_ids:
+                struct_output_scheduler_to_persistent[batch_index] = structured_output_request_ids[req_id]
+
+        if not struct_output_scheduler_to_persistent:
+            return
+        
+        # The grammar bitmask is compressed as packed int32 values where each bit 
+        # represents one token. We need to unpack it like the TPU model runner.
+        # Create arange for bit positions within each int32 word
+
+        #TODO this is likely a quite inefficient way of doing it on host.
+
+        for scheduler_index, persistent_index in struct_output_scheduler_to_persistent.items():
+            unpacked_bitmask = (torch.bitwise_right_shift(
+                grammar_bitmask[scheduler_index][:, None], self.structured_decode_arange[None, :]) & 1) == 0
+            unpacked_bitmask = unpacked_bitmask.reshape(-1)[:logits.shape[-1]]
+            logits[persistent_index].masked_fill_(unpacked_bitmask, -float("inf"))
+
 
     def generate_runner_output(self, sampled_token_ids: list[list[int]]):
         # Cache the sampled tokens in the model runner, so that the scheduler
