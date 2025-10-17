@@ -573,9 +573,10 @@ def get_mesh_grid(dp_rank=0):
             "MESH_DEVICE must be set when running with data_parallel_size > 1")
         mesh_grid = (1, num_devices_available)
 
-    if dp_rank == 0 and mesh_grid[0] * mesh_grid[1] > num_devices_available:
-        assert (f"Requested mesh grid shape {mesh_grid} is larger than "
-                f"number of available devices {num_devices_available}")
+    assert dp_rank != 0 or (
+        mesh_grid[0] * mesh_grid[1] <= num_devices_available), (
+            f"Requested mesh grid shape {mesh_grid} is larger than "
+            f"number of available devices {num_devices_available}")
 
     return mesh_grid
 
