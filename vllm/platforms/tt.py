@@ -187,6 +187,6 @@ class TTPlatform(Platform):
                 or sampling_params.prompt_logprobs is not None
                 or sampling_params.logits_processors is not None
                 or sampling_params.truncate_prompt_tokens is not None
-                or sampling_params.guided_decoding is not None
+                or (sampling_params.guided_decoding is not None and not envs.VLLM_USE_V1)
                 or sampling_params.logit_bias is not None
                 or sampling_params.allowed_token_ids is not None)

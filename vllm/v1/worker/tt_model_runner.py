@@ -953,6 +953,8 @@ class TTModelRunner:
 
         if not struct_output_scheduler_to_persistent:
             return
+
+        grammar_bitmask = torch.from_numpy(grammar_bitmask)
         
         # The grammar bitmask is compressed as packed int32 values where each bit 
         # represents one token. We need to unpack it like the TPU model runner.
@@ -962,7 +964,7 @@ class TTModelRunner:
 
         for scheduler_index, persistent_index in struct_output_scheduler_to_persistent.items():
             unpacked_bitmask = (torch.bitwise_right_shift(
-                grammar_bitmask[scheduler_index][:, None], self.structured_decode_arange[None, :]) & 1) == 0
+                grammar_bitmask[scheduler_index][:, None], self.structured_output_arange[None, :]) & 1) == 0
             unpacked_bitmask = unpacked_bitmask.reshape(-1)[:logits.shape[-1]]
             logits[persistent_index].masked_fill_(unpacked_bitmask, -float("inf"))
 
