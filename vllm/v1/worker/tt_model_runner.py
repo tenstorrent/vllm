@@ -78,6 +78,9 @@ class TTModelRunner:
         # the scheduler output.
         self.requests: dict[str, CachedRequestState] = {}
 
+        # Cache the arange needed for unpacking structured output bitmask
+        self.structured_output_arange = torch.arange(0, 32)
+
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(vllm_config=self.vllm_config,
@@ -408,11 +411,19 @@ class TTModelRunner:
         compat_sampling_used = False
         sampling_metadata = None
 
+
         if self.model_config.is_multimodal_model and is_prompt:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
                 scheduler_output)
         else:
             multi_modal_kwargs = {}
+
+        # If we're not using structured outputs,
+        # structured_output_request_ids is an empty dict
+        # and grammar_bitmask is None
+        # We wrap in single-element lists to maintain consistent dtype for DP case
+        grammar_bitmask = [scheduler_output.grammar_bitmask]
+        structured_output_request_ids = [scheduler_output.structured_output_request_ids]
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -426,8 +437,134 @@ class TTModelRunner:
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
-            cross_block_tables=None  # Not yet supported in V1
+            cross_block_tables=None,  # Not yet supported in V1
+            grammar_bitmask=grammar_bitmask,
+            structured_output_request_ids=structured_output_request_ids,
         )
+
+    def concat_model_inputs(
+            self, inputs: list[Optional["TTModelInput"]]) -> "TTModelInput":
+        """
+        Concatenate a DP-sized list of TTModelInput (some may be None) into
+        a single TTModelInput. For None slots, uses zeros for input_tokens and
+        block_tables and -1 for input_positions.
+        """
+        assert inputs, "No inputs to concatenate"
+        active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
+        if not active_inputs:
+            raise ValueError("All inputs are None; nothing to concatenate")
+
+        batch_size_per_dp = [
+            mi.unpadded_batch_size if mi else 0 for mi in inputs
+        ]
+        if os.environ.get("DP_GATHER_DEBUG") == "1":
+            logger.info("batch_size_per_dp=%s", batch_size_per_dp)
+
+        sampling_params_per_dp = [
+            mi.tt_sampling_params if mi else None for mi in inputs
+        ]
+
+        is_decode = active_inputs[0].prompt_lens is None
+        for mi in active_inputs:
+            assert (
+                mi.prompt_lens
+                is None) == is_decode, "All inputs must be for the same mode"
+
+        if not is_decode:
+            # Determine max token width across slots.
+            max_tok_width = 0
+            for mi in active_inputs:
+                assert mi.input_tokens.dim() == 2, "Input tokens must be 2D"
+                max_tok_width = max(max_tok_width, mi.input_tokens.shape[1])
+            assert max_tok_width > 0, "At least one input must have tokens"
+
+        # For block tables, assume each slot is already padded to the max
+        # number of blocks, so we do not pad widths further.
+        max_bt_width = int(active_inputs[0].block_tables.shape[1])
+
+        # Iterate over DP inputs and build segments for concatenation.
+        toks_segments: list[torch.Tensor] = []  # input tokens
+        bt_segments: list[torch.Tensor] = []  # block tables
+        if is_decode:
+            pos_segments: list[torch.Tensor] = []  # input positions
+        else:
+            pl_segments: list[torch.Tensor] = []  # prompt lengths
+        for mi in inputs:
+            if mi is None:
+                # For decode, keep fixed stride by padding with max_batch.
+                # For prefill, skip None slots entirely (do not append rows).
+                if is_decode:
+                    max_batch = self.scheduler_config.max_num_seqs
+                    toks_segments.append(
+                        torch.zeros((max_batch, 1), dtype=torch.int32))
+                    bt_segments.append(
+                        torch.zeros((max_batch, max_bt_width),
+                                    dtype=torch.int32))
+                    pos_segments.append(
+                        torch.full((max_batch, ), -1, dtype=torch.int32))
+            else:
+                # Right-pad tokens and block tables to max widths across slots
+                toks = mi.input_tokens
+                if not is_decode and toks.shape[1] < max_tok_width:
+                    pad_w = max_tok_width - toks.shape[1]
+                    toks = torch.cat([
+                        toks,
+                        torch.zeros((toks.shape[0], pad_w), dtype=toks.dtype)
+                    ],
+                                     dim=1)
+                toks_segments.append(toks)
+                bt_segments.append(mi.block_tables)
+                if is_decode:
+                    pos_segments.append(mi.input_positions)
+                else:
+                    assert mi.prompt_lens is not None
+                    pl_segments.append(mi.prompt_lens)
+
+        input_tokens = torch.cat(toks_segments, dim=0)
+        block_tables = torch.cat(bt_segments, dim=0)
+        if is_decode:
+            input_positions = torch.cat(pos_segments, dim=0)
+            prompt_lens = None
+        else:
+            input_positions = 0
+            prompt_lens = np.concatenate(pl_segments, axis=0)
+
+        assert not TTPlatform.compat_sampling_possible, (
+            "Compatibility sampling is not yet supported in V1 TT backend")
+        sampling_params_list: list[Any] = []
+        compat_sampling_used = False
+        sampling_metadata = None
+
+        # Concatenate structured output information from all DP ranks
+        # Each rank may have different structured output data
+        grammar_bitmask_list = []
+        structured_output_request_ids_list = []
+        for mi in inputs:
+            if mi is None:
+                grammar_bitmask_list.append(None)
+                structured_output_request_ids_list.append(None)
+            else:
+                # The attributes are single-element lists if we've not done the concatenation yet
+                grammar_bitmask_list.extend(mi.grammar_bitmask)
+                structured_output_request_ids_list.extend(mi.structured_output_request_ids)
+
+        merged = TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=prompt_lens,
+            seq_groups=None,
+            block_tables=block_tables,
+            unpadded_batch_size=batch_size_per_dp,
+            tt_sampling_params=sampling_params_per_dp,
+            sampling_params_list=sampling_params_list,
+            compat_sampling_used=compat_sampling_used,
+            sampling_metadata=sampling_metadata,
+            multi_modal_kwargs={},  # Not yet supported in V1
+            cross_block_tables=None,  # Not yet supported in V1
+            grammar_bitmask=grammar_bitmask_list,
+            structured_output_request_ids=structured_output_request_ids_list,
+        )
+        return merged
 
     def build_model_input(
         self,
@@ -672,6 +809,8 @@ class TTModelRunner:
             Execute the model with the given scheduler output.'''
         # In the DP case, this function is skipped!
         # tt_worker.py directly calls execute_with_model_input
+        # With DP, the actual model pass happens on a batch
+        # produced by concatenating the inputs from all DP ranks.
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
@@ -748,7 +887,10 @@ class TTModelRunner:
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
 
+        # The model input we got here may come from concatenating multiple DP ranks.
+        # We need to split the data back before sampling.
         sampled_token_ids_per_dp: list[torch.Tensor] = []
+
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if sz <= 0:
@@ -759,9 +901,25 @@ class TTModelRunner:
                     or (self.sample_on_device_mode == "decode_only"
                         and not is_decode)):
                 logits = tt_out[start:start + sz, -1, :]
+                
+                grammar_bitmask = model_input.grammar_bitmask[dp_rank]
+                structured_output_request_ids = model_input.structured_output_request_ids[dp_rank]
+                
+                if (grammar_bitmask is not None and 
+                    structured_output_request_ids is not None):
+                    self.apply_grammar_bitmask(
+                        logits, 
+                        grammar_bitmask, 
+                        structured_output_request_ids
+                    )
+                
                 next_token_ids = sample_tokens(logits,
                                                sampling_params_per_dp[dp_rank])
             else:
+                # NOTE: Device-side sampling currently doesn't support structured
+                # outputs. Grammar constraints are only applied during host-side
+                # sampling above. For full structured output support, consider
+                # disabling device-side sampling when using structured outputs.
                 next_token_ids = tt_out[start:start + sz]
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
@@ -773,6 +931,41 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp
+
+    def apply_grammar_bitmask(
+        self,
+        logits: torch.Tensor,
+        grammar_bitmask: torch.Tensor,
+        structured_output_request_ids: dict[str, int],
+    ) -> None:
+        """Apply structured output grammar constraints to logits in-place"""
+        if grammar_bitmask is None or structured_output_request_ids is None:
+            return
+
+        # The scheduler knows the mapping from req_id to the index in the scheduler batch
+        # but the persistent batch may have a different ordering of requests.
+
+        # Get a mapping from persistent batch index to scheduler batch (and bitmask) index for structured output requests
+        struct_output_scheduler_to_persistent: dict[int, int] = {}
+        for req_id, batch_index in self.input_batch.req_id_to_index.items():
+            if req_id in structured_output_request_ids:
+                struct_output_scheduler_to_persistent[batch_index] = structured_output_request_ids[req_id]
+
+        if not struct_output_scheduler_to_persistent:
+            return
+        
+        # The grammar bitmask is compressed as packed int32 values where each bit 
+        # represents one token. We need to unpack it like the TPU model runner.
+        # Create arange for bit positions within each int32 word
+
+        #TODO this is likely a quite inefficient way of doing it on host.
+
+        for scheduler_index, persistent_index in struct_output_scheduler_to_persistent.items():
+            unpacked_bitmask = (torch.bitwise_right_shift(
+                grammar_bitmask[scheduler_index][:, None], self.structured_decode_arange[None, :]) & 1) == 0
+            unpacked_bitmask = unpacked_bitmask.reshape(-1)[:logits.shape[-1]]
+            logits[persistent_index].masked_fill_(unpacked_bitmask, -float("inf"))
+
 
     def generate_runner_output(self, sampled_token_ids: torch.Tensor):
         # Cache the sampled tokens in the model runner, so that the scheduler
