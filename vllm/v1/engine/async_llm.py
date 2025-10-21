@@ -36,7 +36,7 @@ from vllm.v1.engine.output_processor import (OutputProcessor,
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
+from vllm.v1.metrics.loggers import GlobalStatLogger, StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
@@ -50,6 +50,8 @@ class AsyncLLM(EngineClient):
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        log_global_stats: bool = False,  # if True and log_stats is True, 
+        # log with GlobalStatLogger instead
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
@@ -123,11 +125,14 @@ class AsyncLLM(EngineClient):
         # Loggers.
         self.logger_manager: Optional[StatLoggerManager] = None
         if self.log_stats:
-            self.logger_manager = StatLoggerManager(
-                vllm_config=vllm_config,
-                engine_idxs=self.engine_core.engine_ranks,
-                custom_stat_loggers=stat_loggers,
-            )
+            if log_global_stats:
+                self.logger_manager = GlobalStatLogger(vllm_config)
+            else:
+                self.logger_manager = StatLoggerManager(
+                    vllm_config=vllm_config,
+                    engine_idxs=self.engine_core.engine_ranks,
+                    custom_stat_loggers=stat_loggers,
+                )
             self.logger_manager.log_engine_initialized()
 
         self.output_handler: Optional[asyncio.Task] = None
@@ -147,6 +152,7 @@ class AsyncLLM(EngineClient):
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         disable_log_requests: bool = False,
         disable_log_stats: bool = False,
+        log_global_stats: bool = False,
         client_addresses: Optional[dict[str, str]] = None,
         client_index: int = 0,
     ) -> "AsyncLLM":
@@ -165,6 +171,7 @@ class AsyncLLM(EngineClient):
             stat_loggers=stat_loggers,
             log_requests=not disable_log_requests,
             log_stats=not disable_log_stats,
+            log_global_stats=log_global_stats,
             usage_context=usage_context,
             client_addresses=client_addresses,
             client_index=client_index,
@@ -190,6 +197,7 @@ class AsyncLLM(EngineClient):
             executor_class=executor_class,
             log_requests=not engine_args.disable_log_requests,
             log_stats=not engine_args.disable_log_stats,
+            log_global_stats=engine_args.log_global_stats,
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
@@ -414,6 +422,14 @@ class AsyncLLM(EngineClient):
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
                         )
+                        # logger_manager.log_out()
+                        # logger.info(f"has unfinished requests: {output_processor.has_unfinished_requests()}")
+                        
+                        if (isinstance(logger_manager, GlobalStatLogger)
+                                and not output_processor.has_unfinished_requests()):
+                            logger_manager.log_out()
+                            logger_manager.reset()
+                        
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

@@ -196,6 +196,7 @@ async def build_async_engine_client_from_engine_args(
                 usage_context=usage_context,
                 disable_log_requests=engine_args.disable_log_requests,
                 disable_log_stats=engine_args.disable_log_stats,
+                log_global_stats=engine_args.log_global_stats,
                 client_addresses=client_config,
                 client_index=client_index)
 

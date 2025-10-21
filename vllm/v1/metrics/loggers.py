@@ -93,6 +93,8 @@ class GlobalStatLogger(StatLoggerBase):
         def avg_list(list):
             return sum(list) / len(list)
 
+        if iteration_stats is None:
+            return
         assert isinstance(iteration_stats, IterationStats)
         batch_ttfts = iteration_stats.time_to_first_tokens_iter
         N_ttfts = len(batch_ttfts)
