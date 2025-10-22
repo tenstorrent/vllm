@@ -454,6 +454,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         num_tt_blocks = int(num_tt_blocks * 1.01)
 
     # round to nearest multiple of 2
+    # needed because of https://github.com/tenstorrent/tt-metal/issues/30979
     return (num_tt_blocks // 2) * 2
 
 
