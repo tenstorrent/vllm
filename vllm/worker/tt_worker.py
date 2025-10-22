@@ -451,8 +451,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     if not envs.VLLM_USE_V1:
         # Add 1% to account for vLLM's watermark_blocks
-        num_tt_blocks = (int(num_tt_blocks * 1.01)//2) * 2
-    return num_tt_blocks
+        num_tt_blocks = int(num_tt_blocks * 1.01)
+    
+    # round to nearest multiple of 2
+    return (num_tt_blocks//2)*2
 
 
 # TT-NN utilities, also used by V1 TTWorker
