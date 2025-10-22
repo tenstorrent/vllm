@@ -27,7 +27,8 @@ class TTModelLoader(BaseModelLoader):
         if optimizations is not None:
             assert optimizations in [
                 "performance", "accuracy"
-            ], "Invalid optimizations configuration, allowed values are 'performance' or 'accuracy'"
+            ], f"""Invalid optimizations configuration `{optimizations}`, 
+            allowed values are 'performance' or 'accuracy'"""
 
         # Model receives max_batch_size as batch_size_per_dp * dp_size
         if envs.VLLM_USE_V1:
