@@ -33,9 +33,9 @@ class TTSamplingParams:
     """
     Used by TTModelInput.
     """
-    temperature: float
-    top_k: int
-    top_p: float
+    temperature: Union[float, list[float]]
+    top_k: Union[int, list[int]]
+    top_p: Union[float, list[float]]
 
 
 @dataclass(frozen=True)
@@ -48,8 +48,9 @@ class TTModelInput(ModelRunnerInputBase):
     prompt_lens: Optional[List[int]]
     seq_groups: List[int]
     block_tables: torch.Tensor
-    unpadded_batch_size: int
-    tt_sampling_params: Optional[TTSamplingParams]
+    unpadded_batch_size: Union[int, List[int]]  # List is used for DP in V1
+    tt_sampling_params: Union[Optional[TTSamplingParams], List[
+        Optional[TTSamplingParams]]]  # List is used for DP in V1
     sampling_params_list: Optional[List[Any]]
     compat_sampling_used: bool
     sampling_metadata: Optional["SamplingMetadata"]
@@ -208,8 +209,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # TODO: Extend this to support other DP models
 
         if ("Llama" in self.model_config.model
-                and "70B" in self.model_config.model and
-                self.device_config.device.get_num_devices() == 32) or is_dp:
+                and "70B" in self.model_config.model
+                and self.device_config.num_devices == 32) or is_dp:
             self.dp_kv_cache = True
         else:
             self.dp_kv_cache = False
@@ -370,9 +371,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             sampling_params = seq_group_metadata.sampling_params
             if compat_sampling_used:
                 sampling_params_list.append(sampling_params)
+            elif TTPlatform.non_greedy_decoding_on_device:
+                # non-uniform sampling
+
+                # initializing an empty list for each value on first iter
+                # fill values after first iter
+                for key in ["temperature", "top_k", "top_p"]:
+                    top_pk_sampling_params.setdefault(key, []).append(
+                        getattr(sampling_params, key))
             else:
-                # TODO: Add support for different sampling
-                # params in the same batch
+                # uniform sampling
                 if len(top_pk_sampling_params) == 0:
                     top_pk_sampling_params[
                         "temperature"] = sampling_params.temperature
@@ -808,6 +816,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs[
                 "cross_page_table"] = model_input.cross_block_tables
 
+        assert isinstance(model_input.unpadded_batch_size,
+                          int), ("unpadded_batch_size must be an int")
+
         if not is_decode:
             if self.dp_kv_cache:
                 slots_to_allocate = self.empty_slots[:model_input.
@@ -993,6 +1004,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # unpadded batch, vocab of last token
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
                 assert model_input.tt_sampling_params is not None
+                assert isinstance(
+                    model_input.tt_sampling_params, TTSamplingParams), (
+                        "tt_sampling_params must be a TTSamplingParams")
                 next_token_ids = sample_tokens(next_logits,
                                                model_input.tt_sampling_params)
             else:  # sample on device

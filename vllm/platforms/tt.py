@@ -127,10 +127,10 @@ class TTPlatform(Platform):
         # based on model implementation, and update platform
         model_class, _ = get_model_architecture(vllm_config.model_config)
         # TODO: this should come from the class itself as an attribute
-        cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
+        cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
         if model_class.__module__.startswith(
-                "models.tt_transformers.tt.generator_vllm"):
-            cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
+                "models.demos.llama3_70b_galaxy.tt.generator_vllm"):
+            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
@@ -155,6 +155,12 @@ class TTPlatform(Platform):
     def is_pin_memory_available(cls) -> bool:
         # The sampling code tries to use pinned memory in case we're using GPUs.
         return False
+
+    # Require DP ranks to gather batches to a single driver
+    # before executing (used by core.py to gate DP-gather behavior).
+    @classmethod
+    def requires_gathered_batch_dp(cls) -> bool:
+        return True
 
     @classmethod
     def validate_request(
