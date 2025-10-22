@@ -565,7 +565,7 @@ def open_mesh_device(override_tt_config, trace_mode):
     mesh_device_env = os.environ.get("MESH_DEVICE")
     if mesh_device_env is not None:
         if isinstance(eval(mesh_device_env), tuple):
-            logger.debug(f"MESH_DEVICE is a tuple: {mesh_device_env}")
+            logger.debug("MESH_DEVICE is a tuple", mesh_device_env)
             mesh_grid = eval(mesh_device_env)
         else:
             assert mesh_device_env in mesh_grid_dict, (
