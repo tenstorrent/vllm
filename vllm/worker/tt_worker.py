@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
 import dataclasses
 import math
 import os
@@ -570,10 +571,16 @@ def get_mesh_grid(dp_rank=0):
     }
     mesh_device_env = os.environ.get("MESH_DEVICE")
     if mesh_device_env is not None:
-        if isinstance(eval(mesh_device_env), tuple):
-            logger.debug("MESH_DEVICE is a tuple", mesh_device_env)
-            mesh_grid = eval(mesh_device_env)
-        else:
+        try:
+            # Try to parse as a literal tuple first
+            parsed_value = ast.literal_eval(mesh_device_env)
+            if isinstance(parsed_value, tuple) and len(parsed_value) == 2:
+                logger.debug("MESH_DEVICE is a tuple", mesh_device_env)
+                mesh_grid = parsed_value
+            else:
+                raise ValueError("Not a valid tuple")
+        except (ValueError, SyntaxError):
+            # If parsing fails, treat as a string key for mesh_grid_dict
             assert mesh_device_env in mesh_grid_dict, (
                 f"Invalid MESH_DEVICE: {mesh_device_env}")
             mesh_grid = mesh_grid_dict[mesh_device_env]
