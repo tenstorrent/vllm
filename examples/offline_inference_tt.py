@@ -260,6 +260,7 @@ def check_tt_model_supported(model):
         "mistralai/Mistral-7B-Instruct-v0.3",
         "google/gemma-3-4b-it",
         "google/gemma-3-27b-it",
+        "zai-org/GLM-4.5-Air"
     ]
     assert model in supported_models, f"Invalid model: {model}"
 

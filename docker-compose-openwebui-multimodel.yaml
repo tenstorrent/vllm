@@ -1,0 +1,34 @@
+# Docker Compose configuration for Open WebUI with Multiple vLLM Servers
+# This setup allows Open WebUI to access multiple models running on different ports
+# Based on official vLLM documentation: https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui.html
+
+version: '3.8'
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui-vllm-multi
+    ports:
+      - "3000:8080"
+    environment:
+      # Connect to multiple vLLM servers (semicolon-separated)
+      # Format: "http://host:port1/v1;http://host:port2/v1;http://host:port3/v1"
+      - OPENAI_API_BASE_URLS=http://host.docker.internal:8000/v1;http://host.docker.internal:8001/v1;http://host.docker.internal:8002/v1
+      
+      # Optional: Provide names for each API endpoint (must match the number of URLs)
+      # - OPENAI_API_NAMES=Llama-1B;Llama-3B;Llama-8B
+      
+      # Disable authentication - no login required
+      - WEBUI_AUTH=False
+      - ENABLE_SIGNUP=False
+      
+    volumes:
+      - open-webui-multimodel:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+volumes:
+  open-webui-multimodel:
+    driver: local
+

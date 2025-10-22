@@ -1,0 +1,56 @@
+# Docker Compose configuration for both vLLM and Open WebUI
+# This runs both containers on the same network for easy communication
+
+version: '3.8'
+
+services:
+  # vLLM Server (this is a template - adjust for your actual vLLM setup)
+  vllm-server:
+    image: your-vllm-image:latest  # Replace with your actual vLLM image
+    container_name: vllm-server
+    ports:
+      - "8000:8000"
+    environment:
+      - MESH_DEVICE=N150
+    # Add your vLLM specific configuration here
+    # volumes:
+    #   - /workspace/tt-metal-apv:/tt-metal
+    #   - /workspace/tt-vllm:/vllm
+    # command: python examples/server_example_tt.py --model meta-llama/Llama-3.2-1B
+    restart: unless-stopped
+    networks:
+      - vllm-network
+
+  # Open WebUI
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui-vllm
+    ports:
+      - "3000:8080"
+    environment:
+      # Connect to vLLM using service name
+      - OPENAI_API_BASE_URL=http://vllm-server:8000/v1
+      
+      # Disable authentication - no login required
+      - WEBUI_AUTH=False
+      - ENABLE_SIGNUP=False
+      
+      # Optional: Set default model
+      - DEFAULT_MODELS=meta-llama/Llama-3.2-1B
+      
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - vllm-server
+    restart: always
+    networks:
+      - vllm-network
+
+networks:
+  vllm-network:
+    driver: bridge
+
+volumes:
+  open-webui-data:
+    driver: local
+

@@ -1,0 +1,33 @@
+# Docker Compose configuration for Open WebUI with vLLM
+# Based on official vLLM documentation: https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui.html
+# Modified to disable authentication (no login required)
+
+version: '3.8'
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui-vllm
+    ports:
+      - "3000:8080"
+    environment:
+      # Connect to vLLM server (as per official docs)
+      - OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1
+      
+      # Disable authentication - no login required
+      - WEBUI_AUTH=False
+      - ENABLE_SIGNUP=False
+      
+      # Optional: Set default model
+      - DEFAULT_MODELS=meta-llama/Llama-3.2-1B
+      
+    volumes:
+      - open-webui-data:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+volumes:
+  open-webui-data:
+    driver: local
+
