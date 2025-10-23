@@ -898,7 +898,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                      unpadded_batch_size]
                 execute_model_kwargs["empty_slots"] = slots_to_allocate
 
-            outputs = self.model.prefill_forward(**execute_model_kwargs)
+            outputs = self.model.prefill_forward(**execute_model_kwargs, enable_trace=self.trace_mode)
 
             if self.dp_kv_cache:
                 # update the batch slot table
