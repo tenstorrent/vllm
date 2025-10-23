@@ -182,6 +182,48 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
     return inputs
 
 
+def check_tt_model_supported(model):
+    supported_models = [
+        "meta-llama/Llama-3.1-70B",
+        "meta-llama/Llama-3.1-70B-Instruct",
+        "meta-llama/Llama-3.1-8B",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.2-1B",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.2-3B",
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "meta-llama/Llama-3.2-11B-Vision",
+        "meta-llama/Llama-3.2-11B-Vision-Instruct",
+        "meta-llama/Llama-3.2-90B-Vision-Instruct",
+        "meta-llama/Llama-3.3-70B",
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "humain-ai/ALLaM-7B-Instruct-preview",
+        "Qwen/Qwen2.5-7B",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-14B",
+        "Qwen/Qwen2.5-14B-Instruct",
+        "Qwen/Qwen2.5-32B",
+        "Qwen/Qwen2.5-32B-Instruct",
+        "Qwen/Qwen2.5-Coder-32B",
+        "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "Qwen/Qwen2.5-72B",
+        "Qwen/Qwen2.5-72B-Instruct",
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        "Qwen/Qwen2.5-VL-32B-Instruct",
+        "Qwen/Qwen2.5-VL-72B-Instruct",
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-14B",
+        "Qwen/Qwen3-32B",
+        "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+        "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "google/gemma-3-4b-it",
+        "google/gemma-3-27b-it",
+    ]
+    assert model in supported_models, f"Invalid model: {model}"
 def run_seq_len_tests(engine_kw_args, sampling_params):
     """
     Test generation of a few simple counting prompts
