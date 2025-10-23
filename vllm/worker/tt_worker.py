@@ -429,6 +429,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
           and is_wormhole):
         # Qwen2.5-VL-72B on WH T3K
         max_tokens_all_users = 65536
+    elif ("ALLaM-7B-Instruct-preview" in model_config.model and is_wormhole):
+        # ALLaM-7B-Instruct-preview supports max context lenght of 4096
+        max_tokens_all_users = 4096 
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
