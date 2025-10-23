@@ -607,7 +607,7 @@ class TTModelRunner:
 
         # Execute model
         if not is_decode:
-            tt_out = self.model.prefill_forward(**kwargs)
+            tt_out = self.model.prefill_forward(**kwargs, enable_trace=self.trace_mode)
         else:
             # TODO: Add encoder-decoder support
             enc_dec_kwargs: dict[str, Any] = {}
