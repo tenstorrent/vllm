@@ -49,6 +49,7 @@ class TTModelInput(ModelRunnerInputBase):
     seq_groups: List[int]
     block_tables: torch.Tensor
     unpadded_batch_size: Union[int, List[int]]  # List is used for DP in V1
+    perform_device_sampling: bool
     tt_sampling_params: Union[Optional[TTSamplingParams], List[
         Optional[TTSamplingParams]]]  # List is used for DP in V1
     sampling_params_list: Optional[List[Any]]
@@ -69,6 +70,7 @@ class TTModelInput(ModelRunnerInputBase):
             "seq_groups": self.seq_groups,
             "block_tables": self.block_tables,
             "unpadded_batch_size": self.unpadded_batch_size,
+            "perform_device_sampling": self.perform_device_sampling,
             "tt_sampling_params": self.tt_sampling_params,
             "sampling_params_list": self.sampling_params_list,
             "compat_sampling_used": self.compat_sampling_used,
@@ -215,16 +217,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.dp_kv_cache = False
 
-        self.async_torch_proc = self.sample_on_device_mode is not None
+        self.may_sample_on_device = self.sample_on_device_mode is not None
 
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            if self.async_torch_proc:
-                self.cached_read_events: List[List[Any]] = [
-                ]  # Only used for multi-step execution
+            if self.may_sample_on_device:
+                self.cached_read_events: List[List[Any]] = []
                 self.perm_table_tensor: List[torch.Tensor] = []
 
     def get_model(self) -> nn.Module:
@@ -317,6 +318,21 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampling_params = seq_group_metadata.sampling_params
                 if TTPlatform.compat_sampling_required(sampling_params):
                     compat_sampling_used = True
+                    break
+
+
+        # If we are using device sampling, we are also deferring the move to torch
+        perform_device_sampling = False
+        if self.sample_on_device_mode == "all" or (self.sample_on_device_mode == "decode_only" and not is_prompt):
+            perform_device_sampling = True
+        elif self.sample_on_device_mode == "when_able":
+            # only sample on device if all sequences in batch can be sampled on device
+            perform_device_sampling = True
+            for seq_group_metadata in seq_group_metadata_list:
+                sampling_params = seq_group_metadata.sampling_params
+                # this covers the case of compat sampling enabled
+                if not TTPlatform.can_sample_on_device(sampling_params):
+                    perform_device_sampling = False
                     break
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -608,6 +624,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             seq_groups=seq_groups_list,
                             block_tables=block_tables,
                             unpadded_batch_size=unpadded_batch_size,
+                            perform_device_sampling=perform_device_sampling,
                             tt_sampling_params=tt_sampling_params,
                             sampling_params_list=sampling_params_list,
                             compat_sampling_used=compat_sampling_used,
@@ -639,7 +656,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.is_first_multi_step:
             # This is a queue of torch tensor with step outputs
             # - full sampler outputs for compat mode,
-            # ttnn tensors in flight for async_torch_proc,
+            # ttnn tensors in flight for device sampling,
             # or torch tensors otherwise.
             # If we do async output processing,
             # the queue is consumed by _send_prev_step_async_out,
@@ -655,11 +672,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     is_decode,
                     use_async_out_proc,
                     step_idx=i)
-                if is_decode and self.async_torch_proc:
+                if model_input.perform_device_sampling:
                     next_token_ids, read_event = next_token_ids
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
-                if (i < num_steps - 1 and not self.sample_on_device_mode):
+                if (i < num_steps - 1 and not model_input.perform_device_sampling):
+                    # Prepare next step input when not sampling on device
+                    # this is always decode, because prefill is always single-step
                     if model_input.compat_sampling_used:
                         # For now, this will only get called
                         # if we explicitly enable compat sampling
@@ -714,7 +733,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     sampler_output = self.cached_step_outputs.pop(0)
                 else:
                     next_token_ids = self.cached_step_outputs.pop(0)
-                    if is_decode and self.async_torch_proc:
+                    if model_input.perform_device_sampling:
                         next_token_ids = self._complete_torch_async_proc(
                             next_token_ids)
                     # TODO: sync read back from device
@@ -729,8 +748,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         read_events = self.cached_read_events.pop(0)
         for event in read_events:
             ttnn.event_synchronize(event)
+        # always tokens because we only do async when sampling on device
         next_token_ids = self.model.process_decode_output_host(
-            next_token_ids, is_tokens=(self.sample_on_device_mode is not None))
+            next_token_ids, is_tokens=True)
         if self.dp_kv_cache:
             # permute the tt_out
             next_token_ids = next_token_ids[self.perm_table_tensor.pop(0)]
@@ -775,7 +795,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = step_output
             else:
                 next_token_ids = step_output
-                if self.async_torch_proc:
+                if self.perform_device_sampling:
                     next_token_ids = self._complete_torch_async_proc(
                         next_token_ids)
                 # TODO: sync read back from device
@@ -807,8 +827,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
 
-        if self.sample_on_device_mode == "all" or (
-                self.sample_on_device_mode == "decode_only" and is_decode):
+        if model_input.perform_device_sampling:
             execute_model_kwargs[
                 "sampling_params"] = model_input.tt_sampling_params
 
@@ -934,7 +953,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     active_slots + self.empty_slots,
                     dtype=torch.long,
                 )
-                if self.async_torch_proc:
+                if self.perform_device_sampling:
                     self.perm_table_tensor.append(perm_table_tensor)
 
                 # Calculate inverse_perm_indices:
@@ -961,7 +980,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # trigger output processor on host while device is executing
                 # next step
                 self._send_prev_step_async_out(model_input, step_idx)
-            if self.async_torch_proc:
+            if self.perform_device_sampling:
                 tt_out, read_event = self.model.read_decode_output(
                     tt_out, async_read=True)
             else:
@@ -969,9 +988,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = self.model.read_decode_output(tt_out)
                 # outputs torch tensor
                 tt_out = self.model.process_decode_output_host(
-                    tt_out, is_tokens=(self.sample_on_device_mode is not None))
-            if self.dp_kv_cache and not self.async_torch_proc:
-                tt_out = tt_out[perm_table_tensor]
+                    tt_out, is_tokens=False)
+                if self.dp_kv_cache:
+                    tt_out = tt_out[perm_table_tensor]
 
         if model_input.compat_sampling_used:
             tt_logits = tt_out[:model_input.unpadded_batch_size,
@@ -993,9 +1012,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             return sampler_output
         else:
-            if not self.sample_on_device_mode or (self.sample_on_device_mode
-                                                  == "decode_only"
-                                                  and not is_decode):
+            if not model_input.perform_device_sampling:
                 # unpadded batch, vocab of last token
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
                 assert model_input.tt_sampling_params is not None
@@ -1005,12 +1022,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 next_token_ids = sample_tokens(next_logits,
                                                model_input.tt_sampling_params)
             else:  # sample on device
-                if self.async_torch_proc:
+                if self.perform_device_sampling:
                     # do not slice as this may be mid-transfer to host
                     next_token_ids = tt_out
                 else:
                     next_token_ids = tt_out[:model_input.unpadded_batch_size]
-            if is_decode and self.async_torch_proc:
+            if self.perform_device_sampling:
                 # async torch proc only works in decode
                 return tt_out, read_event
             else:

@@ -78,7 +78,7 @@ class TTPlatform(Platform):
                 and "sample_on_device_mode" in override_tt_config):
             sample_on_device_mode = override_tt_config["sample_on_device_mode"]
             assert sample_on_device_mode in [
-                "all", "decode_only"
+                "all", "decode_only", "when_able"
             ], f"Invalid sample_on_device_mode: {sample_on_device_mode}"
         else:
             sample_on_device_mode = None
@@ -90,7 +90,7 @@ class TTPlatform(Platform):
         # or if any of the requests in the batch require it.
         # For now, it is only supported with host-side sampling.
         cls.compat_sampling_possible = (  # type: ignore[attr-defined]
-            sample_on_device_mode is None)
+            sample_on_device_mode is None or sample_on_device_mode == "when_able")
 
         if cls.compat_sampling_possible and envs.VLLM_USE_V1:  # type: ignore[attr-defined]
             cls.compat_sampling_possible = False  # type: ignore[attr-defined]
@@ -149,7 +149,7 @@ class TTPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
-        # The sampling code tries to use pinned memory in case we're using GPUs.
+        # The regular v0 vLLM sampling code tries to use pinned memory in case we're using GPUs.
         return False
 
     # Require DP ranks to gather batches to a single driver
@@ -185,15 +185,34 @@ class TTPlatform(Platform):
                     "Sampling params beyond temperature, "
                     "top_k, top_p require compatibility sampling mode"
                     " which is only available with"
-                    "sample_on_device_mode=None. "
+                    "sample_on_device_mode None or 'when_able'. "
                     f"Supplied params: {params}")
+
+
             sample_mode = cls.sample_on_device_mode  # type: ignore[attr-defined]
             non_greedy = cls.non_greedy_decoding_on_device  # type: ignore[attr-defined]
-            if (params.temperature > 0.0 and sample_mode is not None
+            if (params.temperature > 0.0 and sample_mode in ["all", "decode_only"]
                     and not non_greedy):
                 raise ValueError(
                     "Non-greedy decoding on-device is not supported by this "
                     f"model implementation. Supplied params: {params}")
+    
+    @classmethod
+    def can_sample_on_device(cls, sampling_params: SamplingParams) -> bool:
+        if cls.always_compat_sampling:
+            # this covers the case when compat sampling is not required, but used
+            return False
+        compat_sampling_required = TTPlatform.compat_sampling_required(sampling_params)
+        if compat_sampling_required:
+            # if even tt host sampling can't handle it, then device sampling can't either
+            return False
+        if sampling_params.temperature == 0.0:
+            # simple greedy is always supported on device
+            #NB: top-k and top-p don't matter if temperature==0, so we don't check them
+            return True
+        # This means we are doing at most top-k top-p sampling
+        # we assume if non-greedy is supported, then top-k and top-p are also supported
+        return cls.non_greedy_decoding_on_device
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
