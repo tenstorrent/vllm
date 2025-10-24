@@ -423,7 +423,17 @@ class TTModelRunner:
         # and grammar_bitmask is None
         # We wrap in single-element lists to maintain consistent dtype for DP case
         grammar_bitmask = [scheduler_output.grammar_bitmask]
-        structured_output_request_ids = [scheduler_output.structured_output_request_ids]
+        # Get a mapping from scheduler batch (and bitmask) index to persistent batch index f
+        # or structured output requests within a given DP rank
+        # Do this now, because later we lose access to other ranks' self.input_batch
+        structured_output_request_ids = scheduler_output.structured_output_request_ids
+        struct_output_scheduler_to_persistent: dict[int, int] = {}
+        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items():
+            if req_id in structured_output_request_ids:
+                scheduler_batch_index = structured_output_request_ids[req_id]
+                struct_output_scheduler_to_persistent[scheduler_batch_index] = persistent_batch_index
+        struct_output_scheduler_to_persistent = [struct_output_scheduler_to_persistent]
+        
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -439,7 +449,7 @@ class TTModelRunner:
             multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask,
-            structured_output_request_ids=structured_output_request_ids,
+            structured_output_scheduler_to_persistent=struct_output_scheduler_to_persistent,
         )
 
     def concat_model_inputs(
@@ -538,15 +548,15 @@ class TTModelRunner:
         # Concatenate structured output information from all DP ranks
         # Each rank may have different structured output data
         grammar_bitmask_list = []
-        structured_output_request_ids_list = []
+        struct_output_scheduler_to_persistent_list = []
         for mi in inputs:
             if mi is None:
                 grammar_bitmask_list.append(None)
-                structured_output_request_ids_list.append(None)
+                struct_output_scheduler_to_persistent_list.append(None)
             else:
                 # The attributes are single-element lists if we've not done the concatenation yet
                 grammar_bitmask_list.extend(mi.grammar_bitmask)
-                structured_output_request_ids_list.extend(mi.structured_output_request_ids)
+                struct_output_scheduler_to_persistent_list.extend(mi.structured_output_scheduler_to_persistent)
 
         merged = TTModelInput(
             input_tokens=input_tokens,
@@ -562,7 +572,7 @@ class TTModelRunner:
             multi_modal_kwargs={},  # Not yet supported in V1
             cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask_list,
-            structured_output_request_ids=structured_output_request_ids_list,
+            struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent_list,
         )
         return merged
 
@@ -903,14 +913,14 @@ class TTModelRunner:
                 logits = tt_out[start:start + sz, -1, :]
                 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
-                structured_output_request_ids = model_input.structured_output_request_ids[dp_rank]
+                struct_output_scheduler_to_persistent = model_input.structured_output_scheduler_to_persistent[dp_rank]
                 
                 if (grammar_bitmask is not None and 
-                    structured_output_request_ids is not None):
+                    struct_output_scheduler_to_persistent):
                     self.apply_grammar_bitmask(
                         logits, 
                         grammar_bitmask, 
-                        structured_output_request_ids
+                        struct_output_scheduler_to_persistent
                     )
                 
                 next_token_ids = sample_tokens(logits,
@@ -936,22 +946,10 @@ class TTModelRunner:
         self,
         logits: torch.Tensor,
         grammar_bitmask: torch.Tensor,
-        structured_output_request_ids: dict[str, int],
+        struct_output_scheduler_to_persistent: dict[int, int],
     ) -> None:
         """Apply structured output grammar constraints to logits in-place"""
-        if grammar_bitmask is None or structured_output_request_ids is None:
-            return
-
-        # The scheduler knows the mapping from req_id to the index in the scheduler batch
-        # but the persistent batch may have a different ordering of requests.
-
-        # Get a mapping from persistent batch index to scheduler batch (and bitmask) index for structured output requests
-        struct_output_scheduler_to_persistent: dict[int, int] = {}
-        for req_id, batch_index in self.input_batch.req_id_to_index.items():
-            if req_id in structured_output_request_ids:
-                struct_output_scheduler_to_persistent[batch_index] = structured_output_request_ids[req_id]
-
-        if not struct_output_scheduler_to_persistent:
+        if grammar_bitmask is None or not struct_output_scheduler_to_persistent:
             return
 
         grammar_bitmask = torch.from_numpy(grammar_bitmask)

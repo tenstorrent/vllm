@@ -62,7 +62,7 @@ class TTModelInput(ModelRunnerInputBase):
     # V1 structured output support (backward compatible with default None)
     # Always lists: single-element for non-DP, multi-element for DP
     grammar_bitmask: Optional[List[Optional[torch.Tensor]]] = None
-    structured_output_request_ids: Optional[List[Optional[Dict[str, int]]]] = None
+    struct_output_scheduler_to_persistent: [List[Optional[Dict[int, int]]]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -82,7 +82,7 @@ class TTModelInput(ModelRunnerInputBase):
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
             "grammar_bitmask": self.grammar_bitmask,
-            "structured_output_request_ids": self.structured_output_request_ids,
+            "struct_output_scheduler_to_persistent": self.struct_output_scheduler_to_persistent,
         }
 
         return tensor_dict
