@@ -449,7 +449,7 @@ class TTModelRunner:
             multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask,
-            structured_output_scheduler_to_persistent=struct_output_scheduler_to_persistent,
+            struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent,
         )
 
     def concat_model_inputs(
@@ -556,7 +556,7 @@ class TTModelRunner:
             else:
                 # The attributes are single-element lists if we've not done the concatenation yet
                 grammar_bitmask_list.extend(mi.grammar_bitmask)
-                struct_output_scheduler_to_persistent_list.extend(mi.structured_output_scheduler_to_persistent)
+                struct_output_scheduler_to_persistent_list.extend(mi.struct_output_scheduler_to_persistent)
 
         merged = TTModelInput(
             input_tokens=input_tokens,
@@ -888,7 +888,7 @@ class TTModelRunner:
 
         # Execute model
         if not is_decode:
-            tt_out = self.model.prefill_forward(**kwargs, enable_trace=self.trace_mode)
+            tt_out = self.model.prefill_forward(**kwargs)
         else:
             # TODO: Add encoder-decoder support
             enc_dec_kwargs: dict[str, Any] = {}
@@ -913,7 +913,7 @@ class TTModelRunner:
                 logits = tt_out[start:start + sz, -1, :]
                 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
-                struct_output_scheduler_to_persistent = model_input.structured_output_scheduler_to_persistent[dp_rank]
+                struct_output_scheduler_to_persistent = model_input.struct_output_scheduler_to_persistent[dp_rank]
                 
                 if (grammar_bitmask is not None and 
                     struct_output_scheduler_to_persistent):
