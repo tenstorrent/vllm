@@ -283,7 +283,7 @@ class TTModelRunner:
     def _gather_multi_modal_inputs(self, scheduler_output) -> dict:
         """
         Gather and batch multi-modal inputs from scheduled requests.
-        #TODO: Currently only supports image inputs "pixel_values" parameter.
+        #TODO: Currently only supports image inputs in the "pixel_values" field.
 
         Creates a list of pixel values for each request.
         Example:

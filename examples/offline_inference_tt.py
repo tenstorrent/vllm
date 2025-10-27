@@ -177,10 +177,17 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
         ],
     ]
 
+    content = []
+    if "Qwen2.5-VL" in model:
+        # [INFO] Qwen-VL currently does not support a mixture of
+        # text-image and text-only inputs
+        content += single_image_prompts_content
+    else:
+        content += text_prompts_content + single_image_prompts_content
+        if multi_image:
+            content += multi_image_prompts_content
+
     prompts = []
-    content = text_prompts_content + single_image_prompts_content
-    if multi_image:
-        content += multi_image_prompts_content
     for c in content:
         prompts.append([{"role": "user", "content": c}])
 
