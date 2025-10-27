@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import suppress
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
+
+import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -163,22 +165,23 @@ class TTWorker(WorkerBase):
     # ---- DP gather hooks called by DPEngineCoreProc in core.py ----
 
     def build_dp_model_input(
-            self,
-            scheduler_output: "SchedulerOutput") -> Optional[TTModelInput]:
-        """Called by each DP rank to build TTModelInput from scheduler output.
-        Returns None if there is no scheduled work in this step.
+        self, scheduler_output: Optional["SchedulerOutput"], is_decode: bool
+    ) -> Union[Optional[TTModelInput], dict[str, torch.Tensor]]:
+        """Called by each DP rank to build model input from scheduler output.
         """
-        return self.model_runner.build_model_input(scheduler_output)
+        return self.model_runner.build_dp_model_input(scheduler_output,
+                                                      is_decode)
 
-    def concat_and_execute_dp(
-            self,
-            inputs: list[Optional[TTModelInput]]) -> list[list[list[int]]]:
+    def concat_and_execute_dp(self, inputs: Union[list[Optional[TTModelInput]],
+                                                  dict[str,
+                                                       list[torch.Tensor]]],
+                              is_decode: bool) -> list[list[list[int]]]:
         """Called only by DP rank 0 to concatenate DP-sized inputs and execute.
         Returns per-DP sampled ids."""
         assert self.vllm_config.parallel_config.data_parallel_rank == 0, \
             "concat_and_execute_dp must run on DP rank 0"
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
-        merged = self.model_runner.concat_model_inputs(inputs)
+        merged = self.model_runner.concat_model_inputs(inputs, is_decode)
         return self.model_runner.execute_with_model_input(merged)
 
     def apply_dp_execution_result(
