@@ -12,7 +12,7 @@ from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, TypeVar, Union, cast
+from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
 import torch
@@ -1204,26 +1204,29 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Concatenate and execute DP inputs on rank 0.
         if rank == 0:
-            per_rank = self.model_executor.collective_rpc(
+            send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp", args=(gathered_inputs, is_decode))[0]
-            self.dlog("split_counts=%s",
-                      [len(per_rank[i]) for i in range(world)])
-            send_obj = {i: per_rank[i] for i in range(world)}
+            assert isinstance(send_tensor, torch.Tensor)
         else:
-            send_obj = {}
+            B = self.vllm_config.scheduler_config.max_num_seqs
+            # Currently only supporting 1 output token per request.
+            send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
 
-        # Share results via gather of dicts (avoid broadcast on stateless dp)
-        gathered = [None for _ in range(world)]
-        dist.all_gather_object(gathered, send_obj, group=group)
-        # Only rank 0 sends a non-empty dict; it's always at index 0.
-        merged = cast(dict[int, list[Any]], gathered[0] or {})
-        my_ids = merged.get(rank, [])
-        self.dlog("after_results_gather my_ids_len=%d", len(my_ids))
+        # Share results via tensor all_gather. Rank 0 contains real data.
+        gathered_tensors = [
+            torch.empty_like(send_tensor) for _ in range(world)
+        ]
+        dist.all_gather(gathered_tensors, send_tensor, group=group)
+        my_ids = gathered_tensors[0][rank]
+        self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
-        # Apply results locally and return output
-        output = self.model_executor.collective_rpc(
-            "apply_dp_execution_result", args=(my_ids, ))[0]
-        return output
+        # If rank had scheduled tokens, apply results locally and return output
+        if local_has:
+            output = self.model_executor.collective_rpc(
+                "apply_dp_execution_result", args=(my_ids, ))[0]
+            return output
+        else:
+            return EMPTY_MODEL_RUNNER_OUTPUT
 
 
 class DPEngineCoreActor(DPEngineCoreProc):

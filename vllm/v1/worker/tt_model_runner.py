@@ -507,7 +507,8 @@ class TTModelRunner:
             "float_inputs": float_inputs,
         }
 
-    def concat_model_inputs(self, inputs, is_decode: bool) -> "TTModelInput":
+    def concat_dp_model_inputs(self, inputs,
+                               is_decode: bool) -> "TTModelInput":
         """
         Concatenate a DP-sized set of inputs into a single TTModelInput.
         inputs can be either:
@@ -658,7 +659,7 @@ class TTModelRunner:
     def execute_with_model_input(
         self,
         model_input: TTModelInput,
-    ) -> list[list[list[int]]]:
+    ) -> list[torch.Tensor]:
         """
         Execute with a prebuilt input and return per-DP sampled ids without
         mutating internal state. In DP case, called by DP rank 0 to run merged
@@ -698,7 +699,7 @@ class TTModelRunner:
                 self.sample_on_device_mode == "decode_only" and is_decode):
             # Check that sampling params are the same for all DP ranks.
             # TODO: Remove this restriction and concat sampling params in
-            # concat_model_inputs once models can support mixed params.
+            # concat_dp_model_inputs once models can support mixed params.
             non_none_params = [
                 sp for sp in sampling_params_per_dp if sp is not None
             ]
@@ -717,11 +718,12 @@ class TTModelRunner:
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
 
-        sampled_token_ids_per_dp: list[list[list[int]]] = []
+        sampled_token_ids_per_dp: list[torch.Tensor] = []
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if sz <= 0:
-                sampled_token_ids_per_dp.append([])
+                sampled_token_ids_per_dp.append(
+                    torch.tensor([], dtype=torch.int32))
                 continue
             if (not self.sample_on_device_mode
                     or (self.sample_on_device_mode == "decode_only"
@@ -731,7 +733,7 @@ class TTModelRunner:
                                                sampling_params_per_dp[dp_rank])
             else:
                 next_token_ids = tt_out[start:start + sz]
-            sampled_token_ids_per_dp.append([[int(t)] for t in next_token_ids])
+            sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:
                 # Fixed stride segments per DP rank for decode
@@ -742,15 +744,14 @@ class TTModelRunner:
 
         return sampled_token_ids_per_dp
 
-    def generate_runner_output(self, sampled_token_ids: list[list[int]]):
+    def generate_runner_output(self, sampled_token_ids: torch.Tensor):
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
+        num_out_tokens = sampled_token_ids.shape[1]
+        assert num_out_tokens == 1, "Currently only supporting 1 output token"
         for req_idx, sampled_ids in enumerate(sampled_token_ids):
-            if not sampled_ids:
-                continue
-
             start_idx = self.input_batch.num_tokens[req_idx]
-            end_idx = start_idx + len(sampled_ids)
+            end_idx = start_idx + num_out_tokens
             assert end_idx <= self.model_config.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
                 f"Total number of tokens: {end_idx} > max_model_len: "
@@ -776,7 +777,7 @@ class TTModelRunner:
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=sampled_token_ids,
+            sampled_token_ids=sampled_token_ids.tolist(),
             spec_token_ids=None,
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
