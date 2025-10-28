@@ -488,17 +488,17 @@ class TTModelRunner:
         # B = max batch size, W = max_num_blocks_per_req.
         int_inputs = torch.cat(
             [
-                tokens.view(-1),  # B
-                positions.view(-1),  # B
-                block_tables.view(-1),  # B*W
-                unpadded_batch_size.view(-1),  # 1
-                top_k.view(-1),  # 1
+                tokens.contiguous().view(-1),  # B
+                positions.contiguous().view(-1),  # B
+                block_tables.contiguous().view(-1),  # B*W
+                unpadded_batch_size.contiguous().view(-1),  # 1
+                top_k.contiguous().view(-1),  # 1
             ],
             dim=0).contiguous()
         float_inputs = torch.cat(
             [
-                temperature.to(torch.float32).view(-1),  # 1
-                top_p.to(torch.float32).view(-1),  # 1
+                temperature.contiguous().view(-1),  # 1
+                top_p.contiguous().view(-1),  # 1
             ],
             dim=0).contiguous()
 
