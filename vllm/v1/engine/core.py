@@ -1160,9 +1160,7 @@ class DPEngineCoreProc(EngineCoreProc):
         world = self.vllm_config.parallel_config.data_parallel_size
 
         # 0) Check if any rank has work this iteration.
-        local_has = (1 if scheduler_output is not None
-                     and scheduler_output.total_num_scheduled_tokens > 0 else
-                     0)
+        local_has = 1 if scheduler_output is not None else 0
         has_t = torch.tensor([local_has], dtype=torch.int32)
         dist.all_reduce(has_t, op=dist.ReduceOp.SUM, group=group)
         if int(has_t.item()) == 0:
@@ -1203,7 +1201,8 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dlog("after_inputs_gather")
 
         # Concatenate and execute DP inputs on rank 0.
-        if rank == 0:
+        if rank == 0 and (is_decode or any(x is not None
+                                           for x in gathered_inputs)):
             send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp", args=(gathered_inputs, is_decode))[0]
             assert isinstance(send_tensor, torch.Tensor)

@@ -749,6 +749,9 @@ class TTModelRunner:
     def generate_runner_output(self, sampled_token_ids: torch.Tensor):
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
+        assert sampled_token_ids.shape[0] == self.input_batch.num_reqs, (
+            f"Number of request outputs {sampled_token_ids.shape[0]} != "
+            f"number of requests in input batch {self.input_batch.num_reqs}")
         num_out_tokens = sampled_token_ids.shape[1]
         assert num_out_tokens == 1, "Currently only supporting 1 output token"
         for req_idx, sampled_ids in enumerate(sampled_token_ids):
