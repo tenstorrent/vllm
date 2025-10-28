@@ -1182,19 +1182,19 @@ class DPEngineCoreProc(EngineCoreProc):
             "build_dp_model_input", args=(scheduler_output, is_decode))[0]
 
         if is_decode:
-            # Decode: use tensor all_gather with fixed-shape flattened inputs.
-            int_local = local_input["int_inputs"]
-            float_local = local_input["float_inputs"]
-            int_gathered = [torch.empty_like(int_local) for _ in range(world)]
-            float_gathered = [
-                torch.empty_like(float_local) for _ in range(world)
-            ]
-            dist.all_gather(int_gathered, int_local, group=group)
-            dist.all_gather(float_gathered, float_local, group=group)
+            # Decode: use all_gather_into_tensor with fixed-shape inputs.
+            int_local = local_input["int_inputs"]  # 1D int32
+            float_local = local_input["float_inputs"]  # 1D float32
+            int_out_1d = torch.empty(int_local.numel() * world,
+                                     dtype=int_local.dtype)
+            float_out_1d = torch.empty(float_local.numel() * world,
+                                       dtype=float_local.dtype)
+            dist.all_gather_into_tensor(int_out_1d, int_local, group=group)
+            dist.all_gather_into_tensor(float_out_1d, float_local, group=group)
             if rank == 0:
                 gathered_inputs = {
-                    "int_inputs": int_gathered,
-                    "float_inputs": float_gathered,
+                    "int_inputs": int_out_1d.view(world, -1),
+                    "float_inputs": float_out_1d.view(world, -1),
                 }
         else:
             # Prefill: use object all_gather with variable sized inputs.
@@ -1212,12 +1212,12 @@ class DPEngineCoreProc(EngineCoreProc):
             # Currently only supporting 1 output token per request.
             send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
 
-        # Share results via tensor all_gather. Rank 0 contains real data.
-        gathered_tensors = [
-            torch.empty_like(send_tensor) for _ in range(world)
-        ]
-        dist.all_gather(gathered_tensors, send_tensor, group=group)
-        my_ids = gathered_tensors[0][rank]
+        # Share results via all_gather_into_tensor. Rank 0 contains real data.
+        out = torch.empty((world * world, ) + tuple(send_tensor.shape)[1:],
+                          dtype=send_tensor.dtype)
+        dist.all_gather_into_tensor(out, send_tensor, group=group)
+        # Take rank 0's payload, then local DP slice.
+        my_ids = out[:world][rank]
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
         # If rank had scheduled tokens, apply results locally and return output

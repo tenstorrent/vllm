@@ -513,7 +513,9 @@ class TTModelRunner:
         Concatenate a DP-sized set of inputs into a single TTModelInput.
         inputs can be either:
         - For prefill: list[Optional[TTModelInput]]
-        - For decode (optimized gather): dict[str, list[torch.Tensor]]
+        - For decode (optimized gather): dict[str, torch.Tensor] with keys:
+          - "int_inputs": stacked int32 tensor of shape [world, -1]
+          - "float_inputs": stacked float32 tensor of shape [world, -1]
         """
 
         input_tokens_list: list[torch.Tensor] = []
