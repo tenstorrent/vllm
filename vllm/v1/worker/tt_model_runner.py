@@ -701,6 +701,9 @@ class TTModelRunner:
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
+        if not any(bs > 0 for bs in batch_size_per_dp):
+            return [torch.tensor([], dtype=torch.int32)
+                    ] * len(batch_size_per_dp)
 
         sampling_params_per_dp = model_input.tt_sampling_params
         if not isinstance(sampling_params_per_dp, list):
