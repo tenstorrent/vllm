@@ -615,6 +615,17 @@ class TTModelRunner:
                 "Sampling params must be the same for all active DP ranks")
             kwargs["sampling_params"] = non_none_params[0]
 
+            # If sampling on device, we pass the bitmask as well
+            # None if no structured output requests are present
+            # or a len(input_batch) x ceil(vocab_size/32) tensort
+            integrated_reordered_bitmask = self.prepare_bitmask_for_device(
+                is_decode,
+                model_input.unpadded_batch_size,
+                model_input.grammar_bitmask,
+                model_input.struct_output_scheduler_to_persistent)
+            
+            kwargs["bitmask"] = integrated_reordered_bitmask
+
         # Execute model
         if not is_decode:
             tt_out = self.model.prefill_forward(**kwargs)
@@ -653,11 +664,8 @@ class TTModelRunner:
                 
                 next_token_ids = sample_tokens(logits,
                                                sampling_params_per_dp[dp_rank])
-            else:
-                # NOTE: Device-side sampling currently doesn't support structured
-                # outputs. Grammar constraints are only applied during host-side
-                # sampling above. For full structured output support, consider
-                # disabling device-side sampling when using structured outputs.
+            else: # sample on device
+                # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start:start + sz]
             sampled_token_ids_per_dp.append([[int(t)] for t in next_token_ids])
 
@@ -669,6 +677,53 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp
+
+    def prepare_bitmask_for_device(
+        self,
+        is_decode: bool,
+        batch_size_per_dp: list[int],
+        grammar_bitmask_list: list[Optional[torch.Tensor]],
+        struct_output_scheduler_to_persistent_list: list[Optional[dict[int, int]]],
+    ) -> torch.Tensor:
+        """Prepare the bitmask for device sampling
+           Reorder to match persistent batch and pad to batch size
+           Return None if no structured output requests are present
+           or a len(input_batch) x ceil(vocab_size/32) tensor if structured output requests are present"""
+
+        # Both None and {} evaluate to False
+        has_any_structured = any(struct_output_scheduler_to_persistent_list)
+        if not has_any_structured:
+            return None
+
+        # We want to match the shape of the joint input batch
+        if is_decode:
+            total_batch_size = self.scheduler_config.max_num_seqs * len(batch_size_per_dp)
+        else:
+            total_batch_size = sum(batch_size_per_dp)
+
+        # we need to find what is the length of the compressed bitmask
+        grammar_bitmask_length = None
+        for bitmask in grammar_bitmask_list:
+            if bitmask is not None:
+                grammar_bitmask_length = bitmask.shape[1]
+                break
+        if grammar_bitmask_length is None:
+            raise ValueError("No grammar bitmask found, but structured output requests are present")
+
+        # Ones in the compressed bitmask represent tokens that are allowed.
+        joint_bitmask = torch.ones((total_batch_size, grammar_bitmask_length), dtype=torch.int32)
+        start = 0
+        for dp_rank, sz in enumerate(batch_size_per_dp):
+            local_struct_output_scheduler_to_persistent = struct_output_scheduler_to_persistent_list[dp_rank]
+            for scheduler_index, persistent_index in local_struct_output_scheduler_to_persistent.items():
+                joint_bitmask[start + persistent_index, :] = grammar_bitmask_list[dp_rank][scheduler_index]
+            if is_decode:
+                start += self.scheduler_config.max_num_seqs
+            else:
+                start += sz
+
+        return joint_bitmask
+
 
     def apply_grammar_bitmask(
         self,
@@ -684,7 +739,7 @@ class TTModelRunner:
         
         # The grammar bitmask is compressed as packed int32 values where each bit 
         # represents one token. We need to unpack it like the TPU model runner.
-        # Create arange for bit positions within each int32 word
+        # Ones in the compressed bitmask represent tokens that are allowed.
 
         #TODO this is likely a quite inefficient way of doing it on host.
 
