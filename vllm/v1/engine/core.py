@@ -260,6 +260,7 @@ class EngineCore:
         was executed.
         """
 
+        start_set_mode = time.perf_counter()
         # For gathered DP execution, agree on mode BEFORE any early returns,
         # and only apply it if we will schedule locally.
         forced_mode: Optional[int] = None
@@ -294,6 +295,7 @@ class EngineCore:
             self.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
             # Record forced_mode so it can be used by _execute_model_dp_gather.
             self._dp_gather_forced_mode = forced_mode
+        set_mode_time = time.perf_counter() - start_set_mode
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -304,6 +306,8 @@ class EngineCore:
                 _ = self.execute_model(None)  # type: ignore[arg-type]
             return {}, False
 
+        start_schedule = time.perf_counter()
+
         # Apply the forced mode only for ranks that will call schedule().
         if requires_gather and forced_mode is not None:
             set_mode = getattr(self.scheduler, "set_forced_mode", None)
@@ -311,7 +315,9 @@ class EngineCore:
                 set_mode(forced_mode)
 
         scheduler_output = self.scheduler.schedule()
+        schedule_time = time.perf_counter() - start_schedule
 
+        start_execute_model = time.perf_counter()
         if requires_gather and forced_mode is not None:
             # Reset forced mode after scheduling to leave no residual state.
             set_mode = getattr(self.scheduler, "set_forced_mode", None)
@@ -327,8 +333,18 @@ class EngineCore:
                 self.dp_decode_streak = 0
 
         model_output = self.execute_model(scheduler_output)
+        execute_model_time = time.perf_counter() - start_execute_model
+
+        start_update_from_output = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+        update_from_output_time = time.perf_counter(
+        ) - start_update_from_output
+
+        logger.info(
+            "set_mode_time=%.2fms, schedule_time=%.2fms, execute_model_time=%.2fms, update_from_output_time=%.2fms",
+            set_mode_time * 1000, schedule_time * 1000,
+            execute_model_time * 1000, update_from_output_time * 1000)
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -1159,6 +1175,7 @@ class DPEngineCoreProc(EngineCoreProc):
         rank = self.dp_rank
         world = self.vllm_config.parallel_config.data_parallel_size
 
+        start_check_has_work = time.perf_counter()
         # 0) Check if any rank has work this iteration.
         local_has = 1 if scheduler_output is not None else 0
         has_t = torch.tensor([local_has], dtype=torch.int32)
@@ -1169,17 +1186,21 @@ class DPEngineCoreProc(EngineCoreProc):
         if scheduler_output is not None:
             self.dlog("enter_gather tokens=%d",
                       scheduler_output.total_num_scheduled_tokens)
+        check_has_work_time = time.perf_counter() - start_check_has_work
 
         # Detect decode vs prefill using forced_mode negotiated earlier.
         # 0=decode, 1=prefill.
         assert hasattr(self, "_dp_gather_forced_mode"), "forced_mode not set"
         is_decode = self._dp_gather_forced_mode == 0
 
+        start_build_local_input = time.perf_counter()
         # Build local dp model input (or None).
         local_input, local_max_blocks = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
         max_blocks_decode = None  # Only used for decode.
+        build_local_input_time = time.perf_counter() - start_build_local_input
 
+        start_gather_inputs = time.perf_counter()
         if is_decode:
             # Gather max blocks from all ranks.
             max_blocks_t = torch.tensor([local_max_blocks], dtype=torch.int32)
@@ -1210,7 +1231,9 @@ class DPEngineCoreProc(EngineCoreProc):
             gathered_inputs = [None for _ in range(world)]  # type: ignore
             dist.all_gather_object(gathered_inputs, local_input, group=group)
         self.dlog("after_inputs_gather")
+        gather_inputs_time = time.perf_counter() - start_gather_inputs
 
+        start_concat_and_execute_dp = time.perf_counter()
         # Concatenate and execute DP inputs on rank 0.
         if rank == 0 and (is_decode or any(x is not None
                                            for x in gathered_inputs)):
@@ -1222,7 +1245,10 @@ class DPEngineCoreProc(EngineCoreProc):
             B = self.vllm_config.scheduler_config.max_num_seqs
             # Currently only supporting 1 output token per request.
             send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
+        concat_and_execute_dp_time = time.perf_counter(
+        ) - start_concat_and_execute_dp
 
+        start_all_gather_into_tensor = time.perf_counter()
         # Share results via all_gather_into_tensor. Rank 0 contains real data.
         out = torch.empty((world * world, ) + tuple(send_tensor.shape)[1:],
                           dtype=send_tensor.dtype)
@@ -1230,6 +1256,14 @@ class DPEngineCoreProc(EngineCoreProc):
         # Take rank 0's payload, then local DP slice.
         my_ids = out[:world][rank]
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
+        all_gather_into_tensor_time = time.perf_counter(
+        ) - start_all_gather_into_tensor
+
+        logger.info(
+            "check_has_work_time=%.2fms, build_local_input_time=%.2fms, gather_inputs_time=%.2fms, concat_and_execute_dp_time=%.2fms, all_gather_into_tensor_time=%.2fms",
+            check_has_work_time * 1000, build_local_input_time * 1000,
+            gather_inputs_time * 1000, concat_and_execute_dp_time * 1000,
+            all_gather_into_tensor_time * 1000)
 
         # If rank had scheduled tokens, apply results locally and return output
         if local_has:
