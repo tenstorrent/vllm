@@ -983,7 +983,8 @@ class TTModelRunner:
             raise ValueError("No grammar bitmask found, but structured output requests are present")
 
         # Ones in the compressed bitmask represent tokens that are allowed.
-        joint_bitmask = torch.ones((total_batch_size, grammar_bitmask_length), dtype=torch.int32)
+        joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length), dtype=torch.int32)
+        joint_bitmask = torch.bitwise_not(joint_bitmask)
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             local_struct_output_scheduler_to_persistent = struct_output_scheduler_to_persistent_list[dp_rank]
