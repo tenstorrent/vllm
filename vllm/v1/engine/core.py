@@ -1198,6 +1198,8 @@ class DPEngineCoreProc(EngineCoreProc):
                                      dtype=int_local.dtype)
             float_out_1d = torch.empty(float_local.numel() * world,
                                        dtype=float_local.dtype)
+            # Stateless DP group doesn't support rooted collectives, otherwise
+            # this could be gather instead of all_gather.
             dist.all_gather_into_tensor(int_out_1d, int_local, group=group)
             dist.all_gather_into_tensor(float_out_1d, float_local, group=group)
             if rank == 0:
@@ -1223,12 +1225,12 @@ class DPEngineCoreProc(EngineCoreProc):
             # Currently only supporting 1 output token per request.
             send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
 
-        # Share results via all_gather_into_tensor. Rank 0 contains real data.
-        out = torch.empty((world * world, ) + tuple(send_tensor.shape)[1:],
-                          dtype=send_tensor.dtype)
-        dist.all_gather_into_tensor(out, send_tensor, group=group)
-        # Take rank 0's payload, then local DP slice.
-        my_ids = out[:world][rank]
+        # Stateless DP group doesn't support rooted collectives, otherwise
+        # this could be scatter instead of all_reduce.
+        # Rank 0 contributes the full tensor; others contribute zeros.
+        input_tensor = send_tensor.contiguous()
+        dist.all_reduce(input_tensor, op=dist.ReduceOp.SUM, group=group)
+        my_ids = input_tensor[rank]
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
         # If rank had scheduled tokens, apply results locally and return output
