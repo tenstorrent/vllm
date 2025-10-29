@@ -183,8 +183,7 @@ class TTWorker(WorkerBase):
 
     def concat_and_execute_dp(
             self, inputs: Union[list[Optional[TTModelInput]],
-                                dict[str,
-                                     list[torch.Tensor]]], is_decode: bool,
+                                dict[str, torch.Tensor]], is_decode: bool,
             max_blocks_decode_batch: Optional[int]) -> torch.Tensor:
         """Called only by DP rank 0 to concatenate DP-sized inputs and execute.
         Returns a stacked tensor [world, max_num_seqs, 1] of sampled ids.
