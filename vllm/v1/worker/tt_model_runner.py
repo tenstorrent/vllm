@@ -330,6 +330,15 @@ class TTModelRunner:
         block_tables = input_batch.block_table[0].get_cpu_tensor(
         )[:num_reqs, :self.max_num_blocks_per_req]
 
+        # DP optimization: don't send padding blocks if possible to reduce
+        # overhead from gathering inputs to rank 0 and rely on DP concat
+        # function to pad to global max blocks.
+        if self.parallel_config.data_parallel_size > 1:
+            max_tokens_in_batch = max(input_batch.num_tokens[:num_reqs])
+            max_blocks_in_batch = cdiv(max_tokens_in_batch,
+                                       self.cache_config.block_size)
+            block_tables = block_tables[:, :max_blocks_in_batch]
+
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
@@ -444,30 +453,25 @@ class TTModelRunner:
         model_input = self._prepare_model_inputs(scheduler_output)
         return model_input
 
-    def build_dp_model_input(
+    def build_dp_decode_gather_input(
         self,
-        scheduler_output: Optional["SchedulerOutput"],
-        is_decode: bool = False,
-    ) -> object:
+        model_input: Optional[TTModelInput],
+        max_blocks_decode_batch: int,
+    ) -> dict[str, torch.Tensor]:
         """
-        Build DP input for model execution.
-        - Prefill: returns Optional[TTModelInput]
-        - Decode (optimized gather): returns dict[str, torch.Tensor] with keys:
+        Called by each DP rank to build tensorized gather input for decode.
+        max_blocks_decode_batch is the max blocks in the global DP batch.
+        Returns dict[str, torch.Tensor] with keys:
           - "int_inputs": flattened int tensor of constant size.
           - "float_inputs": flattened float tensor of constant size.
         """
-        model_input = None
-        if scheduler_output is not None:
-            model_input = self.build_model_input(scheduler_output)
-        if not is_decode:
-            return model_input
 
         if model_input is None:
             max_batch = int(self.scheduler_config.max_num_seqs)
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
             positions = torch.full((max_batch, ), -1, dtype=torch.int32)
-            block_tables = torch.zeros(
-                (max_batch, self.max_num_blocks_per_req), dtype=torch.int32)
+            block_tables = torch.zeros((max_batch, max_blocks_decode_batch),
+                                       dtype=torch.int32)
             unpadded_batch_size = torch.tensor([0], dtype=torch.int32)
             temperature = torch.tensor([-1.0], dtype=torch.float32)
             top_k = torch.tensor([-1], dtype=torch.int32)
@@ -476,6 +480,15 @@ class TTModelRunner:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
             block_tables = model_input.block_tables
+            # Pad block tables to max_blocks_decode_batch
+            if block_tables.shape[1] < max_blocks_decode_batch:
+                pad_w = max_blocks_decode_batch - block_tables.shape[1]
+                block_tables = torch.cat([
+                    block_tables,
+                    torch.zeros((block_tables.shape[0], pad_w),
+                                dtype=block_tables.dtype)
+                ],
+                                         dim=1)
             unpadded_batch_size = torch.tensor(
                 [int(model_input.unpadded_batch_size)], dtype=torch.int32)
             sp = model_input.tt_sampling_params
@@ -507,8 +520,9 @@ class TTModelRunner:
             "float_inputs": float_inputs,
         }
 
-    def concat_dp_model_inputs(self, inputs,
-                               is_decode: bool) -> "TTModelInput":
+    def concat_dp_model_inputs(
+            self, inputs, is_decode: bool,
+            max_blocks_decode_batch: Optional[int]) -> "TTModelInput":
         """
         Concatenate a DP-sized set of inputs into a single TTModelInput.
         inputs can be either:
@@ -525,12 +539,27 @@ class TTModelRunner:
         batch_size_per_dp: list[int] = []
         sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
 
+        # Need to pad block tables to global max num blocks for constant shape.
+        def pad_block_tables(block_tables):
+            max_bt_width = self.max_num_blocks_per_req
+            if block_tables.shape[1] < max_bt_width:
+                pad_w = max_bt_width - block_tables.shape[1]
+                block_tables = torch.cat([
+                    block_tables,
+                    torch.zeros((block_tables.shape[0], pad_w),
+                                dtype=block_tables.dtype)
+                ],
+                                         dim=1)
+            return block_tables
+
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W), bs(1), top_k(1)]
             # Floats: [temperature(1), top_p(1)]
+            assert max_blocks_decode_batch is not None, (
+                "max_blocks_decode_batch must be provided for decode")
             B = int(self.scheduler_config.max_num_seqs)
-            W = int(self.max_num_blocks_per_req)
+            W = max_blocks_decode_batch
             for int_inputs, float_inputs in zip(inputs["int_inputs"],
                                                 inputs["float_inputs"]):
                 # Slices
@@ -542,7 +571,7 @@ class TTModelRunner:
                 positions = int_inputs[off:off + stride].view(B)
                 off += stride
                 stride = B * W
-                btable = int_inputs[off:off + stride].view(B, W)
+                block_tables = int_inputs[off:off + stride].view(B, W)
                 off += stride
                 batch_size = int(int_inputs[off].item())
                 off += 1
@@ -553,7 +582,7 @@ class TTModelRunner:
 
                 input_tokens_list.append(tokens)
                 input_positions_list.append(positions)
-                block_tables_list.append(btable)
+                block_tables_list.append(pad_block_tables(block_tables))
                 batch_size_per_dp.append(batch_size)
                 if batch_size > 0:
                     sampling_params_per_dp.append(
@@ -593,8 +622,8 @@ class TTModelRunner:
                         ],
                                          dim=1)
                     input_tokens_list.append(toks)
-                    block_tables_list.append(mi.block_tables)
                     prompt_lens_list.append(mi.prompt_lens)
+                    block_tables_list.append(pad_block_tables(mi.block_tables))
 
                 batch_size_per_dp.append(mi.unpadded_batch_size if mi else 0)
                 sampling_params_per_dp.append(

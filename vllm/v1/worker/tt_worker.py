@@ -165,17 +165,27 @@ class TTWorker(WorkerBase):
     # ---- DP gather hooks called by DPEngineCoreProc in core.py ----
 
     def build_dp_model_input(
-        self, scheduler_output: Optional["SchedulerOutput"], is_decode: bool
-    ) -> Union[Optional[TTModelInput], dict[str, torch.Tensor]]:
+        self, scheduler_output: Optional["SchedulerOutput"]
+    ) -> tuple[Optional[TTModelInput], int]:
         """Called by each DP rank to build model input from scheduler output.
         """
-        return self.model_runner.build_dp_model_input(scheduler_output,
-                                                      is_decode)
+        model_input = None
+        if scheduler_output is not None:
+            model_input = self.model_runner.build_model_input(scheduler_output)
+        max_blocks = model_input.block_tables.shape[1] if model_input else 0
+        return model_input, max_blocks
 
-    def concat_and_execute_dp(self, inputs: Union[list[Optional[TTModelInput]],
-                                                  dict[str,
-                                                       list[torch.Tensor]]],
-                              is_decode: bool) -> torch.Tensor:
+    def build_dp_decode_gather_input(
+            self, model_input: Optional[TTModelInput],
+            max_blocks_decode_batch: int) -> dict[str, torch.Tensor]:
+        return self.model_runner.build_dp_decode_gather_input(
+            model_input, max_blocks_decode_batch)
+
+    def concat_and_execute_dp(
+            self, inputs: Union[list[Optional[TTModelInput]],
+                                dict[str,
+                                     list[torch.Tensor]]], is_decode: bool,
+            max_blocks_decode_batch: Optional[int]) -> torch.Tensor:
         """Called only by DP rank 0 to concatenate DP-sized inputs and execute.
         Returns a stacked tensor [world, max_num_seqs, 1] of sampled ids.
         Each DP slice is right-padded with zeros to max_num_seqs; empty entries
@@ -184,7 +194,8 @@ class TTWorker(WorkerBase):
         assert self.vllm_config.parallel_config.data_parallel_rank == 0, \
             "concat_and_execute_dp must run on DP rank 0"
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
-        merged = self.model_runner.concat_dp_model_inputs(inputs, is_decode)
+        merged = self.model_runner.concat_dp_model_inputs(
+            inputs, is_decode, max_blocks_decode_batch)
         sampled_token_ids_per_dp: list[
             torch.Tensor] = self.model_runner.execute_with_model_input(merged)
 
