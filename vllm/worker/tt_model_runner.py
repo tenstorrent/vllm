@@ -320,8 +320,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     compat_sampling_used = True
                     break
 
-
-        # If we are using device sampling, we are also deferring the move to torch
+        # We perform device sampling:
+        # - always if sample_on_device_mode is "all", rejecting requests that cannot be sampled on device
+        # - always when decoding if  sample_on_device_mode is "decode_only" , rejecting requests that cannot be sampled on device
+        # - never if sample_on_device_mode is None
+        # - if sample_on_device_mode is "when_able" and all sequences in the batch can be sampled on device, otherwise we sample on host
         perform_device_sampling = False
         if self.sample_on_device_mode == "all" or (self.sample_on_device_mode == "decode_only" and not is_prompt):
             perform_device_sampling = True
@@ -795,7 +798,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = step_output
             else:
                 next_token_ids = step_output
-                if self.perform_device_sampling:
+                if model_input.perform_device_sampling:
                     next_token_ids = self._complete_torch_async_proc(
                         next_token_ids)
                 # TODO: sync read back from device
@@ -953,7 +956,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     active_slots + self.empty_slots,
                     dtype=torch.long,
                 )
-                if self.perform_device_sampling:
+                if model_input.perform_device_sampling:
                     self.perm_table_tensor.append(perm_table_tensor)
 
                 # Calculate inverse_perm_indices:
@@ -980,7 +983,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # trigger output processor on host while device is executing
                 # next step
                 self._send_prev_step_async_out(model_input, step_idx)
-            if self.perform_device_sampling:
+            if model_input.perform_device_sampling:
                 tt_out, read_event = self.model.read_decode_output(
                     tt_out, async_read=True)
             else:
@@ -993,6 +996,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     tt_out = tt_out[perm_table_tensor]
 
         if model_input.compat_sampling_used:
+            # compat sampling is only supported on host
             tt_logits = tt_out[:model_input.unpadded_batch_size,
                                -1, :]  # [unpadded batch, vocab]
             #This is coincidentally the same shape as the logits
@@ -1021,17 +1025,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         "tt_sampling_params must be a TTSamplingParams")
                 next_token_ids = sample_tokens(next_logits,
                                                model_input.tt_sampling_params)
-            else:  # sample on device
-                if self.perform_device_sampling:
-                    # do not slice as this may be mid-transfer to host
-                    next_token_ids = tt_out
-                else:
-                    next_token_ids = tt_out[:model_input.unpadded_batch_size]
-            if self.perform_device_sampling:
-                # async torch proc only works in decode
-                return tt_out, read_event
-            else:
                 return next_token_ids
+            else:  # sample on device
+                if is_decode:
+                    return tt_out, read_event
+                else:
+                    return tt_out
 
     def _get_next_token_ids_from_sampler_output(
             self, sampler_output: SamplerOutput) -> torch.Tensor:
