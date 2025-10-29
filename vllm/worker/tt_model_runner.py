@@ -675,7 +675,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     is_decode,
                     use_async_out_proc,
                     step_idx=i)
-                if model_input.perform_device_sampling:
+                if is_decode and model_input.perform_device_sampling:
                     next_token_ids, read_event = next_token_ids
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
@@ -736,7 +736,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     sampler_output = self.cached_step_outputs.pop(0)
                 else:
                     next_token_ids = self.cached_step_outputs.pop(0)
-                    if model_input.perform_device_sampling:
+                    if is_decode and model_input.perform_device_sampling:
                         next_token_ids = self._complete_torch_async_proc(
                             next_token_ids)
                     # TODO: sync read back from device
