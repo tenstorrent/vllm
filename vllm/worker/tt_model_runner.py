@@ -52,7 +52,6 @@ class TTModelInput(ModelRunnerInputBase):
     perform_device_sampling: bool
     tt_sampling_params: Union[Optional[TTSamplingParams], List[
         Optional[TTSamplingParams]]]  # List is used for DP in V1
-    sampling_params_list: Optional[List[Any]]
     compat_sampling_used: bool
     sampling_metadata: Optional["SamplingMetadata"]
     multi_modal_kwargs: Dict[str, Any]
@@ -72,7 +71,6 @@ class TTModelInput(ModelRunnerInputBase):
             "unpadded_batch_size": self.unpadded_batch_size,
             "perform_device_sampling": self.perform_device_sampling,
             "tt_sampling_params": self.tt_sampling_params,
-            "sampling_params_list": self.sampling_params_list,
             "compat_sampling_used": self.compat_sampling_used,
             "sampling_metadata": self.sampling_metadata,
             "multi_modal_kwargs": self.multi_modal_kwargs,
@@ -679,7 +677,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             unpadded_batch_size=unpadded_batch_size,
                             perform_device_sampling=perform_device_sampling,
                             tt_sampling_params=tt_sampling_params,
-                            sampling_params_list=[], #todo remove
                             compat_sampling_used=compat_sampling_used,
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
