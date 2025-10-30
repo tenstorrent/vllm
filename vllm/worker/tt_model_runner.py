@@ -375,7 +375,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     self.sample_on_device_mode == "all" or
                 (self.sample_on_device_mode == "decode_only"
                  and not is_prompt)):
-                # non-uniform sampling is not supported on host without compat sampling
+                # non-uniform sampling is not supported on host
+                # without compat sampling
 
                 # initializing an empty list for each value on first iter
                 # fill values after first iter
