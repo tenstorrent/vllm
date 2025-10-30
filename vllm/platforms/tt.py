@@ -152,7 +152,8 @@ class TTPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
-        # The regular v0 vLLM sampling code tries to use pinned memory in case we're using GPUs.
+        # The regular v0 vLLM sampling code tries
+        # to use pinned memory in case we're using GPUs.
         return False
 
     # Require DP ranks to gather batches to a single driver
