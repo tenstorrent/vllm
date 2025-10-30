@@ -117,7 +117,7 @@ class TTPlatform(Platform):
 
         if cls.always_compat_sampling and not cls.compat_sampling_possible:  # type: ignore[attr-defined]
             raise ValueError("Compatibility sampling mode only works with"
-                             "sample_on_device_mode=None")
+                             "sample_on_device_mode=when_able or sample_on_device_mode=None")
 
         # must perform local import to get around circular import
         from vllm.model_executor.model_loader.utils import (
