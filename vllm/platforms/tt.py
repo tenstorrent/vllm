@@ -197,25 +197,10 @@ class TTPlatform(Platform):
                     "Non-greedy decoding on-device is not supported by this "
                     f"model implementation. Supplied params: {params}")
     
-    @classmethod
-    def can_sample_on_device(cls, sampling_params: SamplingParams) -> bool:
-        if cls.always_compat_sampling:
-            # this covers the case when compat sampling is not required, but used
-            return False
-        compat_sampling_required = TTPlatform.compat_sampling_required(sampling_params)
-        if compat_sampling_required:
-            # if even tt host sampling can't handle it, then device sampling can't either
-            return False
-        if sampling_params.temperature == 0.0:
-            # simple greedy is always supported on device
-            #NB: top-k and top-p don't matter if temperature==0, so we don't check them
-            return True
-        # This means we are doing at most top-k top-p sampling
-        # we assume if non-greedy is supported, then top-k and top-p are also supported
-        return cls.non_greedy_decoding_on_device
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
+        # anything beyond top-k top-p sampling requires compat sampling
         return (sampling_params.presence_penalty != 0.0
                 or sampling_params.frequency_penalty != 0.0
                 or sampling_params.repetition_penalty != 1.0

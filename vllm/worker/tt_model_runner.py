@@ -262,6 +262,39 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # sort empty_slots for consistency
         self.empty_slots.sort()
 
+    def can_sample_sequence_on_device(self, sampling_params) -> bool:
+        if TTPlatform.always_compat_sampling:
+            # this covers the case when compat sampling is not required, but used
+            return False
+        compat_sampling_required = TTPlatform.compat_sampling_required(sampling_params)
+        if compat_sampling_required:
+            # anything beyond top-k top-p we can't handle on device
+            return False
+        if sampling_params.temperature == 0.0:
+            # simple greedy is always supported on device
+            #NB: top-k and top-p don't matter if temperature==0, so we don't check them
+            return True
+        # This means we are doing at most top-k top-p sampling
+        # non_greedy_decoding_on_device means that is actually supports
+        # top-k top-p temperature sampling with non-uniform parameters
+        return TTPlatform.non_greedy_decoding_on_device
+
+    def can_sample_batch_on_device(self, is_prompt: bool, seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
+
+        if is_prompt and not TTPlatform.non_greedy_decoding_on_device:
+            # This means we have a TTT model,
+            # and these do not support device sampling in prefill.
+            # TODO: remove this once TTT supports device sampling in prefill
+            return False
+        
+        for seq_group_metadata in seq_group_metadata_list:
+            sampling_params = seq_group_metadata.sampling_params
+            # this covers the case of compat sampling enabled
+            if not self.can_sample_sequence_on_device(sampling_params):
+                return False
+
+        return True
+
     def prepare_model_input(
             self,
             seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -284,7 +317,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         seq_lens: List[int] = []
         block_tables_list: List[List[int]] = []
         seq_groups_list: List[int] = []
-        sampling_params_list = []
         top_pk_sampling_params: Dict[str, Any] = {}
         multi_modal_kwargs: Dict[str, Any] = {}
         if supports_multimodal(self.model) and is_prompt:
@@ -317,6 +349,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
                 if TTPlatform.compat_sampling_required(sampling_params):
+                    # we know it's possible because we check when validating request
                     compat_sampling_used = True
                     break
 
@@ -325,17 +358,35 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # - always when decoding if  sample_on_device_mode is "decode_only" , rejecting requests that cannot be sampled on device
         # - never if sample_on_device_mode is None
         # - if sample_on_device_mode is "when_able" and all sequences in the batch can be sampled on device, otherwise we sample on host
+        # WARNING:
+        # when_able may choose to sample on device,
+        # when batch contains top-k top-p sampling with non-uniform parameters,
+        # even if the model currently does not support non-uniform sampling on device
+        # and we will not be able to salvage it with compat sampling.
+        # This will stop being a problem once TTT supports non-uniform sampling on device,
+        # and implementing a workaround now is not worth the complexity
         perform_device_sampling = False
         if self.sample_on_device_mode == "all" or (self.sample_on_device_mode == "decode_only" and not is_prompt):
             perform_device_sampling = True
         elif self.sample_on_device_mode == "when_able":
             # only sample on device if all sequences in batch can be sampled on device
-            perform_device_sampling = True
+            perform_device_sampling = self.can_sample_batch_on_device(is_prompt, seq_group_metadata_list)
+
+        # If we are not sampling on device, have non-uniform top-p top-k, and compat sampling is possible,
+        # use it to avoid overriding the non-uniform sampling parameters with uniform sampling
+        if not perform_device_sampling and TTPlatform.compat_sampling_possible and not compat_sampling_used:
+            first_values = {}
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
-                # this covers the case of compat sampling enabled
-                if not TTPlatform.can_sample_on_device(sampling_params):
-                    perform_device_sampling = False
+                for key in ["temperature", "top_k", "top_p"]:
+                    current_value = getattr(sampling_params, key)
+                    if key not in first_values:
+                        first_values[key] = current_value
+                    else:
+                        if current_value != first_values[key]:
+                            compat_sampling_used = True
+                            break
+                if compat_sampling_used:
                     break
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -389,10 +440,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             sampling_params = seq_group_metadata.sampling_params
             if compat_sampling_used:
-                sampling_params_list.append(sampling_params)
-            elif TTPlatform.non_greedy_decoding_on_device:
-                # non-uniform sampling
-
+                pass
+            elif TTPlatform.non_greedy_decoding_on_device and perform_device_sampling:
+                # non greedy actually means that it also supports non-uniform sampling
                 # initializing an empty list for each value on first iter
                 # fill values after first iter
                 for key in ["temperature", "top_k", "top_p"]:
@@ -629,7 +679,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             unpadded_batch_size=unpadded_batch_size,
                             perform_device_sampling=perform_device_sampling,
                             tt_sampling_params=tt_sampling_params,
-                            sampling_params_list=sampling_params_list,
+                            sampling_params_list=[], #todo remove
                             compat_sampling_used=compat_sampling_used,
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
