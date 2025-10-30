@@ -270,7 +270,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # top-k top-p temperature sampling with non-uniform parameters
         return TTPlatform.non_greedy_decoding_on_device
 
-    def can_sample_batch_on_device(self, is_prompt: bool, compat_sampling_used: bool,seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
+    def can_sample_batch_on_device(
+            self, is_prompt: bool, compat_sampling_used: bool,
+            seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
         if compat_sampling_used:
             return False
 
@@ -279,10 +281,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # and these do not support device sampling in prefill.
             # TODO: remove this once TTT supports device sampling in prefill
             return False
-        
+
         for seq_group_metadata in seq_group_metadata_list:
             sampling_params = seq_group_metadata.sampling_params
-            if not self.can_sample_sequence_on_device(compat_sampling_used, sampling_params):
+            if not self.can_sample_sequence_on_device(compat_sampling_used,
+                                                      sampling_params):
                 return False
         return True
 
@@ -357,11 +360,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # This will stop being a problem once TTT supports non-uniform sampling on device,
         # and implementing a workaround now is not worth the complexity
         perform_device_sampling = False
-        if self.sample_on_device_mode == "all" or (self.sample_on_device_mode == "decode_only" and not is_prompt):
+        if self.sample_on_device_mode == "all" or (
+                self.sample_on_device_mode == "decode_only" and not is_prompt):
             perform_device_sampling = True
         elif self.sample_on_device_mode == "when_able":
             # only sample on device if all sequences in batch can be sampled on device
-            perform_device_sampling = self.can_sample_batch_on_device(is_prompt, seq_group_metadata_list)
+            perform_device_sampling = self.can_sample_batch_on_device(
+                is_prompt, seq_group_metadata_list)
 
         # If we are not sampling on device, have non-uniform top-p top-k, and compat sampling is possible,
         # use it to avoid overriding the non-uniform sampling parameters with uniform sampling
@@ -719,7 +724,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     next_token_ids, read_event = next_token_ids
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
-                if (i < num_steps - 1 and not model_input.perform_device_sampling):
+                if (i < num_steps - 1
+                        and not model_input.perform_device_sampling):
                     # Prepare next step input when not sampling on device
                     # this is always decode, because prefill is always single-step
                     if model_input.compat_sampling_used:
@@ -792,8 +798,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         for event in read_events:
             ttnn.event_synchronize(event)
         # always tokens because we only do async when sampling on device
-        next_token_ids = self.model.process_decode_output_host(
-            next_token_ids, is_tokens=True)
+        next_token_ids = self.model.process_decode_output_host(next_token_ids,
+                                                               is_tokens=True)
         if self.dp_kv_cache:
             # permute the tt_out
             next_token_ids = next_token_ids[self.perm_table_tensor.pop(0)]
@@ -1030,8 +1036,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # outputs ttnn host tensors
                 tt_out = self.model.read_decode_output(tt_out)
                 # outputs torch tensor
-                tt_out = self.model.process_decode_output_host(
-                    tt_out, is_tokens=False)
+                tt_out = self.model.process_decode_output_host(tt_out,
+                                                               is_tokens=False)
                 if self.dp_kv_cache:
                     tt_out = tt_out[perm_table_tensor]
 

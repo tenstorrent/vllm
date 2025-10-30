@@ -90,7 +90,8 @@ class TTPlatform(Platform):
         # or if any of the requests in the batch require it.
         # For now, it is only supported with host-side sampling.
         cls.compat_sampling_possible = (  # type: ignore[attr-defined]
-            sample_on_device_mode is None or sample_on_device_mode == "when_able")
+            sample_on_device_mode is None
+            or sample_on_device_mode == "when_able")
 
         if cls.compat_sampling_possible and envs.VLLM_USE_V1:  # type: ignore[attr-defined]
             cls.compat_sampling_possible = False  # type: ignore[attr-defined]
@@ -116,8 +117,10 @@ class TTPlatform(Platform):
         cls.always_compat_sampling = always_compat_sampling  # type: ignore[attr-defined]
 
         if cls.always_compat_sampling and not cls.compat_sampling_possible:  # type: ignore[attr-defined]
-            raise ValueError("Compatibility sampling mode only works with"
-                             "sample_on_device_mode=when_able or sample_on_device_mode=None")
+            raise ValueError(
+                "Compatibility sampling mode only works with"
+                "sample_on_device_mode=when_able or sample_on_device_mode=None"
+            )
 
         # must perform local import to get around circular import
         from vllm.model_executor.model_loader.utils import (
@@ -188,15 +191,14 @@ class TTPlatform(Platform):
                     "sample_on_device_mode None or 'when_able'. "
                     f"Supplied params: {params}")
 
-
             sample_mode = cls.sample_on_device_mode  # type: ignore[attr-defined]
             non_greedy = cls.non_greedy_decoding_on_device  # type: ignore[attr-defined]
-            if (params.temperature > 0.0 and sample_mode in ["all", "decode_only"]
+            if (params.temperature > 0.0
+                    and sample_mode in ["all", "decode_only"]
                     and not non_greedy):
                 raise ValueError(
                     "Non-greedy decoding on-device is not supported by this "
                     f"model implementation. Supplied params: {params}")
-    
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
