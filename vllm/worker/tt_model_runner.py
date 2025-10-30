@@ -261,13 +261,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.empty_slots.sort()
 
     def can_sample_sequence_on_device(self, sampling_params) -> bool:
-        if TTPlatform.always_compat_sampling:
-            # this covers the case when compat sampling is not required, but used
-            return False
-        compat_sampling_required = TTPlatform.compat_sampling_required(sampling_params)
-        if compat_sampling_required:
-            # anything beyond top-k top-p we can't handle on device
-            return False
         if sampling_params.temperature == 0.0:
             # simple greedy is always supported on device
             #NB: top-k and top-p don't matter if temperature==0, so we don't check them
@@ -277,7 +270,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # top-k top-p temperature sampling with non-uniform parameters
         return TTPlatform.non_greedy_decoding_on_device
 
-    def can_sample_batch_on_device(self, is_prompt: bool, seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
+    def can_sample_batch_on_device(self, is_prompt: bool, compat_sampling_used: bool,seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
+        if compat_sampling_used:
+            return False
 
         if is_prompt and not TTPlatform.non_greedy_decoding_on_device:
             # This means we have a TTT model,
@@ -287,10 +282,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         
         for seq_group_metadata in seq_group_metadata_list:
             sampling_params = seq_group_metadata.sampling_params
-            # this covers the case of compat sampling enabled
-            if not self.can_sample_sequence_on_device(sampling_params):
+            if not self.can_sample_sequence_on_device(compat_sampling_used, sampling_params):
                 return False
-
         return True
 
     def prepare_model_input(
