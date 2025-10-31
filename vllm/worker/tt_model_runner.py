@@ -152,6 +152,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.trace_mode,
             self.sample_on_device_mode,
         )
+        self.async_read_decode = True
 
         self.cached_step_outputs: List[torch.Tensor] = [
         ]  # Only used for multi-step execution
@@ -173,17 +174,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert ("TTModelRunner does not currently support models with "
                     "mrope rope_scaling")
 
-        if TTPlatform.compat_sampling_possible:
-            vocab_size = self.model_config.get_vocab_size()
-            self.logits_processor = LogitsProcessor(vocab_size,
-                                                    logits_as_input=True)
-            # We are relying on having our logits shaped correctly,
-            # as if they came from a regular vLLM model
-            # and then got trimmed by the LogitsProcessor.
-            # If we add prompt_logprobs or chunked prefill,
-            # we need to fully match the relevant parts of
-            # SamplingMetadata.selected_token_indices logic.
-            self.sampler = get_sampler()
+        vocab_size = self.model_config.get_vocab_size()
+        self.logits_processor = LogitsProcessor(vocab_size,
+                                                logits_as_input=True)
+        # We are relying on having our logits shaped correctly,
+        # as if they came from a regular vLLM model
+        # and then got trimmed by the LogitsProcessor.
+        # If we add prompt_logprobs or chunked prefill,
+        # we need to fully match the relevant parts of
+        # SamplingMetadata.selected_token_indices logic.
+        self.sampler = get_sampler()
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -215,14 +215,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.dp_kv_cache = False
 
-        self.may_sample_on_device = self.sample_on_device_mode is not None
 
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            if self.may_sample_on_device:
+            if self.async_read_decode:
                 self.cached_read_events: List[List[Any]] = []
                 self.perm_table_tensor: List[torch.Tensor] = []
 
@@ -685,7 +684,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # except the last step
             # If not, we consume the whole queue after executing the last step.
             self.cached_step_outputs = []
-            if is_decode:
+            if is_decode and self.async_read_decode:
                 self.cached_read_events = []
             for i in range(num_steps):
                 next_token_ids = self._execute_model_single_step(
@@ -694,7 +693,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     is_decode,
                     use_async_out_proc,
                     step_idx=i)
-                if is_decode and model_input.perform_device_sampling:
+                if self.async_read_decode and is_decode and model_input.perform_device_sampling:
                     next_token_ids, read_event = next_token_ids
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
@@ -704,10 +703,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     # this is always decode,
                     # because prefill is always single-step
                     if model_input.compat_sampling_used:
-                        # For now, this will only get called
-                        # if we explicitly enable compat sampling
-                        # Most cases where we want to use compat sampling
-                        # are not compatible with multistep
                         next_token_ids = self._get_next_token_ids_from_sampler_output(  #noqa: E501
                             next_token_ids)
                     # Prepare the inputs for the next step
@@ -757,7 +752,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     sampler_output = self.cached_step_outputs.pop(0)
                 else:
                     next_token_ids = self.cached_step_outputs.pop(0)
-                    if is_decode and model_input.perform_device_sampling:
+                    if self.async_read_decode and is_decode and model_input.perform_device_sampling:
                         next_token_ids = self._complete_torch_async_proc(
                             next_token_ids)
                     # TODO: sync read back from device
@@ -819,7 +814,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = step_output
             else:
                 next_token_ids = step_output
-                if model_input.perform_device_sampling:
+                if self.async_read_decode and model_input.perform_device_sampling:
                     next_token_ids = self._complete_torch_async_proc(
                         next_token_ids)
                 # TODO: sync read back from device
@@ -1004,7 +999,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # trigger output processor on host while device is executing
                 # next step
                 self._send_prev_step_async_out(model_input, step_idx)
-            if model_input.perform_device_sampling:
+            if self.async_read_decode and model_input.perform_device_sampling:
                 tt_out, read_event = self.model.read_decode_output(
                     tt_out, async_read=True)
             else:
@@ -1048,7 +1043,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                model_input.tt_sampling_params)
                 return next_token_ids
             else:  # sample on device
-                if is_decode:
+                if self.async_read_decode and is_decode:
                     return tt_out, read_event
                 else:
                     return tt_out
