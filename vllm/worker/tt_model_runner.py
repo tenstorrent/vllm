@@ -370,8 +370,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if compat_sampling_used:
                     break
 
-        if compat_sampling_used:
-            logger.info("Compat host sampling used for batch")
+        logger.info("perform_device_sampling: %s", perform_device_sampling)
+        logger.info("compat_sampling_used: %s", compat_sampling_used)
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
