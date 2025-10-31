@@ -285,8 +285,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         for seq_group_metadata in seq_group_metadata_list:
             sampling_params = seq_group_metadata.sampling_params
-            if not self.can_sample_sequence_on_device(compat_sampling_used,
-                                                      sampling_params):
+            if not self.can_sample_sequence_on_device(sampling_params):
                 return False
         return True
 
@@ -375,7 +374,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # only sample on device
             # if all sequences in batch can be sampled on device
             perform_device_sampling = self.can_sample_batch_on_device(
-                is_prompt, seq_group_metadata_list)
+                is_prompt, compat_sampling_used, seq_group_metadata_list)
 
         # If we are not sampling on device,
         # have non-uniform top-p top-k,
