@@ -173,16 +173,6 @@ class TTPlatform(Platform):
                     f"Currently not supporting prompt_logprobs on "
                     f"{cls.device_name}")
 
-            sample_mode = cls.sample_on_device_mode  # type: ignore[attr-defined]
-            non_greedy = cls.non_greedy_decoding_on_device  # type: ignore[attr-defined]
-            if (params.temperature > 0.0
-                    and sample_mode in ["all", "decode_only"]
-                    and not non_greedy):
-                # TODO add this as a fallback condition
-                raise ValueError(
-                    "Non-greedy decoding on-device is not supported by this "
-                    f"model implementation. Supplied params: {params}")
-
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
         # anything beyond top-k top-p sampling requires compat sampling
