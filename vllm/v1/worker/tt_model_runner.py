@@ -405,8 +405,6 @@ class TTModelRunner:
             top_p=top_p[0],
         )
 
-        assert not TTPlatform.compat_sampling_possible, (
-            "Compatibility sampling is not yet supported in V1 TT backend")
         compat_sampling_used = False
         sampling_metadata = None
 
@@ -634,8 +632,6 @@ class TTModelRunner:
         input_tokens = torch.cat(input_tokens_list, dim=0)
         block_tables = torch.cat(block_tables_list, dim=0)
 
-        assert not TTPlatform.compat_sampling_possible, (
-            "Compatibility sampling is not yet supported in V1 TT backend")
         compat_sampling_used = False
         sampling_metadata = None
 
