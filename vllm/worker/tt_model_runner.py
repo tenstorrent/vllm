@@ -260,23 +260,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # sort empty_slots for consistency
         self.empty_slots.sort()
 
-    def can_sample_sequence_on_device(self, sampling_params) -> bool:
-        if sampling_params.temperature == 0.0:
-            # simple greedy is always supported on device
-            #NB: top-k and top-p don't matter if temperature==0,
-            # so we don't check them
-            return True
-        # This means we are doing at most top-k top-p sampling
-        # non_greedy_decoding_on_device means that is actually supports
-        # top-k top-p temperature sampling with non-uniform parameters
-        return TTPlatform.non_greedy_decoding_on_device
 
     def can_sample_batch_on_device(
             self, is_prompt: bool, compat_sampling_used: bool,
             seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
+
         if compat_sampling_used:
             return False
-
         if is_prompt and not TTPlatform.non_greedy_decoding_on_device:
             # This means we have a TTT model,
             # and these do not support device sampling in prefill.
@@ -285,8 +275,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         for seq_group_metadata in seq_group_metadata_list:
             sampling_params = seq_group_metadata.sampling_params
-            if not self.can_sample_sequence_on_device(sampling_params):
+            # simple greedy is always supported on device
+            if sampling_params.temperature != 0.0 and not TTPlatform.non_greedy_decoding_on_device:
+                # NB: top-k and top-p don't matter if temperature==0,
+                # so we don't check them
                 return False
+                
         return True
 
     def prepare_model_input(
@@ -343,46 +337,25 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
                 if TTPlatform.compat_sampling_required(sampling_params):
-                    # we know it's possible because
-                    # we check when validating request
                     compat_sampling_used = True
                     break
 
-        # We perform device sampling:
-        # - always if sample_on_device_mode is "all",
-        #   rejecting requests that cannot be sampled on device
-        # - always when decoding if  sample_on_device_mode is "decode_only",
-        #   rejecting requests that cannot be sampled on device
-        # - never if sample_on_device_mode is None
-        # - if sample_on_device_mode is "when_able"
-        #  and all sequences in the batch can be sampled on device,
-        #  otherwise we sample on host
-        # WARNING:
-        # when_able may choose to sample on device,
-        # when batch contains top-k top-p sampling with non-uniform parameters,
-        # even if the model currently does not support
-        # non-uniform sampling on device and we will not be able to
-        # salvage it with compat sampling.
-        # This will stop being a problem once TTT supports non-uniform
-        # sampling on device, and implementing a workaround now
-        # is not worth the complexity
-        perform_device_sampling = False
+        # We attempt to perform device sampling
+        # according to the sample_on_device_mode setting.
+        # but fall back to host sampling if any request in the batch requires it.
         if self.sample_on_device_mode == "all" or (
                 self.sample_on_device_mode == "decode_only" and not is_prompt):
-            perform_device_sampling = True
-        elif self.sample_on_device_mode == "when_able":
-            # only sample on device
-            # if all sequences in batch can be sampled on device
             perform_device_sampling = self.can_sample_batch_on_device(
                 is_prompt, compat_sampling_used, seq_group_metadata_list)
+        else:
+            perform_device_sampling = False
 
-        # If we are not sampling on device,
-        # have non-uniform top-p top-k,
-        # and compat sampling is possible,
-        # use it to avoid overriding the non-uniform sampling parameters
-        # with uniform sampling
-        if (not perform_device_sampling and TTPlatform.compat_sampling_possible
-                and not compat_sampling_used):
+        # We support non-uniform top-p top-k with some device sampling models,
+        # and with compat sampling.
+        # If we have non-uniform top-p top-k parameters in batch
+        # not handled by device sampling or previously enabled compat sampling,
+        # use compat sampling to avoid overriding the non-uniform sampling parameters
+        if not ((perform_device_sampling and TTPlatform.non_greedy_decoding_on_device) or compat_sampling_used):
             first_values = {}
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
@@ -393,6 +366,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     else:
                         if current_value != first_values[key]:
                             compat_sampling_used = True
+                            perform_device_sampling = False
                             break
                 if compat_sampling_used:
                     break
@@ -466,27 +440,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     top_pk_sampling_params["top_k"] = sampling_params.top_k
                     top_pk_sampling_params["top_p"] = sampling_params.top_p
                 else:
-                    if (top_pk_sampling_params["temperature"]
-                            != sampling_params.temperature):
-                        logger.warning(
-                            "Currently only supporting same temperature for"
-                            "all sequences in batch, falling back to first "
-                            "sequence's temperature (%s)",
-                            top_pk_sampling_params['temperature'])
-                    if top_pk_sampling_params[
-                            "top_k"] != sampling_params.top_k:
-                        logger.warning(
-                            "Currently only supporting same top_k"
-                            "for all sequences in batch, "
-                            "falling back to first sequence's top_k (%s)",
-                            top_pk_sampling_params['top_k'])
-                    if top_pk_sampling_params[
-                            "top_p"] != sampling_params.top_p:
-                        logger.warning(
-                            "Currently only supporting same top_p"
-                            "for all sequences in batch, "
-                            "falling back to first sequence's top_p (%s)",
-                            top_pk_sampling_params['top_p'])
+                    different_temp = top_pk_sampling_params["temperature"] != sampling_params.temperature
+                    different_top_k = top_pk_sampling_params["top_k"] != sampling_params.top_k
+                    different_top_p = top_pk_sampling_params["top_p"] != sampling_params.top_p
+                    if different_temp or different_top_k or different_top_p:
+                        # This should never happen, we always fall back
+                        # to a different sampling implementation if needed
+                        raise ValueError("Attempting non-uniform top-p top-k when unsupported")
 
         if compat_sampling_used:
             # seq_lens means how many tokens are in the sequence in total,
