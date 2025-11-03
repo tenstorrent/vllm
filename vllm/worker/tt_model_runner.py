@@ -318,8 +318,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             param_values = {}
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
-                # If any request in the batch requires compat sampling individually,
-                # enable compat sampling for the batch
+                # If any request in the batch requires compat sampling
+                # individually, enable compat sampling for the batch
                 if TTPlatform.compat_sampling_required(sampling_params):
                     compat_sampling_used = True
                     break
@@ -427,7 +427,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         # This should never happen, we always fall back
                         # to a different sampling implementation if needed
                         raise ValueError(
-                            "Attempting non-uniform top-p top-k when unsupported"
+                            "Attempting non-uniform top-p top-k when unsupported"  # noqa: E501
                         )
 
         if compat_sampling_used:
@@ -677,7 +677,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     is_decode,
                     use_async_out_proc,
                     step_idx=i)
-                if self.async_read_decode and is_decode and model_input.perform_device_sampling:
+                if self.async_read_decode and is_decode and model_input.perform_device_sampling:  # noqa: E501
                     next_token_ids, read_event = next_token_ids
                     self.cached_read_events.append(read_event)
                 self.cached_step_outputs.append(next_token_ids)
@@ -736,7 +736,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     sampler_output = self.cached_step_outputs.pop(0)
                 else:
                     next_token_ids = self.cached_step_outputs.pop(0)
-                    if self.async_read_decode and is_decode and model_input.perform_device_sampling:
+                    if self.async_read_decode and is_decode and model_input.perform_device_sampling:  # noqa: E501
                         next_token_ids = self._complete_torch_async_proc(
                             next_token_ids)
                     # TODO: sync read back from device
@@ -798,7 +798,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampler_output = step_output
             else:
                 next_token_ids = step_output
-                if self.async_read_decode and model_input.perform_device_sampling:
+                if self.async_read_decode and model_input.perform_device_sampling:  # noqa: E501
                     next_token_ids = self._complete_torch_async_proc(
                         next_token_ids)
                 # TODO: sync read back from device
@@ -956,7 +956,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     active_slots + self.empty_slots,
                     dtype=torch.long,
                 )
-                if self.async_read_decode and model_input.perform_device_sampling:
+                if self.async_read_decode and model_input.perform_device_sampling:  # noqa: E501
                     self.perm_table_tensor.append(perm_table_tensor)
 
                 # Calculate inverse_perm_indices:
