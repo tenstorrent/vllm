@@ -218,6 +218,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             self.dp_kv_cache = False
 
+        if self.async_read_decode:
+            self.cached_read_events: List[List[Any]] = []
 
         if self.dp_kv_cache:
             # Map request id strs to seq group ids
@@ -225,7 +227,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
             if self.async_read_decode:               
-                self.cached_read_events: List[List[Any]] = []
                 self.perm_table_tensor: List[torch.Tensor] = []
 
     def get_model(self) -> nn.Module:
@@ -951,7 +952,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     active_slots + self.empty_slots,
                     dtype=torch.long,
                 )
-                if model_input.perform_device_sampling:
+                if self.async_read_decode and model_input.perform_device_sampling:
                     self.perm_table_tensor.append(perm_table_tensor)
 
                 # Calculate inverse_perm_indices:
