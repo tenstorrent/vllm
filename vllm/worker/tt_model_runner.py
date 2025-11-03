@@ -259,29 +259,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # sort empty_slots for consistency
         self.empty_slots.sort()
 
-
-    def can_sample_batch_on_device(
-            self, is_prompt: bool, compat_sampling_used: bool,
-            seq_group_metadata_list: List[SequenceGroupMetadata]) -> bool:
-
-        if compat_sampling_used:
-            return False
-        if is_prompt and not TTPlatform.non_greedy_decoding_on_device:
-            # This means we have a TTT model,
-            # and these do not support device sampling in prefill.
-            # TODO: remove this once TTT supports device sampling in prefill
-            return False
-
-        for seq_group_metadata in seq_group_metadata_list:
-            sampling_params = seq_group_metadata.sampling_params
-            # simple greedy is always supported on device
-            if sampling_params.temperature != 0.0 and not TTPlatform.non_greedy_decoding_on_device:
-                # NB: top-k and top-p don't matter if temperature==0,
-                # so we don't check them
-                return False
-                
-        return True
-
     def prepare_model_input(
             self,
             seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -327,51 +304,46 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         self.req_id_to_seq_id[req_id])
                     del self.req_id_to_seq_id[req_id]
 
-        # Compat sampling is off by default, and enabled only on request
-        # or if any of the requests in the batch require it
+
+        # Decide the sampling mode for the batch
         compat_sampling_used = False
+        uniform_sampling = True
+        greedy = True
         if TTPlatform.always_compat_sampling:
             compat_sampling_used = True
         else:
+            param_values = {}
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
+                # If any request in the batch requires compat sampling individually,
+                # enable compat sampling for the batch
                 if TTPlatform.compat_sampling_required(sampling_params):
                     compat_sampling_used = True
                     break
-
-        # We attempt to perform device sampling
-        # according to the sample_on_device_mode setting.
-        # but fall back to host sampling if any request in the batch requires it.
-        if self.sample_on_device_mode == "all" or (
-                self.sample_on_device_mode == "decode_only" and not is_prompt):
-            perform_device_sampling = self.can_sample_batch_on_device(
-                is_prompt, compat_sampling_used, seq_group_metadata_list)
-        else:
-            perform_device_sampling = False
-
-        # We support non-uniform top-p top-k with some device sampling models,
-        # and with compat sampling.
-        # If we have non-uniform top-p top-k parameters in batch
-        # not handled by device sampling or previously enabled compat sampling,
-        # use compat sampling to avoid overriding the non-uniform sampling parameters
-        if not ((perform_device_sampling and TTPlatform.non_greedy_decoding_on_device) or compat_sampling_used):
-            first_values = {}
-            for seq_group_metadata in seq_group_metadata_list:
-                sampling_params = seq_group_metadata.sampling_params
                 for key in ["temperature", "top_k", "top_p"]:
                     current_value = getattr(sampling_params, key)
-                    if key not in first_values:
-                        first_values[key] = current_value
+                    if key not in param_values:
+                        param_values[key] = current_value
                     else:
-                        if current_value != first_values[key]:
-                            compat_sampling_used = True
-                            perform_device_sampling = False
-                            break
-                if compat_sampling_used:
-                    break
+                        if current_value != param_values[key]:
+                            uniform_sampling = False
+                if sampling_params.temperature != 0.0:
+                    greedy = False
+        
 
-        logger.info("perform_device_sampling: %s", perform_device_sampling)
-        logger.info("compat_sampling_used: %s", compat_sampling_used)
+        want_device_sampling = (self.sample_on_device_mode == "all" or (
+                self.sample_on_device_mode == "decode_only" and not is_prompt))
+        params_device_supported = TTPlatform.non_greedy_decoding_on_device or (uniform_sampling and greedy)
+        if compat_sampling_used:
+            perform_device_sampling = False
+        elif want_device_sampling and params_device_supported:
+            perform_device_sampling = True
+        else:
+            perform_device_sampling = False
+            # Host sampling only supports uniform
+            if not uniform_sampling:
+                compat_sampling_used = True
+
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -678,10 +650,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             assert num_steps == 1, "Num steps must be 1 for prefill"
         # always true if not using multi-step
         if model_input.is_first_multi_step:
-            # This is a queue of torch tensor with step outputs
+            # This is a queue of past step outputs
             # - full sampler outputs for compat mode,
-            # ttnn tensors in flight for device sampling,
-            # or torch tensors otherwise.
+            # ttnn logit tensors in flight for async_read_decode
+            # if sampling on device and in decode mode,
+            # or torch tensors with token ids otherwise.
             # If we do async output processing,
             # the queue is consumed by _send_prev_step_async_out,
             # except the last step
@@ -1046,6 +1019,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                model_input.tt_sampling_params)
                 return next_token_ids
             else:  # sample on device
+                # tt_out: [padded_batch_size]
+                # _make_sampler_output picks out the non-padding entries
                 if self.async_read_decode and is_decode:
                     return tt_out, read_event
                 else:
