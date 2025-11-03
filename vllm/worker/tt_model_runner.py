@@ -152,6 +152,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.trace_mode,
             self.sample_on_device_mode,
         )
+
+        # If sampling on device and in decode, delay reading the token
+        # until after we start executing the next step on device.
         self.async_read_decode = True
 
         self.cached_step_outputs: List[torch.Tensor] = [
@@ -221,7 +224,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            if self.async_read_decode:
+            if self.async_read_decode:               
                 self.cached_read_events: List[List[Any]] = []
                 self.perm_table_tensor: List[torch.Tensor] = []
 
