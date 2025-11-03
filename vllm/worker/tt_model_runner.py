@@ -226,7 +226,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.req_id_to_seq_id: Dict[str, int] = {}
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
-            if self.async_read_decode:               
+            if self.async_read_decode:
                 self.perm_table_tensor: List[torch.Tensor] = []
 
     def get_model(self) -> nn.Module:
@@ -308,7 +308,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         self.req_id_to_seq_id[req_id])
                     del self.req_id_to_seq_id[req_id]
 
-
         # Decide the sampling mode for the batch
         compat_sampling_used = False
         uniform_sampling = True
@@ -333,11 +332,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             uniform_sampling = False
                 if sampling_params.temperature != 0.0:
                     greedy = False
-        
 
-        want_device_sampling = (self.sample_on_device_mode == "all" or (
-                self.sample_on_device_mode == "decode_only" and not is_prompt))
-        params_device_supported = TTPlatform.non_greedy_decoding_on_device or (uniform_sampling and greedy)
+        want_device_sampling = (self.sample_on_device_mode == "all"
+                                or (self.sample_on_device_mode == "decode_only"
+                                    and not is_prompt))
+        params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
+            uniform_sampling and greedy)
         if compat_sampling_used:
             perform_device_sampling = False
         elif want_device_sampling and params_device_supported:
@@ -347,7 +347,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # Host sampling only supports uniform
             if not uniform_sampling:
                 compat_sampling_used = True
-
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -418,13 +417,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     top_pk_sampling_params["top_k"] = sampling_params.top_k
                     top_pk_sampling_params["top_p"] = sampling_params.top_p
                 else:
-                    different_temp = top_pk_sampling_params["temperature"] != sampling_params.temperature
-                    different_top_k = top_pk_sampling_params["top_k"] != sampling_params.top_k
-                    different_top_p = top_pk_sampling_params["top_p"] != sampling_params.top_p
+                    different_temp = top_pk_sampling_params[
+                        "temperature"] != sampling_params.temperature
+                    different_top_k = top_pk_sampling_params[
+                        "top_k"] != sampling_params.top_k
+                    different_top_p = top_pk_sampling_params[
+                        "top_p"] != sampling_params.top_p
                     if different_temp or different_top_k or different_top_p:
                         # This should never happen, we always fall back
                         # to a different sampling implementation if needed
-                        raise ValueError("Attempting non-uniform top-p top-k when unsupported")
+                        raise ValueError(
+                            "Attempting non-uniform top-p top-k when unsupported"
+                        )
 
         if compat_sampling_used:
             # seq_lens means how many tokens are in the sequence in total,

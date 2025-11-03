@@ -78,7 +78,8 @@ class TTPlatform(Platform):
                 and "sample_on_device_mode" in override_tt_config):
             sample_on_device_mode = override_tt_config["sample_on_device_mode"]
             assert sample_on_device_mode in [
-                "all", "decode_only",
+                "all",
+                "decode_only",
             ], f"Invalid sample_on_device_mode: {sample_on_device_mode}"
         else:
             sample_on_device_mode = None

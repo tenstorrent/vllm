@@ -421,7 +421,7 @@ class TTModelRunner:
             seq_groups=None,  # Not used in V1
             block_tables=block_tables,
             unpadded_batch_size=num_reqs,
-            perform_device_sampling=None, #currently unused in v1
+            perform_device_sampling=None,  #currently unused in v1
             tt_sampling_params=tt_sampling_params,
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
@@ -653,7 +653,7 @@ class TTModelRunner:
             seq_groups=None,
             block_tables=block_tables,
             unpadded_batch_size=batch_size_per_dp,
-            perform_device_sampling=None, #currently unused in v1
+            perform_device_sampling=None,  #currently unused in v1
             tt_sampling_params=sampling_params_per_dp,
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
