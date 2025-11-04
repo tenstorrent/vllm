@@ -387,6 +387,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     # Default top_k=0 means "consider all tokens" which is inefficient
                     # Set to 32 for efficient sampling
                     if top_k == 0 or top_k == -1:
+                        logger.warning(
+                            "Overriding user-provided top_k value (%s) to 32 for efficient sampling "
+                            "because temperature > 0. To avoid this override, set top_k explicitly.",
+                            sampling_params.top_k)
                         top_k = 32
                 
                 # Collect per-request sampling params as lists for permutation support
