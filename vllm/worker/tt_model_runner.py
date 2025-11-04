@@ -660,7 +660,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.is_first_multi_step:
             # This is a queue of past step outputs
             # - full sampler outputs for compat mode,
-            # ttnn logit tensors in flight for async_read_decode
+            # ttnn token id tensors in flight for async_read_decode
             # if sampling on device and in decode mode,
             # or torch tensors with token ids otherwise.
             # If we do async output processing,
