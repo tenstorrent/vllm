@@ -554,8 +554,8 @@ def device_params_from_override_tt_config(override_tt_config, trace_mode):
 
 def get_mesh_grid(dp_rank=0):
     if dp_rank == 0:
-        # Only DP rank 0 should get device ids, otherwise device init may hang.
-        num_devices_available = len(ttnn.get_device_ids())
+        # Only DP rank 0 should query devices.
+        num_devices_available = ttnn.get_num_devices()
     mesh_grid_dict = {
         "N150": (1, 1),
         "P100": (1, 1),
@@ -589,7 +589,7 @@ def get_mesh_grid(dp_rank=0):
             "MESH_DEVICE must be set when running with data_parallel_size > 1")
         mesh_grid = (1, num_devices_available)
 
-    assert dp_rank != 0 or (
+    assert dp_rank != 0 or ttnn.using_distributed_env() or (
         mesh_grid[0] * mesh_grid[1] <= num_devices_available), (
             f"Requested mesh grid shape {mesh_grid} is larger than "
             f"number of available devices {num_devices_available}")
@@ -624,6 +624,8 @@ def close_mesh_device(mesh_device, override_tt_config):
 
     # Close devices
     num_devices = mesh_device.get_num_devices()
+    for submesh in mesh_device.get_submeshes():
+        ttnn.close_mesh_device(submesh)
     ttnn.close_mesh_device(mesh_device)
 
     # Reset fabric
