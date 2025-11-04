@@ -33,6 +33,12 @@ logger = init_logger(__name__)
 # diversity and performance.
 DEFAULT_SAMPLING_TOP_K = 32
 
+# Padding default values for sampling parameters in decode mode
+# These values ensure greedy/deterministic behavior for padded positions
+PADDING_TEMPERATURE = 0.0  # Greedy sampling (argmax)
+PADDING_TOP_K = 1  # Consider only the top token (argmax)
+PADDING_TOP_P = 1.0  # No nucleus filtering
+
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -464,10 +470,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     temp_list) < self.scheduler_config.max_num_seqs:
                 batch_pad_len = self.scheduler_config.max_num_seqs - len(
                     temp_list)
-                # Pad with default values: temp=0.0 (greedy), top_k=1 (argmax), top_p=1.0 (no filtering)
-                temp_list = temp_list + [0.0] * batch_pad_len
-                top_k_list = top_k_list + [1] * batch_pad_len
-                top_p_list = top_p_list + [1.0] * batch_pad_len
+                # Pad with default values for greedy/deterministic behavior
+                temp_list = temp_list + [PADDING_TEMPERATURE] * batch_pad_len
+                top_k_list = top_k_list + [PADDING_TOP_K] * batch_pad_len
+                top_p_list = top_p_list + [PADDING_TOP_P] * batch_pad_len
 
             tt_sampling_params = TTSamplingParams(temperature=temp_list,
                                                   top_k=top_k_list,
