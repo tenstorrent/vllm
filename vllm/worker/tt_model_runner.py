@@ -990,8 +990,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # outputs ttnn host tensors
                 tt_out = self.model.read_decode_output(tt_out)
                 # outputs torch tensor
-                tt_out = self.model.process_decode_output_host(tt_out,
-                                                               is_tokens=False)
+                tt_out = self.model.process_decode_output_host(
+                    tt_out, is_tokens=model_input.perform_device_sampling)
                 if self.dp_kv_cache:
                     tt_out = tt_out[perm_table_tensor]
 
