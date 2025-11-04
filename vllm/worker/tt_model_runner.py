@@ -987,6 +987,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     tt_sampling_params = execute_model_kwargs["sampling_params"]
                     # Permute each sampling parameter list using the full inverse_perm_indices
                     if isinstance(tt_sampling_params.temperature, list) and len(tt_sampling_params.temperature) > 0:
+                        # Defensive check: ensure all indices are within bounds
+                        max_idx = len(tt_sampling_params.temperature)
+                        assert all(0 <= int(i) < max_idx for i in inverse_perm_indices), (
+                            f"Out-of-bounds index in inverse_perm_indices: "
+                            f"{inverse_perm_indices.tolist()} for sampling param list of length {max_idx}"
+                        )
                         permuted_temp = [tt_sampling_params.temperature[i] for i in inverse_perm_indices]
                         permuted_top_k = [tt_sampling_params.top_k[i] for i in inverse_perm_indices]
                         permuted_top_p = [tt_sampling_params.top_p[i] for i in inverse_perm_indices]
