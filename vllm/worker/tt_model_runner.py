@@ -390,11 +390,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # If temperature is non-zero (sampling mode) and top_k/top_p are at defaults,
                 # override with better defaults for sampling
                 if temp > 0:
-                    # Default top_k=0 means "consider all tokens" which is inefficient
-                    # Set to 32 for efficient sampling
+                    # Default top_k=0 means argmax
+                    # Set to 32 for correct sampling
                     if top_k == 0 or top_k == -1:
                         logger.warning(
-                            "Overriding user-provided top_k value (%s) to 32 for efficient sampling "
+                            "Overriding default top_k value (%s) to 32 "
                             "because temperature > 0. To avoid this override, set top_k explicitly.",
                             sampling_params.top_k)
                         top_k = 32
