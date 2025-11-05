@@ -796,6 +796,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # based on tpu_model_runner.py
         # TT backend does not support the advanced sampling parameters
         # such as logprobs.
+        
+        next_token_ids = next_token_ids.reshape(-1)
         zero_logprob = Logprob(0.0)
         sampler_outputs = []
         for batch_idx, seq_id in enumerate(seq_groups):
