@@ -64,6 +64,8 @@ class BlockTable:
         self.block_table_np[row_idx, start:start + num_blocks] = block_ids
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        num_blocks = self.num_blocks_per_row[row_idx]
+        self.block_table_np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
