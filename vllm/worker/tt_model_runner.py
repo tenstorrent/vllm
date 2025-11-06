@@ -417,17 +417,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 top_k = sampling_params.top_k
                 top_p = sampling_params.top_p
 
-                # If temperature is non-zero (sampling mode) and top_k/top_p are at defaults,
-                # override with better defaults for sampling
-                if temp > 0:
-                    # Default top_k=0 means argmax
-                    # Set to 32 for correct sampling
-                    if top_k == 0 or top_k == -1:
-                        logger.warning(
-                            "Overriding default top_k value (%s) to 32 "
-                            "because temperature > 0. To avoid this override, set top_k explicitly.",
-                            sampling_params.top_k)
-                        top_k = 32
 
                 # Collect per-request sampling params as lists for permutation support
                 top_pk_sampling_params.setdefault("temperature",
@@ -478,6 +467,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             temp_list = top_pk_sampling_params.get("temperature", [])
             top_k_list = top_pk_sampling_params.get("top_k", [])
             top_p_list = top_pk_sampling_params.get("top_p", [])
+            
+            # Handle both scalar and list cases (uniform sampling stores scalars)
+            if not isinstance(temp_list, list):
+                temp_list = [temp_list] if temp_list is not None else []
+            if not isinstance(top_k_list, list):
+                top_k_list = [top_k_list] if top_k_list is not None else []
+            if not isinstance(top_p_list, list):
+                top_p_list = [top_p_list] if top_p_list is not None else []
 
             # Pad sampling params to max_num_seqs in decode mode for proper permutation
             # This must be done before permutation, just like tokens and page_table
@@ -820,6 +817,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # TT backend does not support the advanced sampling parameters
         # such as logprobs.
         
+        # Ensure next_token_ids is a 1D tensor for consistent indexing
+        # Token ids can come from different paths (device sampling, host sampling)
+        # with potentially different shapes (e.g., [batch_size] or [batch_size, 1])
         next_token_ids = next_token_ids.reshape(-1)
         zero_logprob = Logprob(0.0)
         sampler_outputs = []
