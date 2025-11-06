@@ -156,7 +156,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.cached_step_outputs: List[torch.Tensor] = [
         ]  # Only used for multi-step execution
 
-        self.request_specific_rope = 'Qwen2.5-VL' in self.model_config.model
+        self.request_specific_rope = ('Qwen2.5-VL' in self.model_config.model
+                                      or 'olmOCR-2' in self.model_config.model)
+
         if self.model_config.is_encoder_decoder or self.request_specific_rope:
             assert (
                 self.model_config.is_encoder_decoder
