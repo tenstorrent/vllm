@@ -52,7 +52,8 @@ class TTWorker(WorkerBase):
 
     def init_device(self) -> None:
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        if dp_rank == 0:
+        local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        if local_dp_rank == 0:
             self.mesh_device = open_mesh_device(
                 self.model_config.override_tt_config, self.trace_mode, dp_rank)
             self.device_config.device = self.mesh_device

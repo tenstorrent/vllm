@@ -1213,13 +1213,30 @@ class DPEngineCoreProc(EngineCoreProc):
             dist.all_gather_object(gathered_inputs, local_input, group=group)
         self.dlog("after_inputs_gather")
 
-        # Concatenate and execute DP inputs on rank 0.
-        if rank == 0 and (is_decode or any(x is not None
-                                           for x in gathered_inputs)):
+        # Concatenate and execute DP inputs on designated ranks.
+        # Default behavior (non-TT): only DP rank 0 executes.
+        # TT backend: both hosts' designated ranks (local_dp_rank==0) enter
+        # execute step so TT SPMD progresses on all hosts; only global rank 0
+        # contributes results to the all_reduce.
+        from vllm.platforms import current_platform
+        is_tt_backend = current_platform.is_tt()
+        local_dp_rank = (
+            self.vllm_config.parallel_config.data_parallel_rank_local)
+
+        should_execute = (
+            (is_decode or any(x is not None for x in gathered_inputs))
+            and ((rank == 0) if not is_tt_backend else (local_dp_rank == 0))
+        )
+
+        if should_execute:
             send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp",
                 args=(gathered_inputs, is_decode, max_blocks_decode))[0]
             assert isinstance(send_tensor, torch.Tensor)
+            # For TT backend, only global DP rank 0 contributes results; other
+            # designated ranks zero-out before the SUM all_reduce.
+            if is_tt_backend and rank != 0:
+                send_tensor.zero_()
         else:
             B = self.vllm_config.scheduler_config.max_num_seqs
             # Currently only supporting 1 output token per request.

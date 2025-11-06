@@ -3,6 +3,9 @@
 
 import contextlib
 import os
+import shlex
+import sys
+import os
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -598,12 +601,19 @@ def launch_core_engines(
         yield engine_actor_manager, coordinator, addresses
         return
 
+    # If using TT-MPI, do not mark any engines as local; all are external.
+    from vllm.platforms import current_platform
+    use_tt_mpi_flag = (current_platform.is_tt()
+                       and os.environ.get("VLLM_TT_USE_TTRUN") == "1")
+
+    effective_local_engine_count = 0 if use_tt_mpi_flag else local_engine_count
+
     if offline_mode or (external_dp_lb and dp_rank > 0):
         assert local_engine_count == 1
         engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
     else:
         engines_to_handshake = [
-            CoreEngine(index=i, local=(i < local_engine_count))
+            CoreEngine(index=i, local=(i < effective_local_engine_count))
             for i in range(dp_size)
         ]
 
@@ -629,23 +639,69 @@ def launch_core_engines(
 
         from vllm.v1.engine.core import EngineCoreProc
 
-        # Start local engines.
-        if local_engine_count:
-            # In server mode, start_index and local_start_index will
-            # both be 0.
-            local_engine_manager = CoreEngineProcManager(
-                EngineCoreProc.run_engine_core,
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=log_stats,
-                handshake_address=handshake_address,
-                client_handshake_address=client_handshake_address,
-                local_client=True,
-                local_engine_count=local_engine_count,
-                start_index=dp_rank,
-                local_start_index=local_start_index or 0)
-        else:
-            local_engine_manager = None
+        # TT-MPI launcher path: if enabled, launch all engine processes
+        # across hosts via tt-run once from dp_rank=0.
+        local_engine_manager = None
+        from vllm.platforms import current_platform
+        use_tt_mpi = (current_platform.is_tt()
+                      and os.environ.get("VLLM_TT_USE_TTRUN") == "1")
+
+        if use_tt_mpi and dp_rank == 0:
+            import subprocess
+            import tempfile
+            import cloudpickle
+
+            # Serialize vllm_config for remote engines to load.
+            cfg_path_env = os.environ.get("VLLM_TT_CONFIG_PICKLE_PATH")
+            if cfg_path_env:
+                config_pickle_path = cfg_path_env
+                with open(config_pickle_path, "wb") as tf:
+                    cloudpickle.dump(vllm_config, tf)
+            else:
+                with tempfile.NamedTemporaryFile(prefix="vllm_tt_cfg_",
+                                                 suffix=".pkl",
+                                                 delete=False) as tf:
+                    cloudpickle.dump(vllm_config, tf)
+                    config_pickle_path = tf.name
+
+            # Build tt-run command.
+            rank_binding = os.environ.get("VLLM_TT_RANK_BINDING")
+            if not rank_binding:
+                raise RuntimeError("VLLM_TT_RANK_BINDING env not set for tt-run launch")
+
+            mpi_args = os.environ.get("VLLM_TT_MPI_ARGS", "")
+            mpi_args_list = shlex.split(mpi_args) if mpi_args else []
+
+            # Propagate handshake info to engines via env.
+            child_env = os.environ.copy()
+            child_env["VLLM_TT_HANDSHAKE_ADDR"] = handshake_address
+            child_env["VLLM_TT_CONFIG_PICKLE"] = config_pickle_path
+
+            cmd = ["tt-run", "--rank-binding", rank_binding]
+            if mpi_args_list:
+                cmd.extend(["--mpi-args", shlex.join(mpi_args_list)])
+            # Program to run per MPI rank: engine entrypoint
+            cmd.extend([sys.executable, "-m",
+                        "vllm.v1.entrypoints.tt_engine_core"])
+
+            logger.info("Launching engines with tt-run: %s", " ".join(cmd))
+            proc = subprocess.Popen(cmd, env=child_env)
+            # Keep reference so process isn't garbage collected.
+            _ = proc
+        elif not use_tt_mpi:
+            # Start local engines as usual.
+            if local_engine_count:
+                local_engine_manager = CoreEngineProcManager(
+                    EngineCoreProc.run_engine_core,
+                    vllm_config=vllm_config,
+                    executor_class=executor_class,
+                    log_stats=log_stats,
+                    handshake_address=handshake_address,
+                    client_handshake_address=client_handshake_address,
+                    local_client=True,
+                    local_engine_count=local_engine_count,
+                    start_index=dp_rank,
+                    local_start_index=local_start_index or 0)
 
         yield local_engine_manager, coordinator, addresses
 
