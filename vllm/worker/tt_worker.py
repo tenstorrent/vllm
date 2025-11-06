@@ -552,8 +552,8 @@ def device_params_from_override_tt_config(override_tt_config, trace_mode):
     return device_params
 
 
-def get_mesh_grid(dp_rank=0):
-    if dp_rank == 0:
+def get_mesh_grid(local_dp_rank=0):
+    if local_dp_rank == 0:
         # Only DP rank 0 should query devices.
         num_devices_available = ttnn.get_num_devices()
     mesh_grid_dict = {
@@ -585,11 +585,11 @@ def get_mesh_grid(dp_rank=0):
                 f"Invalid MESH_DEVICE: {mesh_device_env}")
             mesh_grid = mesh_grid_dict[mesh_device_env]
     else:
-        assert dp_rank == 0, (
+        assert local_dp_rank == 0, (
             "MESH_DEVICE must be set when running with data_parallel_size > 1")
         mesh_grid = (1, num_devices_available)
 
-    assert dp_rank != 0 or ttnn.using_distributed_env() or (
+    assert local_dp_rank != 0 or ttnn.using_distributed_env() or (
         mesh_grid[0] * mesh_grid[1] <= num_devices_available), (
             f"Requested mesh grid shape {mesh_grid} is larger than "
             f"number of available devices {num_devices_available}")
@@ -597,9 +597,9 @@ def get_mesh_grid(dp_rank=0):
     return mesh_grid
 
 
-def open_mesh_device(override_tt_config, trace_mode, dp_rank=0):
-    assert dp_rank == 0, "open_mesh_device must run on DP rank 0"
-    mesh_grid = get_mesh_grid(dp_rank)
+def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
+    assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
+    mesh_grid = get_mesh_grid(local_dp_rank)
 
     device_params = device_params_from_override_tt_config(
         override_tt_config, trace_mode)
