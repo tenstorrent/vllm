@@ -409,14 +409,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             elif (TTPlatform.non_greedy_decoding_on_device
                   and perform_device_sampling):
                 # non-uniform sampling - supports per-request sampling params
-
-                # Set better defaults for sampling when temperature is non-zero
-                # If user provides temperature > 0 but doesn't specify top_k/top_p,
-                # use defaults that enable proper sampling rather than greedy decoding
                 temp = sampling_params.temperature
                 top_k = sampling_params.top_k
                 top_p = sampling_params.top_p
-
 
                 # Collect per-request sampling params as lists for permutation support
                 top_pk_sampling_params.setdefault("temperature",
@@ -817,10 +812,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # TT backend does not support the advanced sampling parameters
         # such as logprobs.
         
-        # Ensure next_token_ids is a 1D tensor for consistent indexing
-        # Token ids can come from different paths (device sampling, host sampling)
-        # with potentially different shapes (e.g., [batch_size] or [batch_size, 1])
-        next_token_ids = next_token_ids.reshape(-1)
         zero_logprob = Logprob(0.0)
         sampler_outputs = []
         for batch_idx, seq_id in enumerate(seq_groups):
