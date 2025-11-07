@@ -465,15 +465,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             top_k_list = top_pk_sampling_params.top_k
             top_p_list = top_pk_sampling_params.top_p
 
-            # Always create TTSamplingParams with lists for proper permutation support
-            # Handle both scalar and list cases (uniform sampling stores scalars)
-            if not isinstance(temp_list, list):
-                temp_list = [temp_list] if temp_list is not None else []
-            if not isinstance(top_k_list, list):
-                top_k_list = [top_k_list] if top_k_list is not None else []
-            if not isinstance(top_p_list, list):
-                top_p_list = [top_p_list] if top_p_list is not None else []
-
             # Pad sampling params to max_num_seqs in decode mode for proper permutation
             # This must be done before permutation, just like tokens and page_table
             if not is_prompt and len(temp_list) > 0 and len(
@@ -494,7 +485,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             temperature=top_pk_sampling_params["temperature"],
                             top_k=top_pk_sampling_params["top_k"],
                             top_p=top_pk_sampling_params["top_p"])
-                            
+
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
