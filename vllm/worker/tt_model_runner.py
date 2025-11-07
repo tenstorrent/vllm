@@ -460,9 +460,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         elif (TTPlatform.non_greedy_decoding_on_device
                   and perform_device_sampling):
             sampling_metadata = None
-            temp_list = top_pk_sampling_params.temperature
-            top_k_list = top_pk_sampling_params.top_k
-            top_p_list = top_pk_sampling_params.top_p
+            temp_list = top_pk_sampling_params["temperature"]
+            top_k_list = top_pk_sampling_params["top_k"]
+            top_p_list = top_pk_sampling_params["top_p"]
 
             # Pad sampling params to max_num_seqs in decode mode for proper permutation
             # This must be done before permutation, just like tokens and page_table
