@@ -456,13 +456,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 pin_memory=False,
                 generators=generators)
             tt_sampling_params = None
-        else:
+
+        elif (TTPlatform.non_greedy_decoding_on_device
+                  and perform_device_sampling):
             sampling_metadata = None
             # Always create TTSamplingParams with lists for proper permutation support
-            temp_list = top_pk_sampling_params.get("temperature", [])
-            top_k_list = top_pk_sampling_params.get("top_k", [])
-            top_p_list = top_pk_sampling_params.get("top_p", [])
-            
+            temp_list = top_pk_sampling_params.temperature
+            top_k_list = top_pk_sampling_params.top_k
+            top_p_list = top_pk_sampling_params.top_p
+
+            # Always create TTSamplingParams with lists for proper permutation support
             # Handle both scalar and list cases (uniform sampling stores scalars)
             if not isinstance(temp_list, list):
                 temp_list = [temp_list] if temp_list is not None else []
@@ -485,7 +488,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             tt_sampling_params = TTSamplingParams(temperature=temp_list,
                                                   top_k=top_k_list,
                                                   top_p=top_p_list)
-
+        else:
+            sampling_metadata = None
+            tt_sampling_params = TTSamplingParams(
+                            temperature=top_pk_sampling_params["temperature"],
+                            top_k=top_pk_sampling_params["top_k"],
+                            top_p=top_pk_sampling_params["top_p"])
+                            
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
         # (assume they were either finished or preempted)
