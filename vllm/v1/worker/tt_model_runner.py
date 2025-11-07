@@ -318,6 +318,8 @@ class TTModelRunner:
 
     def _prepare_model_inputs(
             self, scheduler_output: "SchedulerOutput") -> TTModelInput:
+        # In DP, called on each rank
+        # In non-DP, this is the only input preparation function
 
         assert scheduler_output.total_num_scheduled_tokens > 0
         input_batch = self.input_batch
@@ -452,129 +454,19 @@ class TTModelRunner:
             struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent,
         )
 
-    def concat_model_inputs(
-            self, inputs: list[Optional["TTModelInput"]]) -> "TTModelInput":
-        """
-        Concatenate a DP-sized list of TTModelInput (some may be None) into
-        a single TTModelInput. For None slots, uses zeros for input_tokens and
-        block_tables and -1 for input_positions.
-        """
-        assert inputs, "No inputs to concatenate"
-        active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
-        if not active_inputs:
-            raise ValueError("All inputs are None; nothing to concatenate")
-
-        batch_size_per_dp = [
-            mi.unpadded_batch_size if mi else 0 for mi in inputs
-        ]
-        if os.environ.get("DP_GATHER_DEBUG") == "1":
-            logger.info("batch_size_per_dp=%s", batch_size_per_dp)
-
-        sampling_params_per_dp = [
-            mi.tt_sampling_params if mi else None for mi in inputs
-        ]
-
-        is_decode = active_inputs[0].prompt_lens is None
-        for mi in active_inputs:
-            assert (
-                mi.prompt_lens
-                is None) == is_decode, "All inputs must be for the same mode"
-
-        if not is_decode:
-            # Determine max token width across slots.
-            max_tok_width = 0
-            for mi in active_inputs:
-                assert mi.input_tokens.dim() == 2, "Input tokens must be 2D"
-                max_tok_width = max(max_tok_width, mi.input_tokens.shape[1])
-            assert max_tok_width > 0, "At least one input must have tokens"
-
-        # For block tables, assume each slot is already padded to the max
-        # number of blocks, so we do not pad widths further.
-        max_bt_width = int(active_inputs[0].block_tables.shape[1])
-
-        # Iterate over DP inputs and build segments for concatenation.
-        toks_segments: list[torch.Tensor] = []  # input tokens
-        bt_segments: list[torch.Tensor] = []  # block tables
-        if is_decode:
-            pos_segments: list[torch.Tensor] = []  # input positions
-        else:
-            pl_segments: list[torch.Tensor] = []  # prompt lengths
-        for mi in inputs:
-            if mi is None:
-                # For decode, keep fixed stride by padding with max_batch.
-                # For prefill, skip None slots entirely (do not append rows).
-                if is_decode:
-                    max_batch = self.scheduler_config.max_num_seqs
-                    toks_segments.append(
-                        torch.zeros((max_batch, 1), dtype=torch.int32))
-                    bt_segments.append(
-                        torch.zeros((max_batch, max_bt_width),
-                                    dtype=torch.int32))
-                    pos_segments.append(
-                        torch.full((max_batch, ), -1, dtype=torch.int32))
-            else:
-                # Right-pad tokens and block tables to max widths across slots
-                toks = mi.input_tokens
-                if not is_decode and toks.shape[1] < max_tok_width:
-                    pad_w = max_tok_width - toks.shape[1]
-                    toks = torch.cat([
-                        toks,
-                        torch.zeros((toks.shape[0], pad_w), dtype=toks.dtype)
-                    ],
-                                     dim=1)
-                toks_segments.append(toks)
-                bt_segments.append(mi.block_tables)
-                if is_decode:
-                    pos_segments.append(mi.input_positions)
-                else:
-                    assert mi.prompt_lens is not None
-                    pl_segments.append(mi.prompt_lens)
-
-        input_tokens = torch.cat(toks_segments, dim=0)
-        block_tables = torch.cat(bt_segments, dim=0)
-        if is_decode:
-            input_positions = torch.cat(pos_segments, dim=0)
-            prompt_lens = None
-        else:
-            input_positions = 0
-            prompt_lens = np.concatenate(pl_segments, axis=0)
-
-        assert not TTPlatform.compat_sampling_possible, (
-            "Compatibility sampling is not yet supported in V1 TT backend")
-        sampling_params_list: list[Any] = []
-        compat_sampling_used = False
-        sampling_metadata = None
-
-        # Concatenate structured output information from all DP ranks
-        # Each rank may have different structured output data
-        grammar_bitmask_list = []
-        struct_output_scheduler_to_persistent_list = []
-        for mi in inputs:
-            if mi is None:
-                grammar_bitmask_list.append(None)
-                struct_output_scheduler_to_persistent_list.append(None)
-            else:
-                # The attributes are single-element lists if we've not done the concatenation yet
-                grammar_bitmask_list.extend(mi.grammar_bitmask)
-                struct_output_scheduler_to_persistent_list.extend(mi.struct_output_scheduler_to_persistent)
-
-        merged = TTModelInput(
-            input_tokens=input_tokens,
-            input_positions=input_positions,
-            prompt_lens=prompt_lens,
-            seq_groups=None,
-            block_tables=block_tables,
-            unpadded_batch_size=batch_size_per_dp,
-            tt_sampling_params=sampling_params_per_dp,
-            sampling_params_list=sampling_params_list,
-            compat_sampling_used=compat_sampling_used,
-            sampling_metadata=sampling_metadata,
-            multi_modal_kwargs={},  # Not yet supported in V1
-            cross_block_tables=None,  # Not yet supported in V1
-            grammar_bitmask=grammar_bitmask_list,
-            struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent_list,
-        )
-        return merged
+#TODO integrate this
+        # # Concatenate structured output information from all DP ranks
+        # # Each rank may have different structured output data
+        # grammar_bitmask_list = []
+        # struct_output_scheduler_to_persistent_list = []
+        # for mi in inputs:
+        #     if mi is None:
+        #         grammar_bitmask_list.append(None)
+        #         struct_output_scheduler_to_persistent_list.append(None)
+        #     else:
+        #         # The attributes are single-element lists if we've not done the concatenation yet
+        #         grammar_bitmask_list.extend(mi.grammar_bitmask)
+        #         struct_output_scheduler_to_persistent_list.extend(mi.struct_output_scheduler_to_persistent)
 
     def build_model_input(
         self,
