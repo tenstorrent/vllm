@@ -454,19 +454,6 @@ class TTModelRunner:
             struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent,
         )
 
-#TODO integrate this
-        # # Concatenate structured output information from all DP ranks
-        # # Each rank may have different structured output data
-        # grammar_bitmask_list = []
-        # struct_output_scheduler_to_persistent_list = []
-        # for mi in inputs:
-        #     if mi is None:
-        #         grammar_bitmask_list.append(None)
-        #         struct_output_scheduler_to_persistent_list.append(None)
-        #     else:
-        #         # The attributes are single-element lists if we've not done the concatenation yet
-        #         grammar_bitmask_list.extend(mi.grammar_bitmask)
-        #         struct_output_scheduler_to_persistent_list.extend(mi.struct_output_scheduler_to_persistent)
 
     def build_model_input(
         self,
@@ -502,6 +489,7 @@ class TTModelRunner:
           - "float_inputs": flattened float tensor of constant size.
         """
 
+        bitmask_size = (self.model_config.vocab_size + 31) // 32
         if model_input is None:
             max_batch = int(self.scheduler_config.max_num_seqs)
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
@@ -512,6 +500,9 @@ class TTModelRunner:
             temperature = torch.tensor([-1.0], dtype=torch.float32)
             top_k = torch.tensor([-1], dtype=torch.int32)
             top_p = torch.tensor([-1.0], dtype=torch.float32)
+            bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
+            struct_output_scheduler_to_persistent_keys = torch.zeros((max_batch, ), dtype=torch.int32)
+            struct_output_scheduler_to_persistent_values = torch.zeros((max_batch, ), dtype=torch.int32)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -532,6 +523,20 @@ class TTModelRunner:
                                        dtype=torch.float32)
             top_k = torch.tensor([int(sp.top_k)], dtype=torch.int32)
             top_p = torch.tensor([float(sp.top_p)], dtype=torch.float32)
+            # pad bitmask to constant shape
+            # TODO check if this is needed
+            real_bitmask = model_input.grammar_bitmask[0] #it's wrapped in 1-element list
+            padded_bitmask = torch.zeros((max_batch, bitmask_size))
+            real_bitmask_length = real_bitmask.shape[0]
+            padded_bitmask[:real_bitmask_length, :] = real_bitmask
+
+
+            struct_output_scheduler_to_persistent_keys = torch.zeros((max_batch, ), dtype=torch.int32)
+            struct_output_scheduler_to_persistent_values = torch.zeros((max_batch, ), dtype=torch.int32)
+            for idx, (scheduler_index, persistent_index) in enumerate(model_input.struct_output_scheduler_to_persistent.items()):
+                struct_output_scheduler_to_persistent_keys[idx] = scheduler_index
+                struct_output_scheduler_to_persistent_values[idx] = persistent_index
+
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
@@ -542,6 +547,9 @@ class TTModelRunner:
                 block_tables.contiguous().view(-1),  # B*W
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # 1
+                padded_bitmask.contiguous().view(-1),  # B*bitmask_size
+                struct_output_scheduler_to_persistent_keys.contiguous().view(-1),  # B
+                struct_output_scheduler_to_persistent_values.contiguous().view(-1),  # B
             ],
             dim=0).contiguous()
         float_inputs = torch.cat(
@@ -574,6 +582,8 @@ class TTModelRunner:
         prompt_lens_list: list[np.ndarray] = []  # (prefill only)
         batch_size_per_dp: list[int] = []
         sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
+        grammar_bitmask_list = []
+        struct_output_scheduler_to_persistent_list = []
 
         # Need to pad block tables to global max num blocks for constant shape.
         def pad_block_tables(block_tables):
@@ -613,6 +623,15 @@ class TTModelRunner:
                 off += 1
                 top_k = int(int_inputs[off].item())
                 off += 1
+                bitmask_size = ((self.model_config.vocab_size + 31) // 32)
+                stride = bitmask_size * B
+                padded_bitmask = int_inputs[off:off + stride].view(B, bitmask_size)
+                off += stride
+                stride = B
+                struct_output_scheduler_to_persistent_keys = int_inputs[off:off + stride].view(B)
+                off += stride
+                struct_output_scheduler_to_persistent_values = int_inputs[off:off + stride].view(B)
+                off += stride
                 temperature = float(float_inputs[0].item())
                 top_p = float(float_inputs[1].item())
 
@@ -627,6 +646,11 @@ class TTModelRunner:
                                          top_p=top_p))
                 else:
                     sampling_params_per_dp.append(None)
+                grammar_bitmask_list.append(padded_bitmask)
+                struct_output_scheduler_to_persistent_list.append({
+                    struct_output_scheduler_to_persistent_keys[i].item(): struct_output_scheduler_to_persistent_values[i].item()
+                    for i in range(B)
+                })
 
             input_positions = torch.cat(input_positions_list, dim=0)
             prompt_lens = None
@@ -664,6 +688,8 @@ class TTModelRunner:
                 batch_size_per_dp.append(mi.unpadded_batch_size if mi else 0)
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
+                grammar_bitmask_list.append(mi.grammar_bitmask if mi else None)
+                struct_output_scheduler_to_persistent_list.append(mi.struct_output_scheduler_to_persistent if mi else None)
 
             input_positions = 0
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
