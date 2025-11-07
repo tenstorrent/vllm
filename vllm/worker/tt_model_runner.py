@@ -460,7 +460,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         elif (TTPlatform.non_greedy_decoding_on_device
                   and perform_device_sampling):
             sampling_metadata = None
-            # Always create TTSamplingParams with lists for proper permutation support
             temp_list = top_pk_sampling_params.temperature
             top_k_list = top_pk_sampling_params.top_k
             top_p_list = top_pk_sampling_params.top_p
