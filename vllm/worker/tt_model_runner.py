@@ -408,17 +408,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 pass
             elif (TTPlatform.non_greedy_decoding_on_device
                   and perform_device_sampling):
-                # non-uniform sampling - supports per-request sampling params
-                temp = sampling_params.temperature
-                top_k = sampling_params.top_k
-                top_p = sampling_params.top_p
+                # non greedy actually means
+                # that it also supports non-uniform sampling
+                # initializing an empty list for each value on first iter
+                # fill values after first iter
+                for key in ["temperature", "top_k", "top_p"]:
+                    top_pk_sampling_params.setdefault(key, []).append(
+                        getattr(sampling_params, key))
 
-                # Collect per-request sampling params as lists for
-                # permutation support
-                top_pk_sampling_params.setdefault("temperature",
-                                                  []).append(temp)
-                top_pk_sampling_params.setdefault("top_k", []).append(top_k)
-                top_pk_sampling_params.setdefault("top_p", []).append(top_p)
             else:
                 # uniform sampling - all requests must have same params
                 if len(top_pk_sampling_params) == 0:
