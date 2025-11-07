@@ -31,6 +31,15 @@ def main() -> None:
     with open(config_pickle_path, "rb") as f:
         vllm_config: VllmConfig = cloudpickle.load(f)
 
+    # Ensure TT model classes are registered in this process (MPI rank).
+    try:
+        from examples.offline_inference_tt import register_tt_models
+        register_tt_models()
+    except Exception:
+        # If examples module is unavailable, continue; custom registration may
+        # be handled elsewhere.
+        pass
+
     # Derive MPI ranks if present (device ranks).
     has_mpi = ("OMPI_COMM_WORLD_SIZE" in os.environ
                or "PMI_SIZE" in os.environ)

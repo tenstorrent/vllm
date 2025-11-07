@@ -575,7 +575,6 @@ def get_mesh_grid(local_dp_rank=0):
             # Try to parse as a literal tuple first
             parsed_value = ast.literal_eval(mesh_device_env)
             if isinstance(parsed_value, tuple) and len(parsed_value) == 2:
-                logger.debug("MESH_DEVICE is a tuple", mesh_device_env)
                 mesh_grid = parsed_value
             else:
                 raise ValueError("Not a valid tuple")

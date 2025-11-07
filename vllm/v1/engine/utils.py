@@ -626,6 +626,8 @@ def launch_core_engines(
         device_dp_ranks_for_handshake = {i * segment for i in range(mpi_world)}
         # In mixed launch, dp_rank==0 host starts all non-device ranks locally.
         local_set = set(range(dp_size)) - device_dp_ranks_for_handshake if dp_rank == 0 else set()
+        # Update local count to match what we actually start locally.
+        vllm_config.parallel_config.data_parallel_size_local = len(local_set)
         engines_to_handshake = [
             CoreEngine(index=i, local=(i in local_set)) for i in range(dp_size)
         ]
