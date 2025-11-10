@@ -602,28 +602,37 @@ def launch_core_engines(
         yield engine_actor_manager, coordinator, addresses
         return
 
-    # If using TT-MPI, do not mark any engines as local; all are external.
+    # TT-MPI args from override_tt_config: enabled when rank_binding is set,
+    # and only when running on TT platform.
+    use_tt_mpi: bool = False
     from vllm.platforms import current_platform
-    use_tt_mpi_flag = (current_platform.is_tt()
-                       and os.environ.get("VLLM_TT_USE_TTRUN") == "1")
-
-    # Determine which engines are expected to be local vs remote for handshake.
-    if use_tt_mpi_flag:
-        # Compute device dp ranks deterministically from rank binding.
-        rank_binding_path = os.environ.get("VLLM_TT_RANK_BINDING")
-        if not rank_binding_path:
-            raise RuntimeError("VLLM_TT_RANK_BINDING must be set for tt-run launch")
+    if current_platform.is_tt():
+        override_tt_config = vllm_config.model_config.override_tt_config or {}
+        rank_binding = override_tt_config.get("rank_binding")
+        if not isinstance(rank_binding, str):
+            raise RuntimeError(
+                "override_tt_config['rank_binding'] must be a non-empty string")
+        use_tt_mpi = bool(rank_binding)
+        mpi_args = override_tt_config.get("mpi_args", "")
+        config_pkl_dir = override_tt_config.get("config_pkl_dir")
+    # Pre-validate and pre-compute TT device ranks if tt-run is enabled.
+    if use_tt_mpi:
         try:
-            with open(rank_binding_path, "r") as f:
+            with open(rank_binding, "r") as f:
                 rb = yaml.safe_load(f)
             mpi_world = len(rb.get("rank_bindings", []))
         except Exception as e:
-            raise RuntimeError(f"Failed to read rank binding '{rank_binding_path}': {e}") from e
+            raise RuntimeError(
+                f"Failed to read rank binding '{rank_binding}': {e}") from e
         if mpi_world <= 0 or dp_size % mpi_world != 0:
             raise RuntimeError(
-                f"dp_size ({dp_size}) must be divisible by number of device MPI ranks ({mpi_world})")
+                f"data_parallel_size ({dp_size}) must be divisible by number of "
+                f"device MPI ranks ({mpi_world})")
         segment = dp_size // mpi_world
+        # First local dp rank per host group: 0, segment, 2*segment, ...
         device_dp_ranks_for_handshake = {i * segment for i in range(mpi_world)}
+
+        # Determine which engines are expected to be local vs remote for handshake.
         # In mixed launch, dp_rank==0 host starts all non-device ranks locally.
         local_set = set(range(dp_size)) - device_dp_ranks_for_handshake if dp_rank == 0 else set()
         # Update local count to match what we actually start locally.
@@ -668,60 +677,32 @@ def launch_core_engines(
         # - mixed-launch: launch only device ranks via tt-run and start local
         #   non-device ranks with CoreEngineProcManager.
         local_engine_manager = None
-        from vllm.platforms import current_platform
-        use_tt_mpi = (current_platform.is_tt()
-                      and os.environ.get("VLLM_TT_USE_TTRUN") == "1")
 
-        # Determine device dp ranks deterministically from rank-binding if present.
-        # We assume the tt-run rank binding has one entry per MPI device rank.
-        device_dp_ranks: set[int] = set()
-        if use_tt_mpi:
-            rank_binding_path = os.environ.get("VLLM_TT_RANK_BINDING")
-            if not rank_binding_path:
-                raise RuntimeError("VLLM_TT_RANK_BINDING must be set for tt-run launch")
-            try:
-                with open(rank_binding_path, "r") as f:
-                    rb = yaml.safe_load(f)
-                mpi_world = len(rb.get("rank_bindings", []))
-            except Exception as e:
-                raise RuntimeError(f"Failed to read rank binding '{rank_binding_path}': {e}") from e
-            dp_size_total = vllm_config.parallel_config.data_parallel_size
-            if mpi_world <= 0 or dp_size_total % mpi_world != 0:
-                raise RuntimeError(
-                    f"dp_size ({dp_size_total}) must be divisible by number of device MPI ranks ({mpi_world})")
-            segment = dp_size_total // mpi_world
-            # Pick the first local dp rank per host group: 0, segment, 2*segment, ...
-            device_dp_ranks = {i * segment for i in range(mpi_world)}
-
-        if use_tt_mpi and dp_rank == 0 and (device_dp_ranks or True):
+        # Launch device ranks via tt-run from rank 0 when enabled.
+        if use_tt_mpi and dp_rank == 0:
             import subprocess
             import tempfile
             import cloudpickle
 
             # Serialize vllm_config for remote engines to load.
-            cfg_path_env = os.environ.get("VLLM_TT_CONFIG_PICKLE_PATH")
-            if cfg_path_env:
-                config_pickle_path = cfg_path_env
-                with open(config_pickle_path, "wb") as tf:
-                    cloudpickle.dump(vllm_config, tf)
-            else:
-                with tempfile.NamedTemporaryFile(prefix="vllm_tt_cfg_",
-                                                 suffix=".pkl",
-                                                 delete=False) as tf:
-                    cloudpickle.dump(vllm_config, tf)
-                    config_pickle_path = tf.name
+            dir_for_cfg = None
+            if config_pkl_dir:
+                if not os.path.isdir(config_pkl_dir):
+                    raise RuntimeError(
+                        "override_tt_config['config_pkl_dir'] must be a directory")
+                dir_for_cfg = config_pkl_dir
+            with tempfile.NamedTemporaryFile(prefix="vllm_tt_cfg_",
+                                             suffix=".pkl",
+                                             dir=dir_for_cfg,
+                                             delete=False) as tf:
+                cloudpickle.dump(vllm_config, tf)
+                serialized_config_path = tf.name
 
             # Build tt-run command.
-            rank_binding = os.environ.get("VLLM_TT_RANK_BINDING")
-            if not rank_binding:
-                raise RuntimeError("VLLM_TT_RANK_BINDING env not set for tt-run launch")
-
-            mpi_args = os.environ.get("VLLM_TT_MPI_ARGS", "")
-
             # Propagate handshake info to engines via env.
             child_env = os.environ.copy()
             child_env["VLLM_TT_HANDSHAKE_ADDR"] = handshake_address
-            child_env["VLLM_TT_CONFIG_PICKLE"] = config_pickle_path
+            child_env["VLLM_TT_CONFIG_PICKLE"] = serialized_config_path
 
             cmd = ["tt-run", "--rank-binding", rank_binding]
             if mpi_args:
@@ -753,10 +734,10 @@ def launch_core_engines(
             # Mixed-launch: start all non-device DP ranks locally on host 0.
             # Reserve local_dp_rank=0 for device ranks; assign 1..N to non-device ranks
             # in ascending global DP order.
-            if device_dp_ranks and dp_rank == 0:
+            if device_dp_ranks_for_handshake and dp_rank == 0:
                 non_device_ranks = sorted(
                     r for r in range(vllm_config.parallel_config.data_parallel_size)
-                    if r not in device_dp_ranks
+                    if r not in device_dp_ranks_for_handshake
                 )
                 if non_device_ranks:
                     context = get_mp_context()
