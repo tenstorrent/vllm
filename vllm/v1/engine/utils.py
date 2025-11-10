@@ -602,50 +602,27 @@ def launch_core_engines(
         yield engine_actor_manager, coordinator, addresses
         return
 
-    # TT-MPI args from override_tt_config: enabled when rank_binding is set,
-    # and only when running on TT platform.
-    use_tt_mpi: bool = False
+    # Parse TT-MPI args and set engines to handshake accordingly.
+    use_tt_mpi = False
     from vllm.platforms import current_platform
     if current_platform.is_tt():
-        override_tt_config = vllm_config.model_config.override_tt_config or {}
-        rank_binding = override_tt_config.get("rank_binding")
-        if not isinstance(rank_binding, str):
-            raise RuntimeError(
-                "override_tt_config['rank_binding'] must be a non-empty string")
-        use_tt_mpi = bool(rank_binding)
-        mpi_args = override_tt_config.get("mpi_args", "")
-        config_pkl_dir = override_tt_config.get("config_pkl_dir")
-    # Pre-validate and pre-compute TT device ranks if tt-run is enabled.
-    if use_tt_mpi:
-        try:
-            with open(rank_binding, "r") as f:
-                rb = yaml.safe_load(f)
-            mpi_world = len(rb.get("rank_bindings", []))
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to read rank binding '{rank_binding}': {e}") from e
-        if mpi_world <= 0 or dp_size % mpi_world != 0:
-            raise RuntimeError(
-                f"data_parallel_size ({dp_size}) must be divisible by number of "
-                f"device MPI ranks ({mpi_world})")
-        segment = dp_size // mpi_world
-        # First local dp rank per host group: 0, segment, 2*segment, ...
-        device_dp_ranks_for_handshake = {i * segment for i in range(mpi_world)}
+        from vllm.v1.entrypoints.tt_engine_core import parse_tt_mpi_params
+        rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+        use_tt_mpi = rank_binding_file is not None
 
-        # Determine which engines are expected to be local vs remote for handshake.
-        # In mixed launch, dp_rank==0 host starts all non-device ranks locally.
-        local_set = set(range(dp_size)) - device_dp_ranks_for_handshake if dp_rank == 0 else set()
-        # Update local count to match what we actually start locally.
-        vllm_config.parallel_config.data_parallel_size_local = len(local_set)
-        engines_to_handshake = [
-            CoreEngine(index=i, local=(i in local_set)) for i in range(dp_size)
-        ]
+    if use_tt_mpi:
+        # Override local DP size to exclude device DP ranks.
+        # Device ranks are considered remote since they're launched via MPI,
+        # and are expected to connect over the handshake socket as they have no
+        # local process sentinel.
+        vllm_config.parallel_config.data_parallel_size_local = len(non_device_dp_ranks)
+        engines_to_handshake = [CoreEngine(index=i, local=(i in non_device_dp_ranks))
+                                for i in range(vllm_config.parallel_config.data_parallel_size)]
+    elif offline_mode or (external_dp_lb and dp_rank > 0):
+        assert local_engine_count == 1
+        engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
     else:
-        if offline_mode or (external_dp_lb and dp_rank > 0):
-            assert local_engine_count == 1
-            engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
-        else:
-            engines_to_handshake = [
+        engines_to_handshake = [
                 CoreEngine(index=i, local=(i < local_engine_count))
                 for i in range(dp_size)
             ]
@@ -672,97 +649,57 @@ def launch_core_engines(
 
         from vllm.v1.engine.core import EngineCoreProc
 
-        # TT-MPI launcher path: if enabled, we can either:
-        # - launch all engines via tt-run, or
-        # - mixed-launch: launch only device ranks via tt-run and start local
-        #   non-device ranks with CoreEngineProcManager.
+        # Start local engines.
         local_engine_manager = None
-
-        # Launch device ranks via tt-run from rank 0 when enabled.
-        if use_tt_mpi and dp_rank == 0:
-            import subprocess
-            import tempfile
-            import cloudpickle
-
-            # Serialize vllm_config for remote engines to load.
-            dir_for_cfg = None
-            if config_pkl_dir:
-                if not os.path.isdir(config_pkl_dir):
-                    raise RuntimeError(
-                        "override_tt_config['config_pkl_dir'] must be a directory")
-                dir_for_cfg = config_pkl_dir
-            with tempfile.NamedTemporaryFile(prefix="vllm_tt_cfg_",
-                                             suffix=".pkl",
-                                             dir=dir_for_cfg,
-                                             delete=False) as tf:
-                cloudpickle.dump(vllm_config, tf)
-                serialized_config_path = tf.name
-
-            # Build tt-run command.
-            # Propagate handshake info to engines via env.
-            child_env = os.environ.copy()
-            child_env["VLLM_TT_HANDSHAKE_ADDR"] = handshake_address
-            child_env["VLLM_TT_CONFIG_PICKLE"] = serialized_config_path
-
-            cmd = ["tt-run", "--rank-binding", rank_binding]
-            if mpi_args:
-                # Pass raw string; tt-run will shlex.split it
-                cmd.extend(["--mpi-args", mpi_args])
-            # Program to run per MPI rank: engine entrypoint
-            cmd.extend([sys.executable, "-m",
-                        "vllm.v1.entrypoints.tt_engine_core"])
-
-            logger.info("Launching engines with tt-run: %s", " ".join(cmd))
-            proc = subprocess.Popen(cmd, env=child_env)
-            # Keep reference so process isn't garbage collected.
-            _ = proc
-        if not use_tt_mpi:
-            # Start all local engines as usual.
-            if local_engine_count:
-                local_engine_manager = CoreEngineProcManager(
-                    EngineCoreProc.run_engine_core,
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
-                    handshake_address=handshake_address,
-                    client_handshake_address=client_handshake_address,
-                    local_client=True,
-                    local_engine_count=local_engine_count,
-                    start_index=dp_rank,
-                    local_start_index=local_start_index or 0)
-        else:
-            # Mixed-launch: start all non-device DP ranks locally on host 0.
-            # Reserve local_dp_rank=0 for device ranks; assign 1..N to non-device ranks
-            # in ascending global DP order.
-            if device_dp_ranks_for_handshake and dp_rank == 0:
-                non_device_ranks = sorted(
-                    r for r in range(vllm_config.parallel_config.data_parallel_size)
-                    if r not in device_dp_ranks_for_handshake
-                )
-                if non_device_ranks:
-                    context = get_mp_context()
-                    procs: list[BaseProcess] = []
-                    for i, r in enumerate(non_device_ranks, start=1):
-                        local_idx = i  # 1..N, leaving 0 to device rank(s)
-                        p = context.Process(target=EngineCoreProc.run_engine_core,
-                                            name=f"EngineCore_{r}",
-                                            kwargs=dict(vllm_config=vllm_config,
-                                                        executor_class=executor_class,
-                                                        log_stats=log_stats,
-                                                        handshake_address=handshake_address,
-                                                        client_handshake_address=client_handshake_address,
-                                                        local_client=True,
-                                                        dp_rank=r,
-                                                        local_dp_rank=local_idx))
-                        p.start()
-                        procs.append(p)
-                    # Wrap in a minimal manager-like object
-                    class _TmpMgr:
-                        def __init__(self, ps): self.processes = ps; self._finalizer = weakref.finalize(self, shutdown, ps)
-                        def sentinels(self): return [p.sentinel for p in self.processes]
-                        def finished_procs(self): return {p.name: p.exitcode for p in self.processes if p.exitcode is not None}
-                        def close(self): self._finalizer()
-                    local_engine_manager = _TmpMgr(procs)
+        if not use_tt_mpi and local_engine_count:
+            # In server mode, start_index and local_start_index will
+            # both be 0.
+            local_engine_manager = CoreEngineProcManager(
+                EngineCoreProc.run_engine_core,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=log_stats,
+                handshake_address=handshake_address,
+                client_handshake_address=client_handshake_address,
+                local_client=True,
+                local_engine_count=local_engine_count,
+                start_index=dp_rank,
+                local_start_index=local_start_index or 0)
+        elif use_tt_mpi:
+            # Mixed-launch: start all non-device DP ranks locally on host 0 and
+            # launch device ranks (including on other hosts) via tt-run (MPI).
+            # Device ranks have local_dp_rank=0 and 
+            # dp_rank = mpi_rank * (dp_size // mpi_world).
+            # Non-device ranks have local_dp_rank=1..len(non_device_dp_ranks).
+            assert dp_rank == 0, "TT MPI must be launched from rank 0"
+            from vllm.v1.entrypoints.tt_engine_core import tt_run_launch
+            tt_run_launch(handshake_address=handshake_address,
+                          vllm_config=vllm_config,
+                          rank_binding_file=rank_binding_file)
+            if non_device_dp_ranks:
+                context = get_mp_context()
+                procs: list[BaseProcess] = []
+                for i, r in enumerate(non_device_dp_ranks, start=1):
+                    local_idx = i  # 1..N, leaving 0 to device rank(s)
+                    p = context.Process(target=EngineCoreProc.run_engine_core,
+                                        name=f"EngineCore_{r}",
+                                        kwargs=dict(vllm_config=vllm_config,
+                                                    executor_class=executor_class,
+                                                    log_stats=log_stats,
+                                                    handshake_address=handshake_address,
+                                                    client_handshake_address=client_handshake_address,
+                                                    local_client=True,
+                                                    dp_rank=r,
+                                                    local_dp_rank=local_idx))
+                    p.start()
+                    procs.append(p)
+                # Wrap in a minimal manager-like object
+                class _TmpMgr:
+                    def __init__(self, ps): self.processes = ps; self._finalizer = weakref.finalize(self, shutdown, ps)
+                    def sentinels(self): return [p.sentinel for p in self.processes]
+                    def finished_procs(self): return {p.name: p.exitcode for p in self.processes if p.exitcode is not None}
+                    def close(self): self._finalizer()
+                local_engine_manager = _TmpMgr(procs)
 
         yield local_engine_manager, coordinator, addresses
 
