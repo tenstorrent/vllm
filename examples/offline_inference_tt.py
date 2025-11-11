@@ -342,6 +342,8 @@ def run_inference(
     max_num_batched_tokens=None,
     data_parallel_size=1,
     block_size=64,
+    data_parallel_address=None,
+    data_parallel_rpc_port=None,
 ):
     check_tt_model_supported(model)
 
@@ -372,6 +374,11 @@ def run_inference(
         "disable_async_output_proc": disable_async_output_proc,
         "data_parallel_size": data_parallel_size,
     }
+    
+    if data_parallel_address:
+        engine_kw_args["data_parallel_address"] = data_parallel_address
+    if data_parallel_rpc_port:
+        engine_kw_args["data_parallel_rpc_port"] = data_parallel_rpc_port
 
     try:
         if override_tt_config:
@@ -750,6 +757,18 @@ if __name__ == "__main__":
         default=64,
         help="KV cache block size",
     )
+    parser.add_argument(
+        "--data_parallel_address",
+        type=str,
+        default=None,
+        help="Data parallel address",
+    )
+    parser.add_argument(
+        "--data_parallel_rpc_port",
+        type=int,
+        default=None,
+        help="Data parallel RPC port",
+    )
 
     args = parser.parse_args()
 
@@ -774,4 +793,6 @@ if __name__ == "__main__":
         max_num_batched_tokens=args.max_num_batched_tokens,
         data_parallel_size=args.data_parallel_size,
         block_size=args.block_size,
+        data_parallel_address=args.data_parallel_address,
+        data_parallel_rpc_port=args.data_parallel_rpc_port,
     )
