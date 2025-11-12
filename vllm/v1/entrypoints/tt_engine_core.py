@@ -75,26 +75,30 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
             raise RuntimeError(
                 "override_tt_config['config_pkl_dir'] must be a directory")
         dir_for_cfg = config_pkl_dir
-    with tempfile.NamedTemporaryFile(prefix="vllm_tt_cfg_",
-                                     suffix=".pkl",
-                                     dir=dir_for_cfg,
-                                     delete=False) as tf:
+    cfg_dir = dir_for_cfg if dir_for_cfg is not None else tempfile.gettempdir()
+    serialized_config_path = os.path.join(cfg_dir, "tmp_vllm_tt_cfg.pkl")
+    with open(serialized_config_path, "wb") as tf:
         cloudpickle.dump(vllm_config, tf)
-        serialized_config_path = tf.name
 
-    # Build tt-run command.
-    cmd = ["tt-run", "--rank-binding", rank_binding_file]
+    # Create a temporary rank binding file that augments global_env
+    # with the handshake address and config pickle path.
+    with open(rank_binding_file, "r") as f:
+        rb = yaml.safe_load(f)
+    rb.setdefault("global_env", {})
+    rb["global_env"]["VLLM_TT_HANDSHAKE_ADDR"] = str(handshake_address)
+    rb["global_env"]["VLLM_TT_CONFIG_PICKLE"] = str(serialized_config_path)
+    tmp_rb_path = os.path.join(tempfile.gettempdir(), "tmp_vllm_tt_rank_binding.yaml")
+    with open(tmp_rb_path, "w") as tf:
+        yaml.safe_dump(rb, tf)
+
+    cmd = ["tt-run", "--rank-binding", tmp_rb_path]
     if mpi_args:
         # Pass raw string; tt-run will shlex.split it
         cmd.extend(["--mpi-args", mpi_args])
     # Program to run per MPI rank: engine entrypoint
     cmd.extend([sys.executable, "-m", "vllm.v1.entrypoints.tt_engine_core"])
 
-    # Propagate handshake info to engines via env.
     child_env = os.environ.copy()
-    child_env["VLLM_TT_HANDSHAKE_ADDR"] = handshake_address
-    child_env["VLLM_TT_CONFIG_PICKLE"] = serialized_config_path
-
     logger.info("Launching engines with tt-run: %s", " ".join(cmd))
     subprocess.Popen(cmd, env=child_env)
 
