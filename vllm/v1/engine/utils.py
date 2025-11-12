@@ -541,6 +541,21 @@ def launch_core_engines(
         EngineZmqAddresses,
 ]]:
     """Launch engine and DP coordinator processes as needed."""
+    
+    # Parse TT-MPI args as early as possible so address topology reflects
+    # remote MPI-launched device ranks. This may change local_engine_count.
+    use_tt_mpi = False
+    non_device_dp_ranks: set[int] = set()
+    from vllm.platforms import current_platform
+    if current_platform.is_tt():
+        from vllm.v1.entrypoints.tt_engine_core import parse_tt_mpi_params
+        rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+        use_tt_mpi = rank_binding_file is not None
+        if use_tt_mpi:
+            # Device ranks (one per host) are launched via MPI and considered
+            # remote here; only non-device ranks are local on host 0.
+            vllm_config.parallel_config.data_parallel_size_local = len(
+                non_device_dp_ranks)
 
     parallel_config = vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
@@ -602,20 +617,11 @@ def launch_core_engines(
         yield engine_actor_manager, coordinator, addresses
         return
 
-    # Parse TT-MPI args and set engines to handshake accordingly.
-    use_tt_mpi = False
-    from vllm.platforms import current_platform
-    if current_platform.is_tt():
-        from vllm.v1.entrypoints.tt_engine_core import parse_tt_mpi_params
-        rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
-        use_tt_mpi = rank_binding_file is not None
-
     if use_tt_mpi:
         # Override local DP size to exclude device DP ranks.
         # Device ranks are considered remote since they're launched via MPI,
         # and are expected to connect over the handshake socket as they have no
         # local process sentinel.
-        vllm_config.parallel_config.data_parallel_size_local = len(non_device_dp_ranks)
         engines_to_handshake = [CoreEngine(index=i, local=(i in non_device_dp_ranks))
                                 for i in range(vllm_config.parallel_config.data_parallel_size)]
     elif offline_mode or (external_dp_lb and dp_rank > 0):

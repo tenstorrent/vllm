@@ -87,6 +87,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     rb.setdefault("global_env", {})
     rb["global_env"]["VLLM_TT_HANDSHAKE_ADDR"] = str(handshake_address)
     rb["global_env"]["VLLM_TT_CONFIG_PICKLE"] = str(serialized_config_path)
+    rb["global_env"]["VLLM_DP_MASTER_PORT"] = os.environ.get("VLLM_DP_MASTER_PORT")
     tmp_rb_path = os.path.join(tempfile.gettempdir(), "tmp_vllm_tt_rank_binding.yaml")
     with open(tmp_rb_path, "w") as tf:
         yaml.safe_dump(rb, tf)
@@ -112,6 +113,9 @@ def main() -> None:
     # Read handshake address and config pickle path from env.
     handshake_address = _get_env("VLLM_TT_HANDSHAKE_ADDR")
     config_pickle_path = _get_env("VLLM_TT_CONFIG_PICKLE")
+    
+    print(f"handshake_address: {handshake_address}")
+    print(f"config_pickle_path: {config_pickle_path}")
 
     # Load vllm config.
     with open(config_pickle_path, "rb") as f:
