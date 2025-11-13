@@ -723,7 +723,7 @@ class TTModelRunner:
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
-            cross_block_tables=None  # Not yet supported in V1,
+            cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask_list,
             struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent_list,
         )
