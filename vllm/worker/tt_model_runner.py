@@ -456,7 +456,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     request_id = seq_group_metadata.request_id
                     seed = seq_group_metadata.sampling_params.seed
                     if request_id not in generators and seed is not None:
-                        generators[request_id] = torch.Generator(device="cpu").manual_seed(seed)
+                        generators[request_id] = torch.Generator(
+                            device="cpu").manual_seed(seed)
 
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list,
