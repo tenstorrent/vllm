@@ -511,6 +511,22 @@ def get_fabric_config(override_tt_config, num_devices):
     return fabric_config
 
 
+def get_reliability_mode(override_tt_config):
+    # Default to strict init and override if specified in override_tt_config.
+    reliability_mode = ttnn.FabricReliabilityMode.STRICT_INIT
+    if override_tt_config is not None and "fabric_reliability_mode" in override_tt_config:
+        reliability_mode_str = override_tt_config["fabric_reliability_mode"]
+        reliability_mode_map = {
+            "STRICT_INIT": ttnn.FabricReliabilityMode.STRICT_INIT,
+            "RELAXED_INIT": ttnn.FabricReliabilityMode.RELAXED_INIT,
+        }
+        reliability_mode = reliability_mode_map.get(reliability_mode_str)
+        assert reliability_mode is not None, (
+            f"Invalid fabric_reliability_mode: {reliability_mode_str}. "
+            f"Expected one of {list(reliability_mode_map.keys())}.")
+    return reliability_mode
+
+
 # From tt-metal/conftest.py:
 # Set fabric config to passed in value
 # Do nothing if not set
@@ -518,8 +534,9 @@ def get_fabric_config(override_tt_config, num_devices):
 def set_fabric(override_tt_config, num_devices):
     fabric_config = get_fabric_config(override_tt_config, num_devices)
     if fabric_config:
-        ttnn.set_fabric_config(fabric_config)
-
+        reliability_mode = get_reliability_mode(override_tt_config)
+        logger.info(f"Setting fabric config: {fabric_config}, reliability mode: {reliability_mode}")
+        ttnn.set_fabric_config(fabric_config, reliability_mode)
 
 # From tt-metal/conftest.py:
 # Reset fabric config to DISABLED if not None, and do nothing otherwise
@@ -599,6 +616,7 @@ def get_mesh_grid(local_dp_rank=0):
 def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
     assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
     mesh_grid = get_mesh_grid(local_dp_rank)
+    logger.info(f"Attempting to open mesh device with grid shape {mesh_grid}")
 
     device_params = device_params_from_override_tt_config(
         override_tt_config, trace_mode)

@@ -88,6 +88,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     rb["global_env"]["VLLM_TT_HANDSHAKE_ADDR"] = str(handshake_address)
     rb["global_env"]["VLLM_TT_CONFIG_PICKLE"] = str(serialized_config_path)
     rb["global_env"]["VLLM_DP_MASTER_PORT"] = os.environ.get("VLLM_DP_MASTER_PORT")
+    rb["global_env"]["MESH_DEVICE"] = os.environ.get("MESH_DEVICE")
     tmp_rb_path = os.path.join(tempfile.gettempdir(), "tmp_vllm_tt_rank_binding.yaml")
     with open(tmp_rb_path, "w") as tf:
         yaml.safe_dump(rb, tf)
@@ -120,6 +121,9 @@ def main() -> None:
     # Load vllm config.
     with open(config_pickle_path, "rb") as f:
         vllm_config: VllmConfig = cloudpickle.load(f)
+        
+    # print data parallel master port
+    print(f"data parallel master port: {vllm_config.parallel_config.data_parallel_master_port}")
 
     # Ensure TT model classes are registered in this process (MPI rank).
     try:
