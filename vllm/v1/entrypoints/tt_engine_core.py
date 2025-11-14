@@ -6,6 +6,7 @@ import sys
 from typing import Optional
 import subprocess
 import tempfile
+import fnmatch
 import yaml
 import cloudpickle
 from vllm.config import VllmConfig
@@ -87,8 +88,22 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     rb.setdefault("global_env", {})
     rb["global_env"]["VLLM_TT_HANDSHAKE_ADDR"] = str(handshake_address)
     rb["global_env"]["VLLM_TT_CONFIG_PICKLE"] = str(serialized_config_path)
-    rb["global_env"]["VLLM_DP_MASTER_PORT"] = os.environ.get("VLLM_DP_MASTER_PORT")
-    rb["global_env"]["MESH_DEVICE"] = os.environ.get("MESH_DEVICE")
+
+    # Whitelist-based env passthrough (patterns) to avoid copying full env.
+    default_env_patterns = ["VLLM_*", "MESH_DEVICE"]
+    env_passthrough = override_tt_config.get("env_passthrough",
+                                             default_env_patterns)
+    if isinstance(env_passthrough, (list, tuple)):
+        to_inject = {}
+        for key, val in os.environ.items():
+            for pattern in env_passthrough:
+                if fnmatch.fnmatch(key, pattern):
+                    to_inject[key] = val
+                    break
+        # Do not override existing keys in global_env.
+        for k, v in to_inject.items():
+            rb["global_env"].setdefault(k, v)
+
     tmp_rb_path = os.path.join(tempfile.gettempdir(), "tmp_vllm_tt_rank_binding.yaml")
     with open(tmp_rb_path, "w") as tf:
         yaml.safe_dump(rb, tf)
@@ -111,19 +126,21 @@ def _get_env(name: str, default: Optional[str] = None) -> str:
     return val
 
 def main() -> None:
+    # Derive MPI ranks if present (device ranks).
+    has_mpi = ("OMPI_COMM_WORLD_SIZE" in os.environ
+               or "PMI_SIZE" in os.environ)
+    mpi_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK",
+                                  os.environ.get("PMI_RANK", "0")))
+    mpi_world = int(os.environ.get("OMPI_COMM_WORLD_SIZE",
+                                   os.environ.get("PMI_SIZE", "1")))
+
     # Read handshake address and config pickle path from env.
     handshake_address = _get_env("VLLM_TT_HANDSHAKE_ADDR")
     config_pickle_path = _get_env("VLLM_TT_CONFIG_PICKLE")
-    
-    print(f"handshake_address: {handshake_address}")
-    print(f"config_pickle_path: {config_pickle_path}")
 
     # Load vllm config.
     with open(config_pickle_path, "rb") as f:
         vllm_config: VllmConfig = cloudpickle.load(f)
-        
-    # print data parallel master port
-    print(f"data parallel master port: {vllm_config.parallel_config.data_parallel_master_port}")
 
     # Ensure TT model classes are registered in this process (MPI rank).
     try:
@@ -133,14 +150,6 @@ def main() -> None:
         # If examples module is unavailable, continue; custom registration may
         # be handled elsewhere.
         pass
-
-    # Derive MPI ranks if present (device ranks).
-    has_mpi = ("OMPI_COMM_WORLD_SIZE" in os.environ
-               or "PMI_SIZE" in os.environ)
-    mpi_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK",
-                                  os.environ.get("PMI_RANK", "0")))
-    mpi_world = int(os.environ.get("OMPI_COMM_WORLD_SIZE",
-                                   os.environ.get("PMI_SIZE", "1")))
 
     # Determine the global DP topology from the serialized config.
     pc = vllm_config.parallel_config
