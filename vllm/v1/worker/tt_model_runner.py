@@ -646,8 +646,8 @@ class TTModelRunner:
                                          top_p=top_p))
                 else:
                     sampling_params_per_dp.append(None)
-                grammar_bitmask_list.append(padded_bitmask)
-                struct_output_scheduler_to_persistent_list.append({
+                grammar_bitmask_list.extend(padded_bitmask)
+                struct_output_scheduler_to_persistent_list.extend({
                     struct_output_scheduler_to_persistent_keys[i].item(): struct_output_scheduler_to_persistent_values[i].item()
                     for i in range(B)
                 })
