@@ -545,7 +545,6 @@ def launch_core_engines(
     # Parse TT-MPI args as early as possible so address topology reflects
     # remote MPI-launched device ranks. This may change local_engine_count.
     use_tt_mpi = False
-    non_device_dp_ranks: set[int] = set()
     from vllm.platforms import current_platform
     if current_platform.is_tt():
         from vllm.v1.entrypoints.tt_engine_core import parse_tt_mpi_params
@@ -677,6 +676,12 @@ def launch_core_engines(
             # Device ranks have local_dp_rank=0 and 
             # dp_rank = mpi_rank * (dp_size // mpi_world).
             # Non-device ranks have local_dp_rank=1..len(non_device_dp_ranks).
+            logger.info(
+                "TT-MPI mixed launch: dp_size=%d local_count=%d non_device_ranks=%s handshake=%s",
+                vllm_config.parallel_config.data_parallel_size,
+                vllm_config.parallel_config.data_parallel_size_local,
+                sorted(non_device_dp_ranks),
+                handshake_address)
             assert dp_rank == 0, "TT MPI must be launched from rank 0"
             from vllm.v1.entrypoints.tt_engine_core import tt_run_launch
             tt_run_launch(handshake_address=handshake_address,
