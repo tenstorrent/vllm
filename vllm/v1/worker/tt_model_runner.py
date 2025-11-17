@@ -489,7 +489,7 @@ class TTModelRunner:
           - "float_inputs": flattened float tensor of constant size.
         """
 
-        bitmask_size = (self.model_config.vocab_size + 31) // 32
+        bitmask_size = (self.model_config.get_vocab_size() + 31) // 32
         if model_input is None:
             max_batch = int(self.scheduler_config.max_num_seqs)
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
@@ -623,7 +623,7 @@ class TTModelRunner:
                 off += 1
                 top_k = int(int_inputs[off].item())
                 off += 1
-                bitmask_size = ((self.model_config.vocab_size + 31) // 32)
+                bitmask_size = ((self.model_config.get_vocab_size() + 31) // 32)
                 stride = bitmask_size * B
                 padded_bitmask = int_inputs[off:off + stride].view(B, bitmask_size)
                 off += stride
