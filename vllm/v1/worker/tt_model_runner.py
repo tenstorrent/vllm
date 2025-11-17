@@ -646,8 +646,8 @@ class TTModelRunner:
                                          top_p=top_p))
                 else:
                     sampling_params_per_dp.append(None)
-                grammar_bitmask_list.extend(padded_bitmask)
-                struct_output_scheduler_to_persistent_list.extend({
+                grammar_bitmask_list.append(padded_bitmask)
+                struct_output_scheduler_to_persistent_list.append({
                     struct_output_scheduler_to_persistent_keys[i].item(): struct_output_scheduler_to_persistent_values[i].item()
                     for i in range(B)
                 })
@@ -688,8 +688,9 @@ class TTModelRunner:
                 batch_size_per_dp.append(mi.unpadded_batch_size if mi else 0)
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
-                grammar_bitmask_list.append(mi.grammar_bitmask if mi else None)
-                struct_output_scheduler_to_persistent_list.append(mi.struct_output_scheduler_to_persistent if mi else None)
+                # Unwrap the single-element list wrappers
+                grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None)
+                struct_output_scheduler_to_persistent_list.append(mi.struct_output_scheduler_to_persistent[0] if mi else None)
 
             input_positions = 0
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
