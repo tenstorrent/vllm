@@ -225,15 +225,6 @@ def main() -> None:
     with open(config_pickle_path, "rb") as f:
         vllm_config: VllmConfig = cloudpickle.load(f)
 
-    # Ensure TT model classes are registered in this process (MPI rank).
-    try:
-        from examples.offline_inference_tt import register_tt_models
-        register_tt_models()
-    except Exception:
-        # If examples module is unavailable, continue; custom registration may
-        # be handled elsewhere.
-        pass
-
     # Determine the global DP topology from the serialized config.
     pc = vllm_config.parallel_config
     dp_size = pc.data_parallel_size
