@@ -3,6 +3,7 @@
 
 import os
 import sys
+import argparse
 from typing import Optional
 import subprocess
 import tempfile
@@ -125,7 +126,7 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[Optional[str], set[int
     return rank_binding_file, non_device_dp_ranks
 
 def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
-                  rank_binding_file: str) -> None:
+                  rank_binding_file: str, log_stats: bool) -> None:
     """
     Launch TT MPI processes via tt-run from rank 0.
     Uses args from override_tt_config:
@@ -164,14 +165,11 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     with open(serialized_config_path, "wb") as tf:
         cloudpickle.dump(vllm_config, tf)
 
-    # Create a temporary rank binding file that augments global_env
-    # with the handshake address and config pickle path.
+    # Create a temporary rank binding file that augments global_env with
+    # any env_passthrough variables.
     with open(rank_binding_file, "r") as f:
         rb = yaml.safe_load(f)
     rb.setdefault("global_env", {})
-    rb["global_env"]["VLLM_TT_HANDSHAKE_ADDR"] = str(handshake_address)
-    rb["global_env"]["VLLM_TT_CONFIG_PICKLE"] = str(serialized_config_path)
-
     # Whitelist-based env passthrough (patterns) to avoid copying full env.
     default_env_patterns = ["VLLM_*", "MESH_DEVICE"]
     env_passthrough = override_tt_config.get("env_passthrough",
@@ -195,20 +193,33 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     if mpi_args:
         # Pass raw string; tt-run will shlex.split it
         cmd.extend(["--mpi-args", mpi_args])
-    # Program to run per MPI rank: engine entrypoint
-    cmd.extend([sys.executable, "-m", "vllm.v1.entrypoints.tt_engine_core"])
+    # Program to run per MPI rank: engine entrypoint with explicit args
+    cmd.extend([sys.executable, "-m", "vllm.v1.entrypoints.tt_engine_core",
+                "--handshake", str(handshake_address),
+                "--config-pkl", str(serialized_config_path),
+                "--log-stats", ("1" if log_stats else "0")])
 
     child_env = os.environ.copy()
     logger.info("Launching engines with tt-run: %s", " ".join(cmd))
     subprocess.Popen(cmd, env=child_env)
 
-def _get_env(name: str, default: Optional[str] = None) -> str:
-    val = os.environ.get(name, default)
-    if val is None:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="TT engine core entrypoint")
+    parser.add_argument("--handshake", required=True, help="Handshake address")
+    parser.add_argument("--config-pkl", required=True,
+                        dest="config_pkl",
+                        help="Path to serialized VllmConfig pickle")
+    parser.add_argument("--log-stats", required=True, choices=["0", "1"],
+                        dest="log_stats",
+                        help="Enable stat logging (1) or disable (0)")
+    return parser.parse_args()
 
 def main() -> None:
+    args = _parse_args()
+    handshake_address = args.handshake
+    config_pickle_path = args.config_pkl
+    log_stats = (args.log_stats == "1")
+
     # Derive MPI ranks if present (device ranks).
     has_mpi = ("OMPI_COMM_WORLD_SIZE" in os.environ
                or "PMI_SIZE" in os.environ)
@@ -216,10 +227,6 @@ def main() -> None:
                                   os.environ.get("PMI_RANK", "0")))
     mpi_world = int(os.environ.get("OMPI_COMM_WORLD_SIZE",
                                    os.environ.get("PMI_SIZE", "1")))
-
-    # Read handshake address and config pickle path from env.
-    handshake_address = _get_env("VLLM_TT_HANDSHAKE_ADDR")
-    config_pickle_path = _get_env("VLLM_TT_CONFIG_PICKLE")
 
     # Load vllm config.
     with open(config_pickle_path, "rb") as f:
@@ -251,7 +258,7 @@ def main() -> None:
                                    local_client=False,
                                    handshake_address=handshake_address,
                                    executor_class=UniProcExecutor,
-                                   log_stats=False,
+                                   log_stats=log_stats,
                                    dp_rank=pc.data_parallel_rank,
                                    local_dp_rank=pc.data_parallel_rank_local)
 

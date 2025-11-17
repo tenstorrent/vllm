@@ -686,7 +686,8 @@ def launch_core_engines(
             from vllm.v1.entrypoints.tt_engine_core import tt_run_launch
             tt_run_launch(handshake_address=handshake_address,
                           vllm_config=vllm_config,
-                          rank_binding_file=rank_binding_file)
+                          rank_binding_file=rank_binding_file,
+                          log_stats=log_stats)
             if non_device_dp_ranks:
                 context = get_mp_context()
                 procs: list[BaseProcess] = []
