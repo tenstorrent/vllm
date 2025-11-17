@@ -194,7 +194,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
         # Pass raw string; tt-run will shlex.split it
         cmd.extend(["--mpi-args", mpi_args])
     # Program to run per MPI rank: engine entrypoint with explicit args
-    cmd.extend([sys.executable, "-m", "vllm.v1.entrypoints.tt_engine_core",
+    cmd.extend([sys.executable, "-m", "vllm.v1.entrypoints.tt_core_launcher",
                 "--handshake", str(handshake_address),
                 "--config-pkl", str(serialized_config_path),
                 "--log-stats", ("1" if log_stats else "0")])

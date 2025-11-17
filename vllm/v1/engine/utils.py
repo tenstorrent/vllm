@@ -547,7 +547,7 @@ def launch_core_engines(
     use_tt_mpi = False
     from vllm.platforms import current_platform
     if current_platform.is_tt():
-        from vllm.v1.entrypoints.tt_engine_core import parse_tt_mpi_params
+        from vllm.v1.entrypoints.tt_core_launcher import parse_tt_mpi_params
         rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
         use_tt_mpi = rank_binding_file is not None
         if use_tt_mpi:
@@ -683,7 +683,7 @@ def launch_core_engines(
                 sorted(non_device_dp_ranks),
                 handshake_address)
             assert dp_rank == 0, "TT MPI must be launched from rank 0"
-            from vllm.v1.entrypoints.tt_engine_core import tt_run_launch
+            from vllm.v1.entrypoints.tt_core_launcher import tt_run_launch
             tt_run_launch(handshake_address=handshake_address,
                           vllm_config=vllm_config,
                           rank_binding_file=rank_binding_file,
