@@ -212,8 +212,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
         for k, v in to_inject.items():
             rb["global_env"].setdefault(k, v)
 
-    tmp_rb_path = os.path.join(tempfile.gettempdir(),
-                               "tmp_vllm_tt_rank_binding.yaml")
+    tmp_rb_path = os.path.join(cfg_dir, "tmp_vllm_tt_rank_binding.yaml")
     with open(tmp_rb_path, "w") as tf:
         yaml.safe_dump(rb, tf)
 
