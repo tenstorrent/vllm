@@ -267,7 +267,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 del self.req_id_to_seq_id[req_id]
 
         # sort empty_slots for consistency
+        logger.info("before SORT: %s", self.empty_slots)
         self.empty_slots.sort()
+        logger.info("after SORT: %s", self.empty_slots)
 
     def prepare_model_input(
             self,
