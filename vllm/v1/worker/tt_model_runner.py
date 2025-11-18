@@ -424,7 +424,9 @@ class TTModelRunner:
         # structured_output_request_ids is an empty dict
         # and grammar_bitmask is None
         # We wrap in single-element lists to maintain consistent dtype for DP case
-        grammar_bitmask = [scheduler_output.grammar_bitmask]
+        # using torch tensor instead of numpy array for consistency because we need it as tensor for ipc
+        bitmask = torch.from_numpy(scheduler_output.grammar_bitmask) if scheduler_output.grammar_bitmask is not None else None
+        grammar_bitmask = [bitmask]
         # Get a mapping from scheduler batch (and bitmask) index to persistent batch index f
         # or structured output requests within a given DP rank
         # Do this now, because later we lose access to other ranks' self.input_batch
@@ -939,9 +941,6 @@ class TTModelRunner:
         """Apply structured output grammar constraints to logits in-place"""
         if grammar_bitmask is None or not struct_output_scheduler_to_persistent:
             return
-
-        #TODO slice in numpy so we only get non-padding rows
-        grammar_bitmask = torch.from_numpy(grammar_bitmask)
         
         # The grammar bitmask is compressed as packed int32 values where each bit 
         # represents one token. We need to unpack it like the TPU model runner.
