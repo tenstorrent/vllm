@@ -608,6 +608,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             self.seq_groups_to_batch_slot[seq_id])
                         # Only add to empty_slots if not already present
                         # (prevent duplicates)
+                        logger.info("NIKOLA")
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
                         else:
