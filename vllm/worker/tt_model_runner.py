@@ -609,6 +609,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         # Only add to empty_slots if not already present
                         # (prevent duplicates)
                         logger.info("NIKOLA")
+                        logger.info(empty_batch_slot)
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
                         else:
