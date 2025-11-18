@@ -610,6 +610,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         # (prevent duplicates)
                         if empty_batch_slot not in self.empty_slots:
                             self.empty_slots.append(empty_batch_slot)
+                            logger.warning("NIKOLA")
                         else:
                             logger.warning(
                                 "SLOT_DEBUG: Slot %s from seq %s already in "
