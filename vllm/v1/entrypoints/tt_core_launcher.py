@@ -126,7 +126,7 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[Optional[str], set[int
     return rank_binding_file, non_device_dp_ranks
 
 def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
-                  rank_binding_file: str, log_stats: bool) -> None:
+                  rank_binding_file: str, log_stats: bool):
     """
     Launch TT MPI processes via tt-run from rank 0.
     Uses args from override_tt_config:
@@ -201,7 +201,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
 
     child_env = os.environ.copy()
     logger.info("Launching engines with tt-run: %s", " ".join(cmd))
-    subprocess.Popen(cmd, env=child_env)
+    return subprocess.Popen(cmd, env=child_env)
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TT engine core entrypoint")
