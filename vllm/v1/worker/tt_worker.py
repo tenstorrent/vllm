@@ -4,7 +4,6 @@
 from contextlib import suppress
 from typing import TYPE_CHECKING, Optional, Union
 
-import os
 import torch
 
 from vllm.config import VllmConfig
@@ -52,12 +51,12 @@ class TTWorker(WorkerBase):
             self.trace_mode = override_tt_config[trace_key]
 
     def init_device(self) -> None:
-        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
         # Open mesh only on local DP rank 0 (device ranks).
         if local_dp_rank == 0:
             self.mesh_device = open_mesh_device(
-                self.model_config.override_tt_config, self.trace_mode, local_dp_rank)
+                self.model_config.override_tt_config, self.trace_mode,
+                local_dp_rank)
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
             self.device_config.num_devices = self.mesh_device.get_num_devices()
@@ -75,7 +74,7 @@ class TTWorker(WorkerBase):
 
     def load_model(self):
         # Only local DP rank 0 (device rank) loads the model
-        if self.vllm_config.parallel_config.data_parallel_rank_local == 0:
+        if self.parallel_config.data_parallel_rank_local == 0:
             self.model_runner.load_model()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -198,7 +197,7 @@ class TTWorker(WorkerBase):
         Each DP slice is right-padded with zeros to max_num_seqs; empty entries
         are zeros. Same behavior for both prefill and decode."""
 
-        assert (self.vllm_config.parallel_config.data_parallel_rank_local == 0), \
+        assert (self.parallel_config.data_parallel_rank_local == 0), \
             "concat_and_execute_dp must run on local DP rank 0 (device rank)"
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
         merged = self.model_runner.concat_dp_model_inputs(
@@ -207,7 +206,7 @@ class TTWorker(WorkerBase):
             torch.Tensor] = self.model_runner.execute_with_model_input(merged)
 
         # Pad each DP result to uniform shape for tensor all_gather.
-        world = self.vllm_config.parallel_config.data_parallel_size
+        world = self.parallel_config.data_parallel_size
         assert len(sampled_token_ids_per_dp) == world
         B = int(self.model_runner.scheduler_config.max_num_seqs)
         for dp_rank in range(world):

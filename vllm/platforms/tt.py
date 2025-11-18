@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Optional, Union
 import os
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -26,10 +26,11 @@ logger = init_logger(__name__)
 
 def register_tt_models():
     from vllm import ModelRegistry
-    
+
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
-        path_llama_text = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
+        path_llama_text = (
+            "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM")
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:LlamaForCausalLM"
@@ -41,8 +42,7 @@ def register_tt_models():
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]"
-        )
+            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]")
 
     # Llama3.1/3.2 - Text
     ModelRegistry.register_model("TTLlamaForCausalLM", path_llama_text)
@@ -132,7 +132,8 @@ def check_tt_model_supported(model):
         "openai/gpt-oss-120b",
         "deepseek-ai/DeepSeek-R1-0528",
     ]
-    assert model in supported_models, f"{model} is not in list of supported TT models"
+    assert model in supported_models, (
+        f"{model} is not in list of supported TT models")
 
 
 class TTPlatform(Platform):
@@ -161,10 +162,10 @@ class TTPlatform(Platform):
             "LoRA is not supported for TT backend")
         assert not vllm_config.cache_config.enable_prefix_caching, (
             "Automatic prefix caching is not yet supported for TT backend")
-        
+
         # Check if model is in list of supported models
         check_tt_model_supported(vllm_config.model_config.model)
-        
+
         # Import and register models from tt-metal
         register_tt_models()
 

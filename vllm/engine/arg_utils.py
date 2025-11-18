@@ -1096,9 +1096,8 @@ class EngineArgs:
         if self.data_parallel_address is None:
             if current_platform.is_tt():
                 host_ip = get_ip()
-                logger.info(
-                    "Using host IP %s as TT data parallel address",
-                    host_ip)
+                logger.info("Using host IP %s as TT data parallel address",
+                            host_ip)
                 data_parallel_address = host_ip
             elif self.data_parallel_backend == "ray":
                 host_ip = get_ip()

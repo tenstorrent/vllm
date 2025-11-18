@@ -272,20 +272,23 @@ class EngineCore:
             assert hasattr(self, "dp_group")
             # Check if any rank has work before doing intent all_reduce.
             local_has_requests = 1 if self.scheduler.has_requests() else 0
-            has_requests_t = torch.tensor([local_has_requests], dtype=torch.int32)
+            has_requests_t = torch.tensor([local_has_requests],
+                                          dtype=torch.int32)
             try:
                 dist.all_reduce(has_requests_t,
                                 op=dist.ReduceOp.SUM,
                                 group=self.dp_group)
             except RuntimeError as e:
                 # During shutdown, peers may close connections mid-collective.
-                # If this happens, exit gracefully to allow coordinated shutdown.
+                # Exit gracefully to allow coordinated shutdown.
                 if "Connection closed by peer" in str(e):
-                    logger.debug("Collective failed during shutdown, exiting gracefully")
+                    logger.debug(
+                        "Collective failed during shutdown, exiting gracefully"
+                    )
                     raise SystemExit() from e
                 raise
             if int(has_requests_t.item()) == 0:
-                # No rank has work, return early without scheduling or execution.
+                # No rank has work, return early without scheduling.
                 return {}, False
 
             # Max-consecutive-decoding guard: if there are waiting prefills
@@ -1172,9 +1175,10 @@ class DPEngineCoreProc(EngineCoreProc):
                         self.dp_rank)
 
     def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
+        parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
-        world = self.vllm_config.parallel_config.data_parallel_size
+        world = parallel_config.data_parallel_size
 
         local_has_requests = scheduler_output is not None
         if local_has_requests:
@@ -1251,12 +1255,12 @@ class DPEngineCoreProc(EngineCoreProc):
         # contributes results to the all_reduce.
         from vllm.platforms import current_platform
         is_tt_backend = current_platform.is_tt()
-        local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        local_dp_rank = parallel_config.data_parallel_rank_local
 
-        should_execute = (
-            (is_decode or any(x is not None for x in gathered_inputs)) and
-            ((rank == 0) if not is_tt_backend else (local_dp_rank == 0))
-        )
+        should_execute = ((is_decode or any(x is not None
+                                            for x in gathered_inputs))
+                          and ((rank == 0) if not is_tt_backend else
+                               (local_dp_rank == 0)))
 
         if should_execute:
             send_tensor = self.model_executor.collective_rpc(

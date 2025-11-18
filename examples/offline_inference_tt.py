@@ -259,7 +259,7 @@ def run_inference(
         "disable_async_output_proc": disable_async_output_proc,
         "data_parallel_size": data_parallel_size,
     }
-    
+
     if data_parallel_address:
         engine_kw_args["data_parallel_address"] = data_parallel_address
     if data_parallel_rpc_port:

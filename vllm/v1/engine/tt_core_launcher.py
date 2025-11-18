@@ -1,25 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-import sys
 import argparse
-from typing import Optional
-import subprocess
-import tempfile
 import fnmatch
+import os
 import shlex
 import socket
-import yaml
-import cloudpickle
+import subprocess
+import sys
+import tempfile
 import weakref
+from typing import Optional
+
+import cloudpickle
+import yaml
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils import get_ip, kill_process_tree
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.abstract import UniProcExecutor
-from vllm.utils import get_ip, kill_process_tree
 
 logger = init_logger(__name__)
+
 
 def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     # Parse --map-by to locate rankfile and ensure rank 0 host matches host_ip.
@@ -41,7 +44,8 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
                 value = ""
             # Extract file=... from VALUE like "rankfile:file=/path"
             if "file=" in value:
-                mapby_path = value.split("file=", 1)[1].split(",", 1)[0].strip()
+                mapby_path = value.split("file=", 1)[1].split(",",
+                                                              1)[0].strip()
             # If value itself is a path, accept it as fallback
             if not mapby_path and value and os.path.isfile(value):
                 mapby_path = value
@@ -51,15 +55,17 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
 
     rank0_host = None
     try:
-        with open(mapby_path, "r") as f:
+        with open(mapby_path) as f:
             for line in f:
                 s = line.strip()
                 if not s or s.startswith("#"):
                     continue
                 # Format: rank 0=HOST slot=...
                 tokens = s.split()
-                if len(tokens) >= 2 and tokens[0] == "rank" and "=" in tokens[1]:
-                    left, right = tokens[1].split("=", 1)  # left: "0", right: "HOST"
+                if (len(tokens) >= 2 and tokens[0] == "rank"
+                        and "=" in tokens[1]):
+                    # left: "0", right: "HOST"
+                    left, right = tokens[1].split("=", 1)
                     try:
                         rnum = int(left)
                     except Exception:
@@ -84,10 +90,13 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     assert host_ip in resolved_ips, (
         f"MPI rank 0 host {rank0_host} from rankfile {mapby_path} "
         f"(resolves to {sorted(resolved_ips)}) does not match "
-        f"launcher host IP {host_ip} (must launch from rank 0 host {rank0_host}).")
+        f"launcher host IP {host_ip} (must launch from rank 0 host "
+        f"{rank0_host}).")
     logger.info("Validated launching from MPI rank 0 host %s", rank0_host)
 
-def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[Optional[str], set[int]]:
+
+def parse_tt_mpi_params(
+        vllm_config: VllmConfig) -> tuple[Optional[str], set[int]]:
     """
     Parse override_tt_config for a rank binding file (required for launching 
     TT MPI processes), and compute device and local DP ranks.
@@ -95,7 +104,7 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[Optional[str], set[int
       - rank_binding_file: str
       - non_device_dp_ranks: set[int]
     """
-    
+
     parallel_config = vllm_config.parallel_config
     assert parallel_config.data_parallel_backend != "ray", (
         "TT does not support ray-based data parallel backend")
@@ -106,25 +115,31 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[Optional[str], set[int
     if rank_binding_file:
         if not isinstance(rank_binding_file, str):
             raise RuntimeError(
-                "override_tt_config['rank_binding'] must be a non-empty string")
+                "override_tt_config['rank_binding'] must be a non-empty string"
+            )
         try:
-            with open(rank_binding_file, "r") as f:
+            with open(rank_binding_file) as f:
                 rb = yaml.safe_load(f)
             mpi_world = len(rb.get("rank_bindings", []))
         except Exception as e:
             raise RuntimeError(
-                f"Failed to read rank binding '{rank_binding_file}': {e}") from e
+                f"Failed to read rank binding '{rank_binding_file}': {e}"
+            ) from e
         if mpi_world <= 0 or dp_size % mpi_world != 0:
             raise RuntimeError(
-                f"data_parallel_size ({dp_size}) must be divisible by number of "
-                f"device MPI ranks ({mpi_world})")
+                f"data_parallel_size ({dp_size}) must be divisible by number "
+                f"of device MPI ranks ({mpi_world})")
         # Assume DP world is evenly split into mpi_world groups and set
         # device DP ranks as the first rank in each group.
         dp_size_per_mpi_rank = dp_size // mpi_world
-        device_dp_ranks = {i * dp_size_per_mpi_rank  for i in range(mpi_world)}
-        non_device_dp_ranks = {i for i in range(dp_size) if i not in device_dp_ranks}
+        device_dp_ranks = {i * dp_size_per_mpi_rank for i in range(mpi_world)}
+        non_device_dp_ranks = {
+            i
+            for i in range(dp_size) if i not in device_dp_ranks
+        }
 
     return rank_binding_file, non_device_dp_ranks
+
 
 def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
                   rank_binding_file: str, log_stats: bool,
@@ -147,17 +162,19 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
 
     assert rank_binding_file and isinstance(rank_binding_file, str), (
         "rank_binding must be provided to tt_run_launch as a non-empty string")
-    
+
     # Parse override_tt_config for optional fields.
     override_tt_config = vllm_config.model_config.override_tt_config or {}
     mpi_args = override_tt_config.get("mpi_args", "")
     config_pkl_dir = override_tt_config.get("config_pkl_dir")
-    
+
     host_ip = get_ip()
     # Data parallel master IP must be the same as the launcher host's IP since
     # the launcher binds the rendezvous port and sends it to all engines.
-    assert vllm_config.parallel_config.data_parallel_master_ip == host_ip, (
-        f"data_parallel_master_ip {vllm_config.parallel_config.data_parallel_master_ip} must be the same as the launcher host's IP {host_ip}")
+    parallel_config = vllm_config.parallel_config
+    assert parallel_config.data_parallel_master_ip == host_ip, (
+        f"data_parallel_master_ip {parallel_config.data_parallel_master_ip} "
+        f"must be the same as the launcher host's IP {host_ip}")
     # Launch must be done on host with MPI rank 0 since we are setting that
     # process's DP rank to 0 and torch distributed uses DP rank 0 to bind TCP
     # rendezvous endpoint.
@@ -177,7 +194,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
 
     # Create a temporary rank binding file that augments global_env with
     # any env_passthrough variables.
-    with open(rank_binding_file, "r") as f:
+    with open(rank_binding_file) as f:
         rb = yaml.safe_load(f)
     rb.setdefault("global_env", {})
     # Whitelist-based env passthrough (patterns) to avoid copying full env.
@@ -195,7 +212,8 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
         for k, v in to_inject.items():
             rb["global_env"].setdefault(k, v)
 
-    tmp_rb_path = os.path.join(tempfile.gettempdir(), "tmp_vllm_tt_rank_binding.yaml")
+    tmp_rb_path = os.path.join(tempfile.gettempdir(),
+                               "tmp_vllm_tt_rank_binding.yaml")
     with open(tmp_rb_path, "w") as tf:
         yaml.safe_dump(rb, tf)
 
@@ -204,27 +222,31 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
         # Pass raw string; tt-run will shlex.split it
         cmd.extend(["--mpi-args", mpi_args])
     # Program to run per MPI rank: engine entrypoint with explicit args
-    cmd.extend([sys.executable, "-m", "vllm.v1.entrypoints.tt_core_launcher",
-                "--handshake", str(handshake_address),
-                "--config-pkl", str(serialized_config_path),
-                "--log-stats", ("1" if log_stats else "0")])
+    cmd.extend([
+        sys.executable, "-m", "vllm.v1.engine.tt_core_launcher", "--handshake",
+        str(handshake_address), "--config-pkl",
+        str(serialized_config_path), "--log-stats", ("1" if log_stats else "0")
+    ])
 
     child_env = os.environ.copy()
     logger.info("Launching engines with tt-run: %s", " ".join(cmd))
     mpi_proc = subprocess.Popen(cmd, env=child_env)
-    
+
     # Set up finalizer for MPI subprocess cleanup
     _setup_mpi_proc_finalizer(mpi_proc, cleanup_target)
 
-def _setup_mpi_proc_finalizer(mpi_proc: subprocess.Popen, cleanup_target: object) -> None:
+
+def _setup_mpi_proc_finalizer(mpi_proc: subprocess.Popen,
+                              cleanup_target: object) -> None:
     """
-    Set up a weakref finalizer to clean up the MPI subprocess when cleanup_target
+    Set up a weakref finalizer to clean up MPI subprocess when cleanup_target
     is garbage collected. This ensures graceful shutdown of TT-MPI processes.
     
     Args:
         mpi_proc: The subprocess.Popen object for the tt-run process
-        cleanup_target: Object whose lifecycle determines when to clean up mpi_proc
+        cleanup_target: Obj whose lifecycle decides when to clean up mpi_proc
     """
+
     def _finalize_mpi(proc_ref):
         proc = proc_ref()
         if proc is None:
@@ -236,22 +258,29 @@ def _setup_mpi_proc_finalizer(mpi_proc: subprocess.Popen, cleanup_target: object
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            logger.warning("tt-run subprocess did not exit within timeout, sending SIGKILL")
+            logger.warning(
+                "tt-run subprocess did not exit within timeout, sending SIGKILL"
+            )
             if proc.pid is not None:
                 kill_process_tree(proc.pid)
-    
+
     weakref.finalize(cleanup_target, _finalize_mpi, weakref.ref(mpi_proc))
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TT engine core entrypoint")
     parser.add_argument("--handshake", required=True, help="Handshake address")
-    parser.add_argument("--config-pkl", required=True,
+    parser.add_argument("--config-pkl",
+                        required=True,
                         dest="config_pkl",
                         help="Path to serialized VllmConfig pickle")
-    parser.add_argument("--log-stats", required=True, choices=["0", "1"],
+    parser.add_argument("--log-stats",
+                        required=True,
+                        choices=["0", "1"],
                         dest="log_stats",
                         help="Enable stat logging (1) or disable (0)")
     return parser.parse_args()
+
 
 def main() -> None:
     args = _parse_args()
@@ -262,10 +291,12 @@ def main() -> None:
     # Derive MPI ranks if present (device ranks).
     has_mpi = ("OMPI_COMM_WORLD_SIZE" in os.environ
                or "PMI_SIZE" in os.environ)
-    mpi_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK",
-                                  os.environ.get("PMI_RANK", "0")))
-    mpi_world = int(os.environ.get("OMPI_COMM_WORLD_SIZE",
-                                   os.environ.get("PMI_SIZE", "1")))
+    mpi_rank = int(
+        os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMI_RANK",
+                                                              "0")))
+    mpi_world = int(
+        os.environ.get("OMPI_COMM_WORLD_SIZE", os.environ.get("PMI_SIZE",
+                                                              "1")))
 
     # Load vllm config.
     with open(config_pickle_path, "rb") as f:
@@ -279,13 +310,13 @@ def main() -> None:
     # dp_rank = mpi_rank * (dp_size / mpi_world), assuming divisibility.
     # This picks the first local DP rank on each host.
     if not has_mpi:
-        raise RuntimeError("tt_engine_core must be launched under MPI (tt-run)")
+        raise RuntimeError(
+            "tt_engine_core must be launched under MPI (tt-run)")
     assert dp_size % mpi_world == 0, (
-        f"dp_size ({dp_size}) must be divisible by mpi_world ({mpi_world})"
-    )
+        f"dp_size ({dp_size}) must be divisible by mpi_world ({mpi_world})")
     segment = dp_size // mpi_world
     pc.data_parallel_rank = mpi_rank * segment
-    pc.data_parallel_rank_local = 0  # device executor per host uses local dp rank 0
+    pc.data_parallel_rank_local = 0  # Device processes use local DP rank 0.
 
     # Ensure uniproc in engine process (worker inline).
     assert pc.distributed_executor_backend == "uni", (
@@ -301,6 +332,7 @@ def main() -> None:
                                    dp_rank=pc.data_parallel_rank,
                                    local_dp_rank=pc.data_parallel_rank_local)
 
+
 if __name__ == "__main__":
     try:
         main()
@@ -309,5 +341,3 @@ if __name__ == "__main__":
     except Exception:
         logger.exception("tt_engine_core failed")
         sys.exit(1)
-
-
