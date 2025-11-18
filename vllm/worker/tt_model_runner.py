@@ -66,9 +66,12 @@ class TTModelInput(ModelRunnerInputBase):
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
     # V1 structured output support (backward compatible with default None)
-    # Always lists: single-element for non-DP, multi-element for DP
+    # None in v0
+    # In v1, always lists: single-element for non-DP, multi-element for DP
+    # If not using structured outputs, [None]
     grammar_bitmask: Optional[List[Optional[torch.Tensor]]] = None
-    struct_output_scheduler_to_persistent: [List[Optional[Dict[int, int]]]] = None
+    # If not using structured outputs, [{}]
+    struct_output_scheduler_to_persistent: Optional[List[Dict[int, int]]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:

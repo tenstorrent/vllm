@@ -500,9 +500,13 @@ class TTModelRunner:
             temperature = torch.tensor([-1.0], dtype=torch.float32)
             top_k = torch.tensor([-1], dtype=torch.int32)
             top_p = torch.tensor([-1.0], dtype=torch.float32)
+
+            # We're fine with reading back a mask where we used to have None,
+            # because the corresponding dict will be empty.
             padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
-            struct_output_scheduler_to_persistent_keys = torch.zeros((max_batch, ), dtype=torch.int32)
-            struct_output_scheduler_to_persistent_values = torch.zeros((max_batch, ), dtype=torch.int32)
+            # Use -1 for padding because zero would be a valid key.
+            struct_output_scheduler_to_persistent_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
+            struct_output_scheduler_to_persistent_values = torch.full((max_batch, ), -1, dtype=torch.int32)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -525,15 +529,22 @@ class TTModelRunner:
             top_p = torch.tensor([float(sp.top_p)], dtype=torch.float32)
             # pad bitmask to constant shape
             # TODO check if this is needed
-            real_bitmask = model_input.grammar_bitmask[0] #it's wrapped in 1-element list
-            padded_bitmask = torch.zeros((max_batch, bitmask_size))
-            real_bitmask_length = real_bitmask.shape[0]
-            padded_bitmask[:real_bitmask_length, :] = real_bitmask
 
+            # Before concatenating this is always a single-element list
+            if model_input.grammar_bitmask[0] is not None:
+                real_bitmask = model_input.grammar_bitmask[0] #it's wrapped in 1-element list
+                padded_bitmask = torch.zeros((max_batch, bitmask_size))
+                real_bitmask_length = real_bitmask.shape[0]
+                padded_bitmask[:real_bitmask_length, :] = real_bitmask
+            else:
+                padded_bitmask = torch.zeros((max_batch, bitmask_size))
 
-            struct_output_scheduler_to_persistent_keys = torch.zeros((max_batch, ), dtype=torch.int32)
-            struct_output_scheduler_to_persistent_values = torch.zeros((max_batch, ), dtype=torch.int32)
-            for idx, (scheduler_index, persistent_index) in enumerate(model_input.struct_output_scheduler_to_persistent.items()):
+            # Use -1 for padding because zero would be a valid key.
+            struct_output_scheduler_to_persistent_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
+            struct_output_scheduler_to_persistent_values = torch.full((max_batch, ), -1, dtype=torch.int32)
+            # This is always a single-element list, if not using structured outputs, it's [{}]
+            original_dict = model_input.struct_output_scheduler_to_persistent[0]
+            for idx, (scheduler_index, persistent_index) in enumerate(original_dict.items()):
                 struct_output_scheduler_to_persistent_keys[idx] = scheduler_index
                 struct_output_scheduler_to_persistent_values[idx] = persistent_index
 
@@ -646,11 +657,18 @@ class TTModelRunner:
                                          top_p=top_p))
                 else:
                     sampling_params_per_dp.append(None)
-                grammar_bitmask_list.append(padded_bitmask)
-                struct_output_scheduler_to_persistent_list.append({
-                    struct_output_scheduler_to_persistent_keys[i].item(): struct_output_scheduler_to_persistent_values[i].item()
-                    for i in range(B)
-                })
+                mapping = {}
+                for i in range(B):
+                    key = struct_output_scheduler_to_persistent_keys[i].item()
+                    if key != -1: # -1 is padding
+                        mapping[key] = struct_output_scheduler_to_persistent_values[i].item()
+                struct_output_scheduler_to_persistent_list.append(mapping)
+                # We may have padded the bitmask, but we want to maintain the property
+                # that if there are no structured output requests, the bitmask is None
+                if len(mapping) > 0:    
+                    grammar_bitmask_list.append(padded_bitmask)
+                else:
+                    grammar_bitmask_list.append(None)
 
             input_positions = torch.cat(input_positions_list, dim=0)
             prompt_lens = None
@@ -894,14 +912,7 @@ class TTModelRunner:
         else:
             total_batch_size = sum(batch_size_per_dp)
 
-        # we need to find what is the length of the compressed bitmask
-        grammar_bitmask_length = None
-        for bitmask in grammar_bitmask_list:
-            if bitmask is not None:
-                grammar_bitmask_length = bitmask.shape[1]
-                break
-        if grammar_bitmask_length is None:
-            raise ValueError("No grammar bitmask found, but structured output requests are present")
+        grammar_bitmask_length = ((self.model_config.get_vocab_size() + 31) // 32)
 
         # Ones in the compressed bitmask represent tokens that are allowed.
         joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length), dtype=torch.int32)
@@ -929,6 +940,7 @@ class TTModelRunner:
         if grammar_bitmask is None or not struct_output_scheduler_to_persistent:
             return
 
+        #TODO slice in numpy so we only get non-padding rows
         grammar_bitmask = torch.from_numpy(grammar_bitmask)
         
         # The grammar bitmask is compressed as packed int32 values where each bit 
