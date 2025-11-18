@@ -533,11 +533,11 @@ class TTModelRunner:
             # Before concatenating this is always a single-element list
             if model_input.grammar_bitmask[0] is not None:
                 real_bitmask = model_input.grammar_bitmask[0] #it's wrapped in 1-element list
-                padded_bitmask = torch.zeros((max_batch, bitmask_size))
+                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
                 real_bitmask_length = real_bitmask.shape[0]
                 padded_bitmask[:real_bitmask_length, :] = real_bitmask
             else:
-                padded_bitmask = torch.zeros((max_batch, bitmask_size))
+                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
 
             # Use -1 for padding because zero would be a valid key.
             struct_output_scheduler_to_persistent_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
