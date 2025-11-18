@@ -12,11 +12,12 @@ import shlex
 import socket
 import yaml
 import cloudpickle
+import weakref
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.abstract import UniProcExecutor
-from vllm.utils import get_ip
+from vllm.utils import get_ip, kill_process_tree
 
 logger = init_logger(__name__)
 
@@ -126,13 +127,22 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[Optional[str], set[int
     return rank_binding_file, non_device_dp_ranks
 
 def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
-                  rank_binding_file: str, log_stats: bool):
+                  rank_binding_file: str, log_stats: bool,
+                  cleanup_target: object):
     """
     Launch TT MPI processes via tt-run from rank 0.
     Uses args from override_tt_config:
       - rank_binding: str (required, already parsed)
       - mpi_args: str (optional, parsed here)
       - config_pkl_dir: str (required for multi-host systems, parsed here)
+    
+    Args:
+        handshake_address: ZMQ address for engine handshake communication.
+        vllm_config: Configuration object containing model and parallel config.
+        rank_binding_file: Path to YAML file specifying MPI rank bindings.
+        log_stats: Whether to enable statistics logging in engine processes.
+        cleanup_target: Object whose lifecycle determines when to clean up
+            the MPI subprocess. A finalizer will be set up automatically.
     """
 
     assert rank_binding_file and isinstance(rank_binding_file, str), (
@@ -201,7 +211,36 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
 
     child_env = os.environ.copy()
     logger.info("Launching engines with tt-run: %s", " ".join(cmd))
-    return subprocess.Popen(cmd, env=child_env)
+    mpi_proc = subprocess.Popen(cmd, env=child_env)
+    
+    # Set up finalizer for MPI subprocess cleanup
+    _setup_mpi_proc_finalizer(mpi_proc, cleanup_target)
+
+def _setup_mpi_proc_finalizer(mpi_proc: subprocess.Popen, cleanup_target: object) -> None:
+    """
+    Set up a weakref finalizer to clean up the MPI subprocess when cleanup_target
+    is garbage collected. This ensures graceful shutdown of TT-MPI processes.
+    
+    Args:
+        mpi_proc: The subprocess.Popen object for the tt-run process
+        cleanup_target: Object whose lifecycle determines when to clean up mpi_proc
+    """
+    def _finalize_mpi(proc_ref):
+        proc = proc_ref()
+        if proc is None:
+            return
+        # Check if process is already dead
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            logger.warning("tt-run subprocess did not exit within timeout, sending SIGKILL")
+            if proc.pid is not None:
+                kill_process_tree(proc.pid)
+    
+    weakref.finalize(cleanup_target, _finalize_mpi, weakref.ref(mpi_proc))
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TT engine core entrypoint")

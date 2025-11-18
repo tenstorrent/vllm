@@ -3,7 +3,7 @@
 
 import contextlib
 import os
-import os
+import subprocess
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -18,7 +18,8 @@ import zmq
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.ray.ray_env import get_env_vars_to_copy
-from vllm.utils import get_mp_context, get_open_zmq_ipc_path, zmq_socket_ctx
+from vllm.utils import (get_mp_context, get_open_zmq_ipc_path, zmq_socket_ctx,
+                        kill_process_tree)
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
@@ -678,10 +679,12 @@ def launch_core_engines(
                 handshake_address)
             assert dp_rank == 0, "TT MPI must be launched from rank 0"
             from vllm.v1.entrypoints.tt_core_launcher import tt_run_launch
-            mpi_proc = tt_run_launch(handshake_address=handshake_address,
+            # Pass addresses as cleanup_target so finalizer persists as long as engines run
+            tt_run_launch(handshake_address=handshake_address,
                           vllm_config=vllm_config,
                           rank_binding_file=rank_binding_file,
-                          log_stats=log_stats)
+                          log_stats=log_stats,
+                          cleanup_target=addresses)
             if non_device_dp_ranks:
                 # Use CoreEngineProcManager with explicit dp_ranks list.
                 # local_dp_rank starts at 1 (0 is reserved for device rank).
