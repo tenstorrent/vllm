@@ -490,8 +490,8 @@ class TTModelRunner:
         """
 
         bitmask_size = (self.model_config.get_vocab_size() + 31) // 32
+        max_batch = int(self.scheduler_config.max_num_seqs)
         if model_input is None:
-            max_batch = int(self.scheduler_config.max_num_seqs)
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
             positions = torch.full((max_batch, ), -1, dtype=torch.int32)
             block_tables = torch.zeros((max_batch, max_blocks_decode_batch),
@@ -500,7 +500,7 @@ class TTModelRunner:
             temperature = torch.tensor([-1.0], dtype=torch.float32)
             top_k = torch.tensor([-1], dtype=torch.int32)
             top_p = torch.tensor([-1.0], dtype=torch.float32)
-            bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
+            padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
             struct_output_scheduler_to_persistent_keys = torch.zeros((max_batch, ), dtype=torch.int32)
             struct_output_scheduler_to_persistent_values = torch.zeros((max_batch, ), dtype=torch.int32)
         else:
