@@ -427,16 +427,16 @@ class TTModelRunner:
         # using torch tensor instead of numpy array for consistency because we need it as tensor for ipc
         bitmask = torch.from_numpy(scheduler_output.grammar_bitmask) if scheduler_output.grammar_bitmask is not None else None
         grammar_bitmask = [bitmask]
-        # Get a mapping from scheduler batch (and bitmask) index to persistent batch index f
-        # or structured output requests within a given DP rank
+        # Get a mapping from scheduler batch (and bitmask) index to persistent batch index
+        # for structured output requests within a given DP rank
         # Do this now, because later we lose access to other ranks' self.input_batch
         structured_output_request_ids = scheduler_output.structured_output_request_ids
-        struct_output_scheduler_to_persistent: dict[int, int] = {}
+        sched_to_pers: dict[int, int] = {}
         for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items():
             if req_id in structured_output_request_ids:
                 scheduler_batch_index = structured_output_request_ids[req_id]
-                struct_output_scheduler_to_persistent[scheduler_batch_index] = persistent_batch_index
-        struct_output_scheduler_to_persistent = [struct_output_scheduler_to_persistent]
+                sched_to_pers[scheduler_batch_index] = persistent_batch_index
+        sched_to_pers = [sched_to_pers]
         
 
         return TTModelInput(
@@ -453,7 +453,7 @@ class TTModelRunner:
             multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask,
-            struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent,
+            sched_to_pers=sched_to_pers,
         )
 
 
@@ -507,8 +507,8 @@ class TTModelRunner:
             # because the corresponding dict will be empty.
             padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
             # Use -1 for padding because zero would be a valid key.
-            struct_output_scheduler_to_persistent_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
-            struct_output_scheduler_to_persistent_values = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -542,13 +542,13 @@ class TTModelRunner:
                 padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
 
             # Use -1 for padding because zero would be a valid key.
-            struct_output_scheduler_to_persistent_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
-            struct_output_scheduler_to_persistent_values = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32)
             # This is always a single-element list, if not using structured outputs, it's [{}]
-            original_dict = model_input.struct_output_scheduler_to_persistent[0]
+            original_dict = model_input.sched_to_pers[0]
             for idx, (scheduler_index, persistent_index) in enumerate(original_dict.items()):
-                struct_output_scheduler_to_persistent_keys[idx] = scheduler_index
-                struct_output_scheduler_to_persistent_values[idx] = persistent_index
+                sched_to_pers_keys[idx] = scheduler_index
+                sched_to_pers_values[idx] = persistent_index
 
 
         # Pack into flattened tensors to reduce number of collectives.
@@ -561,8 +561,8 @@ class TTModelRunner:
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # 1
                 padded_bitmask.contiguous().view(-1),  # B*bitmask_size
-                struct_output_scheduler_to_persistent_keys.contiguous().view(-1),  # B
-                struct_output_scheduler_to_persistent_values.contiguous().view(-1),  # B
+                sched_to_pers_keys.contiguous().view(-1),  # B
+                sched_to_pers_values.contiguous().view(-1),  # B
             ],
             dim=0).contiguous()
         float_inputs = torch.cat(
@@ -596,7 +596,7 @@ class TTModelRunner:
         batch_size_per_dp: list[int] = []
         sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
         grammar_bitmask_list = []
-        struct_output_scheduler_to_persistent_list = []
+        sched_to_pers_list = []
 
         # Need to pad block tables to global max num blocks for constant shape.
         def pad_block_tables(block_tables):
@@ -641,9 +641,9 @@ class TTModelRunner:
                 padded_bitmask = int_inputs[off:off + stride].view(B, bitmask_size)
                 off += stride
                 stride = B
-                struct_output_scheduler_to_persistent_keys = int_inputs[off:off + stride].view(B)
+                sched_to_pers_keys = int_inputs[off:off + stride].view(B)
                 off += stride
-                struct_output_scheduler_to_persistent_values = int_inputs[off:off + stride].view(B)
+                sched_to_pers_values = int_inputs[off:off + stride].view(B)
                 off += stride
                 temperature = float(float_inputs[0].item())
                 top_p = float(float_inputs[1].item())
@@ -661,10 +661,10 @@ class TTModelRunner:
                     sampling_params_per_dp.append(None)
                 mapping = {}
                 for i in range(B):
-                    key = struct_output_scheduler_to_persistent_keys[i].item()
+                    key = sched_to_pers_keys[i].item()
                     if key != -1: # -1 is padding
-                        mapping[key] = struct_output_scheduler_to_persistent_values[i].item()
-                struct_output_scheduler_to_persistent_list.append(mapping)
+                        mapping[key] = sched_to_pers_values[i].item()
+                sched_to_pers_list.append(mapping)
                 # We may have padded the bitmask, but we want to maintain the property
                 # that if there are no structured output requests, the bitmask is None
                 if len(mapping) > 0:    
@@ -710,7 +710,7 @@ class TTModelRunner:
                     mi.tt_sampling_params if mi else None)
                 # Unwrap the single-element list wrappers
                 grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None)
-                struct_output_scheduler_to_persistent_list.append(mi.struct_output_scheduler_to_persistent[0] if mi else None)
+                sched_to_pers_list.append(mi.sched_to_pers[0] if mi else None)
 
             input_positions = 0
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
@@ -746,7 +746,7 @@ class TTModelRunner:
             multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask_list,
-            struct_output_scheduler_to_persistent=struct_output_scheduler_to_persistent_list,
+            sched_to_pers=sched_to_pers_list,
         )
         return merged
 
@@ -834,7 +834,7 @@ class TTModelRunner:
                 is_decode,
                 model_input.unpadded_batch_size,
                 model_input.grammar_bitmask,
-                model_input.struct_output_scheduler_to_persistent)
+                model_input.sched_to_pers)
             
             #TODO: re-enable this when we all generators are updated to handle it
             #kwargs["bitmask"] = integrated_reordered_bitmask
@@ -866,14 +866,14 @@ class TTModelRunner:
                 logits = tt_out[start:start + sz, -1, :]
                 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
-                struct_output_scheduler_to_persistent = model_input.struct_output_scheduler_to_persistent[dp_rank]
+                sched_to_pers = model_input.sched_to_pers[dp_rank]
                 
                 if (grammar_bitmask is not None and 
-                    struct_output_scheduler_to_persistent):
+                    sched_to_pers):
                     self.apply_grammar_bitmask(
                         logits, 
                         grammar_bitmask, 
-                        struct_output_scheduler_to_persistent
+                        sched_to_pers
                     )
                 
                 next_token_ids = sample_tokens(logits,
@@ -897,7 +897,7 @@ class TTModelRunner:
         is_decode: bool,
         batch_size_per_dp: list[int],
         grammar_bitmask_list: list[Optional[torch.Tensor]],
-        struct_output_scheduler_to_persistent_list: list[Optional[dict[int, int]]],
+        sched_to_pers_list: list[Optional[dict[int, int]]],
     ) -> torch.Tensor:
         """Prepare the bitmask for device sampling
            Reorder to match persistent batch and pad to batch size
@@ -905,7 +905,7 @@ class TTModelRunner:
            or a len(input_batch) x ceil(vocab_size/32) tensor if structured output requests are present"""
 
         # Both None and {} evaluate to False
-        has_any_structured = any(struct_output_scheduler_to_persistent_list)
+        has_any_structured = any(sched_to_pers_list)
         if not has_any_structured:
             return None
 
@@ -922,8 +922,8 @@ class TTModelRunner:
         joint_bitmask = torch.bitwise_not(joint_bitmask)
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
-            local_struct_output_scheduler_to_persistent = struct_output_scheduler_to_persistent_list[dp_rank]
-            for scheduler_index, persistent_index in local_struct_output_scheduler_to_persistent.items():
+            local_sched_to_pers = sched_to_pers_list[dp_rank]
+            for scheduler_index, persistent_index in local_sched_to_pers.items():
                 joint_bitmask[start + persistent_index, :] = grammar_bitmask_list[dp_rank][scheduler_index]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
@@ -937,10 +937,10 @@ class TTModelRunner:
         self,
         logits: torch.Tensor,
         grammar_bitmask: torch.Tensor,
-        struct_output_scheduler_to_persistent: dict[int, int],
+        sched_to_pers: dict[int, int],
     ) -> None:
         """Apply structured output grammar constraints to logits in-place"""
-        if grammar_bitmask is None or not struct_output_scheduler_to_persistent:
+        if grammar_bitmask is None or not sched_to_pers:
             return
         
         # The grammar bitmask is compressed as packed int32 values where each bit 
@@ -949,7 +949,7 @@ class TTModelRunner:
 
         #TODO this is likely a quite inefficient way of doing it on host.
 
-        for scheduler_index, persistent_index in struct_output_scheduler_to_persistent.items():
+        for scheduler_index, persistent_index in sched_to_pers.items():
             unpacked_bitmask = (torch.bitwise_right_shift(
                 grammar_bitmask[scheduler_index][:, None], self.structured_output_arange[None, :]) & 1) == 0
             unpacked_bitmask = unpacked_bitmask.reshape(-1)[:logits.shape[-1]]
