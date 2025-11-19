@@ -422,13 +422,10 @@ class TTModelRunner:
         # If we're not using structured outputs,
         # structured_output_request_ids is an empty dict
         # and grammar_bitmask is None
-        # We wrap in single-element lists
-        # to maintain consistent dtype for DP case.
         # Using torch tensor instead of numpy array for consistency
         # because we need it as tensor for ipc.
         bitmask = scheduler_output.grammar_bitmask
         bitmask = torch.from_numpy(bitmask) if bitmask is not None else None
-        grammar_bitmask = [bitmask]
         # Get a mapping from scheduler batch (and bitmask) index
         # to persistent batch index
         # for structured output requests within a given DP rank
@@ -441,7 +438,6 @@ class TTModelRunner:
             if req_id in structured_output_request_ids:
                 scheduler_batch_index = structured_output_request_ids[req_id]
                 sched_to_pers[scheduler_batch_index] = persistent_batch_index
-        sched_to_pers = [sched_to_pers]
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -456,8 +452,8 @@ class TTModelRunner:
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None,  # Not yet supported in V1
-            grammar_bitmask=grammar_bitmask,
-            sched_to_pers=sched_to_pers,
+            grammar_bitmask=[bitmask], # wrap to match DP case
+            sched_to_pers=[sched_to_pers], # wrap to match DP case
         )
 
     def build_model_input(
@@ -942,11 +938,14 @@ class TTModelRunner:
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             local_sched_to_pers = sched_to_pers_list[dp_rank]
+            # local_sched_to_pers is always non-None in v1
             for scheduler_index, persistent_index in local_sched_to_pers.items(
-            ):
+            ): # type: ignore[union-attr]      
+                # We know that grammar_bitmask_list[dp_rank] is not None
+                # because local_sched_to_pers in not-empty
                 joint_bitmask[start +
                               persistent_index, :] = grammar_bitmask_list[
-                                  dp_rank][scheduler_index]
+                                  dp_rank][scheduler_index] # type: ignore[index]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
