@@ -16,6 +16,11 @@ class SamplingInputBatch:
         self.temperature_cpu = np.empty(max_num_reqs, dtype=np.float32)
         self.top_p_cpu = np.empty(max_num_reqs, dtype=np.float32)
         self.top_k_cpu = np.empty(max_num_reqs, dtype=np.int32)
+        self.presence_penalty_cpu = np.empty(max_num_reqs, dtype=np.float32)
+        self.frequency_penalty_cpu = np.empty(max_num_reqs, dtype=np.float32)
+        self.repetition_penalty_cpu = np.empty(max_num_reqs, dtype=np.float32)
+        self.seed_cpu = np.empty(max_num_reqs, dtype=np.int64)
+        self.n_cpu = np.empty(max_num_reqs, dtype=np.int32)
 
 
 class InputBatch:
@@ -111,6 +116,21 @@ class InputBatch:
         self.sampling.temperature_cpu[req_index] = sampling_params.temperature
         self.sampling.top_p_cpu[req_index] = sampling_params.top_p
         self.sampling.top_k_cpu[req_index] = sampling_params.top_k
+        self.sampling.presence_penalty_cpu[
+            req_index] = sampling_params.presence_penalty
+        self.sampling.frequency_penalty_cpu[
+            req_index] = sampling_params.frequency_penalty
+        self.sampling.repetition_penalty_cpu[
+            req_index] = sampling_params.repetition_penalty
+        seed_value = sampling_params.seed
+        if isinstance(seed_value, list):
+            seed_value = seed_value[0] if seed_value else None
+        self.sampling.seed_cpu[req_index] = (
+            seed_value if seed_value is not None else -1)
+        n_value = sampling_params.n
+        if isinstance(n_value, list):
+            n_value = n_value[0] if n_value else 1
+        self.sampling.n_cpu[req_index] = n_value if n_value else 1
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -177,6 +197,14 @@ class InputBatch:
                 last_req_index]
             sampling.top_k_cpu[empty_index] = sampling.top_k_cpu[
                 last_req_index]
+            sampling.presence_penalty_cpu[
+                empty_index] = sampling.presence_penalty_cpu[last_req_index]
+            sampling.frequency_penalty_cpu[
+                empty_index] = sampling.frequency_penalty_cpu[last_req_index]
+            sampling.repetition_penalty_cpu[
+                empty_index] = sampling.repetition_penalty_cpu[last_req_index]
+            sampling.seed_cpu[empty_index] = sampling.seed_cpu[last_req_index]
+            sampling.n_cpu[empty_index] = sampling.n_cpu[last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
