@@ -836,7 +836,8 @@ class TTModelRunner:
                 model_input.grammar_bitmask,
                 model_input.struct_output_scheduler_to_persistent)
             
-            kwargs["bitmask"] = integrated_reordered_bitmask
+            #TODO: re-enable this when we all generators are updated to handle it
+            #kwargs["bitmask"] = integrated_reordered_bitmask
 
         # Execute model
         if not is_decode:
