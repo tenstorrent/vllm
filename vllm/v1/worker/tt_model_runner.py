@@ -434,9 +434,9 @@ class TTModelRunner:
         # to persistent batch index
         # for structured output requests within a given DP rank
         # Do this now, because later we lose access to other ranks' self.input_batch
-        structured_output_request_ids = scheduler_output.structured_output_request_ids # noqa: E501
+        structured_output_request_ids = scheduler_output.structured_output_request_ids
         sched_to_pers: dict[int, int] = {}
-        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items(): # noqa: E501
+        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items():
             if req_id in structured_output_request_ids:
                 scheduler_batch_index = structured_output_request_ids[req_id]
                 sched_to_pers[scheduler_batch_index] = persistent_batch_index
@@ -509,10 +509,10 @@ class TTModelRunner:
 
             # We're fine with reading back a mask where we used to have None,
             # because the corresponding dict will be empty.
-            padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32) # noqa: E501
+            padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
             # Use -1 for padding because zero would be a valid key.
-            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32) # noqa: E501
-            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32) # noqa: E501
+            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -539,19 +539,19 @@ class TTModelRunner:
             # Before concatenating this is always a single-element list
             if model_input.grammar_bitmask[0] is not None:   
                 real_bitmask = model_input.grammar_bitmask[0]
-                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32) # noqa: E501
+                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
                 real_bitmask_length = real_bitmask.shape[0]
                 padded_bitmask[:real_bitmask_length, :] = real_bitmask
             else:
-                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32) # noqa: E501
+                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
 
             # Use -1 for padding because zero would be a valid key.
-            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32) # noqa: E501
-            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32) # noqa: E501
+            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32)
             # This is always a single-element list,
             # if not using structured outputs, it's [{}]
             original_dict = model_input.sched_to_pers[0]
-            for idx, (scheduler_index, persistent_index) in enumerate(original_dict.items()): # noqa: E501
+            for idx, (scheduler_index, persistent_index) in enumerate(original_dict.items()):
                 sched_to_pers_keys[idx] = scheduler_index
                 sched_to_pers_values[idx] = persistent_index
 
@@ -643,7 +643,7 @@ class TTModelRunner:
                 off += 1
                 bitmask_size = ((self.model_config.get_vocab_size() + 31) // 32)
                 stride = bitmask_size * B
-                padded_bitmask = int_inputs[off:off + stride].view(B, bitmask_size) # noqa: E501
+                padded_bitmask = int_inputs[off:off + stride].view(B, bitmask_size)
                 off += stride
                 stride = B
                 sched_to_pers_keys = int_inputs[off:off + stride].view(B)
@@ -716,7 +716,7 @@ class TTModelRunner:
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
                 # Unwrap the single-element list wrappers
-                grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None) # noqa: E501
+                grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None)
                 sched_to_pers_list.append(mi.sched_to_pers[0] if mi else None)
 
             input_positions = 0
@@ -919,20 +919,20 @@ class TTModelRunner:
 
         # We want to match the shape of the joint input batch
         if is_decode:
-            total_batch_size = self.scheduler_config.max_num_seqs * len(batch_size_per_dp) # noqa: E501
+            total_batch_size = self.scheduler_config.max_num_seqs * len(batch_size_per_dp)
         else:
             total_batch_size = sum(batch_size_per_dp)
 
         grammar_bitmask_length = ((self.model_config.get_vocab_size() + 31) // 32)
 
         # Ones in the compressed bitmask represent tokens that are allowed.
-        joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length), dtype=torch.int32) # noqa: E501
+        joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length), dtype=torch.int32)
         joint_bitmask = torch.bitwise_not(joint_bitmask)
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             local_sched_to_pers = sched_to_pers_list[dp_rank]
             for scheduler_index, persistent_index in local_sched_to_pers.items():
-                joint_bitmask[start + persistent_index, :] = grammar_bitmask_list[dp_rank][scheduler_index] # noqa: E501
+                joint_bitmask[start + persistent_index, :] = grammar_bitmask_list[dp_rank][scheduler_index]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
@@ -959,7 +959,7 @@ class TTModelRunner:
 
         for scheduler_index, persistent_index in sched_to_pers.items():
             unpacked_bitmask = (torch.bitwise_right_shift(
-                grammar_bitmask[scheduler_index][:, None], self.structured_output_arange[None, :]) & 1) == 0 # noqa: E501
+                grammar_bitmask[scheduler_index][:, None], self.structured_output_arange[None, :]) & 1) == 0
             unpacked_bitmask = unpacked_bitmask.reshape(-1)[:logits.shape[-1]]
             logits[persistent_index].masked_fill_(unpacked_bitmask, -float("inf"))
 
