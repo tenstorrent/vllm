@@ -177,6 +177,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
             self.previous_seq_ids: Set[int] = set()
 
+        # Detect if the model has "mrope" rope_scaling type.
+        # mrope requires keep "rope_deltas" between prompt and decoding phases.
+        if self.model_config.uses_mrope:
+            assert ("TTModelRunner does not currently support models with "
+                    "mrope rope_scaling")
+
         vocab_size = self.model_config.get_vocab_size()
         self.logits_processor = LogitsProcessor(vocab_size,
                                                 logits_as_input=True)
