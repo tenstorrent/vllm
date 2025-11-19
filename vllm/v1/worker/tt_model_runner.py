@@ -452,8 +452,8 @@ class TTModelRunner:
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
             cross_block_tables=None,  # Not yet supported in V1
-            grammar_bitmask=[bitmask], # wrap to match DP case
-            sched_to_pers=[sched_to_pers], # wrap to match DP case
+            grammar_bitmask=[bitmask],  # wrap to match DP case
+            sched_to_pers=[sched_to_pers],  # wrap to match DP case
         )
 
     def build_model_input(
@@ -939,13 +939,14 @@ class TTModelRunner:
         for dp_rank, sz in enumerate(batch_size_per_dp):
             local_sched_to_pers = sched_to_pers_list[dp_rank]
             # local_sched_to_pers is always non-None in v1
-            for scheduler_index, persistent_index in local_sched_to_pers.items(
-            ): # type: ignore[union-attr]      
+            for scheduler_index, persistent_index in local_sched_to_pers.items(  # type: ignore[union-attr]
+            ):
                 # We know that grammar_bitmask_list[dp_rank] is not None
                 # because local_sched_to_pers in not-empty
-                joint_bitmask[start +
-                              persistent_index, :] = grammar_bitmask_list[
-                                  dp_rank][scheduler_index] # type: ignore[index]
+                joint_bitmask[
+                    start +
+                    persistent_index, :] = grammar_bitmask_list[dp_rank][
+                        scheduler_index]  # type: ignore[index]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
