@@ -413,7 +413,6 @@ class TTModelRunner:
         compat_sampling_used = False
         sampling_metadata = None
 
-
         if self.model_config.is_multimodal_model and is_prompt:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
                 scheduler_output)
@@ -425,7 +424,7 @@ class TTModelRunner:
         # and grammar_bitmask is None
         # We wrap in single-element lists
         # to maintain consistent dtype for DP case.
-        # Using torch tensor instead of numpy array for consistency 
+        # Using torch tensor instead of numpy array for consistency
         # because we need it as tensor for ipc.
         bitmask = scheduler_output.grammar_bitmask
         bitmask = torch.from_numpy(bitmask) if bitmask is not None else None
@@ -436,12 +435,12 @@ class TTModelRunner:
         # Do this now, because later we lose access to other ranks' self.input_batch
         structured_output_request_ids = scheduler_output.structured_output_request_ids
         sched_to_pers: dict[int, int] = {}
-        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items():
+        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items(
+        ):
             if req_id in structured_output_request_ids:
                 scheduler_batch_index = structured_output_request_ids[req_id]
                 sched_to_pers[scheduler_batch_index] = persistent_batch_index
         sched_to_pers = [sched_to_pers]
-        
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -459,7 +458,6 @@ class TTModelRunner:
             grammar_bitmask=grammar_bitmask,
             sched_to_pers=sched_to_pers,
         )
-
 
     def build_model_input(
         self,
@@ -509,10 +507,15 @@ class TTModelRunner:
 
             # We're fine with reading back a mask where we used to have None,
             # because the corresponding dict will be empty.
-            padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
+            padded_bitmask = torch.zeros((max_batch, bitmask_size),
+                                         dtype=torch.int32)
             # Use -1 for padding because zero would be a valid key.
-            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
-            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_keys = torch.full((max_batch, ),
+                                            -1,
+                                            dtype=torch.int32)
+            sched_to_pers_values = torch.full((max_batch, ),
+                                              -1,
+                                              dtype=torch.int32)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -537,24 +540,30 @@ class TTModelRunner:
             # TODO check if this is needed
 
             # Before concatenating this is always a single-element list
-            if model_input.grammar_bitmask[0] is not None:   
+            if model_input.grammar_bitmask[0] is not None:
                 real_bitmask = model_input.grammar_bitmask[0]
-                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
+                padded_bitmask = torch.zeros((max_batch, bitmask_size),
+                                             dtype=torch.int32)
                 real_bitmask_length = real_bitmask.shape[0]
                 padded_bitmask[:real_bitmask_length, :] = real_bitmask
             else:
-                padded_bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
+                padded_bitmask = torch.zeros((max_batch, bitmask_size),
+                                             dtype=torch.int32)
 
             # Use -1 for padding because zero would be a valid key.
-            sched_to_pers_keys = torch.full((max_batch, ), -1, dtype=torch.int32)
-            sched_to_pers_values = torch.full((max_batch, ), -1, dtype=torch.int32)
+            sched_to_pers_keys = torch.full((max_batch, ),
+                                            -1,
+                                            dtype=torch.int32)
+            sched_to_pers_values = torch.full((max_batch, ),
+                                              -1,
+                                              dtype=torch.int32)
             # This is always a single-element list,
             # if not using structured outputs, it's [{}]
             original_dict = model_input.sched_to_pers[0]
-            for idx, (scheduler_index, persistent_index) in enumerate(original_dict.items()):
+            for idx, (scheduler_index,
+                      persistent_index) in enumerate(original_dict.items()):
                 sched_to_pers_keys[idx] = scheduler_index
                 sched_to_pers_values[idx] = persistent_index
-
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
@@ -641,9 +650,11 @@ class TTModelRunner:
                 off += 1
                 top_k = int(int_inputs[off].item())
                 off += 1
-                bitmask_size = ((self.model_config.get_vocab_size() + 31) // 32)
+                bitmask_size = ((self.model_config.get_vocab_size() + 31) //
+                                32)
                 stride = bitmask_size * B
-                padded_bitmask = int_inputs[off:off + stride].view(B, bitmask_size)
+                padded_bitmask = int_inputs[off:off + stride].view(
+                    B, bitmask_size)
                 off += stride
                 stride = B
                 sched_to_pers_keys = int_inputs[off:off + stride].view(B)
@@ -667,14 +678,14 @@ class TTModelRunner:
                 mapping = {}
                 for i in range(B):
                     key = sched_to_pers_keys[i].item()
-                    if key != -1: # -1 is padding
+                    if key != -1:  # -1 is padding
                         mapping[key] = sched_to_pers_values[i].item()
                 sched_to_pers_list.append(mapping)
                 # We may have padded the bitmask,
                 # but we want to maintain the property
                 # that if there are no structured output requests,
                 # the bitmask is None
-                if len(mapping) > 0:    
+                if len(mapping) > 0:
                     grammar_bitmask_list.append(padded_bitmask)
                 else:
                     grammar_bitmask_list.append(None)
@@ -716,7 +727,8 @@ class TTModelRunner:
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
                 # Unwrap the single-element list wrappers
-                grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None)
+                grammar_bitmask_list.append(
+                    mi.grammar_bitmask[0] if mi else None)
                 sched_to_pers_list.append(mi.sched_to_pers[0] if mi else None)
 
             input_positions = 0
@@ -838,11 +850,9 @@ class TTModelRunner:
             # None if no structured output requests are present
             # or a len(input_batch) x ceil(vocab_size/32) tensort
             integrated_reordered_bitmask = self.prepare_bitmask_for_device(
-                is_decode,
-                model_input.unpadded_batch_size,
-                model_input.grammar_bitmask,
-                model_input.sched_to_pers)
-            
+                is_decode, model_input.unpadded_batch_size,
+                model_input.grammar_bitmask, model_input.sched_to_pers)
+
             #TODO: re-enable this when we all generators are updated to handle it
             #kwargs["bitmask"] = integrated_reordered_bitmask
 
@@ -871,21 +881,17 @@ class TTModelRunner:
                     or (self.sample_on_device_mode == "decode_only"
                         and not is_decode)):
                 logits = tt_out[start:start + sz, -1, :]
-                
+
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
                 sched_to_pers = model_input.sched_to_pers[dp_rank]
-                
-                if (grammar_bitmask is not None and 
-                    sched_to_pers):
-                    self.apply_grammar_bitmask(
-                        logits, 
-                        grammar_bitmask, 
-                        sched_to_pers
-                    )
-                
+
+                if (grammar_bitmask is not None and sched_to_pers):
+                    self.apply_grammar_bitmask(logits, grammar_bitmask,
+                                               sched_to_pers)
+
                 next_token_ids = sample_tokens(logits,
                                                sampling_params_per_dp[dp_rank])
-            else: # sample on device
+            else:  # sample on device
                 # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start:start + sz]
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
@@ -919,27 +925,32 @@ class TTModelRunner:
 
         # We want to match the shape of the joint input batch
         if is_decode:
-            total_batch_size = self.scheduler_config.max_num_seqs * len(batch_size_per_dp)
+            total_batch_size = self.scheduler_config.max_num_seqs * len(
+                batch_size_per_dp)
         else:
             total_batch_size = sum(batch_size_per_dp)
 
-        grammar_bitmask_length = ((self.model_config.get_vocab_size() + 31) // 32)
+        grammar_bitmask_length = ((self.model_config.get_vocab_size() + 31) //
+                                  32)
 
         # Ones in the compressed bitmask represent tokens that are allowed.
-        joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length), dtype=torch.int32)
+        joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length),
+                                    dtype=torch.int32)
         joint_bitmask = torch.bitwise_not(joint_bitmask)
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             local_sched_to_pers = sched_to_pers_list[dp_rank]
-            for scheduler_index, persistent_index in local_sched_to_pers.items():
-                joint_bitmask[start + persistent_index, :] = grammar_bitmask_list[dp_rank][scheduler_index]
+            for scheduler_index, persistent_index in local_sched_to_pers.items(
+            ):
+                joint_bitmask[start +
+                              persistent_index, :] = grammar_bitmask_list[
+                                  dp_rank][scheduler_index]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
                 start += sz
 
         return joint_bitmask
-
 
     def apply_grammar_bitmask(
         self,
@@ -950,8 +961,8 @@ class TTModelRunner:
         """Apply structured output grammar constraints to logits in-place"""
         if grammar_bitmask is None or not sched_to_pers:
             return
-        
-        # The grammar bitmask is compressed as packed int32 values where each bit 
+
+        # The grammar bitmask is compressed as packed int32 values where each bit
         # represents one token. We need to unpack it like the TPU model runner.
         # Ones in the compressed bitmask represent tokens that are allowed.
 
@@ -959,10 +970,11 @@ class TTModelRunner:
 
         for scheduler_index, persistent_index in sched_to_pers.items():
             unpacked_bitmask = (torch.bitwise_right_shift(
-                grammar_bitmask[scheduler_index][:, None], self.structured_output_arange[None, :]) & 1) == 0
+                grammar_bitmask[scheduler_index][:, None],
+                self.structured_output_arange[None, :]) & 1) == 0
             unpacked_bitmask = unpacked_bitmask.reshape(-1)[:logits.shape[-1]]
-            logits[persistent_index].masked_fill_(unpacked_bitmask, -float("inf"))
-
+            logits[persistent_index].masked_fill_(unpacked_bitmask,
+                                                  -float("inf"))
 
     def generate_runner_output(self, sampled_token_ids: torch.Tensor):
         # Cache the sampled tokens in the model runner, so that the scheduler
