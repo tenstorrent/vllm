@@ -432,10 +432,11 @@ class TTModelRunner:
         # Get a mapping from scheduler batch (and bitmask) index
         # to persistent batch index
         # for structured output requests within a given DP rank
-        # Do this now, because later we lose access to other ranks' self.input_batch
-        structured_output_request_ids = scheduler_output.structured_output_request_ids
+        # Do this now, because later we lose access
+        # to other ranks' self.input_batch
+        structured_output_request_ids = scheduler_output.structured_output_request_ids  # noqa: E501
         sched_to_pers: dict[int, int] = {}
-        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items(
+        for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items(  # noqa: E501
         ):
             if req_id in structured_output_request_ids:
                 scheduler_batch_index = structured_output_request_ids[req_id]
@@ -849,11 +850,11 @@ class TTModelRunner:
             # If sampling on device, we pass the bitmask as well
             # None if no structured output requests are present
             # or a len(input_batch) x ceil(vocab_size/32) tensort
-            integrated_reordered_bitmask = self.prepare_bitmask_for_device(
-                is_decode, model_input.unpadded_batch_size,
-                model_input.grammar_bitmask, model_input.sched_to_pers)
 
-            #TODO: re-enable this when we all generators are updated to handle it
+            #TODO: re-enable this when we all models are updated to handle it
+            # integrated_reordered_bitmask = self.prepare_bitmask_for_device(
+            #     is_decode, model_input.unpadded_batch_size,
+            #     model_input.grammar_bitmask, model_input.sched_to_pers)
             #kwargs["bitmask"] = integrated_reordered_bitmask
 
         # Execute model
@@ -867,7 +868,8 @@ class TTModelRunner:
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
 
-        # The model input we got here may come from concatenating multiple DP ranks.
+        # The model input we got here may come from
+        # concatenating multiple DP ranks.
         # We need to split the data back before sampling.
         sampled_token_ids_per_dp: list[torch.Tensor] = []
 
@@ -962,8 +964,9 @@ class TTModelRunner:
         if grammar_bitmask is None or not sched_to_pers:
             return
 
-        # The grammar bitmask is compressed as packed int32 values where each bit
-        # represents one token. We need to unpack it like the TPU model runner.
+        # The grammar bitmask is compressed as packed int32 values
+        # where each bit represents one token. We need to unpack it
+        # like the TPU model runner does.
         # Ones in the compressed bitmask represent tokens that are allowed.
 
         #TODO this is likely a quite inefficient way of doing it on host.
