@@ -103,7 +103,7 @@ class AscendScheduler(Scheduler):
                 else:
                     skip_cur_request()
                     continue
-        
+
             # Skip request if the structured output request is still waiting
             # for FSM compilation.
             if request.status == RequestStatus.WAITING_FOR_FSM:
@@ -115,7 +115,6 @@ class AscendScheduler(Scheduler):
                     # skip request if FSM is still not ready
                     skip_cur_request()
                     continue
-
 
             # Check that adding the request still respects the max_loras
             # constraint.
@@ -336,7 +335,8 @@ class AscendScheduler(Scheduler):
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
                 if request.use_structured_output:
-                    structured_output_request_ids[request.request_id] = req_index
+                    structured_output_request_ids[
+                        request.request_id] = req_index
                 self.scheduled_req_ids.add(request.request_id)
                 req_to_new_block_ids[request.request_id] = (
                     new_blocks.get_block_ids())
