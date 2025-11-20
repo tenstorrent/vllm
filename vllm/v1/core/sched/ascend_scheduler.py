@@ -264,7 +264,6 @@ class AscendScheduler(Scheduler):
             while req_index < len(self.running) and token_budget > 0:
                 request = self.running[req_index]
                 if request.request_id in self.scheduled_req_ids:
-                    #TODO when can this happen?
                     # This request has already been scheduled.
                     req_index += 1
                     continue
@@ -520,7 +519,6 @@ class AscendScheduler(Scheduler):
                 continue
             if req_id in self.scheduled_req_ids:
                 self.scheduled_req_ids.remove(req_id)
-                #TODO what is happening here?
 
         return super().update_from_output(scheduler_output,
                                           model_runner_output)

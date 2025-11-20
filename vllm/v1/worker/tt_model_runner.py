@@ -423,7 +423,7 @@ class TTModelRunner:
         # structured_output_request_ids is an empty dict
         # and grammar_bitmask is None
         # Using torch tensor instead of numpy array for consistency
-        # because we need it as tensor for ipc.
+        # because we need it as tensor for gather.
         bitmask = scheduler_output.grammar_bitmask
         bitmask = torch.from_numpy(bitmask) if bitmask is not None else None
         # Get a mapping from scheduler batch (and bitmask) index
