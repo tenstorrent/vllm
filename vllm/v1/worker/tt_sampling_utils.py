@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 import torch
 
@@ -12,8 +12,6 @@ SAMPLING_FIELDS: tuple[tuple[str, type, Any], ...] = (
     ("presence_penalty", float, 0.0),
     ("frequency_penalty", float, 0.0),
     ("repetition_penalty", float, 1.0),
-    ("n", int, 1),
-    ("seed", Optional[int], None),
 )
 
 
@@ -25,8 +23,6 @@ class SamplingDefaults:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    n: int = 1
-    seed: Optional[int] = None
 
 
 DEFAULTS = SamplingDefaults()
@@ -47,11 +43,6 @@ def sampling_lists_from_numpy(sampling, length: int):
         sampling.frequency_penalty_cpu[:length].tolist())
     lists["repetition_penalty"] = (
         sampling.repetition_penalty_cpu[:length].tolist())
-    lists["n"] = sampling.n_cpu[:length].astype(int).tolist()
-    lists["seed"] = [
-        int(value) if int(value) >= 0 else None
-        for value in sampling.seed_cpu[:length].tolist()
-    ]
     return lists
 
 
@@ -83,8 +74,6 @@ def coerce_sampling_lists(
         params.frequency_penalty, defaults.frequency_penalty)
     lists["repetition_penalty"] = _coerce(
         params.repetition_penalty, defaults.repetition_penalty)
-    lists["n"] = [int(v) for v in _coerce(params.n, defaults.n)]
-    lists["seed"] = _coerce(params.seed, defaults.seed)
     return lists
 
 
@@ -103,8 +92,6 @@ def pad_sampling_lists(
     lists["presence_penalty"].extend([defaults.presence_penalty] * pad)
     lists["frequency_penalty"].extend([defaults.frequency_penalty] * pad)
     lists["repetition_penalty"].extend([defaults.repetition_penalty] * pad)
-    lists["n"].extend([defaults.n] * pad)
-    lists["seed"].extend([defaults.seed] * pad)
 
 
 def lists_to_tt_params(lists, cls):
@@ -115,23 +102,11 @@ def lists_to_tt_params(lists, cls):
         presence_penalty=lists["presence_penalty"],
         frequency_penalty=lists["frequency_penalty"],
         repetition_penalty=lists["repetition_penalty"],
-        n=lists["n"],
-        seed=lists["seed"],
     )
 
 
 def flatten_sampling_lists(lists):
-    ints = torch.cat(
-        [
-            torch.tensor(lists["top_k"], dtype=torch.int32),
-            torch.tensor(lists["n"], dtype=torch.int32),
-            torch.tensor(
-                [seed if seed is not None else -1 for seed in lists["seed"]],
-                dtype=torch.int32,
-            ),
-        ],
-        dim=0,
-    )
+    ints = torch.tensor(lists["top_k"], dtype=torch.int32)
     floats = torch.cat(
         [
             torch.tensor(lists["temperature"], dtype=torch.float32),
@@ -146,15 +121,7 @@ def flatten_sampling_lists(lists):
 
 
 def sampling_lists_from_flat(ints: torch.Tensor, floats: torch.Tensor, length: int):
-    off = 0
-    top_k = ints[off:off + length].tolist()
-    off += length
-    n_values = ints[off:off + length].tolist()
-    off += length
-    seed_values = [
-        int(val) if int(val) >= 0 else None
-        for val in ints[off:off + length].tolist()
-    ]
+    top_k = ints[:length].tolist()
 
     f_off = 0
     temperature = floats[f_off:f_off + length].tolist()
@@ -174,7 +141,5 @@ def sampling_lists_from_flat(ints: torch.Tensor, floats: torch.Tensor, length: i
         "presence_penalty": presence,
         "frequency_penalty": frequency,
         "repetition_penalty": repetition,
-        "n": [int(v) for v in n_values],
-        "seed": seed_values,
     }
 

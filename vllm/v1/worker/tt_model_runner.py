@@ -19,6 +19,7 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.tt_sampling_utils import (
+    DEFAULTS,
     coerce_sampling_lists,
     empty_sampling_lists,
     flatten_sampling_lists,
@@ -36,6 +37,8 @@ import numpy as np
 
 logger = init_logger(__name__)
 
+DEFAULT_SAMPLING = DEFAULTS
+
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -49,8 +52,6 @@ class TTSamplingParams:
     presence_penalty: float | list[float] = 0.0
     frequency_penalty: float | list[float] = 0.0
     repetition_penalty: float | list[float] = 1.0
-    n: int | list[int] = 1
-    seed: Optional[int] | list[Optional[int]] = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,14 @@ class TTModelRunner:
         assert (len(input_batch.block_table.block_tables) == 1
                 ), "Currently only supporting 1 KV cache group"
 
+        sampling = input_batch.sampling
+        penalties_requested = (
+            bool(np.any(sampling.presence_penalty_cpu[:num_reqs] != 0.0))
+            or bool(np.any(sampling.frequency_penalty_cpu[:num_reqs] != 0.0))
+            or bool(np.any(sampling.repetition_penalty_cpu[:num_reqs] != 1.0)))
+        prompt_tokens_tensor: Optional[torch.Tensor] = None
+        vocab_size = self.model_config.get_vocab_size()
+
         # Second dim of block table is (ceil(max_model_len / block_size)).
         # Slice to self.max_num_blocks_per_req which also takes into
         # account max num blocks in KV cache in case max KV blocks is smaller.
@@ -453,6 +462,23 @@ class TTModelRunner:
                 torch.arange(num_reqs), input_positions].view(-1, 1)
             prompt_lens = None
 
+            if penalties_requested:
+                max_prompt_len = int(
+                    np.max(input_batch.num_tokens[:num_reqs])) if num_reqs > 0 else 0
+                if max_prompt_len > 0:
+                    prompt_tokens_tensor = torch.full(
+                        (num_reqs, max_prompt_len),
+                        vocab_size,
+                        dtype=torch.int32)
+                    for i in range(num_reqs):
+                        seq_len = int(input_batch.num_tokens[i])
+                        if seq_len > 0:
+                            prompt_tokens_tensor[i, :seq_len] = (
+                                input_batch.token_ids_cpu_tensor[i, :seq_len])
+                else:
+                    prompt_tokens_tensor = torch.empty((num_reqs, 0),
+                                                       dtype=torch.int32)
+
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad batch to max_num_reqs.
             if input_tokens.shape[0] < input_batch.max_num_reqs:
@@ -472,6 +498,13 @@ class TTModelRunner:
                                 block_tables.shape[1],
                                 dtype=torch.int32)
                 ])
+                if prompt_tokens_tensor is not None:
+                    pad_tensor = torch.full(
+                        (batch_pad, prompt_tokens_tensor.shape[1]),
+                        vocab_size,
+                        dtype=torch.int32)
+                    prompt_tokens_tensor = torch.cat(
+                        [prompt_tokens_tensor, pad_tensor], dim=0)
 
         # Sampling-related.
         sampling_lists = sampling_lists_from_numpy(
@@ -500,7 +533,8 @@ class TTModelRunner:
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
-            cross_block_tables=None  # Not yet supported in V1
+            cross_block_tables=None,  # Not yet supported in V1
+            prompt_tokens=prompt_tokens_tensor
         )
 
     def build_model_input(
@@ -537,6 +571,7 @@ class TTModelRunner:
           - "float_inputs": flattened float tensor of constant size.
         """
 
+        vocab_size = self.model_config.get_vocab_size()
         if model_input is None:
             max_batch = int(self.scheduler_config.max_num_seqs)
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
@@ -547,6 +582,7 @@ class TTModelRunner:
             sampling_lists = empty_sampling_lists()
             pad_sampling_lists(
                 sampling_lists, max_batch, defaults=DEFAULT_SAMPLING)
+            prompt_tokens = torch.empty((max_batch, 0), dtype=torch.int32)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -563,9 +599,23 @@ class TTModelRunner:
                 [int(model_input.unpadded_batch_size)], dtype=torch.int32)
             sampling_lists = coerce_sampling_lists(
                 model_input.tt_sampling_params)
+            prompt_tokens = (model_input.prompt_tokens
+                             if model_input.prompt_tokens is not None else
+                             torch.empty((tokens.shape[0], 0),
+                                         dtype=torch.int32))
+            if prompt_tokens.shape[0] < tokens.shape[0]:
+                pad_rows = tokens.shape[0] - prompt_tokens.shape[0]
+                pad_tensor = torch.full(
+                    (pad_rows, prompt_tokens.shape[1]),
+                    vocab_size,
+                    dtype=torch.int32)
+                prompt_tokens = torch.cat([prompt_tokens, pad_tensor], dim=0)
 
         sampling_int_tensor, sampling_float_tensor = (
             flatten_sampling_lists(sampling_lists))
+        prompt_width_tensor = torch.tensor([prompt_tokens.shape[1]],
+                                           dtype=torch.int32)
+        prompt_tokens_flat = prompt_tokens.contiguous().view(-1)
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
@@ -576,6 +626,8 @@ class TTModelRunner:
                 block_tables.contiguous().view(-1),  # B*W
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 sampling_int_tensor.contiguous().view(-1),
+                prompt_width_tensor,
+                prompt_tokens_flat,
             ],
             dim=0).contiguous()
         float_inputs = torch.cat(
@@ -621,15 +673,18 @@ class TTModelRunner:
                                          dim=1)
             return block_tables
 
+        prompt_tokens = None
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W), bs(1),
-            #        sampling_ints(3*B)]
+            #        sampling_ints(B), prompt_width(1), prompt_tokens(B*prompt_width)]
             # Floats: [sampling floats (5*B)]
             assert max_blocks_decode_batch is not None, (
                 "max_blocks_decode_batch must be provided for decode")
             B = int(self.scheduler_config.max_num_seqs)
             W = max_blocks_decode_batch
+            prompt_tokens_list: list[Optional[torch.Tensor]] = []
+            prompt_widths: list[int] = []
             for int_inputs, float_inputs in zip(inputs["int_inputs"],
                                                 inputs["float_inputs"]):
                 # Slices
@@ -645,8 +700,17 @@ class TTModelRunner:
                 off += stride
                 batch_size = int(int_inputs[off].item())
                 off += 1
+                sampling_int_size = B
                 sampling_lists = sampling_lists_from_flat(
-                    int_inputs[off:], float_inputs, B)
+                    int_inputs[off:off + sampling_int_size], float_inputs, B)
+                off += sampling_int_size
+                prompt_width = int(int_inputs[off].item())
+                off += 1
+                prompt_tensor: Optional[torch.Tensor] = None
+                if prompt_width > 0:
+                    prompt_tokens_flat = int_inputs[off:off + B * prompt_width]
+                    prompt_tensor = prompt_tokens_flat.view(B, prompt_width)
+                    off += B * prompt_width
 
                 input_tokens_list.append(tokens)
                 input_positions_list.append(positions)
@@ -657,9 +721,34 @@ class TTModelRunner:
                         lists_to_tt_params(sampling_lists))
                 else:
                     sampling_params_per_dp.append(None)
+                prompt_tokens_list.append(prompt_tensor)
+                prompt_widths.append(prompt_width)
 
             input_positions = torch.cat(input_positions_list, dim=0)
             prompt_lens = None
+            if any(width > 0 for width in prompt_widths):
+                vocab_size = self.model_config.get_vocab_size()
+                max_prompt_width = max(prompt_widths)
+                merged_prompt_tokens = []
+                for prompt_tensor, width in zip(prompt_tokens_list,
+                                                prompt_widths):
+                    if width == 0 or prompt_tensor is None:
+                        merged_prompt_tokens.append(
+                            torch.full((B, max_prompt_width),
+                                       vocab_size,
+                                       dtype=torch.int32))
+                    elif width < max_prompt_width:
+                        pad_cols = max_prompt_width - width
+                        pad = torch.full((prompt_tensor.shape[0], pad_cols),
+                                         vocab_size,
+                                         dtype=torch.int32)
+                        merged_prompt_tokens.append(
+                            torch.cat([prompt_tensor, pad], dim=1))
+                    else:
+                        merged_prompt_tokens.append(prompt_tensor)
+                prompt_tokens = torch.cat(merged_prompt_tokens, dim=0)
+            else:
+                prompt_tokens = None
         else:
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
@@ -727,7 +816,8 @@ class TTModelRunner:
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
-            cross_block_tables=None  # Not yet supported in V1
+            cross_block_tables=None,  # Not yet supported in V1
+            prompt_tokens=prompt_tokens
         )
         return merged
 
@@ -794,6 +884,8 @@ class TTModelRunner:
                 kwargs["empty_slots"] = empty_slots
         else:
             kwargs["start_pos"] = model_input.input_positions
+            if model_input.prompt_tokens is not None:
+                kwargs["prompt_tokens"] = model_input.prompt_tokens
         if self.sample_on_device_mode == "all" or (
                 self.sample_on_device_mode == "decode_only" and is_decode):
             merged_sampling = self._merge_sampling_params(

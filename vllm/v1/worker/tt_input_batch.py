@@ -13,14 +13,40 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 class SamplingInputBatch:
 
     def __init__(self, max_num_reqs: int):
-        self.temperature_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.top_p_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.top_k_cpu = np.empty(max_num_reqs, dtype=np.int32)
-        self.presence_penalty_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.frequency_penalty_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.repetition_penalty_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.seed_cpu = np.empty(max_num_reqs, dtype=np.int64)
-        self.n_cpu = np.empty(max_num_reqs, dtype=np.int32)
+        self.temperature_cpu_tensor = torch.zeros((max_num_reqs, ),
+                                                  dtype=torch.float32)
+        self.temperature_cpu = self.temperature_cpu_tensor.numpy()
+
+        self.top_p_cpu_tensor = torch.ones((max_num_reqs, ),
+                                           dtype=torch.float32)
+        self.top_p_cpu = self.top_p_cpu_tensor.numpy()
+
+        self.top_k_cpu_tensor = torch.ones((max_num_reqs, ),
+                                           dtype=torch.int32)
+        self.top_k_cpu = self.top_k_cpu_tensor.numpy()
+
+        self.presence_penalty_cpu_tensor = torch.zeros((max_num_reqs, ),
+                                                       dtype=torch.float32)
+        self.presence_penalty_cpu = (
+            self.presence_penalty_cpu_tensor.numpy())
+
+        self.frequency_penalty_cpu_tensor = torch.zeros((max_num_reqs, ),
+                                                        dtype=torch.float32)
+        self.frequency_penalty_cpu = (
+            self.frequency_penalty_cpu_tensor.numpy())
+
+        self.repetition_penalty_cpu_tensor = torch.ones((max_num_reqs, ),
+                                                        dtype=torch.float32)
+        self.repetition_penalty_cpu = (
+            self.repetition_penalty_cpu_tensor.numpy())
+
+    def clear_index(self, req_index: int) -> None:
+        self.temperature_cpu[req_index] = 0.0
+        self.top_p_cpu[req_index] = 1.0
+        self.top_k_cpu[req_index] = 1
+        self.presence_penalty_cpu[req_index] = 0.0
+        self.frequency_penalty_cpu[req_index] = 0.0
+        self.repetition_penalty_cpu[req_index] = 1.0
 
 
 class InputBatch:
@@ -122,15 +148,6 @@ class InputBatch:
             req_index] = sampling_params.frequency_penalty
         self.sampling.repetition_penalty_cpu[
             req_index] = sampling_params.repetition_penalty
-        seed_value = sampling_params.seed
-        if isinstance(seed_value, list):
-            seed_value = seed_value[0] if seed_value else None
-        self.sampling.seed_cpu[req_index] = (
-            seed_value if seed_value is not None else -1)
-        n_value = sampling_params.n
-        if isinstance(n_value, list):
-            n_value = n_value[0] if n_value else 1
-        self.sampling.n_cpu[req_index] = n_value if n_value else 1
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -140,6 +157,7 @@ class InputBatch:
             return None
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
+        self.sampling.clear_index(req_index)
 
         return req_index
 
@@ -203,8 +221,6 @@ class InputBatch:
                 empty_index] = sampling.frequency_penalty_cpu[last_req_index]
             sampling.repetition_penalty_cpu[
                 empty_index] = sampling.repetition_penalty_cpu[last_req_index]
-            sampling.seed_cpu[empty_index] = sampling.seed_cpu[last_req_index]
-            sampling.n_cpu[empty_index] = sampling.n_cpu[last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
