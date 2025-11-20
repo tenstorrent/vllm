@@ -530,15 +530,18 @@ class TTModelRunner:
                 ],
                                          dim=1)
             unpadded_batch_size = torch.tensor(
-                [int(model_input.unpadded_batch_size)],
-                dtype=torch.int32)  # type: ignore
+                [int(model_input.unpadded_batch_size)],  # type: ignore
+                dtype=torch.int32)
             sp = model_input.tt_sampling_params
-            temperature = torch.tensor([float(sp.temperature)],
-                                       dtype=torch.float32)  # type: ignore
-            top_k = torch.tensor([int(sp.top_k)],
-                                 dtype=torch.int32)  # type: ignore
-            top_p = torch.tensor([float(sp.top_p)],
-                                 dtype=torch.float32)  # type: ignore
+            temperature = torch.tensor(
+                [float(sp.temperature)],  # type: ignore
+                dtype=torch.float32)
+            top_k = torch.tensor(
+                [int(sp.top_k)],  # type: ignore
+                dtype=torch.int32)
+            top_p = torch.tensor(
+                [float(sp.top_p)],  # type: ignore
+                dtype=torch.float32)
 
             # Before concatenating this is always a single-element list
             if model_input.grammar_bitmask[0] is not None:
