@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, List, Dict, Union, Callable
+from dataclasses import dataclass
 
 import torch
 import ttnn
@@ -18,7 +19,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
-from vllm.worker.tt_model_runner import (TTModelInput, TTSamplingParams,
+from vllm.worker.tt_model_runner import (TTSamplingParams,
                                          sample_tokens)
 
 if TYPE_CHECKING:
@@ -27,6 +28,25 @@ if TYPE_CHECKING:
 import numpy as np
 
 logger = init_logger(__name__)
+@dataclass(frozen=True)
+class TTModelInput:
+    """
+    Used by the TTModelRunner.
+    """
+    input_tokens: torch.Tensor
+    input_positions: torch.Tensor
+    prompt_lens: Optional[List[int]]
+    block_tables: torch.Tensor
+    unpadded_batch_size: Union[int, List[int]]  # List is used for DP in V1
+    tt_sampling_params: Union[Optional[TTSamplingParams], List[
+        Optional[TTSamplingParams]]]  # List is used for DP in V1
+    multi_modal_kwargs: Dict[str, Any]
+
+    #always lists: single-element for non-DP, multi-element for DP
+    # If not using structured outputs, [None]
+    grammar_bitmask: List[Optional[torch.Tensor]] = None
+    # If not using structured outputs, [{}]
+    sched_to_pers: List[Dict[int, int]] = None
 
 
 class TTModelRunner:
@@ -410,9 +430,6 @@ class TTModelRunner:
             top_p=top_p[0],
         )
 
-        compat_sampling_used = False
-        sampling_metadata = None
-
         if self.model_config.is_multimodal_model and is_prompt:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
                 scheduler_output)
@@ -443,15 +460,10 @@ class TTModelRunner:
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
-            seq_groups=None,  # Not used in V1
             block_tables=block_tables,
             unpadded_batch_size=num_reqs,
-            perform_device_sampling=None,  #currently unused in v1
             tt_sampling_params=tt_sampling_params,
-            compat_sampling_used=compat_sampling_used,
-            sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
-            cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=[bitmask],  # wrap to match DP case
             sched_to_pers=[sched_to_pers],  # wrap to match DP case
         )
@@ -734,9 +746,6 @@ class TTModelRunner:
         input_tokens = torch.cat(input_tokens_list, dim=0)
         block_tables = torch.cat(block_tables_list, dim=0)
 
-        compat_sampling_used = False
-        sampling_metadata = None
-
         if self.model_config.is_multimodal_model and not is_decode:
             # Gather multi-modal inputs from all DP ranks
             multi_modal_kwargs: MultiModalKwargs = {"pixel_values": []}
@@ -752,15 +761,10 @@ class TTModelRunner:
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
-            seq_groups=None,
             block_tables=block_tables,
             unpadded_batch_size=batch_size_per_dp,
-            perform_device_sampling=None,  #currently unused in v1
             tt_sampling_params=sampling_params_per_dp,
-            compat_sampling_used=compat_sampling_used,
-            sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
-            cross_block_tables=None,  # Not yet supported in V1
             grammar_bitmask=grammar_bitmask_list,
             sched_to_pers=sched_to_pers_list,
         )
@@ -939,7 +943,7 @@ class TTModelRunner:
         for dp_rank, sz in enumerate(batch_size_per_dp):
             local_sched_to_pers = sched_to_pers_list[dp_rank]
             # local_sched_to_pers is always non-None in v1
-            for scheduler_index, persistent_index in local_sched_to_pers.items(  # type: ignore[union-attr]
+            for scheduler_index, persistent_index in local_sched_to_pers.items(
             ):
                 # We know that grammar_bitmask_list[dp_rank] is not None
                 # because local_sched_to_pers in not-empty
