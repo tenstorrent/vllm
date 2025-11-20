@@ -39,8 +39,7 @@ class TTModelInput:
     prompt_lens: Optional[list[int]]
     block_tables: torch.Tensor
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
-    tt_sampling_params: Union[Optional[TTSamplingParams], list[
-        Optional[TTSamplingParams]]]  # List is used for DP
+    tt_sampling_params: Union[TTSamplingParams, list[TTSamplingParams]]
     multi_modal_kwargs: dict[str, Any]
 
     # always lists: single-element for non-DP, multi-element for DP
@@ -531,14 +530,15 @@ class TTModelRunner:
                 ],
                                          dim=1)
             unpadded_batch_size = torch.tensor(
-                [int(model_input.unpadded_batch_size)], dtype=torch.int32)
+                [int(model_input.unpadded_batch_size)],
+                dtype=torch.int32)  # type: ignore
             sp = model_input.tt_sampling_params
             temperature = torch.tensor([float(sp.temperature)],
-                                       dtype=torch.float32)
-            top_k = torch.tensor([int(sp.top_k)], dtype=torch.int32)
-            top_p = torch.tensor([float(sp.top_p)], dtype=torch.float32)
-            # pad bitmask to constant shape
-            # TODO check if this is needed
+                                       dtype=torch.float32)  # type: ignore
+            top_k = torch.tensor([int(sp.top_k)],
+                                 dtype=torch.int32)  # type: ignore
+            top_p = torch.tensor([float(sp.top_p)],
+                                 dtype=torch.float32)  # type: ignore
 
             # Before concatenating this is always a single-element list
             if model_input.grammar_bitmask[0] is not None:
@@ -693,7 +693,8 @@ class TTModelRunner:
                     prompt_lens_list.append(mi.prompt_lens)
                     block_tables_list.append(pad_block_tables(mi.block_tables))
 
-                batch_size_per_dp.append(mi.unpadded_batch_size if mi else 0)
+                batch_size_per_dp.append(
+                    mi.unpadded_batch_size if mi else 0)  # type: ignore
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
                 grammar_bitmask_list.append(
