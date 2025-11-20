@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 import torch
@@ -28,7 +29,7 @@ from vllm.v1.worker.tt_sampling_utils import (
     sampling_lists_from_flat,
     sampling_lists_from_numpy,
 )
-from vllm.worker.tt_model_runner import sample_tokens
+from vllm.worker.tt_model_runner import (ModelRunnerInputBase, sample_tokens)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -405,7 +406,7 @@ class TTModelRunner:
                 merged[key].extend(values)
         if not merged["temperature"]:
             return None
-        return lists_to_tt_params(merged)
+        return lists_to_tt_params(merged, TTSamplingParams)
 
     def _prepare_model_inputs(
             self, scheduler_output: "SchedulerOutput") -> TTModelInput:
@@ -529,7 +530,7 @@ class TTModelRunner:
             block_tables=block_tables,
             unpadded_batch_size=num_reqs,
             perform_device_sampling=None,  #currently unused in v1
-            tt_sampling_params=lists_to_tt_params(sampling_lists),
+            tt_sampling_params=lists_to_tt_params(sampling_lists, TTSamplingParams),
             compat_sampling_used=compat_sampling_used,
             sampling_metadata=sampling_metadata,
             multi_modal_kwargs=multi_modal_kwargs,
@@ -677,7 +678,8 @@ class TTModelRunner:
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W), bs(1),
-            #        sampling_ints(B), prompt_width(1), prompt_tokens(B*prompt_width)]
+            #        sampling_ints(B), prompt_width(1),
+            #        prompt_tokens(B*prompt_width)]
             # Floats: [sampling floats (5*B)]
             assert max_blocks_decode_batch is not None, (
                 "max_blocks_decode_batch must be provided for decode")
@@ -718,7 +720,7 @@ class TTModelRunner:
                 batch_size_per_dp.append(batch_size)
                 if batch_size > 0:
                     sampling_params_per_dp.append(
-                        lists_to_tt_params(sampling_lists))
+                        lists_to_tt_params(sampling_lists, TTSamplingParams))
                 else:
                     sampling_params_per_dp.append(None)
                 prompt_tokens_list.append(prompt_tensor)
