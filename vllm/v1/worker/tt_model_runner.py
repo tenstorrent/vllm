@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import TYPE_CHECKING, Any, Optional, List, Dict, Union, Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import ttnn
@@ -19,8 +19,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
-from vllm.worker.tt_model_runner import (TTSamplingParams,
-                                         sample_tokens)
+from vllm.worker.tt_model_runner import TTSamplingParams, sample_tokens
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -28,6 +27,8 @@ if TYPE_CHECKING:
 import numpy as np
 
 logger = init_logger(__name__)
+
+
 @dataclass(frozen=True)
 class TTModelInput:
     """
@@ -35,16 +36,16 @@ class TTModelInput:
     """
     input_tokens: torch.Tensor
     input_positions: torch.Tensor
-    prompt_lens: Optional[List[int]]
+    prompt_lens: Optional[list[int]]
     block_tables: torch.Tensor
-    unpadded_batch_size: Union[int, List[int]]  # List is used for DP in V1
-    tt_sampling_params: Union[Optional[TTSamplingParams], List[
-        Optional[TTSamplingParams]]]  # List is used for DP in V1
-    multi_modal_kwargs: Dict[str, Any]
+    unpadded_batch_size: Union[int, list[int]]  # List is used for DP
+    tt_sampling_params: Union[Optional[TTSamplingParams], list[
+        Optional[TTSamplingParams]]]  # List is used for DP
+    multi_modal_kwargs: dict[str, Any]
 
-    #always lists: single-element for non-DP, multi-element for DP
+    # always lists: single-element for non-DP, multi-element for DP
     # If not using structured outputs, [None]
-    grammar_bitmask: List[Optional[torch.Tensor]] = None
+    grammar_bitmask: list[Optional[torch.Tensor]]
 
 
 class TTModelRunner:
@@ -440,18 +441,20 @@ class TTModelRunner:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
             bitmask = torch.from_numpy(bitmask)
-            batch_length = input_tokens.shape[0] # unpadded for prefill, padded for decode
+            # unpadded for prefill, padded for decode
+            batch_length = input_tokens.shape[0]
             grammar_bitmask_length = bitmask.shape[1]
             # Ones in the compressed bitmask represent tokens that are allowed.
-            reordered_bitmask = torch.zeros((batch_length, grammar_bitmask_length),
-                                            dtype=torch.int32)
+            reordered_bitmask = torch.zeros(
+                (batch_length, grammar_bitmask_length), dtype=torch.int32)
             reordered_bitmask = torch.bitwise_not(reordered_bitmask)
-            structured_output_request_ids = scheduler_output.structured_output_request_ids  # noqa: E501
+            structured_request_ids = scheduler_output.structured_output_request_ids  # noqa: E501
             for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items(  # noqa: E501
             ):
-                if req_id in structured_output_request_ids:
-                    scheduler_batch_index = structured_output_request_ids[req_id]
-                    reordered_bitmask[persistent_batch_index, :] = bitmask[scheduler_batch_index, :]
+                if req_id in structured_request_ids:
+                    scheduler_batch_index = structured_request_ids[req_id]
+                    reordered_bitmask[persistent_batch_index, :] = bitmask[
+                        scheduler_batch_index, :]
             bitmask = reordered_bitmask
 
         return TTModelInput(
@@ -511,8 +514,7 @@ class TTModelRunner:
             top_k = torch.tensor([-1], dtype=torch.int32)
             top_p = torch.tensor([-1.0], dtype=torch.float32)
 
-            padded_bitmask = torch.zeros((max_batch, bitmask_size),
-                                         dtype=torch.int32)
+            bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
             has_structured_inputs = torch.tensor([0], dtype=torch.int32)
 
         else:
@@ -544,7 +546,7 @@ class TTModelRunner:
                 has_structured_inputs = torch.tensor([1], dtype=torch.int32)
             else:
                 bitmask = torch.zeros((max_batch, bitmask_size),
-                                             dtype=torch.int32)
+                                      dtype=torch.int32)
                 has_structured_inputs = torch.tensor([0], dtype=torch.int32)
 
         # Pack into flattened tensors to reduce number of collectives.
@@ -633,8 +635,7 @@ class TTModelRunner:
                 bitmask_size = ((self.model_config.get_vocab_size() + 31) //
                                 32)
                 stride = bitmask_size * B
-                bitmask = int_inputs[off:off + stride].view(
-                    B, bitmask_size)
+                bitmask = int_inputs[off:off + stride].view(B, bitmask_size)
                 off += stride
                 stride = 1
                 has_structured_inputs = int_inputs[off:off + stride].view(1)
@@ -653,7 +654,7 @@ class TTModelRunner:
                                          top_p=top_p))
                 else:
                     sampling_params_per_dp.append(None)
-                
+
                 if int(has_structured_inputs.item()) > 0:
                     grammar_bitmask_list.append(bitmask)
                 else:
@@ -695,7 +696,6 @@ class TTModelRunner:
                 batch_size_per_dp.append(mi.unpadded_batch_size if mi else 0)
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
-                # Unwrap the single-element list wrappers
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
@@ -864,10 +864,8 @@ class TTModelRunner:
         return sampled_token_ids_per_dp
 
     def prepare_bitmask_for_device(
-        self,
-        is_decode: bool,
-        batch_size_per_dp: list[int],
-        grammar_bitmask_list: list[Optional[torch.Tensor]]
+            self, is_decode: bool, batch_size_per_dp: list[int],
+            grammar_bitmask_list: list[Optional[torch.Tensor]]
     ) -> torch.Tensor:
         """Prepare the bitmask for device sampling
            Return None if no structured output requests are present
@@ -896,7 +894,8 @@ class TTModelRunner:
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if grammar_bitmask_list[dp_rank] is not None:
-                joint_bitmask[start:start + sz, :] = grammar_bitmask_list[dp_rank]
+                joint_bitmask[start:start +
+                              sz, :] = grammar_bitmask_list[dp_rank]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
@@ -904,11 +903,8 @@ class TTModelRunner:
 
         return joint_bitmask
 
-    def apply_grammar_bitmask(
-        self,
-        logits: torch.Tensor,
-        grammar_bitmask: torch.Tensor
-    ) -> None:
+    def apply_grammar_bitmask(self, logits: torch.Tensor,
+                              grammar_bitmask: torch.Tensor) -> None:
         """Apply structured output grammar constraints to logits in-place"""
         # The grammar bitmask is compressed as packed int32 values
         # where each bit represents one token. We need to unpack it
@@ -920,9 +916,10 @@ class TTModelRunner:
         # grammar_bitmask: (batch_size, bitmask_size)
         # logits: (batch_size, vocab_size)
         unpacked_bitmask = (torch.bitwise_right_shift(
-                grammar_bitmask[:, :, None],
-                self.structured_output_arange[None, None, :]) & 1) == 0
-        unpacked_bitmask = unpacked_bitmask.reshape(grammar_bitmask.shape[0], -1)[:, :logits.shape[-1]]
+            grammar_bitmask[:, :, None],
+            self.structured_output_arange[None, None, :]) & 1) == 0
+        unpacked_bitmask = unpacked_bitmask.reshape(grammar_bitmask.shape[0],
+                                                    -1)[:, :logits.shape[-1]]
         logits.masked_fill_(unpacked_bitmask, -float("inf"))
 
     def generate_runner_output(self, sampled_token_ids: torch.Tensor):
