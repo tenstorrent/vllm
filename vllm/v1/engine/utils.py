@@ -698,7 +698,6 @@ def launch_core_engines(
                 local_start_index = 1
 
         # Start local engines.
-        local_engine_manager = None
         if local_engine_count:
             # In server mode, start_index and local_start_index will
             # both be 0.
@@ -714,6 +713,8 @@ def launch_core_engines(
                 start_index=dp_rank,
                 local_start_index=local_start_index or 0,
                 dp_ranks=local_engine_dp_ranks)
+        else:
+            local_engine_manager = None
 
         yield local_engine_manager, coordinator, addresses
 

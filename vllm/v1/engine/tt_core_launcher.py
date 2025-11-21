@@ -181,13 +181,10 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     _validate_launch_from_rank0_host(mpi_args, host_ip)
 
     # Serialize vllm_config for remote engines to load.
-    dir_for_cfg = None
-    if config_pkl_dir:
-        if not os.path.isdir(config_pkl_dir):
-            raise RuntimeError(
-                "override_tt_config['config_pkl_dir'] must be a directory")
-        dir_for_cfg = config_pkl_dir
-    cfg_dir = dir_for_cfg if dir_for_cfg is not None else tempfile.gettempdir()
+    if config_pkl_dir and not os.path.isdir(config_pkl_dir):
+        raise RuntimeError(
+            "override_tt_config['config_pkl_dir'] must be a directory")
+    cfg_dir = config_pkl_dir if config_pkl_dir else tempfile.gettempdir()
     serialized_config_path = os.path.join(cfg_dir, "tmp_vllm_tt_cfg.pkl")
     with open(serialized_config_path, "wb") as tf:
         cloudpickle.dump(vllm_config, tf)
