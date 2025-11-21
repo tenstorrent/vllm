@@ -1224,7 +1224,8 @@ class DPEngineCoreProc(EngineCoreProc):
                                             local_bitmask,
                                             group=group)
                 bitmasks = bitmask_out_1d.view(world, -1)
-                gathered_inputs["bitmasks"] = bitmasks
+                if rank == 0:
+                    gathered_inputs["bitmasks"] = bitmasks
 
         else:
             # Prefill: use object all_gather with variable sized inputs.
