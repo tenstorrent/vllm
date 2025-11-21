@@ -683,6 +683,9 @@ def launch_core_engines(
             from vllm.v1.engine.tt_core_launcher import tt_run_launch
 
             # Pass addresses so finalizer persists while engines run.
+            assert isinstance(
+                rank_binding_file,
+                str), ("rank_binding_file must be a non-empty string")
             tt_run_launch(handshake_address=handshake_address,
                           vllm_config=vllm_config,
                           rank_binding_file=rank_binding_file,
