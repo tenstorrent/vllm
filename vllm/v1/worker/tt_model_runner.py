@@ -847,11 +847,10 @@ class TTModelRunner:
                 logits = tt_out[start:start + sz, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
-                # match shape of logits, which are now unpadded on batch dim
+                
                 if grammar_bitmask is not None:
-                    grammar_bitmask = grammar_bitmask[start:start + sz]
-
-                if (grammar_bitmask is not None):
+                    # match shape of logits, which are now unpadded on batch dim
+                    grammar_bitmask = grammar_bitmask[start:start + sz, :]
                     self.apply_grammar_bitmask(logits, grammar_bitmask)
 
                 next_token_ids = sample_tokens(logits,
