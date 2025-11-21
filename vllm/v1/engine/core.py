@@ -1176,10 +1176,9 @@ class DPEngineCoreProc(EngineCoreProc):
         is_decode = self._dp_gather_forced_mode == 0
 
         # Build local dp model input (or None).
-        local_input, local_max_blocks, local_has_structured = self.model_executor.collective_rpc(  # noqa: E501
+        local_input, local_max_blocks = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
         max_blocks_decode = None  # Only used for decode.
-        has_structured_list = None
 
         if is_decode:
             # Gather max blocks from all ranks.
@@ -1187,23 +1186,14 @@ class DPEngineCoreProc(EngineCoreProc):
             dist.all_reduce(max_blocks_t, op=dist.ReduceOp.MAX, group=group)
             max_blocks_decode = int(max_blocks_t.item())
 
-            has_structured_t = torch.tensor([local_has_structured],
-                                            dtype=torch.int32)
-            has_structured_out = torch.empty((world, ), dtype=torch.int32)
-            dist.all_gather_into_tensor(has_structured_out,
-                                        has_structured_t,
-                                        group=group)
-            has_structured_list = has_structured_out.tolist()
-            has_any_structured = any(has_structured_list)
-
             # Build tensorized gather input for decode.
-            local_input = self.model_executor.collective_rpc(
+            tensorized_input = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
-                args=(local_input, max_blocks_decode, has_any_structured))[0]
+                args=(local_input, max_blocks_decode))[0]
 
             # Decode: use all_gather_into_tensor with fixed-shape inputs.
-            int_local = local_input["int_inputs"]  # 1D int32
-            float_local = local_input["float_inputs"]  # 1D float32
+            int_local = tensorized_input["int_inputs"]  # 1D int32
+            float_local = tensorized_input["float_inputs"]  # 1D float32
             int_out_1d = torch.empty(int_local.numel() * world,
                                      dtype=int_local.dtype)
             float_out_1d = torch.empty(float_local.numel() * world,
@@ -1212,11 +1202,29 @@ class DPEngineCoreProc(EngineCoreProc):
             # this could be gather instead of all_gather.
             dist.all_gather_into_tensor(int_out_1d, int_local, group=group)
             dist.all_gather_into_tensor(float_out_1d, float_local, group=group)
+
+            int_inputs = int_out_1d.view(world, -1)
+            float_inputs = float_out_1d.view(world, -1)
+
             if rank == 0:
                 gathered_inputs = {
-                    "int_inputs": int_out_1d.view(world, -1),
-                    "float_inputs": float_out_1d.view(world, -1),
+                    "int_inputs": int_inputs,
+                    "float_inputs": float_inputs,
                 }
+
+            # has_structured_inputs is always last element of int_inputs
+            has_structured_inputs = int_inputs[:, -1]
+            if any(has_structured_inputs > 0):
+                local_bitmask = self.model_executor.collective_rpc(
+                    "build_padded_bitmasks", args=(local_input, ))[0]
+                bitmask_out_1d = torch.empty(local_bitmask.numel() * world,
+                                             dtype=local_bitmask.dtype)
+                dist.all_gather_into_tensor(bitmask_out_1d,
+                                            local_bitmask,
+                                            group=group)
+                bitmasks = bitmask_out_1d.view(world, -1)
+                gathered_inputs["bitmasks"] = bitmasks
+
         else:
             # Prefill: use object all_gather with variable sized inputs.
             gathered_inputs = [None for _ in range(world)]  # type: ignore
@@ -1228,8 +1236,7 @@ class DPEngineCoreProc(EngineCoreProc):
                                            for x in gathered_inputs)):
             send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp",
-                args=(gathered_inputs, is_decode, max_blocks_decode,
-                      has_structured_list))[0]
+                args=(gathered_inputs, is_decode, max_blocks_decode))[0]
             assert isinstance(send_tensor, torch.Tensor)
         else:
             B = self.vllm_config.scheduler_config.max_num_seqs
