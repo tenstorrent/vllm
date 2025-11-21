@@ -807,16 +807,6 @@ class TTModelRunner:
                 "Sampling params must be the same for all active DP ranks")
             kwargs["sampling_params"] = non_none_params[0]
 
-            # If sampling on device, we pass the bitmask as well
-            # None if no structured output requests are present
-            # or a len(input_batch) x ceil(vocab_size/32) tensort
-
-            #TODO: re-enable this when we all models are updated to handle it
-            # integrated_reordered_bitmask = self.prepare_bitmask_for_device(
-            #     is_decode, model_input.unpadded_batch_size,
-            #     model_input.grammar_bitmask, model_input.sched_to_pers)
-            #kwargs["bitmask"] = integrated_reordered_bitmask
-
         # Execute model
         if not is_decode:
             tt_out = self.model.prefill_forward(**kwargs)
@@ -866,46 +856,6 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp
-
-    def prepare_bitmask_for_device(
-            self, is_decode: bool, batch_size_per_dp: list[int],
-            grammar_bitmask_list: list[Optional[torch.Tensor]]
-    ) -> torch.Tensor:
-        """Prepare the bitmask for device sampling
-           Return None if no structured output requests are present
-           or a len(joint_input_batch) x ceil(vocab_size/32) tensor
-           if structured output requests are present"""
-
-        # Both None and {} evaluate to False
-        has_any_structured = any(grammar_bitmask_list)
-        if not has_any_structured:
-            return None
-
-        # We want to match the shape of the joint input batch
-        if is_decode:
-            total_batch_size = self.scheduler_config.max_num_seqs * len(
-                batch_size_per_dp)
-        else:
-            total_batch_size = sum(batch_size_per_dp)
-
-        grammar_bitmask_length = ((self.model_config.get_vocab_size() + 31) //
-                                  32)
-
-        # Ones in the compressed bitmask represent tokens that are allowed.
-        joint_bitmask = torch.zeros((total_batch_size, grammar_bitmask_length),
-                                    dtype=torch.int32)
-        joint_bitmask = torch.bitwise_not(joint_bitmask)
-        start = 0
-        for dp_rank, sz in enumerate(batch_size_per_dp):
-            if grammar_bitmask_list[dp_rank] is not None:
-                joint_bitmask[start:start +
-                              sz, :] = grammar_bitmask_list[dp_rank]
-            if is_decode:
-                start += self.scheduler_config.max_num_seqs
-            else:
-                start += sz
-
-        return joint_bitmask
 
     def apply_grammar_bitmask(self, logits: torch.Tensor,
                               grammar_bitmask: torch.Tensor) -> None:
