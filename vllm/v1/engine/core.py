@@ -1217,6 +1217,7 @@ class DPEngineCoreProc(EngineCoreProc):
             if any(has_structured_inputs > 0):
                 local_bitmask = self.model_executor.collective_rpc(
                     "build_padded_bitmasks", args=(local_input, ))[0]
+                local_bitmask = local_bitmask.contiguous().view(-1)
                 bitmask_out_1d = torch.empty(local_bitmask.numel() * world,
                                              dtype=local_bitmask.dtype)
                 dist.all_gather_into_tensor(bitmask_out_1d,
