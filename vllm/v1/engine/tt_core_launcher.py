@@ -8,7 +8,6 @@ import shlex
 import socket
 import subprocess
 import sys
-import tempfile
 import weakref
 from typing import Optional
 
@@ -79,14 +78,20 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
         return
 
     resolved_ips: set[str] = set()
+    # If rank0_host is already an IP address, add it directly
+    if all(c.isdigit() or c == "." for c in rank0_host):
+        resolved_ips.add(rank0_host)
+    # Also try to resolve hostname to IP addresses
     try:
         info = socket.getaddrinfo(rank0_host, None, proto=socket.IPPROTO_TCP)
         for ai in info:
             resolved_ips.add(ai[4][0])
-    except Exception:
-        pass
-    if all(c.isdigit() or c == "." for c in rank0_host):
-        resolved_ips.add(rank0_host)
+    except Exception as e:
+        logger.warning("Failed to resolve IP address for rank 0 host %s: %s",
+                       rank0_host, e)
+        # If resolution failed and rank0_host is not an IP, we can't validate
+        if not resolved_ips:
+            return
     assert host_ip in resolved_ips, (
         f"MPI rank 0 host {rank0_host} from rankfile {mapby_path} "
         f"(resolves to {sorted(resolved_ips)}) does not match "
@@ -98,7 +103,7 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
 def parse_tt_mpi_params(
         vllm_config: VllmConfig) -> tuple[Optional[str], set[int]]:
     """
-    Parse override_tt_config for a rank binding file (required for launching 
+    Parse override_tt_config for a rank binding file (required for launching
     TT MPI processes), and compute device and local DP ranks.
     Returns tuple with:
       - rank_binding_file: str
@@ -149,8 +154,7 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     Uses args from override_tt_config:
       - rank_binding: str (required, already parsed)
       - mpi_args: str (optional, parsed here)
-      - config_pkl_dir: str (required for multi-host systems, parsed here)
-    
+      - config_pkl_dir: str (required, parsed here)
     Args:
         handshake_address: ZMQ address for engine handshake communication.
         vllm_config: Configuration object containing model and parallel config.
@@ -166,7 +170,15 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     # Parse override_tt_config for optional fields.
     override_tt_config = vllm_config.model_config.override_tt_config or {}
     mpi_args = override_tt_config.get("mpi_args", "")
-    config_pkl_dir = override_tt_config.get("config_pkl_dir")
+    cfg_dir = override_tt_config.get("config_pkl_dir")
+
+    if not cfg_dir:
+        raise RuntimeError(
+            "override_tt_config['config_pkl_dir'] is required for TT MPI launch"
+        )
+    if not os.path.isdir(cfg_dir):
+        raise RuntimeError(
+            "override_tt_config['config_pkl_dir'] must be a directory")
 
     host_ip = get_ip()
     # Data parallel master IP must be the same as the launcher host's IP since
@@ -181,10 +193,6 @@ def tt_run_launch(handshake_address: str, vllm_config: VllmConfig,
     _validate_launch_from_rank0_host(mpi_args, host_ip)
 
     # Serialize vllm_config for remote engines to load.
-    if config_pkl_dir and not os.path.isdir(config_pkl_dir):
-        raise RuntimeError(
-            "override_tt_config['config_pkl_dir'] must be a directory")
-    cfg_dir = config_pkl_dir if config_pkl_dir else tempfile.gettempdir()
     serialized_config_path = os.path.join(cfg_dir, "tmp_vllm_tt_cfg.pkl")
     with open(serialized_config_path, "wb") as tf:
         cloudpickle.dump(vllm_config, tf)
@@ -237,7 +245,6 @@ def _setup_mpi_proc_finalizer(mpi_proc: subprocess.Popen,
     """
     Set up a weakref finalizer to clean up MPI subprocess when cleanup_target
     is garbage collected. This ensures graceful shutdown of TT-MPI processes.
-    
     Args:
         mpi_proc: The subprocess.Popen object for the tt-run process
         cleanup_target: Obj whose lifecycle decides when to clean up mpi_proc
@@ -295,6 +302,12 @@ def main() -> None:
                                                               "1")))
 
     # Load vllm config.
+    if not os.path.isfile(config_pickle_path):
+        raise RuntimeError(
+            f"Config file doesn't exist or isn't a file: {config_pickle_path}")
+    if os.path.islink(config_pickle_path):
+        raise RuntimeError(
+            f"Config file is a symlink (not allowed): {config_pickle_path}")
     with open(config_pickle_path, "rb") as f:
         vllm_config: VllmConfig = cloudpickle.load(f)
 
