@@ -1221,7 +1221,7 @@ class DPEngineCoreProc(EngineCoreProc):
             int_inputs = int_out_1d.view(world, -1)
             float_inputs = float_out_1d.view(world, -1)
 
-            if rank == 0:
+            if parallel_config.data_parallel_rank_local == 0:
                 gathered_inputs = {
                     "int_inputs": int_inputs,
                     "float_inputs": float_inputs,
@@ -1239,7 +1239,7 @@ class DPEngineCoreProc(EngineCoreProc):
                                             local_bitmask,
                                             group=group)
                 bitmasks = bitmask_out_1d.view(world, -1)
-                if rank == 0:
+                if parallel_config.data_parallel_rank_local == 0:
                     gathered_inputs["bitmasks"] = bitmasks
 
         else:
