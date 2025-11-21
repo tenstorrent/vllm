@@ -3,7 +3,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import torch
 import ttnn
@@ -423,9 +423,9 @@ class TTModelRunner:
                 "for all sequences in batch, "
                 "falling back to first sequence's top_p (%s)", top_p[0])
         tt_sampling_params = TTSamplingParams(
-            temperature=temperature[0],
-            top_k=top_k[0],
-            top_p=top_p[0],
+            temperature=float(temperature[0]),
+            top_k=int(top_k[0]),
+            top_p=float(top_p[0]),
         )
 
         if self.model_config.is_multimodal_model and is_prompt:
@@ -529,19 +529,15 @@ class TTModelRunner:
                                 dtype=block_tables.dtype)
                 ],
                                          dim=1)
+            # We know these are not a list here before concatenation
             unpadded_batch_size = torch.tensor(
-                [int(model_input.unpadded_batch_size)],  # type: ignore
+                [cast(int, model_input.unpadded_batch_size)],
                 dtype=torch.int32)
-            sp = model_input.tt_sampling_params
-            temperature = torch.tensor(
-                [float(sp.temperature)],  # type: ignore
-                dtype=torch.float32)
-            top_k = torch.tensor(
-                [int(sp.top_k)],  # type: ignore
-                dtype=torch.int32)
-            top_p = torch.tensor(
-                [float(sp.top_p)],  # type: ignore
-                dtype=torch.float32)
+            sp: TTSamplingParams = model_input.tt_sampling_params
+
+            temperature = torch.tensor([sp.temperature], dtype=torch.float32)
+            top_k = torch.tensor([sp.top_k], dtype=torch.int32)
+            top_p = torch.tensor([sp.top_p], dtype=torch.float32)
 
             # Before concatenating this is always a single-element list
             if model_input.grammar_bitmask[0] is not None:
@@ -696,8 +692,10 @@ class TTModelRunner:
                     prompt_lens_list.append(mi.prompt_lens)
                     block_tables_list.append(pad_block_tables(mi.block_tables))
 
-                batch_size_per_dp.append(
-                    mi.unpadded_batch_size if mi else 0)  # type: ignore
+                # We know it's not a list here before concatenation
+                unpadded_batch_size: int = cast(
+                    int, mi.unpadded_batch_size) if mi else 0
+                batch_size_per_dp.append(unpadded_batch_size)
                 sampling_params_per_dp.append(
                     mi.tt_sampling_params if mi else None)
                 grammar_bitmask_list.append(
@@ -847,7 +845,7 @@ class TTModelRunner:
                 logits = tt_out[start:start + sz, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
-                
+
                 if grammar_bitmask is not None:
                     # match shape of logits, which are now unpadded on batch dim
                     grammar_bitmask = grammar_bitmask[start:start + sz, :]
