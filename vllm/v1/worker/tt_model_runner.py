@@ -98,6 +98,7 @@ class TTModelRunner:
 
         # Cache the arange needed for unpacking structured output bitmask
         self.structured_output_arange = torch.arange(0, 32)
+        self.bitmask_size = cdiv(self.model_config.get_vocab_size(), 32)
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
@@ -501,7 +502,6 @@ class TTModelRunner:
           - "float_inputs": flattened float tensor of constant size.
         """
 
-        bitmask_size = (self.model_config.get_vocab_size() + 31) // 32
         max_batch = int(self.scheduler_config.max_num_seqs)
         if model_input is None:
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
@@ -513,7 +513,8 @@ class TTModelRunner:
             top_k = torch.tensor([-1], dtype=torch.int32)
             top_p = torch.tensor([-1.0], dtype=torch.float32)
 
-            bitmask = torch.zeros((max_batch, bitmask_size), dtype=torch.int32)
+            bitmask = torch.zeros((max_batch, self.bitmask_size),
+                                  dtype=torch.int32)
             has_structured_inputs = torch.tensor([0], dtype=torch.int32)
 
         else:
@@ -544,7 +545,7 @@ class TTModelRunner:
                 bitmask = model_input.grammar_bitmask[0]
                 has_structured_inputs = torch.tensor([1], dtype=torch.int32)
             else:
-                bitmask = torch.zeros((max_batch, bitmask_size),
+                bitmask = torch.zeros((max_batch, self.bitmask_size),
                                       dtype=torch.int32)
                 has_structured_inputs = torch.tensor([0], dtype=torch.int32)
 
