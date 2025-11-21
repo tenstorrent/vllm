@@ -271,8 +271,8 @@ class CoordinatorProc:
                         # (engines_running==False).
                         if self.current_wave <= wave:
                             new_wave = wave + 1
-                            # logger.debug("Moving DP wave from %d to %d.",
-                            #              self.current_wave, new_wave)
+                            logger.debug("Moving DP wave from %d to %d.",
+                                         self.current_wave, new_wave)
                             self.current_wave = new_wave
                             self.engines_running = False
                             self.stats_changed = True
