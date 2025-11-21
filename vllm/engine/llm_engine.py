@@ -408,8 +408,11 @@ class LLMEngine:
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
+        self.model_executor.collective_rpc(
+            method="warmup_model_metal",
+            timeout=300.0  # 5 minute timeout for warmup
+        )
 
-        
         logger.info("NIKOLA - KRAJ LLM_ENGINE INITA")
 
     def _initialize_kv_caches(self) -> None:
