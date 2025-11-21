@@ -65,13 +65,6 @@ class TTModelInput(ModelRunnerInputBase):
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
-    # V1 structured output support (backward compatible with default None)
-    # None in v0
-    # In v1, always lists: single-element for non-DP, multi-element for DP
-    # If not using structured outputs, [None]
-    grammar_bitmask: Optional[List[Optional[torch.Tensor]]] = None
-    # If not using structured outputs, [{}]
-    sched_to_pers: Optional[List[Dict[int, int]]] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -90,8 +83,6 @@ class TTModelInput(ModelRunnerInputBase):
             "cross_block_tables": self.cross_block_tables,
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
-            "grammar_bitmask": self.grammar_bitmask,
-            "sched_to_pers": self.sched_to_pers,
         }
 
         return tensor_dict
