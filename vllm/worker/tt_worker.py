@@ -249,6 +249,16 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                                           self.device_config)
         self.tt_cache = self.cache_engine.tt_cache
 
+    def warmup_model(self) -> None:
+        """Warmup model for execution.
+        
+        Calls the warmup_model implementation from the TT model.
+        """
+        logger.info("TTWorker warmup_model called")
+        # We can set page table to shape (1, 1) because it will be padded to the correct shape in tt-metal
+        page_table = torch.zeros(1, 1, dtype=torch.int32)
+        self.model_runner.model.warmup_model(page_table, self.tt_cache, enable_trace=True)
+
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
         speculative decoding.
