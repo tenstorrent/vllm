@@ -32,6 +32,9 @@ logger = init_logger(__name__)
 PADDING_TEMPERATURE = 0.0  # Greedy sampling (argmax)
 PADDING_TOP_K = 1  # Consider only the top token (argmax)
 PADDING_TOP_P = 1.0  # No nucleus filtering
+PADDING_PRESENCE_PENALTY = 0.0
+PADDING_FREQUENCY_PENALTY = 0.0
+PADDING_REPETITION_PENALTY = 1.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,9 @@ class TTSamplingParams:
     temperature: Union[float, list[float]]
     top_k: Union[int, list[int]]
     top_p: Union[float, list[float]]
+    presence_penalty: Union[float, list[float]] 
+    frequency_penalty: Union[float, list[float]]
+    repetition_penalty: Union[float, list[float]]
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,7 @@ class TTModelInput(ModelRunnerInputBase):
     is_first_multi_step: bool = True
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
+    prompt_tokens: Optional[torch.Tensor] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -83,6 +90,7 @@ class TTModelInput(ModelRunnerInputBase):
             "cross_block_tables": self.cross_block_tables,
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
+            "prompt_tokens": self.prompt_tokens,
         }
 
         return tensor_dict
@@ -292,6 +300,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
+        decode_prompt_tokens: List[List[int]] = []
+        penalties_requested = False
 
         # create seq_groups_list before any cleanup to active batch slots
         for seq_group_metadata in seq_group_metadata_list:
@@ -356,12 +366,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.dp_kv_cache:
                 # Add new request id to req_id_to_seq_id
                 self.req_id_to_seq_id[seq_group_metadata.request_id] = seq_id
-
             multi_modal_data = seq_group_metadata.multi_modal_data
             seq_data = seq_group_metadata.seq_data[seq_id]
 
             seq_lens.append(seq_data.get_len())
 
+            sampling_params = seq_group_metadata.sampling_params
+
+            penalties_requested = penalties_requested or (
+                sampling_params.presence_penalty != PADDING_PRESENCE_PENALTY or sampling_params.frequency_penalty != PADDING_FREQUENCY_PENALTY
+                or sampling_params.repetition_penalty != PADDING_REPETITION_PENALTY)
             if is_prompt:
                 # tokens
                 prompt_tokens = seq_data.get_token_ids()
@@ -370,6 +384,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # tokens
                 generation_token = seq_data.get_last_token_id()
                 input_tokens_list.append(generation_token)
+                if penalties_requested:
+                    # need prefill tokens to create prompt histogram
+                    decode_prompt_tokens.append(seq_data.get_token_ids())
 
                 # positions
                 position = seq_data.get_len() - 1
@@ -399,39 +416,49 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 cross_block_table = seq_group_metadata.cross_block_table
                 cross_block_tables_list.append(cross_block_table)
 
-            sampling_params = seq_group_metadata.sampling_params
             if compat_sampling_used:
                 pass
             elif (TTPlatform.non_greedy_decoding_on_device
                   and perform_device_sampling):
                 # non greedy actually means
                 # that it also supports non-uniform sampling
-                # initializing an empty list for each value on first iter
-                # fill values after first iter
-                for key in ["temperature", "top_k", "top_p"]:
-                    top_pk_sampling_params.setdefault(key, []).append(
-                        getattr(sampling_params, key))
+                for key, value in (
+                    ("temperature", sampling_params.temperature),
+                    ("top_k", sampling_params.top_k),
+                    ("top_p", sampling_params.top_p),
+                    ("presence_penalty", presence_penalty),
+                    ("frequency_penalty", frequency_penalty),
+                    ("repetition_penalty", repetition_penalty),
+                ):
+                    top_pk_sampling_params.setdefault(key, []).append(value)
 
             else:
                 # uniform sampling - all requests must have same params
+                param_bundle = {
+                    "temperature": sampling_params.temperature,
+                    "top_k": sampling_params.top_k,
+                    "top_p": sampling_params.top_p,
+                    "presence_penalty": presence_penalty,
+                    "frequency_penalty": frequency_penalty,
+                    "repetition_penalty": repetition_penalty,
+                }
                 if len(top_pk_sampling_params) == 0:
-                    top_pk_sampling_params[
-                        "temperature"] = sampling_params.temperature
-                    top_pk_sampling_params["top_k"] = sampling_params.top_k
-                    top_pk_sampling_params["top_p"] = sampling_params.top_p
+                    top_pk_sampling_params.update(param_bundle)
                 else:
-                    different_temp = top_pk_sampling_params[
-                        "temperature"] != sampling_params.temperature
-                    different_top_k = top_pk_sampling_params[
-                        "top_k"] != sampling_params.top_k
-                    different_top_p = top_pk_sampling_params[
-                        "top_p"] != sampling_params.top_p
-                    if different_temp or different_top_k or different_top_p:
-                        # This should never happen, we always fall back
-                        # to a different sampling implementation if needed
-                        raise ValueError(
-                            "Attempting non-uniform top-p top-k when unsupported"  # noqa: E501
-                        )
+                    for key, value in param_bundle.items():
+                        if top_pk_sampling_params[key] != value:
+                            # This should never happen, we always fall back
+                            # to a different sampling implementation if needed
+                            raise ValueError(
+                                "Attempting non-uniform sampling when unsupported"  # noqa: E501
+                            )
+
+        prompt_tokens_tensor: Optional[torch.Tensor] = None
+        if (not is_prompt and penalties_requested and perform_device_sampling):
+            prompt_tokens_tensor = make_tensor_with_pad(decode_prompt_tokens,
+                                                        dtype=torch.int32,
+                                                        device="cpu",
+                                                        pad=-1)
 
         if compat_sampling_used:
             # seq_lens means how many tokens are in the sequence in total,
@@ -454,7 +481,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     if request_id not in generators and seed is not None:
                         generators[request_id] = torch.Generator(
                             device="cpu").manual_seed(seed)
-
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list,
                 seq_lens,
@@ -470,29 +496,47 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             temp_list = top_pk_sampling_params["temperature"]
             top_k_list = top_pk_sampling_params["top_k"]
             top_p_list = top_pk_sampling_params["top_p"]
+            presence_list = top_pk_sampling_params["presence_penalty"]
+            frequency_list = top_pk_sampling_params[
+                "frequency_penalty"]
+            repetition_list = top_pk_sampling_params[
+                "repetition_penalty"]
 
             # Pad sampling params to max_num_seqs in decode mode for
             # proper permutation
             # This must be done before permutation, just like tokens
             # and page_table
-            if not is_prompt and len(temp_list) > 0 and len(
-                    temp_list) < self.scheduler_config.max_num_seqs:
-                batch_pad_len = self.scheduler_config.max_num_seqs - len(
-                    temp_list)
+            if (not is_prompt and len(temp_list) > 0
+                    and len(temp_list) < self.scheduler_config.max_num_seqs):
+                batch_pad_len = (self.scheduler_config.max_num_seqs -
+                                 len(temp_list))
                 # Pad with default values for greedy/deterministic behavior
                 temp_list = temp_list + [PADDING_TEMPERATURE] * batch_pad_len
                 top_k_list = top_k_list + [PADDING_TOP_K] * batch_pad_len
                 top_p_list = top_p_list + [PADDING_TOP_P] * batch_pad_len
+                presence_list = presence_list + [PADDING_PRESENCE_PENALTY] * batch_pad_len
+                frequency_list = frequency_list + [PADDING_FREQUENCY_PENALTY] * batch_pad_len
+                repetition_list = repetition_list + [PADDING_REPETITION_PENALTY] * batch_pad_len
 
-            tt_sampling_params = TTSamplingParams(temperature=temp_list,
-                                                  top_k=top_k_list,
-                                                  top_p=top_p_list)
+            tt_sampling_params = TTSamplingParams(
+                temperature=temp_list,
+                top_k=top_k_list,
+                top_p=top_p_list,
+                presence_penalty=presence_list,
+                frequency_penalty=frequency_list,
+                repetition_penalty=repetition_list)
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
                 temperature=top_pk_sampling_params["temperature"],
                 top_k=top_pk_sampling_params["top_k"],
-                top_p=top_pk_sampling_params["top_p"])
+                top_p=top_pk_sampling_params["top_p"],
+                presence_penalty=top_pk_sampling_params[
+                    "presence_penalty"],
+                frequency_penalty=top_pk_sampling_params[
+                    "frequency_penalty"],
+                repetition_penalty=top_pk_sampling_params[
+                    "repetition_penalty"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -568,6 +612,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     dtype=torch.int32,
                                     device="cpu")
                     ])
+                if prompt_tokens_tensor is not None:
+                    pad_rows = input_tokens.shape[
+                        0] - prompt_tokens_tensor.shape[0]
+                    if pad_rows > 0:
+                        prompt_tokens_tensor = torch.cat([
+                            prompt_tokens_tensor,
+                            torch.zeros(pad_rows,
+                                        prompt_tokens_tensor.shape[1],
+                                        dtype=torch.int32,
+                                        device="cpu")
+                        ])
 
             # Pad block_tables to max num blocks
             # so ttnn tracing can work (requires constant shape)
@@ -674,7 +729,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             compat_sampling_used=compat_sampling_used,
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
-                            cross_block_tables=cross_block_tables)
+                            cross_block_tables=cross_block_tables,
+                            prompt_tokens=prompt_tokens_tensor)
 
     @torch.no_grad()
     def execute_model(
@@ -870,6 +926,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
+        if model_input.prompt_tokens is not None:
+            execute_model_kwargs["prompt_tokens"] = model_input.prompt_tokens
 
         if model_input.perform_device_sampling:
             execute_model_kwargs[
@@ -1015,6 +1073,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "tokens"][inverse_perm_indices, :]
                 execute_model_kwargs["page_table"] = execute_model_kwargs[
                     "page_table"][inverse_perm_indices, :]
+                if execute_model_kwargs.get("prompt_tokens") is not None:
+                    execute_model_kwargs[
+                        "prompt_tokens"] = execute_model_kwargs[
+                            "prompt_tokens"][inverse_perm_indices, :]
 
                 # permute the sampling_params if present
                 # (already padded to max_num_seqs)
@@ -1046,11 +1108,26 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             tt_sampling_params.top_p[i]
                             for i in inverse_perm_indices
                         ]
+                        permuted_presence = [
+                            tt_sampling_params.presence_penalty[i]
+                            for i in inverse_perm_indices
+                        ]
+                        permuted_frequency = [
+                            tt_sampling_params.frequency_penalty[i]
+                            for i in inverse_perm_indices
+                        ]
+                        permuted_repetition = [
+                            tt_sampling_params.repetition_penalty[i]
+                            for i in inverse_perm_indices
+                        ]
                         execute_model_kwargs[
                             "sampling_params"] = TTSamplingParams(
                                 temperature=permuted_temp,
                                 top_k=permuted_top_k,
-                                top_p=permuted_top_p)
+                                top_p=permuted_top_p,
+                                presence_penalty=permuted_presence,
+                                frequency_penalty=permuted_frequency,
+                                repetition_penalty=permuted_repetition)
 
             tt_out = self.model.decode_forward(**execute_model_kwargs,
                                                **enc_dec_kwargs,
