@@ -270,6 +270,27 @@ class EngineCore:
             assert hasattr(self, "dp_decode_streak")
             assert hasattr(self, "dlog")
             assert hasattr(self, "dp_group")
+            # Check if any rank has work before doing intent all_reduce.
+            local_has_requests = 1 if self.scheduler.has_requests() else 0
+            has_requests_t = torch.tensor([local_has_requests],
+                                          dtype=torch.int32)
+            try:
+                dist.all_reduce(has_requests_t,
+                                op=dist.ReduceOp.SUM,
+                                group=self.dp_group)
+            except RuntimeError as e:
+                # During shutdown, peers may close connections mid-collective.
+                # Exit gracefully to allow coordinated shutdown.
+                if "Connection closed by peer" in str(e):
+                    logger.debug(
+                        "Collective failed during shutdown, exiting gracefully"
+                    )
+                    raise SystemExit() from e
+                raise
+            if int(has_requests_t.item()) == 0:
+                # No rank has work, return early without scheduling.
+                return {}, False
+
             # Max-consecutive-decoding guard: if there are waiting prefills
             # and we decoded for dp_max_consec_decodes steps consecutively,
             # force one prefill step. Otherwise, prefer decode while running.
@@ -299,8 +320,7 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             if requires_gather:
-                # Enter DP-gather every iteration, let execute_model
-                # handle global has-work sync to keep collectives ordered.
+                # Enter DP-gather every iteration to keep collectives ordered.
                 _ = self.execute_model(None)  # type: ignore[arg-type]
             return {}, False
 
@@ -1155,18 +1175,13 @@ class DPEngineCoreProc(EngineCoreProc):
                         self.dp_rank)
 
     def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
+        parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
-        world = self.vllm_config.parallel_config.data_parallel_size
+        world = parallel_config.data_parallel_size
 
-        # 0) Check if any rank has work this iteration.
-        local_has = 1 if scheduler_output is not None else 0
-        has_t = torch.tensor([local_has], dtype=torch.int32)
-        dist.all_reduce(has_t, op=dist.ReduceOp.SUM, group=group)
-        if int(has_t.item()) == 0:
-            # Nobody has work this iteration; return empty output
-            return EMPTY_MODEL_RUNNER_OUTPUT
-        if scheduler_output is not None:
+        local_has_requests = scheduler_output is not None
+        if local_has_requests:
             self.dlog("enter_gather tokens=%d",
                       scheduler_output.total_num_scheduled_tokens)
 
@@ -1187,13 +1202,13 @@ class DPEngineCoreProc(EngineCoreProc):
             max_blocks_decode = int(max_blocks_t.item())
 
             # Build tensorized gather input for decode.
-            local_input = self.model_executor.collective_rpc(
+            tensorized_input = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
                 args=(local_input, max_blocks_decode))[0]
 
             # Decode: use all_gather_into_tensor with fixed-shape inputs.
-            int_local = local_input["int_inputs"]  # 1D int32
-            float_local = local_input["float_inputs"]  # 1D float32
+            int_local = tensorized_input["int_inputs"]  # 1D int32
+            float_local = tensorized_input["float_inputs"]  # 1D float32
             int_out_1d = torch.empty(int_local.numel() * world,
                                      dtype=int_local.dtype)
             float_out_1d = torch.empty(float_local.numel() * world,
@@ -1202,24 +1217,48 @@ class DPEngineCoreProc(EngineCoreProc):
             # this could be gather instead of all_gather.
             dist.all_gather_into_tensor(int_out_1d, int_local, group=group)
             dist.all_gather_into_tensor(float_out_1d, float_local, group=group)
-            if rank == 0:
+
+            int_inputs = int_out_1d.view(world, -1)
+            float_inputs = float_out_1d.view(world, -1)
+
+            if parallel_config.data_parallel_rank_local == 0:
                 gathered_inputs = {
-                    "int_inputs": int_out_1d.view(world, -1),
-                    "float_inputs": float_out_1d.view(world, -1),
+                    "int_inputs": int_inputs,
+                    "float_inputs": float_inputs,
                 }
+
+            # has_structured_inputs is always last element of int_inputs
+            has_structured_inputs = int_inputs[:, -1]
+            if any(has_structured_inputs > 0):
+                local_bitmask = self.model_executor.collective_rpc(
+                    "build_padded_bitmasks", args=(local_input, ))[0]
+                local_bitmask = local_bitmask.contiguous().view(-1)
+                bitmask_out_1d = torch.empty(local_bitmask.numel() * world,
+                                             dtype=local_bitmask.dtype)
+                dist.all_gather_into_tensor(bitmask_out_1d,
+                                            local_bitmask,
+                                            group=group)
+                bitmasks = bitmask_out_1d.view(world, -1)
+                if parallel_config.data_parallel_rank_local == 0:
+                    gathered_inputs["bitmasks"] = bitmasks
+
         else:
             # Prefill: use object all_gather with variable sized inputs.
             gathered_inputs = [None for _ in range(world)]  # type: ignore
             dist.all_gather_object(gathered_inputs, local_input, group=group)
         self.dlog("after_inputs_gather")
 
-        # Concatenate and execute DP inputs on rank 0.
-        if rank == 0 and (is_decode or any(x is not None
-                                           for x in gathered_inputs)):
+        # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
+        if parallel_config.data_parallel_rank_local == 0 and (is_decode or any(
+                x is not None for x in gathered_inputs)):
             send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp",
                 args=(gathered_inputs, is_decode, max_blocks_decode))[0]
             assert isinstance(send_tensor, torch.Tensor)
+            # Only global DP rank 0 contributes results; other
+            # designated ranks zero-out before the SUM all_reduce.
+            if rank != 0:
+                send_tensor.zero_()
         else:
             B = self.vllm_config.scheduler_config.max_num_seqs
             # Currently only supporting 1 output token per request.
@@ -1234,7 +1273,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
         # If rank had scheduled tokens, apply results locally and return output
-        if local_has:
+        if local_has_requests:
             output = self.model_executor.collective_rpc(
                 "apply_dp_execution_result", args=(my_ids, ))[0]
             return output
