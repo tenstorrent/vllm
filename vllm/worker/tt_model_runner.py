@@ -426,9 +426,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     ("temperature", sampling_params.temperature),
                     ("top_k", sampling_params.top_k),
                     ("top_p", sampling_params.top_p),
-                    ("presence_penalty", presence_penalty),
-                    ("frequency_penalty", frequency_penalty),
-                    ("repetition_penalty", repetition_penalty),
+                    ("presence_penalty", sampling_params.presence_penalty),
+                    ("frequency_penalty", sampling_params.frequency_penalty),
+                    ("repetition_penalty", sampling_params.repetition_penalty),
                 ):
                     top_pk_sampling_params.setdefault(key, []).append(value)
 
@@ -438,9 +438,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "temperature": sampling_params.temperature,
                     "top_k": sampling_params.top_k,
                     "top_p": sampling_params.top_p,
-                    "presence_penalty": presence_penalty,
-                    "frequency_penalty": frequency_penalty,
-                    "repetition_penalty": repetition_penalty,
+                    "presence_penalty": sampling_params.presence_penalty,
+                    "frequency_penalty": sampling_params.frequency_penalty,
+                    "repetition_penalty": sampling_params.repetition_penalty,
                 }
                 if len(top_pk_sampling_params) == 0:
                     top_pk_sampling_params.update(param_bundle)
