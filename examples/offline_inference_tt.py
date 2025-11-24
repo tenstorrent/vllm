@@ -57,7 +57,7 @@ def register_tt_models():
     # Qwen2.5 - Text
     path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
     ModelRegistry.register_model("TTQwen2ForCausalLM", path_qwen_text)
-    ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen_text)
+    # ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen_text)
 
     # Qwen2.5 - Vision
     ModelRegistry.register_model(
@@ -87,6 +87,12 @@ def register_tt_models():
     ModelRegistry.register_model(
         "TTGptOssForCausalLM",
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
+    )
+
+    # Qwen3-32b - TG with Llama Optimizations
+    ModelRegistry.register_model(
+        "TTQwen3ForCausalLM",
+        "models.demos.llama3_70b_galaxy.tt.generator_vllm:QwenForCausalLM",
     )
 
 
