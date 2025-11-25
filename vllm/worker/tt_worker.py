@@ -17,9 +17,7 @@ from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
                          ParallelConfig, VllmConfig)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.sampling_params import SamplingParams
-from vllm.sequence import (ExecuteModelRequest, SequenceData,
-                           SequenceGroupMetadata, VLLM_TOKEN_ID_ARRAY_TYPE)
+from vllm.sequence import ExecuteModelRequest
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType
 from vllm.worker.tt_model_runner import TTModelInput, TTModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
