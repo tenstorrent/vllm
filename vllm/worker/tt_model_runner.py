@@ -464,6 +464,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             )
 
         prompt_tokens_tensor: Optional[torch.Tensor] = None
+        new_users_tensor: Optional[torch.Tensor] = None
         if (not is_prompt and penalties_requested and perform_device_sampling):
             prompt_tokens_tensor = make_tensor_with_pad(decode_prompt_tokens,
                                                         dtype=torch.int32,
@@ -487,10 +488,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if not is_prompt:
                 for seq_group_metadata in seq_group_metadata_list:
                     request_id = seq_group_metadata.request_id
-                    seed = seq_group_metadata.sampling_params.seed
-                    if request_id not in generators and seed is not None:
-                        generators[request_id] = torch.Generator(
-                            device="cpu").manual_seed(seed)
+                    
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list,
                 seq_lens,
@@ -626,6 +624,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     dtype=torch.int32,
                                     device="cpu")
                     ])
+
                 if prompt_tokens_tensor is not None:
 
                     prompt_tokens_tensor = torch.cat([
@@ -1106,7 +1105,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if execute_model_kwargs.get("new_users") is not None:
                     execute_model_kwargs[
                         "new_users"] = execute_model_kwargs[
-                            "new_users"][inverse_perm_indices, :]
+                            "new_users"][inverse_perm_indices]
 
                 # permute the sampling_params if present
                 # (already padded to max_num_seqs)
