@@ -35,6 +35,7 @@ PADDING_TOP_P = 1.0  # No nucleus filtering
 PADDING_PRESENCE_PENALTY = 0.0
 PADDING_FREQUENCY_PENALTY = 0.0
 PADDING_REPETITION_PENALTY = 1.0
+PADDING_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class TTSamplingParams:
     presence_penalty: Union[float, list[float]] 
     frequency_penalty: Union[float, list[float]]
     repetition_penalty: Union[float, list[float]]
+    seed: Union[Optional[int], list[Optional[int]]]
 
 
 @dataclass(frozen=True)
@@ -435,6 +437,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     ("presence_penalty", sampling_params.presence_penalty),
                     ("frequency_penalty", sampling_params.frequency_penalty),
                     ("repetition_penalty", sampling_params.repetition_penalty),
+                    ("seed", sampling_params.seed),
                 ):
                     top_pk_sampling_params.setdefault(key, []).append(value)
 
@@ -447,6 +450,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "presence_penalty": sampling_params.presence_penalty,
                     "frequency_penalty": sampling_params.frequency_penalty,
                     "repetition_penalty": sampling_params.repetition_penalty,
+                    "seed": sampling_params.seed,
                 }
                 if len(top_pk_sampling_params) == 0:
                     top_pk_sampling_params.update(param_bundle)
@@ -507,6 +511,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 "frequency_penalty"]
             repetition_list = top_pk_sampling_params[
                 "repetition_penalty"]
+            seed_list = top_pk_sampling_params["seed"]
 
             # Pad sampling params to max_num_seqs in decode mode for
             # proper permutation
@@ -523,6 +528,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 presence_list = presence_list + [PADDING_PRESENCE_PENALTY] * batch_pad_len
                 frequency_list = frequency_list + [PADDING_FREQUENCY_PENALTY] * batch_pad_len
                 repetition_list = repetition_list + [PADDING_REPETITION_PENALTY] * batch_pad_len
+                seed_list = seed_list + [PADDING_SEED] * batch_pad_len
 
             tt_sampling_params = TTSamplingParams(
                 temperature=temp_list,
@@ -530,7 +536,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 top_p=top_p_list,
                 presence_penalty=presence_list,
                 frequency_penalty=frequency_list,
-                repetition_penalty=repetition_list)
+                repetition_penalty=repetition_list,
+                seed=seed_list)
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
@@ -542,7 +549,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 frequency_penalty=top_pk_sampling_params[
                     "frequency_penalty"],
                 repetition_penalty=top_pk_sampling_params[
-                    "repetition_penalty"])
+                    "repetition_penalty"],
+                seed=top_pk_sampling_params["seed"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -1142,6 +1150,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             tt_sampling_params.repetition_penalty[i]
                             for i in inverse_perm_indices
                         ]
+                        permuted_seed = [
+                            tt_sampling_params.seed[i]
+                            for i in inverse_perm_indices
+                        ]
                         execute_model_kwargs[
                             "sampling_params"] = TTSamplingParams(
                                 temperature=permuted_temp,
@@ -1149,7 +1161,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                 top_p=permuted_top_p,
                                 presence_penalty=permuted_presence,
                                 frequency_penalty=permuted_frequency,
-                                repetition_penalty=permuted_repetition)
+                                repetition_penalty=permuted_repetition,
+                                seed=permuted_seed)
 
             tt_out = self.model.decode_forward(**execute_model_kwargs,
                                                **enc_dec_kwargs,
