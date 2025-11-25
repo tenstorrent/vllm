@@ -149,8 +149,7 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def compile_or_warm_up_model(self) -> None:
-        # Currently skip and compile/capture-trace during the first execution.
-        pass
+        self.model_runner.warmup_model() 
 
     def execute_model(
         self,
