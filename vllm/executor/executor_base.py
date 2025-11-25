@@ -125,7 +125,7 @@ class ExecutorBase(ABC):
 
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
-        
+
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         """
         Run a function directly on the model inside each worker,
