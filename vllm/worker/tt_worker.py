@@ -254,10 +254,9 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         
         Calls the warmup_model implementation from the TT model.
         """
-        logger.info("TTWorker warmup_model called")
-        # We can set page table to shape (1, 1) because it will be padded to the correct shape in tt-metal
-        page_table = torch.zeros(1, 1, dtype=torch.int32)
-        self.model_runner.model.warmup_model(page_table, self.tt_cache, enable_trace=True)
+        logger.info("Compile run for prefill started")
+        self.model_runner.model.warmup_model(self.kv_cache, enable_trace=self.trace_mode)
+        logger.info("Compile run for prefill finished")
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in

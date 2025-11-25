@@ -924,3 +924,6 @@ class TTModelRunner:
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )
+
+    def warmup_model(self) -> None:
+        self.model.warmup_model(self.kv_caches, enable_trace=self.trace_mode)
