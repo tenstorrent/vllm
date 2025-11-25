@@ -241,7 +241,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.async_read_decode:
                 self.perm_table_tensor: List[torch.Tensor] = []
 
-        self.prev_req_ids = torch.ones(self.scheduler_config.max_num_seqs) * -1
+        self.prev_req_ids_tensor = torch.ones(self.scheduler_config.max_num_seqs) * -1
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -391,7 +391,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 input_tokens_list.append(generation_token)
                 if penalties_requested:
                     # need prefill tokens to create prompt histogram
-                    decode_prompt_tokens.append(seq_data.get_token_ids())
+                    decode_prompt_tokens.append(seq_data.get_token_ids()[:-2])
                     req_ids.append(seq_id)
 
                 # positions
@@ -633,7 +633,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     dtype=torch.int32,
                                     device="cpu")
                     ])
-                    new_users_tensor = req_ids_tensor != prev_req_ids_tensor
+                    new_users_tensor = req_ids_tensor != self.prev_req_ids_tensor
+                    self.prev_req_ids_tensor = new_users_tensor
 
 
             # Pad block_tables to max num blocks
