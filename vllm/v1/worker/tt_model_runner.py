@@ -975,4 +975,6 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
+        logger.info("Compile run for prefill started")
         self.model.warmup_model(self.kv_caches, enable_trace=self.trace_mode)
+        logger.info("Compile run for prefill finished")

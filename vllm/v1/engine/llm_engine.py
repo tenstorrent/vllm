@@ -119,8 +119,6 @@ class LLMEngine:
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
-        self.model_executor.compile_or_warm_up_model()
-
     @classmethod
     def from_vllm_config(
         cls,
