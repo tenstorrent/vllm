@@ -72,6 +72,7 @@ class TTModelInput(ModelRunnerInputBase):
     is_last_step: bool = True
     async_callback: Optional[Callable] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    new_users: Optional[torch.Tensor] = None
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
@@ -91,6 +92,7 @@ class TTModelInput(ModelRunnerInputBase):
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
             "prompt_tokens": self.prompt_tokens,
+            "new_users": self.new_users
         }
 
         return tensor_dict
@@ -239,6 +241,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.async_read_decode:
                 self.perm_table_tensor: List[torch.Tensor] = []
 
+        self.prev_req_ids = torch.ones(self.scheduler_config.max_num_seqs) * -1
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -301,6 +305,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
         decode_prompt_tokens: List[List[int]] = []
+        req_ids: List[[int]] = []
         penalties_requested = False
 
         # create seq_groups_list before any cleanup to active batch slots
@@ -387,6 +392,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if penalties_requested:
                     # need prefill tokens to create prompt histogram
                     decode_prompt_tokens.append(seq_data.get_token_ids())
+                    req_ids.append(seq_id)
 
                 # positions
                 position = seq_data.get_len() - 1
@@ -613,16 +619,22 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ])
                 if prompt_tokens_tensor is not None:
-                    pad_rows = input_tokens.shape[
-                        0] - prompt_tokens_tensor.shape[0]
-                    if pad_rows > 0:
-                        prompt_tokens_tensor = torch.cat([
-                            prompt_tokens_tensor,
-                            torch.zeros(pad_rows,
-                                        prompt_tokens_tensor.shape[1],
-                                        dtype=torch.int32,
-                                        device="cpu")
-                        ])
+
+                    prompt_tokens_tensor = torch.cat([
+                        prompt_tokens_tensor,
+                        torch.zeros(batch_pad_len,
+                                    prompt_tokens_tensor.shape[1],
+                                    dtype=torch.int32,
+                                    device="cpu")
+                    ])
+                    req_ids_tensor = torch.cat([
+                        torch.tensor(req_ids),
+                        torch.zeros(batch_pad_len,
+                                    dtype=torch.int32,
+                                    device="cpu")
+                    ])
+                    new_users_tensor = req_ids_tensor != prev_req_ids_tensor
+
 
             # Pad block_tables to max num blocks
             # so ttnn tracing can work (requires constant shape)
@@ -730,7 +742,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             sampling_metadata=sampling_metadata,
                             multi_modal_kwargs=multi_modal_kwargs,
                             cross_block_tables=cross_block_tables,
-                            prompt_tokens=prompt_tokens_tensor)
+                            prompt_tokens=prompt_tokens_tensor,
+                            new_users=new_users_tensor)
 
     @torch.no_grad()
     def execute_model(
@@ -929,6 +942,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if model_input.prompt_tokens is not None:
             execute_model_kwargs["prompt_tokens"] = model_input.prompt_tokens
 
+        if model_input.new_users is not None:
+            execute_model_kwargs["new_users"] = model_input.new_users
+
         if model_input.perform_device_sampling:
             execute_model_kwargs[
                 "sampling_params"] = model_input.tt_sampling_params
@@ -1077,6 +1093,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     execute_model_kwargs[
                         "prompt_tokens"] = execute_model_kwargs[
                             "prompt_tokens"][inverse_perm_indices, :]
+
+                if execute_model_kwargs.get("new_users") is not None:
+                    execute_model_kwargs[
+                        "new_users"] = execute_model_kwargs[
+                            "new_users"][inverse_perm_indices, :]
 
                 # permute the sampling_params if present
                 # (already padded to max_num_seqs)
