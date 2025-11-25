@@ -17,7 +17,9 @@ from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
                          ParallelConfig, VllmConfig)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.sequence import ExecuteModelRequest
+from vllm.sampling_params import SamplingParams
+from vllm.sequence import (ExecuteModelRequest, SequenceData,
+                           SequenceGroupMetadata, VLLM_TOKEN_ID_ARRAY_TYPE)
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType
 from vllm.worker.tt_model_runner import TTModelInput, TTModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
@@ -253,8 +255,12 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def warmup_model(self) -> None:
         logger.info("Compile run for prefill started")
-        self.model_runner.model.warmup_model(self.kv_cache, enable_trace=self.trace_mode)
+        self.model_runner.model.warmup_model_prefill(self.kv_cache, self.trace_mode)
         logger.info("Compile run for prefill finished")
+        
+        logger.info("Compile run for decode started")
+        self.model_runner.model.warmup_model_decode(self.kv_cache, self.trace_mode, self.cache_config.num_gpu_blocks)
+        logger.info("Compile run for decode finished")
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
