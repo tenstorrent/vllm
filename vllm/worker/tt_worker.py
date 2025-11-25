@@ -237,6 +237,8 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         self._init_cache_engine()
 
+        self.warmup_model()
+
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
 
@@ -250,10 +252,6 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.tt_cache = self.cache_engine.tt_cache
 
     def warmup_model(self) -> None:
-        """Warmup model for execution.
-        
-        Calls the warmup_model implementation from the TT model.
-        """
         logger.info("Compile run for prefill started")
         self.model_runner.model.warmup_model(self.kv_cache, enable_trace=self.trace_mode)
         logger.info("Compile run for prefill finished")

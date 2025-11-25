@@ -408,8 +408,6 @@ class LLMEngine:
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
-        self.model_executor.warmup_model()
-
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
