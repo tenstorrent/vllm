@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 PADDING_TEMPERATURE = 0.0  # Greedy sampling (argmax)
 PADDING_TOP_K = 1  # Consider only the top token (argmax)
 PADDING_TOP_P = 1.0  # No nucleus filtering
+PADDING_LOGPROBS = None  # No logprobs requested
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class TTSamplingParams:
     temperature: Union[float, list[float]]
     top_k: Union[int, list[int]]
     top_p: Union[float, list[float]]
+    logprobs: Union[Optional[bool], list[Optional[bool]]]
 
 
 @dataclass(frozen=True)
@@ -287,7 +289,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         seq_lens: List[int] = []
         block_tables_list: List[List[int]] = []
         seq_groups_list: List[int] = []
-        top_pk_sampling_params: Dict[str, Any] = {}
+        sampling_params_dict: Dict[str, Any] = {}
         multi_modal_kwargs: Dict[str, Any] = {}
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
@@ -409,22 +411,22 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # initializing an empty list for each value on first iter
                 # fill values after first iter
                 for key in ["temperature", "top_k", "top_p"]:
-                    top_pk_sampling_params.setdefault(key, []).append(
+                    sampling_params_dict.setdefault(key, []).append(
                         getattr(sampling_params, key))
 
             else:
                 # uniform sampling - all requests must have same params
-                if len(top_pk_sampling_params) == 0:
-                    top_pk_sampling_params[
+                if len(sampling_params_dict) == 0:
+                    sampling_params_dict[
                         "temperature"] = sampling_params.temperature
-                    top_pk_sampling_params["top_k"] = sampling_params.top_k
-                    top_pk_sampling_params["top_p"] = sampling_params.top_p
+                    sampling_params_dict["top_k"] = sampling_params.top_k
+                    sampling_params_dict["top_p"] = sampling_params.top_p
                 else:
-                    different_temp = top_pk_sampling_params[
+                    different_temp = sampling_params_dict[
                         "temperature"] != sampling_params.temperature
-                    different_top_k = top_pk_sampling_params[
+                    different_top_k = sampling_params_dict[
                         "top_k"] != sampling_params.top_k
-                    different_top_p = top_pk_sampling_params[
+                    different_top_p = sampling_params_dict[
                         "top_p"] != sampling_params.top_p
                     if different_temp or different_top_k or different_top_p:
                         # This should never happen, we always fall back
@@ -467,9 +469,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         elif (TTPlatform.non_greedy_decoding_on_device
               and perform_device_sampling):
             sampling_metadata = None
-            temp_list = top_pk_sampling_params["temperature"]
-            top_k_list = top_pk_sampling_params["top_k"]
-            top_p_list = top_pk_sampling_params["top_p"]
+            temp_list = sampling_params_dict["temperature"]
+            top_k_list = sampling_params_dict["top_k"]
+            top_p_list = sampling_params_dict["top_p"]
 
             # Pad sampling params to max_num_seqs in decode mode for
             # proper permutation
@@ -490,9 +492,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
-                temperature=top_pk_sampling_params["temperature"],
-                top_k=top_pk_sampling_params["top_k"],
-                top_p=top_pk_sampling_params["top_p"])
+                temperature=sampling_params_dict["temperature"],
+                top_k=sampling_params_dict["top_k"],
+                top_p=sampling_params_dict["top_p"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
