@@ -110,6 +110,7 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(vllm_config=self.vllm_config,
                                        model_config=self.model_config)
+        self.warmup_model()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
