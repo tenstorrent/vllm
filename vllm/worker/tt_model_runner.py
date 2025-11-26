@@ -243,8 +243,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.async_read_decode:
                 self.perm_table_tensor: List[torch.Tensor] = []
 
-        self.prev_req_ids_tensor = torch.ones(self.scheduler_config.max_num_seqs) * -1
-
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -307,7 +305,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             multi_modal_kwargs = {"images": []}
         cross_block_tables_list: List[List[int]] = []
         decode_prompt_tokens: List[List[int]] = []
-        req_ids: List[[int]] = []
+        new_users_list: List[int] = []
         penalties_requested = False
 
         # create seq_groups_list before any cleanup to active batch slots
@@ -391,10 +389,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # tokens
                 generation_token = seq_data.get_last_token_id()
                 input_tokens_list.append(generation_token)
+                # if there is a single deocde token, this user is running decode for the first time after prefill
+                new_users_list.append(seq_data.get_output_len()==1)
                 if penalties_requested:
                     # need prefill tokens to create prompt histogram
-                    decode_prompt_tokens.append(seq_data.get_token_ids()[:-2])
-                    req_ids.append(seq_id)
+                    decode_prompt_tokens.append(seq_data.prompt_token_ids_array)
 
                 # positions
                 position = seq_data.get_len() - 1
@@ -590,6 +589,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             input_positions = torch.tensor(input_positions_list,
                                            dtype=torch.int32,
                                            device="cpu")
+            new_users = torch.tensor(new_users_list,
+                                           dtype=torch.int32,
+                                           device="cpu")
             prompt_lens = None
 
             # TODO: Remove once TT models can support arbitrary batch sizes
@@ -616,6 +618,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                 dtype=torch.int32,
                                 device="cpu")
                 ])
+                new_users_tensor = torch.cat([
+                        new_users,
+                        torch.zeros(batch_pad_len,
+                                    dtype=torch.int32,
+                                    device="cpu")
+                    ])
+
                 if self.model_config.is_encoder_decoder:
                     cross_block_tables = torch.cat([
                         cross_block_tables,
@@ -634,14 +643,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     dtype=torch.int32,
                                     device="cpu")
                     ])
-                    req_ids_tensor = torch.cat([
-                        torch.tensor(req_ids),
-                        torch.zeros(batch_pad_len,
-                                    dtype=torch.int32,
-                                    device="cpu")
-                    ])
-                    new_users_tensor = req_ids_tensor != self.prev_req_ids_tensor
-                    self.prev_req_ids_tensor = new_users_tensor
 
 
             # Pad block_tables to max num blocks
