@@ -252,13 +252,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.tt_cache = self.cache_engine.tt_cache
 
     def warmup_model(self) -> None:
-        logger.info("Compile run for prefill started")
-        self.model_runner.model.warmup_model_prefill(self.kv_cache, self.trace_mode)
-        logger.info("Compile run for prefill finished")
-        
-        logger.info("Compile run for decode started")
-        self.model_runner.model.warmup_model_decode(self.kv_cache, self.trace_mode, self.cache_config.num_gpu_blocks)
-        logger.info("Compile run for decode finished")
+        self.model_runner.warmup_model(self.kv_cache, self.trace_mode)
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
