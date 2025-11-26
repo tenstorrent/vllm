@@ -52,6 +52,12 @@ PENALTY_PARAM_DEFAULTS = {
     "repetition_penalty": PADDING_REPETITION_PENALTY,
 }
 
+def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode):
+    tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
+    start_pos = torch.zeros(max_batch_size, dtype=torch.int32)
+    page_table = torch.zeros(max_batch_size, num_gpu_blocks, dtype=torch.int32)
+    sampling_params = TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0) if sample_on_device_mode else None
+    return tokens, start_pos, page_table, sampling_params
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -1280,3 +1286,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             for seq_output in seq_group_output.samples:
                 next_token_ids.append(seq_output.output_token)
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
+
+    def warmup_model(self, kv_cache, trace_mode) -> None:
+        logger.info("Warmup run for prefill started")
+        self.model.warmup_model_prefill(kv_cache, trace_mode)
+        logger.info("Warmup run for prefill finished")
+        
+        tokens, start_pos, page_table, sampling_params = create_warmup_decode_input_parameters(self.scheduler_config.max_num_seqs, self.cache_config.num_gpu_blocks, self.sample_on_device_mode)
+        logger.info(f"Warmup run for decode with tokens: {tokens.shape}, start_pos: {start_pos.shape}, page_table: {page_table.shape}")
+        logger.info("Warmup run for decode started")
+        self.model.decode_forward(tokens, start_pos, page_table, kv_cache, trace_mode, sampling_params=sampling_params)
+        logger.info("Warmup run for decode finished")
