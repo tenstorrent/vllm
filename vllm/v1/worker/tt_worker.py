@@ -49,6 +49,13 @@ class TTWorker(WorkerBase):
             assert override_tt_config[trace_key] in [True, False], \
                 f"Invalid {trace_key}: {override_tt_config[trace_key]}"
             self.trace_mode = override_tt_config[trace_key]
+        
+        trace_prefill_key = "trace_prefill_mode"
+        self.trace_prefill_mode = True
+        if override_tt_config and trace_prefill_key in override_tt_config:
+            assert override_tt_config[trace_prefill_key] in [True, False], \
+                f"Invalid {trace_prefill_key}: {override_tt_config[trace_prefill_key]}"
+            self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
     def init_device(self) -> None:
         local_dp_rank = self.parallel_config.data_parallel_rank_local
@@ -70,6 +77,7 @@ class TTWorker(WorkerBase):
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
+            trace_prefill_mode=self.trace_prefill_mode,
         )
 
     def load_model(self):
@@ -149,7 +157,9 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def compile_or_warm_up_model(self) -> None:
-        self.model_runner.warmup_model()
+        local_rank = self.parallel_config.data_parallel_rank_local
+        if local_rank == 0:
+            self.model_runner.warmup_model()
 
     def execute_model(
         self,

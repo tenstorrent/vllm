@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
-from vllm.worker.tt_model_runner import TTSamplingParams, sample_tokens
+from vllm.worker.tt_model_runner import TTSamplingParams, create_warmup_decode_input_parameters, decode_warmup, prefill_warmup, sample_tokens
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -28,12 +28,6 @@ import numpy as np
 
 logger = init_logger(__name__)
 
-def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode):
-    tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
-    start_pos = torch.zeros(max_batch_size, dtype=torch.int32)
-    page_table = torch.zeros(max_batch_size, num_gpu_blocks, dtype=torch.int32)
-    sampling_params = TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0) if sample_on_device_mode else None
-    return tokens, start_pos, page_table, sampling_params
 
 @dataclass(frozen=True)
 class TTModelInput:
@@ -60,6 +54,7 @@ class TTModelRunner:
         vllm_config: VllmConfig,
         mesh_device: ttnn.MeshDevice,
         trace_mode: bool,
+        trace_prefill_mode: bool,
     ):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -89,12 +84,14 @@ class TTModelRunner:
 
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
-
+        self.trace_prefill_mode = trace_prefill_mode
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
         logger.info(
-            "TTModelRunner: trace_mode=%s, sample_on_device_mode=%s",
+            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, sample_on_device_mode=%s",
+            self.trace_mode,
+            self.trace_prefill_mode,
             self.trace_mode,
             self.sample_on_device_mode,
         )
@@ -981,12 +978,5 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
-        logger.info("Warmup run for prefill started")
-        self.model.warmup_model_prefill(self.kv_caches, self.trace_mode)
-        logger.info("Warmup run for prefill finished")
-
-        tokens, start_pos, page_table, sampling_params = create_warmup_decode_input_parameters(self.scheduler_config.max_num_seqs, self.max_num_blocks_per_req, self.sample_on_device_mode)
-        logger.info(f"Warmup run for decode with tokens: {tokens.shape}, start_pos: {start_pos.shape}, page_table: {page_table.shape}")
-        logger.info("Warmup run for decode started")
-        self.model.decode_forward(tokens, start_pos, page_table, self.kv_caches, self.trace_mode, sampling_params=sampling_params)
-        logger.info("Warmup run for decode finished")
+        prefill_warmup(self.model, self.kv_caches, self.trace_prefill_mode)
+        decode_warmup(self.model, self.kv_caches, self.trace_mode, self.scheduler_config.max_num_seqs, self.max_num_blocks_per_req, self.sample_on_device_mode)

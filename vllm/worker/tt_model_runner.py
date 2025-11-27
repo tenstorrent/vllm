@@ -52,12 +52,46 @@ PENALTY_PARAM_DEFAULTS = {
     "repetition_penalty": PADDING_REPETITION_PENALTY,
 }
 
-def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode):
+def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size = 1):
+    """
+        This function is used in v0 and v1 to create the warmup decode input parameters.
+        In v0, data_parallel_size is always 1.
+    """
+    max_batch_size = max_batch_size * data_parallel_size
     tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
     start_pos = torch.zeros(max_batch_size, dtype=torch.int32)
     page_table = torch.zeros(max_batch_size, num_gpu_blocks, dtype=torch.int32)
-    sampling_params = TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0) if sample_on_device_mode else None
+    sampling_params = create_sampling_params(sample_on_device_mode)
     return tokens, start_pos, page_table, sampling_params
+
+def create_sampling_params(sample_on_device_mode):
+    if not sample_on_device_mode:
+        return None
+    if TTPlatform.non_greedy_decoding_on_device:
+        return TTSamplingParams(temperature=1.0, top_k=10, top_p=0.9)
+    else:
+        return TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0)
+
+def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
+        logger.info("Warmup run for prefill started")
+        model.warmup_model_prefill(kv_cache, trace_prefill_mode)
+        logger.info("Warmup run for prefill finished")
+
+def decode_warmup(model, kv_cache, trace_mode, max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size = 1) -> None:
+    tokens, start_pos, page_table, sampling_params = create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size)
+    local_kwargs = {
+        "tokens": tokens,
+        "start_pos": start_pos,
+        "page_table": page_table,
+        "kv_cache": kv_cache,
+        "enable_trace": trace_mode,
+        "read_from_device": True,
+        "sampling_params": sampling_params,
+    }
+    logger.info(f"Warmup run for decode with tokens: {tokens.shape}, start_pos: {start_pos.shape}, page_table: {page_table.shape}")
+    logger.info("Warmup run for decode started")
+    model.decode_forward(**local_kwargs)
+    logger.info("Warmup run for decode finished")
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -172,6 +206,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self,
         vllm_config: VllmConfig,
         trace_mode: bool = True,
+        trace_prefill_mode: bool = True,
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
 
@@ -187,9 +222,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # whether to use ttnn tracing for model execution
         self.trace_mode = trace_mode
+        self.trace_prefill_mode = trace_prefill_mode
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
         logger.info(
-            "TTModelRunner: trace_mode=%s, sample_on_device_mode=%s",
+            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, sample_on_device_mode=%s",
             self.trace_mode,
             self.sample_on_device_mode,
         )
@@ -1287,13 +1323,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 next_token_ids.append(seq_output.output_token)
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
 
-    def warmup_model(self, kv_cache, trace_mode) -> None:
-        logger.info("Warmup run for prefill started")
-        self.model.warmup_model_prefill(kv_cache, trace_mode)
-        logger.info("Warmup run for prefill finished")
-        
-        tokens, start_pos, page_table, sampling_params = create_warmup_decode_input_parameters(self.scheduler_config.max_num_seqs, self.cache_config.num_gpu_blocks, self.sample_on_device_mode)
-        logger.info(f"Warmup run for decode with tokens: {tokens.shape}, start_pos: {start_pos.shape}, page_table: {page_table.shape}")
-        logger.info("Warmup run for decode started")
-        self.model.decode_forward(tokens, start_pos, page_table, kv_cache, trace_mode, sampling_params=sampling_params)
-        logger.info("Warmup run for decode finished")
+    def warmup_model(self, kv_cache) -> None:
+        prefill_warmup(self.model, kv_cache, self.trace_prefill_mode)
+        decode_warmup(self.model, kv_cache, self.trace_mode, self.scheduler_config.max_num_seqs, self.cache_config.num_gpu_blocks, self.sample_on_device_mode, self.parallel_config.data_parallel_size)

@@ -163,9 +163,17 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                 f"Invalid {trace_key}: {override_tt_config[trace_key]}"
             self.trace_mode = override_tt_config[trace_key]
 
+        trace_prefill_key = "trace_prefill_mode"
+        self.trace_prefill_mode = True
+        if override_tt_config and trace_prefill_key in override_tt_config:
+            assert override_tt_config[trace_prefill_key] in [True, False], \
+                f"Invalid {trace_prefill_key}: {override_tt_config[trace_prefill_key]}"
+            self.trace_prefill_mode = override_tt_config[trace_prefill_key]
+
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=vllm_config,
             trace_mode=self.trace_mode,
+            trace_prefill_mode=self.trace_prefill_mode,
         )
 
         self.cache_engine: TTCacheEngine
@@ -237,7 +245,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         self._init_cache_engine()
 
-        self.warmup_model()
+        self.model_runner.warmup_model(self.kv_cache)
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
@@ -251,8 +259,6 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                                           self.device_config)
         self.tt_cache = self.cache_engine.tt_cache
 
-    def warmup_model(self) -> None:
-        self.model_runner.warmup_model(self.kv_cache, self.trace_mode)
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
