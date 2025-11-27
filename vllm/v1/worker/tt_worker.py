@@ -149,7 +149,9 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def compile_or_warm_up_model(self) -> None:
-        self.model_runner.warmup_model()
+        # Only local DP rank 0 (device rank) has the model loaded
+        if self.parallel_config.data_parallel_rank_local == 0:
+            self.model_runner.warmup_model()
 
     def execute_model(
         self,
