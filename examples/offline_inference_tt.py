@@ -224,7 +224,7 @@ def run_inference(
     perf_prompt_len=None,
     greedy_sampling=False,  # Use greedy decoding instead of top-k/p
     async_engine=False,
-    num_scheduler_steps=10,
+    num_scheduler_steps=1,
     disable_async_output_proc=False,
     multi_modal=False,
     multi_image=False,
@@ -595,7 +595,7 @@ if __name__ == "__main__":
         help="Disable async output processing",
     )
     parser.add_argument(
-        "--num_scheduler_steps", type=int, default=10, help="Number of scheduler steps"
+        "--num_scheduler_steps", type=int, default=1, help="Number of scheduler steps"
     )
     parser.add_argument(
         "--multi_modal",

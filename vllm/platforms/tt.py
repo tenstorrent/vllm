@@ -251,18 +251,50 @@ class TTPlatform(Platform):
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
-        # V1 support on TT is experimental.
-        # Allow users to opt in, but give a warning.
-        if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
-            if model_config.is_encoder_decoder:
+        unsupported_arch_names = ['Qwen2_5_VLForConditionalGeneration']
+        arch_names = model_config.hf_config.architectures
+        # Encoder-decoder models are not yet supported in V1 for TT.
+        arch_supported_v1 = not model_config.is_encoder_decoder
+        for i in range(len(arch_names)):
+            if arch_names[i] in unsupported_arch_names:
+                arch_supported_v1 = False
+                break
+
+        # If env var is set, use it and raise error if not supported.
+        # If not set, default to True and fallback to V0 if not supported.
+        if not arch_supported_v1:
+            if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
                 raise ValueError(
-                    "VLLM_USE_V1=1 was set but encoder-decoder models aren't "
+                    f"VLLM_USE_V1=1 was set but {model_config.model} is not "
                     "yet supported in V1 for TT")
-            logger.warning(
-                "Enabling V1 since VLLM_USE_V1=1, however V1 is still "
-                "experimental for TT backend.")
-            return envs.VLLM_USE_V1
-        return False
+            else:
+                logger.info(
+                    "Falling back to V0 since %s is not yet supported in V1 "
+                    "for TT", model_config.model)
+                return False
+
+        # Default to V0 if V0 DP arg > 1 until V1 DP performance is improved.
+        v0_dp_arg = 1
+        if (model_config.override_tt_config
+                and "data_parallel" in model_config.override_tt_config):
+            v0_dp_arg = model_config.override_tt_config["data_parallel"]
+        if not envs.is_set("VLLM_USE_V1") and v0_dp_arg > 1:
+            logger.info("Defaulting to V0 for DP > 1 until V1 DP performance "
+                        "is improved for TT")
+            return False
+        elif envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1 and v0_dp_arg > 1:
+            raise ValueError(
+                "--override_tt_config should not be used to set data_parallel "
+                "size for V1 TT backend. Use --data_parallel_size instead.")
+
+        # Default to V0 for Llama70B-GLX until V1 DP performance is improved.
+        if not envs.is_set("VLLM_USE_V1") and os.getenv(
+                "TT_LLAMA_TEXT_VER") == "llama3_70b_galaxy":
+            logger.info("Defaulting to V0 for Llama70B-GLX until V1 DP "
+                        "performance is improved for TT")
+            return False
+
+        return envs.VLLM_USE_V1
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

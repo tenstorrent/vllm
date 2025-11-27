@@ -21,7 +21,7 @@ def main():
         help="Maximum number of sequences to be processed in a single iteration",
     )
     parser.add_argument(
-        "--num_scheduler_steps", type=int, default=10, help="Number of scheduler steps"
+        "--num_scheduler_steps", type=int, default=1, help="Number of scheduler steps"
     )
     parser.add_argument(
         "--block_size", type=int, default=64, help="KV cache block size"
