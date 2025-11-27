@@ -259,7 +259,6 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                                           self.device_config)
         self.tt_cache = self.cache_engine.tt_cache
 
-
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
         speculative decoding.

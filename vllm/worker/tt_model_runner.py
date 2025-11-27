@@ -227,6 +227,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         logger.info(
             "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, sample_on_device_mode=%s",
             self.trace_mode,
+            self.trace_prefill_mode,
             self.sample_on_device_mode,
         )
 
