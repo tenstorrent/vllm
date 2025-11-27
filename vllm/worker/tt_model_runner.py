@@ -46,7 +46,7 @@ class TTSamplingParams:
     temperature: Union[float, list[float]]
     top_k: Union[int, list[int]]
     top_p: Union[float, list[float]]
-    presence_penalty: Union[float, list[float]] 
+    presence_penalty: Union[float, list[float]]
     frequency_penalty: Union[float, list[float]]
     repetition_penalty: Union[float, list[float]]
     seed: Union[Optional[int], list[Optional[int]]]
@@ -310,7 +310,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         cross_block_tables_list: List[List[int]] = []
         decode_prompt_tokens: List[List[int]] = []
         decode_output_tokens:  List[List[int]] = []
-        req_ids: List[[int]] = []
         penalties_requested = False
 
         # create seq_groups_list before any cleanup to active batch slots
@@ -338,6 +337,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             compat_sampling_used = True
         else:
             param_values = {}
+            has_penalties_or_seed = False
             for seq_group_metadata in seq_group_metadata_list:
                 sampling_params = seq_group_metadata.sampling_params
                 # If any request in the batch requires compat sampling
@@ -345,6 +345,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if TTPlatform.compat_sampling_required(sampling_params):
                     compat_sampling_used = True
                     break
+                # Check if any penalties or seed params are present
+                if (sampling_params.presence_penalty != PADDING_PRESENCE_PENALTY or
+                    sampling_params.frequency_penalty != PADDING_FREQUENCY_PENALTY or
+                    sampling_params.repetition_penalty != PADDING_REPETITION_PENALTY or
+                    sampling_params.seed is not None):
+                    has_penalties_or_seed = True
                 for key in ["temperature", "top_k", "top_p"]:
                     current_value = getattr(sampling_params, key)
                     if key not in param_values:
@@ -366,8 +372,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             perform_device_sampling = True
         else:
             perform_device_sampling = False
-            # Host sampling only supports uniform
-            if not uniform_sampling:
+            # Host sampling only supports uniform sampling params
+            # If there are penalties/seed or non-uniform params, use compat sampling
+            if not uniform_sampling or has_penalties_or_seed:
                 compat_sampling_used = True
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -394,8 +401,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # tokens
                 generation_token = seq_data.get_last_token_id()
                 input_tokens_list.append(generation_token)
-                req_ids.append(seq_id)
                 if penalties_requested:
+                    # Prompt tokens are technically only needed for repetition_penalty,
+                    # but they are passed in for all penalty types and automatically
+                    # masked on the metal side for presence/frequency penalties
                     # need prefill tokens to create prompt histogram
                     decode_prompt_tokens.append(seq_data.prompt_token_ids_array)
                     # need decoded tokens to create output histogram
@@ -436,32 +445,22 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                   and perform_device_sampling):
                 # non greedy actually means
                 # that it also supports non-uniform sampling
-                for key, value in (
-                    ("temperature", sampling_params.temperature),
-                    ("top_k", sampling_params.top_k),
-                    ("top_p", sampling_params.top_p),
-                    ("presence_penalty", sampling_params.presence_penalty),
-                    ("frequency_penalty", sampling_params.frequency_penalty),
-                    ("repetition_penalty", sampling_params.repetition_penalty),
-                    ("seed", sampling_params.seed),
-                ):
-                    top_pk_sampling_params.setdefault(key, []).append(value)
+                for key in ("temperature", "top_k", "top_p", "presence_penalty",
+                           "frequency_penalty", "repetition_penalty", "seed"):
+                    top_pk_sampling_params.setdefault(key, []).append(
+                        getattr(sampling_params, key))
 
             else:
                 # uniform sampling - all requests must have same params
-                param_bundle = {
-                    "temperature": sampling_params.temperature,
-                    "top_k": sampling_params.top_k,
-                    "top_p": sampling_params.top_p,
-                    "presence_penalty": sampling_params.presence_penalty,
-                    "frequency_penalty": sampling_params.frequency_penalty,
-                    "repetition_penalty": sampling_params.repetition_penalty,
-                    "seed": sampling_params.seed,
-                }
+                param_keys = ("temperature", "top_k", "top_p", "presence_penalty",
+                             "frequency_penalty", "repetition_penalty", "seed")
                 if len(top_pk_sampling_params) == 0:
-                    top_pk_sampling_params.update(param_bundle)
+                    top_pk_sampling_params.update({
+                        key: getattr(sampling_params, key) for key in param_keys
+                    })
                 else:
-                    for key, value in param_bundle.items():
+                    for key in param_keys:
+                        value = getattr(sampling_params, key)
                         if top_pk_sampling_params[key] != value:
                             # This should never happen, we always fall back
                             # to a different sampling implementation if needed
@@ -472,6 +471,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         prompt_tokens_tensor: Optional[torch.Tensor] = None
         output_tokens_tensor: Optional[torch.Tensor] = None
         reset_batch: bool = True
+        # TODO: Prefill output token sampling also needs to support repetition penalty
+        # (tracked in https://github.com/tenstorrent/tt-metal/issues/32025)
         if (not is_prompt and penalties_requested and perform_device_sampling):
             prompt_tokens_tensor = make_tensor_with_pad(decode_prompt_tokens,
                                                         dtype=torch.int32,
@@ -636,7 +637,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ])
                 req_ids_tensor = torch.cat([
-                        torch.tensor(req_ids),
+                        torch.tensor(seq_groups_list),
                         torch.zeros(batch_pad_len,
                                     dtype=torch.int32,
                                     device="cpu")
@@ -968,6 +969,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
+            # reset_batch indicates whether the batch composition has changed
+            # (e.g., new sequences or finished sequences). The model uses this
+            # to reset internal state like penalty histograms.
             execute_model_kwargs["reset_batch"] = model_input.reset_batch
 
         if model_input.prompt_tokens is not None:
