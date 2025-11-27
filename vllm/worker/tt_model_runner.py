@@ -1326,4 +1326,4 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def warmup_model(self, kv_cache) -> None:
         prefill_warmup(self.model, kv_cache, self.trace_prefill_mode)
-        decode_warmup(self.model, kv_cache, self.trace_mode, self.scheduler_config.max_num_seqs, self.cache_config.num_gpu_blocks, self.sample_on_device_mode, self.parallel_config.data_parallel_size)
+        decode_warmup(self.model, kv_cache, self.trace_mode, self.scheduler_config.max_num_seqs, self.cache_config.num_gpu_blocks, self.sample_on_device_mode)

@@ -978,4 +978,4 @@ class TTModelRunner:
 
     def warmup_model(self) -> None:
         prefill_warmup(self.model, self.kv_caches, self.trace_prefill_mode)
-        decode_warmup(self.model, self.kv_caches, self.trace_mode, self.scheduler_config.max_num_seqs, self.max_num_blocks_per_req, self.sample_on_device_mode)
+        decode_warmup(self.model, self.kv_caches, self.trace_mode, self.scheduler_config.max_num_seqs, self.max_num_blocks_per_req, self.sample_on_device_mode, self.parallel_config.data_parallel_size)
