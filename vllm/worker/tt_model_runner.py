@@ -1030,6 +1030,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             **(model_input.multi_modal_kwargs or {}),
         }
         if not is_decode:
+            execute_model_kwargs["enable_trace"] = self.trace_prefill_mode
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
