@@ -752,10 +752,10 @@ class TTModelRunner:
 
         if self.model_config.is_multimodal_model and not is_decode:
             # Gather multi-modal inputs from all DP ranks
-            multi_modal_kwargs: MultiModalKwargs = {"pixel_values": []}
+            multi_modal_kwargs: list[dict[str, Any]] = []
             for mi in inputs:
-                multi_modal_kwargs["pixel_values"].append(
-                    mi.multi_modal_kwargs["pixel_values"])
+                # mi.multi_modal_kwargs is list[dict[str, Any]], concatenate all dicts
+                multi_modal_kwargs.extend(mi.multi_modal_kwargs)
         else:
             multi_modal_kwargs = []
 
