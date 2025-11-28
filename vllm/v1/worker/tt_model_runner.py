@@ -16,8 +16,8 @@ from vllm.platforms.tt import TTPlatform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType, cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
+                             LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
 from vllm.worker.tt_model_runner import TTSamplingParams, sample_tokens
 
@@ -965,7 +965,6 @@ class TTModelRunner:
                 )
                 logprob_token_ids, logprobs_tensor, sampled_token_ranks = non_empty_logprobs[0]
                 
-                from vllm.v1.outputs import LogprobsLists
                 logprobs_lists = LogprobsLists(
                     logprob_token_ids=logprob_token_ids.tolist(),
                     logprobs=logprobs_tensor.tolist(),
