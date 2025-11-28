@@ -50,6 +50,7 @@ class TTSamplingParams:
     frequency_penalty: Union[float, list[float]]
     repetition_penalty: Union[float, list[float]]
     seed: Union[Optional[int], list[Optional[int]]]
+    log_probs: Union[bool, list[bool]]
 
 
 @dataclass(frozen=True)
@@ -546,7 +547,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 presence_penalty=presence_list,
                 frequency_penalty=frequency_list,
                 repetition_penalty=repetition_list,
-                seed=seed_list)
+                seed=seed_list,
+                log_probs=[False]*len(temp_list))
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
@@ -559,7 +561,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     "frequency_penalty"],
                 repetition_penalty=top_pk_sampling_params[
                     "repetition_penalty"],
-                seed=top_pk_sampling_params["seed"])
+                seed=top_pk_sampling_params["seed"],
+                log_probs=False)
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -1183,7 +1186,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                 presence_penalty=permuted_presence,
                                 frequency_penalty=permuted_frequency,
                                 repetition_penalty=permuted_repetition,
-                                seed=permuted_seed)
+                                seed=permuted_seed,
+                                log_probs=[False]*len(permuted_temp))
 
             tt_out = self.model.decode_forward(**execute_model_kwargs,
                                                **enc_dec_kwargs,
