@@ -323,7 +323,7 @@ class TTModelRunner:
           # for requests w/ single mm_input:
           {"pixel_values": [pixel_values_1], "image_grid_thw": [grid_thw_1]},
           # for requests w/ multiple mm_inputs:
-          {"pixel_values": [pv2, pv3], "image_grid_thw": [thw2, thw3]},
+          {"pixel_values":[pv2, pv3],"image_grid_thw":[grid_thw_2,grid_thw_3]},
         ]
         """
 
