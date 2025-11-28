@@ -73,8 +73,8 @@ class TTModelRunner:
         self.request_specific_rope = bool(self.model_config.uses_mrope)
         if self.request_specific_rope:
             # seq_id -> cached_req_data
-            self.cached_req_data: dict[int, dict[str, Any]] = {}
-            self.previous_req_id_set: set[int] = set()
+            self.cached_req_data: dict[str, dict[str, Any]] = {}
+            self.previous_req_id_set: set[str] = set()
 
         # Because of multiprocessing, the config-dependent
         # class attributes might not have been set in this process,
@@ -477,7 +477,7 @@ class TTModelRunner:
 
         # Build req_ids as a list where the value at
         # position i is the req_id with req_id_to_index[req_id] == i
-        req_ids = [""] * len(self.input_batch.req_id_to_index)
+        req_ids: list[str] = [""] * len(self.input_batch.req_id_to_index)
         for req_id, idx in self.input_batch.req_id_to_index.items():
             req_ids[idx] = req_id
 
@@ -486,7 +486,7 @@ class TTModelRunner:
         if (self.request_specific_rope and
                 not is_prompt and
                 self.cached_req_data):
-            req_ids_to_del = []
+            req_ids_to_del: list[str] = []
             for req_id in self.cached_req_data:
                 if req_id not in req_ids:
                     req_ids_to_del.append(req_id)
@@ -761,7 +761,7 @@ class TTModelRunner:
 
         # Build req_ids as a list where the value at
         # position i is the req_id with req_id_to_index[req_id] == i
-        req_ids = [""] * len(self.input_batch.req_id_to_index)
+        req_ids: list[str] = [""] * len(self.input_batch.req_id_to_index)
         for req_id, idx in self.input_batch.req_id_to_index.items():
             req_ids[idx] = req_id
 
@@ -874,7 +874,7 @@ class TTModelRunner:
                 # Gather and pass rope_deltas from prefill step to decode
                 if any(req_id not in self.previous_req_id_set
                         for req_id in model_input.req_ids):
-                    enc_dec_kwargs = {
+                    enc_dec_kwargs: dict[str, Optional[list[Any]]] = {
                         "rope_deltas_all_users": [
                             self.cached_req_data[req_id]["rope_deltas"]
                             for req_id in model_input.req_ids
