@@ -200,6 +200,14 @@ class TTWorker(WorkerBase):
         assert (self.parallel_config.data_parallel_rank_local == 0), \
             "concat_and_execute_dp must run on local DP rank 0 (device rank)"
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
+        
+        # Check if logprobs are requested in DP mode
+        if self.model_runner.input_batch.max_num_logprobs is not None:
+            raise NotImplementedError(
+                "Logprobs are not yet supported in Data Parallel mode. "
+                "Please use single-device mode or disable logprobs."
+            )
+        
         merged = self.model_runner.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch)
         sampled_token_ids_per_dp, logprobs_data_per_dp = \
@@ -225,7 +233,9 @@ class TTWorker(WorkerBase):
                     ],
                                           dim=0)
             sampled_token_ids_per_dp[dp_rank] = token_ids
-        # TODO: Handle logprobs_data_per_dp for DP mode if needed
+        # Note: Logprobs are not yet supported in DP mode. 
+        # When adding support, logprobs_data_per_dp needs to be gathered
+        # and distributed similarly to sampled_token_ids_per_dp.
         return torch.stack(sampled_token_ids_per_dp)  # [world, B, 1]
 
     def apply_dp_execution_result(

@@ -873,14 +873,13 @@ class TTModelRunner:
             else:  # sample on device
                 # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start:start + sz]
-                # Note: logprobs not supported with on-device sampling yet
+                # Note: logprobs computation not yet supported with on-device sampling
                 if max_logprobs is not None:
-                    # Placeholder empty logprobs for on-device sampling
-                    logprobs_data_per_dp.append((
-                        torch.zeros((sz, max_logprobs + 1), dtype=torch.int32),
-                        torch.zeros((sz, max_logprobs + 1), dtype=torch.float32),
-                        torch.zeros(sz, dtype=torch.int32)
-                    ))
+                    # Raise an error if logprobs requested with on-device sampling
+                    raise NotImplementedError(
+                        "Logprobs computation is not yet supported when sampling "
+                        "on device. Please use host-side sampling to enable logprobs."
+                    )
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:
@@ -946,7 +945,11 @@ class TTModelRunner:
         # Process logprobs if available
         logprobs_lists = None
         if logprobs_data is not None and len(logprobs_data) > 0:
-            # Assuming we're not in DP mode (single rank)
+            # Currently only supporting non-DP mode (single rank)
+            assert len(logprobs_data) == 1, (
+                "Logprobs in DP mode not yet implemented. "
+                f"Expected 1 element, got {len(logprobs_data)}"
+            )
             logprob_token_ids, logprobs_tensor, sampled_token_ranks = logprobs_data[0]
             
             from vllm.v1.outputs import LogprobsLists
