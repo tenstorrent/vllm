@@ -61,10 +61,10 @@ class TTSamplingParams:
     temperature: Union[float, list[float]]
     top_k: Union[int, list[int]]
     top_p: Union[float, list[float]]
-    presence_penalty: Union[float, list[float]] 
-    frequency_penalty: Union[float, list[float]]
-    repetition_penalty: Union[float, list[float]]
-    seed: Union[Optional[int], list[Optional[int]]]
+    presence_penalty: Optional[Union[float, List[float]]] = None
+    frequency_penalty: Optional[Union[float, List[float]]] = None
+    repetition_penalty: Optional[Union[float, List[float]]] = None
+    seed: Optional[Union[int, List[Optional[int]]]] = None
 
 
 @dataclass(frozen=True)
@@ -982,10 +982,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
-            # Signals that decode batch has changed, 
+            # Only needed when sampling on device: signals that decode batch has changed, 
             # either due to a new user or 
             # due to a user finishing decode and existing users getting re-shuffled
-            execute_model_kwargs["reset_batch"] = model_input.reset_batch
+            if model_input.perform_device_sampling:
+                execute_model_kwargs["reset_batch"] = model_input.reset_batch
 
         if model_input.prompt_tokens is not None:
             execute_model_kwargs["prompt_tokens"] = model_input.prompt_tokens
