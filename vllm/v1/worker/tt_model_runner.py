@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
-from vllm.worker.tt_model_runner import TTSamplingParams, create_warmup_decode_input_parameters, decode_warmup, prefill_warmup, sample_tokens
+from vllm.worker.tt_model_runner import TTSamplingParams, decode_warmup, prefill_warmup, sample_tokens
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput

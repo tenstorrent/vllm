@@ -56,6 +56,8 @@ def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample
     """
         This function is used in v0 and v1 to create the warmup decode input parameters.
         In v0, data_parallel_size is always 1.
+        In v1, data_parallel_size can be greater than 1.
+        Called from decode_warmup.
     """
     max_batch_size = max_batch_size * data_parallel_size
     tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
@@ -65,6 +67,10 @@ def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample
     return tokens, start_pos, page_table, sampling_params
 
 def create_sampling_params(sample_on_device_mode):
+    """
+        Called from create_warmup_decode_input_parameters.
+        The function is called for the needs of both v0 and v1.
+    """
     if not sample_on_device_mode:
         return None
     if TTPlatform.non_greedy_decoding_on_device:
@@ -73,6 +79,8 @@ def create_sampling_params(sample_on_device_mode):
         return TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0)
 
 def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
+    # NOTE: Also called from vLLM v1
+
     sampling_params = create_sampling_params(TTPlatform.sample_on_device_mode)
     
     local_kwargs = {
@@ -86,6 +94,8 @@ def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
     logger.info("Warmup run for prefill finished")
 
 def decode_warmup(model, kv_cache, trace_mode, max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size = 1) -> None:
+    # NOTE: Also called from vLLM v1
+
     tokens, start_pos, page_table, sampling_params = create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size)
     local_kwargs = {
         "tokens": tokens,
