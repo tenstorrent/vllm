@@ -16,8 +16,8 @@ from vllm.platforms.tt import TTPlatform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType, cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
-                             LogprobsTensors, ModelRunnerOutput)
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
+                             ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
 from vllm.worker.tt_model_runner import TTSamplingParams, sample_tokens
 
@@ -99,9 +99,6 @@ class TTModelRunner:
         # Cache the arange needed for unpacking structured output bitmask
         self.structured_output_arange = torch.arange(0, 32)
         self.bitmask_size = cdiv(self.model_config.get_vocab_size(), 32)
-        
-        # Temporary storage for logprobs from last execution (used in generate_runner_output)
-        self.last_logprobs_data: Optional[dict[str, Any]] = None
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
@@ -426,18 +423,10 @@ class TTModelRunner:
                 "Currently only supporting same top_p"
                 "for all sequences in batch, "
                 "falling back to first sequence's top_p (%s)", top_p[0])
-        
-        # Get logprobs if any request needs it
-        # Currently only supporting same logprobs value for all sequences
-        logprobs_value = None
-        if input_batch.max_num_logprobs is not None:
-            logprobs_value = input_batch.max_num_logprobs
-        
         tt_sampling_params = TTSamplingParams(
             temperature=float(temperature[0]),
             top_k=int(top_k[0]),
             top_p=float(top_p[0]),
-            logprobs=logprobs_value,
         )
 
         if self.model_config.is_multimodal_model and is_prompt:
@@ -835,28 +824,6 @@ class TTModelRunner:
                                                enable_trace=self.trace_mode,
                                                read_from_device=True)
 
-        # Check if logprobs was requested
-        logprobs_requested = False
-        if isinstance(sampling_params_per_dp, list):
-            logprobs_requested = any(
-                sp and sp.logprobs is not None 
-                for sp in sampling_params_per_dp
-            )
-        elif sampling_params_per_dp and sampling_params_per_dp.logprobs is not None:
-            logprobs_requested = True
-        
-        # When sampling on device with logprobs, tt_out is a dict with:
-        # - 'tokens': sampled token ids
-        # - 'logprobs': dict with logprob data (token_ids, logprobs, ranks)
-        # Otherwise, tt_out is just the tokens or logits tensor
-        if (self.sample_on_device_mode and logprobs_requested and 
-            isinstance(tt_out, dict)):
-            tokens_out = tt_out['tokens']
-            self.last_logprobs_data = tt_out.get('logprobs')
-        else:
-            tokens_out = tt_out
-            self.last_logprobs_data = None
-
         # The model input we got here may come from
         # concatenating multiple DP ranks.
         # We need to split the data back before sampling.
@@ -871,7 +838,7 @@ class TTModelRunner:
             if (not self.sample_on_device_mode
                     or (self.sample_on_device_mode == "decode_only"
                         and not is_decode)):
-                logits = tokens_out[start:start + sz, -1, :]
+                logits = tt_out[start:start + sz, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
 
@@ -884,7 +851,7 @@ class TTModelRunner:
                                                sampling_params_per_dp[dp_rank])
             else:  # sample on device
                 # Grammar bitmask is applied on device
-                next_token_ids = tokens_out[start:start + sz]
+                next_token_ids = tt_out[start:start + sz]
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:
@@ -946,35 +913,14 @@ class TTModelRunner:
         for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
             prompt_logprobs_dict[req_id] = None
 
-        # Process logprobs if available from last execution
-        logprobs_lists = None
-        if self.last_logprobs_data is not None:
-            # Convert logprobs data from device to LogprobsLists format
-            # Expected format from device:
-            # {
-            #   'logprob_token_ids': tensor [batch, max_logprobs+1],
-            #   'logprobs': tensor [batch, max_logprobs+1],
-            #   'selected_token_ranks': tensor [batch]
-            # }
-            num_reqs = self.input_batch.num_reqs
-            logprob_token_ids_tensor = self.last_logprobs_data['logprob_token_ids'][:num_reqs]
-            logprobs_tensor = self.last_logprobs_data['logprobs'][:num_reqs]
-            selected_token_ranks_tensor = self.last_logprobs_data['selected_token_ranks'][:num_reqs]
-            
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=logprob_token_ids_tensor.tolist(),
-                logprobs=logprobs_tensor.tolist(),
-                sampled_token_ranks=selected_token_ranks_tensor.tolist(),
-            )
-            # Clear the temporary storage
-            self.last_logprobs_data = None
-
+        # Note: currently does not support speculative decoding, log probs,
+        # or pooling.
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=sampled_token_ids.tolist(),
             spec_token_ids=None,
-            logprobs=logprobs_lists,
+            logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )

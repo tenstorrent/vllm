@@ -16,8 +16,6 @@ class SamplingInputBatch:
         self.temperature_cpu = np.empty(max_num_reqs, dtype=np.float32)
         self.top_p_cpu = np.empty(max_num_reqs, dtype=np.float32)
         self.top_k_cpu = np.empty(max_num_reqs, dtype=np.int32)
-        # Track logprobs requests per request id (similar to GPU input batch)
-        self.num_logprobs: dict[str, int] = {}
 
 
 class InputBatch:
@@ -72,12 +70,6 @@ class InputBatch:
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
 
-    @property
-    def max_num_logprobs(self) -> Optional[int]:
-        """Get maximum number of logprobs requested across all requests."""
-        return max(self.sampling.num_logprobs.values()) \
-            if self.sampling.num_logprobs else None
-
     def add_request(
         self,
         request: "CachedRequestState",
@@ -119,8 +111,6 @@ class InputBatch:
         self.sampling.temperature_cpu[req_index] = sampling_params.temperature
         self.sampling.top_p_cpu[req_index] = sampling_params.top_p
         self.sampling.top_k_cpu[req_index] = sampling_params.top_k
-        if sampling_params.logprobs is not None:
-            self.sampling.num_logprobs[req_id] = sampling_params.logprobs
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -130,8 +120,6 @@ class InputBatch:
             return None
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
-        # Remove logprobs tracking
-        self.sampling.num_logprobs.pop(req_id, None)
 
         return req_index
 
