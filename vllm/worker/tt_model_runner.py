@@ -837,19 +837,36 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     use_async_out_proc,
                     step_idx=i)
                 if self.async_read_decode and is_decode and model_input.perform_device_sampling:  # noqa: E501
-                    next_token_ids, read_event = next_token_ids
-                    self.cached_read_events.append(read_event)
+                    # Check if this is a tuple (with logprobs) or just tokens
+                    if isinstance(next_token_ids, tuple) and len(next_token_ids) == 2:
+                        # Unpack tokens and potential logprobs data, then handle async read event
+                        if isinstance(next_token_ids[0], tuple):
+                            # Format: ((tokens, logprobs_data), read_event)
+                            (tokens, logprobs_data), read_event = next_token_ids
+                            next_token_ids = (tokens, logprobs_data)
+                        else:
+                            # Format: (tokens, read_event) - no logprobs
+                            next_token_ids, read_event = next_token_ids
+                        self.cached_read_events.append(read_event)
+                    # else: next_token_ids is already in correct format
+                
                 self.cached_step_outputs.append(next_token_ids)
                 if (i < num_steps - 1
                         and not model_input.perform_device_sampling):
                     # Prepare next step input when not sampling on device
                     # this is always decode,
                     # because prefill is always single-step
+                    
+                    # Extract just token IDs if we have logprobs data
+                    tokens_for_next_step = next_token_ids
+                    if isinstance(next_token_ids, tuple) and len(next_token_ids) == 2:
+                        tokens_for_next_step, _ = next_token_ids
+                    
                     if model_input.compat_sampling_used:
-                        next_token_ids = self._get_next_token_ids_from_sampler_output(  #noqa: E501
-                            next_token_ids)
+                        tokens_for_next_step = self._get_next_token_ids_from_sampler_output(  #noqa: E501
+                            tokens_for_next_step)
                     # Prepare the inputs for the next step
-                    new_input_tokens = next_token_ids.unsqueeze(dim=1).int()
+                    new_input_tokens = tokens_for_next_step.unsqueeze(dim=1).int()
                     if new_input_tokens.shape[
                             0] < self.scheduler_config.max_num_seqs:
                         # Pad batch to max_num_seqs
@@ -894,19 +911,27 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if model_input.compat_sampling_used:
                     sampler_output = self.cached_step_outputs.pop(0)
                 else:
-                    next_token_ids = self.cached_step_outputs.pop(0)
+                    output_data = self.cached_step_outputs.pop(0)
+                    
+                    # Check if output contains logprobs data (tuple format)
+                    if isinstance(output_data, tuple) and len(output_data) == 2:
+                        next_token_ids, logprobs_data = output_data
+                    else:
+                        next_token_ids = output_data
+                        logprobs_data = None
+                    
                     if self.async_read_decode and is_decode and model_input.perform_device_sampling:  # noqa: E501
-                        next_token_ids = self._complete_torch_async_proc(
-                            next_token_ids)
+                        next_token_ids, logprobs_data = self._complete_torch_async_proc(
+                            next_token_ids, logprobs_data)
                     # TODO: sync read back from device
                     # once model can keep executing steps on device
                     sampler_output = self._make_sampler_output(
-                        next_token_ids, model_input.seq_groups)
+                        next_token_ids, model_input.seq_groups, logprobs_data)
                 sampler_outputs.append(sampler_output)
 
         return sampler_outputs
 
-    def _complete_torch_async_proc(self, next_token_ids):
+    def _complete_torch_async_proc(self, next_token_ids, logprobs_data=None):
         read_events = self.cached_read_events.pop(0)
         for event in read_events:
             ttnn.event_synchronize(event)
@@ -916,7 +941,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.dp_kv_cache:
             # permute the tt_out
             next_token_ids = next_token_ids[self.perm_table_tensor.pop(0)]
-        return next_token_ids
+        return next_token_ids, logprobs_data
 
     def _send_async_out(self, sampler_output, async_callback,
                         is_first_step_output):
@@ -933,19 +958,42 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self,
         next_token_ids: List[int],
         seq_groups: List[int],
+        logprobs_data: Optional[Dict[str, Any]] = None,
     ) -> SamplerOutput:
         # Minimal code to construct the sampler outputs,
         # based on tpu_model_runner.py
-        # TT backend does not support the advanced sampling parameters
-        # such as logprobs.
+        # When logprobs_data is provided, it should contain:
+        # - 'token_ids': List of token IDs for top logprobs
+        # - 'logprobs': List of logprob values
+        # - 'ranks': List of ranks for the sampled tokens
 
-        zero_logprob = Logprob(0.0)
         sampler_outputs = []
         for batch_idx, seq_id in enumerate(seq_groups):
             next_token_id = int(next_token_ids[batch_idx])
+            
+            # Build logprobs dict for this token
+            if logprobs_data is not None:
+                # Extract logprobs for this batch index
+                token_ids = logprobs_data['token_ids'][batch_idx]
+                logprobs = logprobs_data['logprobs'][batch_idx]
+                rank = logprobs_data.get('ranks', [None] * len(next_token_ids))[batch_idx]
+                
+                # Build the logprobs dictionary
+                logprobs_dict = {}
+                for i, (tok_id, logprob_val) in enumerate(zip(token_ids, logprobs)):
+                    tok_id = int(tok_id)
+                    # For the sampled token, include its rank
+                    if tok_id == next_token_id and rank is not None:
+                        logprobs_dict[tok_id] = Logprob(float(logprob_val), rank=int(rank))
+                    else:
+                        logprobs_dict[tok_id] = Logprob(float(logprob_val))
+            else:
+                # No logprobs requested, use dummy value
+                zero_logprob = Logprob(0.0)
+                logprobs_dict = {next_token_id: zero_logprob}
+            
             seq_outputs = [
-                SequenceOutput(seq_id, next_token_id,
-                               {next_token_id: zero_logprob})
+                SequenceOutput(seq_id, next_token_id, logprobs_dict)
             ]
             sampler_outputs.append(
                 CompletionSequenceGroupOutput(seq_outputs, None))
@@ -957,14 +1005,20 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if model_input.compat_sampling_used:
                 sampler_output = step_output
             else:
-                next_token_ids = step_output
+                # Check if output contains logprobs data (tuple format)
+                if isinstance(step_output, tuple) and len(step_output) == 2:
+                    next_token_ids, logprobs_data = step_output
+                else:
+                    next_token_ids = step_output
+                    logprobs_data = None
+                
                 if self.async_read_decode and model_input.perform_device_sampling:  # noqa: E501
-                    next_token_ids = self._complete_torch_async_proc(
-                        next_token_ids)
+                    next_token_ids, logprobs_data = self._complete_torch_async_proc(
+                        next_token_ids, logprobs_data)
                 # TODO: sync read back from device
                 # once model can keep executing steps on device
                 sampler_output = self._make_sampler_output(
-                    next_token_ids, model_input.seq_groups)
+                    next_token_ids, model_input.seq_groups, logprobs_data)
             self._send_async_out(sampler_output,
                                  model_input.async_callback,
                                  is_first_step_output=(step_idx == 1))
@@ -1262,12 +1316,35 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                model_input.tt_sampling_params)
                 return next_token_ids
             else:  # sample on device
-                # tt_out: [padded_batch_size]
-                # _make_sampler_output picks out the non-padding entries
-                if self.async_read_decode and is_decode:
-                    return tt_out, read_event
+                # When log_probs is requested, tt_out is a dict with:
+                # - 'tokens': tensor of sampled token IDs [batch_size]
+                # - 'logprobs_data': dict with 'token_ids', 'logprobs', 'ranks'
+                # Otherwise, tt_out is just the token IDs tensor
+                
+                # Check if log_probs was requested
+                log_probs_requested = (
+                    model_input.tt_sampling_params is not None and
+                    isinstance(model_input.tt_sampling_params, TTSamplingParams) and
+                    (model_input.tt_sampling_params.log_probs if isinstance(
+                        model_input.tt_sampling_params.log_probs, bool) 
+                     else any(model_input.tt_sampling_params.log_probs))
+                )
+                
+                if log_probs_requested and isinstance(tt_out, dict):
+                    # Extract tokens and logprobs data
+                    tokens_out = tt_out['tokens']
+                    logprobs_data = tt_out.get('logprobs_data')
+                    # Return both for processing
+                    if self.async_read_decode and is_decode:
+                        return (tokens_out, logprobs_data), read_event
+                    else:
+                        return tokens_out, logprobs_data
                 else:
-                    return tt_out
+                    # Original behavior - just tokens
+                    if self.async_read_decode and is_decode:
+                        return tt_out, read_event
+                    else:
+                        return tt_out
 
     def _get_next_token_ids_from_sampler_output(
             self, sampler_output: SamplerOutput) -> torch.Tensor:
