@@ -293,18 +293,19 @@ class TTPlatform(Platform):
                 raise ValueError(
                     f"Currently not supporting prompt_logprobs on "
                     f"{cls.device_name}")
+            # Note: logprobs is now supported in V1 TT backend
 
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
         # anything beyond top-k top-p sampling requires compat sampling
         # seed pending https://github.com/tenstorrent/tt-metal/issues/32209
+        # Note: logprobs is now handled directly, not via compat sampling
         return (sampling_params.presence_penalty != 0.0
                 or sampling_params.frequency_penalty != 0.0
                 or sampling_params.repetition_penalty != 1.0
                 or sampling_params.min_p != 0.0
                 or (sampling_params.bad_words is not None
                     and len(sampling_params.bad_words) > 0)
-                or sampling_params.logprobs is not None
                 or sampling_params.prompt_logprobs is not None
                 or sampling_params.logits_processors is not None
                 or sampling_params.guided_decoding is not None

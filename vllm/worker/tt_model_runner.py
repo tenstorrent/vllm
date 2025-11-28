@@ -120,15 +120,55 @@ def top_pk_logits_efficient(logits,
         return token
 
 
-def sample_tokens(logits, tt_sampling_params: TTSamplingParams):
+def sample_tokens(logits, tt_sampling_params: TTSamplingParams, 
+                  num_logprobs: Optional[int] = None):
+    """Sample tokens from logits and optionally compute logprobs.
+    
+    Args:
+        logits: Logits tensor [batch_size, vocab_size]
+        tt_sampling_params: Sampling parameters
+        num_logprobs: If not None, return logprobs for top-k tokens
+        
+    Returns:
+        If num_logprobs is None:
+            sampled_token_ids: [batch_size] tensor of sampled token IDs
+        If num_logprobs is not None:
+            tuple of (sampled_token_ids, logprobs_data) where logprobs_data is
+            (logprob_token_ids, logprobs, sampled_token_ranks)
+    """
     if tt_sampling_params.temperature == 0:  # greedy decoding
-        return torch.argmax(logits, dim=-1)
+        sampled_token_ids = torch.argmax(logits, dim=-1)
     else:  # top-k top-p sampling
-        return top_pk_logits_efficient(
+        sampled_token_ids = top_pk_logits_efficient(
             logits,
             p=tt_sampling_params.top_p,
             k=tt_sampling_params.top_k,
             temperature=tt_sampling_params.temperature)
+    
+    if num_logprobs is None:
+        return sampled_token_ids
+    
+    # Compute logprobs
+    logprobs = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
+    
+    # Get top-k logprobs
+    topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+    
+    # Get logprobs of sampled tokens
+    sampled_token_ids_unsqueezed = sampled_token_ids.unsqueeze(-1)
+    sampled_logprobs = logprobs.gather(-1, sampled_token_ids_unsqueezed)
+    
+    # Compute ranks of sampled tokens (how many tokens have higher logprobs)
+    sampled_token_ranks = (logprobs > sampled_logprobs).sum(dim=-1).to(torch.int32)
+    
+    # Concatenate sampled token with topk
+    logprob_token_ids = torch.cat((sampled_token_ids_unsqueezed, topk_indices), dim=1)
+    logprobs_concat = torch.cat((sampled_logprobs, topk_logprobs), dim=1)
+    
+    # Convert to int32 to match expected types
+    logprob_token_ids = logprob_token_ids.to(torch.int32)
+    
+    return sampled_token_ids, (logprob_token_ids, logprobs_concat, sampled_token_ranks)
 
 
 class TTModelRunner(ModelRunnerBase[TTModelInput]):

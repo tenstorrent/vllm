@@ -59,6 +59,9 @@ class InputBatch:
 
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs)
+        
+        # Logprobs-related.
+        self.num_logprobs: dict[str, int] = {}
 
     @property
     def req_ids(self) -> list[str]:
@@ -69,6 +72,11 @@ class InputBatch:
     @property
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
+    
+    @property
+    def max_num_logprobs(self) -> Optional[int]:
+        """Return the maximum number of logprobs across all requests."""
+        return max(self.num_logprobs.values()) if self.num_logprobs else None
 
     def add_request(
         self,
@@ -111,6 +119,10 @@ class InputBatch:
         self.sampling.temperature_cpu[req_index] = sampling_params.temperature
         self.sampling.top_p_cpu[req_index] = sampling_params.top_p
         self.sampling.top_k_cpu[req_index] = sampling_params.top_k
+        
+        # Logprobs-related.
+        if sampling_params.logprobs is not None:
+            self.num_logprobs[req_id] = sampling_params.logprobs
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -120,6 +132,9 @@ class InputBatch:
             return None
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
+        
+        # Clean up logprobs tracking
+        self.num_logprobs.pop(req_id, None)
 
         return req_index
 

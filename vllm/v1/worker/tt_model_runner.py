@@ -755,18 +755,23 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         # Only 1 DP rank here
-        sampled_token_ids = self.execute_with_model_input(model_input)[0]
-        output = self.generate_runner_output(sampled_token_ids)
+        sampled_token_ids, logprobs_data = self.execute_with_model_input(model_input)
+        output = self.generate_runner_output(sampled_token_ids[0], logprobs_data)
         return output
 
     def execute_with_model_input(
         self,
         model_input: TTModelInput,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], Optional[list[tuple]]]:
         """
-        Execute with a prebuilt input and return per-DP sampled ids without
-        mutating internal state. In DP case, called by DP rank 0 to run merged
+        Execute with a prebuilt input and return per-DP sampled ids and logprobs
+        without mutating internal state. In DP case, called by DP rank 0 to run merged
         batch. Note: currently does not support chunked prefill.
+        
+        Returns:
+            tuple of (sampled_token_ids_per_dp, logprobs_data_per_dp)
+            where logprobs_data_per_dp is None if no logprobs requested,
+            or a list of tuples (logprob_token_ids, logprobs, sampled_token_ranks)
         """
         is_decode = model_input.prompt_lens is None
 
@@ -774,8 +779,8 @@ class TTModelRunner:
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
         if not any(bs > 0 for bs in batch_size_per_dp):
-            return [torch.tensor([], dtype=torch.int32)
-                    ] * len(batch_size_per_dp)
+            return ([torch.tensor([], dtype=torch.int32)] * len(batch_size_per_dp),
+                    None)
 
         sampling_params_per_dp = model_input.tt_sampling_params
         if not isinstance(sampling_params_per_dp, list):
@@ -828,12 +833,21 @@ class TTModelRunner:
         # concatenating multiple DP ranks.
         # We need to split the data back before sampling.
         sampled_token_ids_per_dp: list[torch.Tensor] = []
+        logprobs_data_per_dp: Optional[list[tuple]] = []
+        max_logprobs = self.input_batch.max_num_logprobs
 
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if sz <= 0:
                 sampled_token_ids_per_dp.append(
                     torch.tensor([], dtype=torch.int32))
+                if max_logprobs is not None:
+                    # Empty logprobs data for empty batch
+                    logprobs_data_per_dp.append((
+                        torch.tensor([], dtype=torch.int32),
+                        torch.tensor([], dtype=torch.float32),
+                        torch.tensor([], dtype=torch.int32)
+                    ))
                 continue
             if (not self.sample_on_device_mode
                     or (self.sample_on_device_mode == "decode_only"
@@ -847,11 +861,26 @@ class TTModelRunner:
                     grammar_bitmask = grammar_bitmask[:sz, :]
                     self.apply_grammar_bitmask(logits, grammar_bitmask)
 
-                next_token_ids = sample_tokens(logits,
-                                               sampling_params_per_dp[dp_rank])
+                # Sample tokens and compute logprobs if requested
+                sample_result = sample_tokens(logits,
+                                             sampling_params_per_dp[dp_rank],
+                                             num_logprobs=max_logprobs)
+                if max_logprobs is not None:
+                    next_token_ids, logprobs_data = sample_result
+                    logprobs_data_per_dp.append(logprobs_data)
+                else:
+                    next_token_ids = sample_result
             else:  # sample on device
                 # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start:start + sz]
+                # Note: logprobs not supported with on-device sampling yet
+                if max_logprobs is not None:
+                    # Placeholder empty logprobs for on-device sampling
+                    logprobs_data_per_dp.append((
+                        torch.zeros((sz, max_logprobs + 1), dtype=torch.int32),
+                        torch.zeros((sz, max_logprobs + 1), dtype=torch.float32),
+                        torch.zeros(sz, dtype=torch.int32)
+                    ))
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:
@@ -861,7 +890,10 @@ class TTModelRunner:
                 # Prefill packed contiguously
                 start += sz
 
-        return sampled_token_ids_per_dp
+        if max_logprobs is None:
+            logprobs_data_per_dp = None
+            
+        return sampled_token_ids_per_dp, logprobs_data_per_dp
 
     def apply_grammar_bitmask(self, logits: torch.Tensor,
                               grammar_bitmask: torch.Tensor) -> None:
@@ -882,7 +914,8 @@ class TTModelRunner:
                                                     -1)[:, :logits.shape[-1]]
         logits.masked_fill_(unpacked_bitmask, -float("inf"))
 
-    def generate_runner_output(self, sampled_token_ids: torch.Tensor):
+    def generate_runner_output(self, sampled_token_ids: torch.Tensor,
+                              logprobs_data: Optional[list[tuple]]):
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         assert sampled_token_ids.shape[0] == self.input_batch.num_reqs, (
@@ -913,14 +946,25 @@ class TTModelRunner:
         for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
             prompt_logprobs_dict[req_id] = None
 
-        # Note: currently does not support speculative decoding, log probs,
-        # or pooling.
+        # Process logprobs if available
+        logprobs_lists = None
+        if logprobs_data is not None and len(logprobs_data) > 0:
+            # Assuming we're not in DP mode (single rank)
+            logprob_token_ids, logprobs_tensor, sampled_token_ranks = logprobs_data[0]
+            
+            from vllm.v1.outputs import LogprobsLists
+            logprobs_lists = LogprobsLists(
+                logprob_token_ids=logprob_token_ids.tolist(),
+                logprobs=logprobs_tensor.tolist(),
+                sampled_token_ranks=sampled_token_ranks.tolist(),
+            )
+
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=sampled_token_ids.tolist(),
             spec_token_ids=None,
-            logprobs=None,
+            logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )
