@@ -834,7 +834,11 @@ class TTModelRunner:
         # We need to split the data back before sampling.
         sampled_token_ids_per_dp: list[torch.Tensor] = []
         max_logprobs = self.input_batch.max_num_logprobs
-        logprobs_data_per_dp: Optional[list[tuple]] = None if max_logprobs is None else []
+        # Each tuple contains: (logprob_token_ids, logprobs, sampled_token_ranks)
+        logprobs_data_per_dp: Optional[list[tuple[torch.Tensor, torch.Tensor, 
+                                                   torch.Tensor]]] = (
+            None if max_logprobs is None else []
+        )
 
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
@@ -946,8 +950,11 @@ class TTModelRunner:
         logprobs_lists = None
         if logprobs_data is not None:
             # Filter out empty batches before processing
-            non_empty_logprobs = [lp for lp in logprobs_data 
-                                 if lp[0].numel() > 0]
+            # Each element is a tuple of (logprob_token_ids, logprobs, sampled_token_ranks)
+            non_empty_logprobs = [
+                lp for lp in logprobs_data 
+                if lp[0].numel() > 0  # Check if logprob_token_ids tensor is non-empty
+            ]
             
             if len(non_empty_logprobs) > 0:
                 # Currently only supporting non-DP mode (single rank)
