@@ -40,7 +40,7 @@ class TTModelInput:
     block_tables: torch.Tensor
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
     tt_sampling_params: Union[TTSamplingParams, list[TTSamplingParams]]
-    req_ids: list[str] # list of request IDs for the batch
+    req_ids: list[str]  # list of request IDs for the batch
     multi_modal_kwargs: list[dict[str, Any]]
 
     # always lists: single-element for non-DP, multi-element for DP
@@ -348,8 +348,10 @@ class TTModelRunner:
                 image_grid_thw_array.append(mm_input["image_grid_thw"])
 
             multi_modal_kwargs_list.append({
-                "pixel_values": pv_array,
-                "image_grid_thw": image_grid_thw_array
+                "pixel_values":
+                pv_array,
+                "image_grid_thw":
+                image_grid_thw_array
             })
         return multi_modal_kwargs_list
 
@@ -483,9 +485,8 @@ class TTModelRunner:
 
         # Remove cached rope_deltas data for any req_ids
         # that are not in the current batch
-        if (self.request_specific_rope and
-                not is_prompt and
-                self.cached_req_data):
+        if (self.request_specific_rope and not is_prompt
+                and self.cached_req_data):
             req_ids_to_del: list[str] = []
             for req_id in self.cached_req_data:
                 if req_id not in req_ids:
@@ -872,7 +873,7 @@ class TTModelRunner:
             if self.request_specific_rope:
                 # Gather and pass rope_deltas from prefill step to decode
                 if any(req_id not in self.previous_req_id_set
-                        for req_id in model_input.req_ids):
+                       for req_id in model_input.req_ids):
                     enc_dec_kwargs: dict[str, Optional[list[Any]]] = {
                         "rope_deltas_all_users": [
                             self.cached_req_data[req_id]["rope_deltas"]
