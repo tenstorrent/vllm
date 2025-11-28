@@ -36,7 +36,7 @@ PADDING_PRESENCE_PENALTY = 0.0
 PADDING_FREQUENCY_PENALTY = 0.0
 PADDING_REPETITION_PENALTY = 1.0
 PADDING_SEED = 0
-PADDING_LOGPROBS = None  # No logprobs for padding positions
+PADDING_LOG_PROBS = False  # No logprobs for padding positions
 
 SAMPLING_PARAM_KEYS = [
     "temperature",
@@ -67,7 +67,7 @@ class TTSamplingParams:
     frequency_penalty: Optional[Union[float, List[float]]] = 0.0
     repetition_penalty: Optional[Union[float, List[float]]] = 1.0
     seed: Optional[Union[int, List[Optional[int]]]] = 0
-    logprobs: Optional[Union[int, List[Optional[int]]]] = None
+    log_probs: Union[bool, List[bool]] = False
 
 
 @dataclass(frozen=True)
@@ -539,7 +539,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             repetition_list = top_pk_sampling_params[
                 "repetition_penalty"]
             seed_list = top_pk_sampling_params["seed"]
-            logprobs_list = top_pk_sampling_params["logprobs"]
+            log_probs_list = top_pk_sampling_params["logprobs"]
 
             # Pad sampling params to max_num_seqs in decode mode for
             # proper permutation
@@ -557,7 +557,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 frequency_list = frequency_list + [PADDING_FREQUENCY_PENALTY] * batch_pad_len
                 repetition_list = repetition_list + [PADDING_REPETITION_PENALTY] * batch_pad_len
                 seed_list = seed_list + [PADDING_SEED] * batch_pad_len
-                logprobs_list = logprobs_list + [PADDING_LOGPROBS] * batch_pad_len
+                log_probs_list = log_probs_list + [PADDING_LOG_PROBS] * batch_pad_len
 
             tt_sampling_params = TTSamplingParams(
                 temperature=temp_list,
@@ -567,7 +567,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 frequency_penalty=frequency_list,
                 repetition_penalty=repetition_list,
                 seed=seed_list,
-                logprobs=logprobs_list)
+                log_probs=log_probs_list)
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
@@ -581,7 +581,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 repetition_penalty=top_pk_sampling_params[
                     "repetition_penalty"],
                 seed=top_pk_sampling_params["seed"],
-                logprobs=top_pk_sampling_params["logprobs"])
+                log_probs=top_pk_sampling_params["logprobs"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
