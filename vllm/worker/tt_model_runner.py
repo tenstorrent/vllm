@@ -73,9 +73,17 @@ def create_sampling_params(sample_on_device_mode):
         return TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0)
 
 def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
-        logger.info("Warmup run for prefill started")
-        model.warmup_model_prefill(kv_cache, trace_prefill_mode)
-        logger.info("Warmup run for prefill finished")
+    sampling_params = create_sampling_params(TTPlatform.sample_on_device_mode)
+    
+    local_kwargs = {
+        "kv_cache": kv_cache,
+        "enable_trace": trace_prefill_mode,
+        "sampling_params": sampling_params,
+    }
+    
+    logger.info("Warmup run for prefill started")
+    model.warmup_model_prefill(**local_kwargs)
+    logger.info("Warmup run for prefill finished")
 
 def decode_warmup(model, kv_cache, trace_mode, max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size = 1) -> None:
     tokens, start_pos, page_table, sampling_params = create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample_on_device_mode, data_parallel_size)
