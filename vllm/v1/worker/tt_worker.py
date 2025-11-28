@@ -202,8 +202,8 @@ class TTWorker(WorkerBase):
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
         merged = self.model_runner.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch)
-        sampled_token_ids_per_dp: list[
-            torch.Tensor] = self.model_runner.execute_with_model_input(merged)
+        sampled_token_ids_per_dp, logprobs_data_per_dp = \
+            self.model_runner.execute_with_model_input(merged)
 
         # Pad each DP result to uniform shape for tensor all_gather.
         world = self.parallel_config.data_parallel_size
@@ -225,6 +225,7 @@ class TTWorker(WorkerBase):
                     ],
                                           dim=0)
             sampled_token_ids_per_dp[dp_rank] = token_ids
+        # TODO: Handle logprobs_data_per_dp for DP mode if needed
         return torch.stack(sampled_token_ids_per_dp)  # [world, B, 1]
 
     def apply_dp_execution_result(
@@ -234,7 +235,8 @@ class TTWorker(WorkerBase):
         # Trim to active local batch size to drop padding rows.
         num_reqs = self.model_runner.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
-        return self.model_runner.generate_runner_output(sampled_token_ids)
+        # Note: logprobs not available in DP mode yet, passing None
+        return self.model_runner.generate_runner_output(sampled_token_ids, None)
 
     # ---- Destructor (used to close devices) ----
 
