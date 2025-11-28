@@ -297,11 +297,11 @@ class TTPlatform(Platform):
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
         # all of the following sampling params require compat sampling
+        # Note: logprobs is now supported on-device, so it doesn't require compat sampling
         return (
                 sampling_params.min_p != 0.0
                 or (sampling_params.bad_words is not None
                     and len(sampling_params.bad_words) > 0)
-                or sampling_params.logprobs is not None
                 or sampling_params.prompt_logprobs is not None
                 or sampling_params.logits_processors is not None
                 or sampling_params.guided_decoding is not None

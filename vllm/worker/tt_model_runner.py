@@ -65,6 +65,7 @@ class TTSamplingParams:
     frequency_penalty: Optional[Union[float, List[float]]] = 0.0
     repetition_penalty: Optional[Union[float, List[float]]] = 1.0
     seed: Optional[Union[int, List[Optional[int]]]] = 0
+    logprobs: Optional[Union[int, List[Optional[int]]]] = None
 
 
 @dataclass(frozen=True)
