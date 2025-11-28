@@ -833,8 +833,8 @@ class TTModelRunner:
         # concatenating multiple DP ranks.
         # We need to split the data back before sampling.
         sampled_token_ids_per_dp: list[torch.Tensor] = []
-        logprobs_data_per_dp: Optional[list[tuple]] = []
         max_logprobs = self.input_batch.max_num_logprobs
+        logprobs_data_per_dp: Optional[list[tuple]] = None if max_logprobs is None else []
 
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
@@ -889,9 +889,6 @@ class TTModelRunner:
             else:
                 # Prefill packed contiguously
                 start += sz
-
-        if max_logprobs is None:
-            logprobs_data_per_dp = None
             
         return sampled_token_ids_per_dp, logprobs_data_per_dp
 
