@@ -36,6 +36,7 @@ PADDING_PRESENCE_PENALTY = 0.0
 PADDING_FREQUENCY_PENALTY = 0.0
 PADDING_REPETITION_PENALTY = 1.0
 PADDING_SEED = 0
+PADDING_LOGPROBS = None  # No logprobs for padding positions
 
 SAMPLING_PARAM_KEYS = [
     "temperature",
@@ -556,7 +557,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 frequency_list = frequency_list + [PADDING_FREQUENCY_PENALTY] * batch_pad_len
                 repetition_list = repetition_list + [PADDING_REPETITION_PENALTY] * batch_pad_len
                 seed_list = seed_list + [PADDING_SEED] * batch_pad_len
-                logprobs_list = logprobs_list + [None] * batch_pad_len
+                logprobs_list = logprobs_list + [PADDING_LOGPROBS] * batch_pad_len
 
             tt_sampling_params = TTSamplingParams(
                 temperature=temp_list,
