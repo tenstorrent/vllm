@@ -61,10 +61,10 @@ class TTSamplingParams:
     temperature: Union[float, list[float]]
     top_k: Union[int, list[int]]
     top_p: Union[float, list[float]]
-    presence_penalty: Optional[Union[float, List[float]]] = None
-    frequency_penalty: Optional[Union[float, List[float]]] = None
-    repetition_penalty: Optional[Union[float, List[float]]] = None
-    seed: Optional[Union[int, List[Optional[int]]]] = None
+    presence_penalty: Optional[Union[float, List[float]]] = 0.0
+    frequency_penalty: Optional[Union[float, List[float]]] = 0.0
+    repetition_penalty: Optional[Union[float, List[float]]] = 1.0
+    seed: Optional[Union[int, List[Optional[int]]]] = 0
 
 
 @dataclass(frozen=True)
