@@ -3,7 +3,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, dict, set, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import torch
 import ttnn
@@ -41,7 +41,7 @@ class TTModelInput:
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
     tt_sampling_params: Union[TTSamplingParams, list[TTSamplingParams]]
     req_ids: list[str] # list of request IDs for the batch
-    multi_modal_kwargs: dict[str, Any]
+    multi_modal_kwargs: list[dict[str, Any]]
 
     # always lists: single-element for non-DP, multi-element for DP
     # If not using structured outputs, [None]
@@ -327,7 +327,7 @@ class TTModelRunner:
         ]
         """
 
-        multi_modal_kwargs_list = []
+        multi_modal_kwargs_list: list[dict[str, Any]] = []
 
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
@@ -451,7 +451,7 @@ class TTModelRunner:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
                 scheduler_output)
         else:
-            multi_modal_kwargs = {}
+            multi_modal_kwargs = []
 
         # If we're not using structured outputs, grammar_bitmask is None
         bitmask = scheduler_output.grammar_bitmask
@@ -477,7 +477,7 @@ class TTModelRunner:
 
         # Build req_ids as a list where the value at
         # position i is the req_id with req_id_to_index[req_id] == i
-        req_ids = [None] * len(self.input_batch.req_id_to_index)
+        req_ids = [""] * len(self.input_batch.req_id_to_index)
         for req_id, idx in self.input_batch.req_id_to_index.items():
             req_ids[idx] = req_id
 
@@ -757,7 +757,13 @@ class TTModelRunner:
                 multi_modal_kwargs["pixel_values"].append(
                     mi.multi_modal_kwargs["pixel_values"])
         else:
-            multi_modal_kwargs = {}
+            multi_modal_kwargs = []
+
+        # Build req_ids as a list where the value at
+        # position i is the req_id with req_id_to_index[req_id] == i
+        req_ids = [""] * len(self.input_batch.req_id_to_index)
+        for req_id, idx in self.input_batch.req_id_to_index.items():
+            req_ids[idx] = req_id
 
         if os.environ.get("DP_GATHER_DEBUG") == "1":
             logger.info("batch_size_per_dp=%s", batch_size_per_dp)
@@ -768,6 +774,7 @@ class TTModelRunner:
             block_tables=block_tables,
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=sampling_params_per_dp,
+            req_ids=req_ids,
             multi_modal_kwargs=multi_modal_kwargs,
             grammar_bitmask=grammar_bitmask_list,
         )
