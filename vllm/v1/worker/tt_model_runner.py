@@ -944,20 +944,26 @@ class TTModelRunner:
 
         # Process logprobs if available
         logprobs_lists = None
-        if logprobs_data is not None and len(logprobs_data) > 0:
-            # Currently only supporting non-DP mode (single rank)
-            assert len(logprobs_data) == 1, (
-                "Logprobs in DP mode not yet implemented. "
-                f"Expected 1 element, got {len(logprobs_data)}"
-            )
-            logprob_token_ids, logprobs_tensor, sampled_token_ranks = logprobs_data[0]
+        if logprobs_data is not None:
+            # Filter out empty batches before processing
+            non_empty_logprobs = [lp for lp in logprobs_data 
+                                 if lp[0].numel() > 0]
             
-            from vllm.v1.outputs import LogprobsLists
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=logprob_token_ids.tolist(),
-                logprobs=logprobs_tensor.tolist(),
-                sampled_token_ranks=sampled_token_ranks.tolist(),
-            )
+            if len(non_empty_logprobs) > 0:
+                # Currently only supporting non-DP mode (single rank)
+                # In non-DP mode there should be exactly one non-empty entry
+                assert len(non_empty_logprobs) == 1, (
+                    "Logprobs in DP mode not yet implemented. "
+                    f"Expected 1 non-empty element, got {len(non_empty_logprobs)}"
+                )
+                logprob_token_ids, logprobs_tensor, sampled_token_ranks = non_empty_logprobs[0]
+                
+                from vllm.v1.outputs import LogprobsLists
+                logprobs_lists = LogprobsLists(
+                    logprob_token_ids=logprob_token_ids.tolist(),
+                    logprobs=logprobs_tensor.tolist(),
+                    sampled_token_ranks=sampled_token_ranks.tolist(),
+                )
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,

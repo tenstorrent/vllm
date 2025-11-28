@@ -162,6 +162,10 @@ def sample_tokens(logits, tt_sampling_params: TTSamplingParams,
     sampled_token_ranks = (logprobs > sampled_logprobs).sum(dim=-1).to(torch.int32)
     
     # Concatenate sampled token with topk
+    # Note: The sampled token may already be in top-k, leading to duplication.
+    # This is intentional and matches OpenAI API behavior where the sampled
+    # token is always included as the first element, regardless of whether
+    # it appears in the top-k tokens.
     logprob_token_ids = torch.cat((sampled_token_ids_unsqueezed, topk_indices), dim=1)
     logprobs_concat = torch.cat((sampled_logprobs, topk_logprobs), dim=1)
     
