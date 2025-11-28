@@ -297,8 +297,7 @@ class TTPlatform(Platform):
     @staticmethod
     def compat_sampling_required(sampling_params) -> bool:
         # all of the following sampling params require compat sampling
-        return (
-                sampling_params.min_p != 0.0
+        return (sampling_params.min_p != 0.0
                 or (sampling_params.bad_words is not None
                     and len(sampling_params.bad_words) > 0)
                 or sampling_params.logprobs is not None

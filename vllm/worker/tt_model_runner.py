@@ -365,8 +365,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     current_value = getattr(sampling_params, key)
                     if key in PENALTY_PARAM_DEFAULTS:
                         penalties_or_seed_in_batch = (
-                            penalties_or_seed_in_batch or
-                            current_value != PENALTY_PARAM_DEFAULTS[key])
+                            penalties_or_seed_in_batch
+                            or current_value != PENALTY_PARAM_DEFAULTS[key])
                     elif key == "seed":
                         penalties_or_seed_in_batch = (
                             penalties_or_seed_in_batch
@@ -407,8 +407,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             sampling_params = seq_group_metadata.sampling_params
 
             penalties_requested = penalties_requested or (
-                sampling_params.presence_penalty != PADDING_PRESENCE_PENALTY or sampling_params.frequency_penalty != PADDING_FREQUENCY_PENALTY
-                or sampling_params.repetition_penalty != PADDING_REPETITION_PENALTY)
+                sampling_params.presence_penalty != PADDING_PRESENCE_PENALTY or
+                sampling_params.frequency_penalty != PADDING_FREQUENCY_PENALTY
+                or sampling_params.repetition_penalty
+                != PADDING_REPETITION_PENALTY)
             if is_prompt:
                 # tokens
                 prompt_tokens = seq_data.get_token_ids()
@@ -420,10 +422,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if penalties_requested:
                     # need prefill tokens to create prompt histogram
                     # repetition_penalty is the only consumer; prompts are
-                    # passed for all penalties because a single trace is used for penalties 
-                    decode_prompt_tokens.append(seq_data.prompt_token_ids_array)
+                    # passed for all penalties because a
+                    # single trace is used for penalties
+                    decode_prompt_tokens.append(
+                        seq_data.prompt_token_ids_array)
                     # need decoded tokens to create output histogram
-                    decode_output_tokens.append(seq_data.output_token_ids_array)
+                    decode_output_tokens.append(
+                        seq_data.output_token_ids_array)
                 # positions
                 position = seq_data.get_len() - 1
                 input_positions_list.append(position)
@@ -492,7 +497,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             output_tokens_tensor = make_tensor_with_pad(decode_output_tokens,
                                                         dtype=torch.int32,
                                                         device="cpu",
-                                                        pad=-1)                                            
+                                                        pad=-1)
 
         if compat_sampling_used:
             # seq_lens means how many tokens are in the sequence in total,
@@ -531,10 +536,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             top_k_list = top_pk_sampling_params["top_k"]
             top_p_list = top_pk_sampling_params["top_p"]
             presence_list = top_pk_sampling_params["presence_penalty"]
-            frequency_list = top_pk_sampling_params[
-                "frequency_penalty"]
-            repetition_list = top_pk_sampling_params[
-                "repetition_penalty"]
+            frequency_list = top_pk_sampling_params["frequency_penalty"]
+            repetition_list = top_pk_sampling_params["repetition_penalty"]
             seed_list = top_pk_sampling_params["seed"]
 
             # Pad sampling params to max_num_seqs in decode mode for
@@ -549,9 +552,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 temp_list = temp_list + [PADDING_TEMPERATURE] * batch_pad_len
                 top_k_list = top_k_list + [PADDING_TOP_K] * batch_pad_len
                 top_p_list = top_p_list + [PADDING_TOP_P] * batch_pad_len
-                presence_list = presence_list + [PADDING_PRESENCE_PENALTY] * batch_pad_len
-                frequency_list = frequency_list + [PADDING_FREQUENCY_PENALTY] * batch_pad_len
-                repetition_list = repetition_list + [PADDING_REPETITION_PENALTY] * batch_pad_len
+                presence_list = presence_list + [PADDING_PRESENCE_PENALTY
+                                                 ] * batch_pad_len
+                frequency_list = frequency_list + [PADDING_FREQUENCY_PENALTY
+                                                   ] * batch_pad_len
+                repetition_list = repetition_list + [
+                    PADDING_REPETITION_PENALTY
+                ] * batch_pad_len
                 seed_list = seed_list + [PADDING_SEED] * batch_pad_len
 
             tt_sampling_params = TTSamplingParams(
@@ -568,10 +575,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 temperature=top_pk_sampling_params["temperature"],
                 top_k=top_pk_sampling_params["top_k"],
                 top_p=top_pk_sampling_params["top_p"],
-                presence_penalty=top_pk_sampling_params[
-                    "presence_penalty"],
-                frequency_penalty=top_pk_sampling_params[
-                    "frequency_penalty"],
+                presence_penalty=top_pk_sampling_params["presence_penalty"],
+                frequency_penalty=top_pk_sampling_params["frequency_penalty"],
                 repetition_penalty=top_pk_sampling_params[
                     "repetition_penalty"],
                 seed=top_pk_sampling_params["seed"])
@@ -669,10 +674,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     dtype=torch.int32,
                                     device="cpu")
                     ])
-            
+
                     seq_ids_tensor = torch.cat([
                         seq_ids_tensor,
-                        torch.zeros(batch_pad_len, dtype=torch.int32, device="cpu")
+                        torch.zeros(batch_pad_len,
+                                    dtype=torch.int32,
+                                    device="cpu")
                     ])
 
             reset_batch = torch.any(seq_ids_tensor != self.prev_seq_ids_tensor)
@@ -982,9 +989,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
-            # Only needed when sampling on device: signals that decode batch has changed, 
-            # either due to a new user or 
-            # due to a user finishing decode and existing users getting re-shuffled
+            # Only needed when sampling on device:
+            # signals that decode batch has changed,
+            # either due to a new user or
+            # due to a user finishing decode and
+            # existing users getting re-shuffled
             if model_input.perform_device_sampling:
                 execute_model_kwargs["reset_batch"] = model_input.reset_batch
 
