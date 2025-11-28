@@ -660,6 +660,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ])
                 if prompt_tokens_tensor is not None:
+                    assert output_tokens_tensor is not None, (
+                        "output_tokens_tensor must be set whenever "
+                        "prompt_tokens_tensor is set")
                     prompt_tokens_tensor = torch.cat([
                         prompt_tokens_tensor,
                         torch.zeros(batch_pad_len,
@@ -675,12 +678,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                     device="cpu")
                     ])
 
-                    seq_ids_tensor = torch.cat([
-                        seq_ids_tensor,
-                        torch.zeros(batch_pad_len,
-                                    dtype=torch.int32,
-                                    device="cpu")
-                    ])
+                seq_ids_tensor = torch.cat([
+                    seq_ids_tensor,
+                    torch.zeros(batch_pad_len, dtype=torch.int32, device="cpu")
+                ])
 
             reset_batch = torch.any(seq_ids_tensor != self.prev_seq_ids_tensor)
             self.prev_seq_ids_tensor = seq_ids_tensor
