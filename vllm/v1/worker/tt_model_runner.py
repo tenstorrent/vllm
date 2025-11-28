@@ -3,7 +3,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Set, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, dict, set, Optional, Union, cast
 
 import torch
 import ttnn
@@ -73,8 +73,8 @@ class TTModelRunner:
         self.request_specific_rope = bool(self.model_config.uses_mrope)
         if self.request_specific_rope:
             # seq_id -> cached_req_data
-            self.cached_req_data: Dict[int, Dict[str, Any]] = {}
-            self.previous_req_id_set: Set[int] = set()
+            self.cached_req_data: dict[int, dict[str, Any]] = {}
+            self.previous_req_id_set: set[int] = set()
 
         # Because of multiprocessing, the config-dependent
         # class attributes might not have been set in this process,
@@ -318,9 +318,12 @@ class TTModelRunner:
 
         Returns list of dicts per-request:
         [
-          {"pixel_values": None, "image_grid_thw": None},  # for requests w/o mm_inputs
-          {"pixel_values": [pixel_values_1], "image_grid_thw": [grid_thw_1]},  # single mm_input
-          {"pixel_values": [pv2, pv3], "image_grid_thw": [thw2, thw3]},  # multiple mm_inputs
+          # for requests w/o mm_inputs:
+          {"pixel_values": None, "image_grid_thw": None},
+          # for requests w/ single mm_input:
+          {"pixel_values": [pixel_values_1], "image_grid_thw": [grid_thw_1]},
+          # for requests w/ multiple mm_inputs:
+          {"pixel_values": [pv2, pv3], "image_grid_thw": [thw2, thw3]},
         ]
         """
 
@@ -472,13 +475,17 @@ class TTModelRunner:
                         scheduler_batch_index, :]
             bitmask = reordered_bitmask
 
-        # Build req_ids as a list where the value at position i is the req_id with req_id_to_index[req_id] == i
+        # Build req_ids as a list where the value at
+        # position i is the req_id with req_id_to_index[req_id] == i
         req_ids = [None] * len(self.input_batch.req_id_to_index)
         for req_id, idx in self.input_batch.req_id_to_index.items():
             req_ids[idx] = req_id
 
-        # Remove cached rope_deltas data for any req_ids that are not in the current batch
-        if self.request_specific_rope and not is_prompt and self.cached_req_data:
+        # Remove cached rope_deltas data for any req_ids
+        # that are not in the current batch
+        if (self.request_specific_rope and
+                not is_prompt and
+                self.cached_req_data):
             req_ids_to_del = []
             for req_id in self.cached_req_data:
                 if req_id not in req_ids:
