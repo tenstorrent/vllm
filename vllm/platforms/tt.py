@@ -88,52 +88,12 @@ def register_tt_models():
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
-
-def check_tt_model_supported(model):
-    supported_models = [
-        "meta-llama/Llama-3.1-70B",
-        "meta-llama/Llama-3.1-70B-Instruct",
-        "meta-llama/Llama-3.1-8B",
-        "meta-llama/Llama-3.1-8B-Instruct",
-        "meta-llama/Llama-3.2-1B",
-        "meta-llama/Llama-3.2-1B-Instruct",
-        "meta-llama/Llama-3.2-3B",
-        "meta-llama/Llama-3.2-3B-Instruct",
-        "meta-llama/Llama-3.2-11B-Vision",
-        "meta-llama/Llama-3.2-11B-Vision-Instruct",
-        "meta-llama/Llama-3.2-90B-Vision-Instruct",
-        "meta-llama/Llama-3.3-70B",
-        "meta-llama/Llama-3.3-70B-Instruct",
-        "Qwen/Qwen2.5-7B",
-        "Qwen/Qwen2.5-7B-Instruct",
-        "Qwen/Qwen2.5-14B",
-        "Qwen/Qwen2.5-14B-Instruct",
-        "Qwen/Qwen2.5-32B",
-        "Qwen/Qwen2.5-32B-Instruct",
-        "Qwen/Qwen2.5-Coder-32B",
-        "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "Qwen/Qwen2.5-72B",
-        "Qwen/Qwen2.5-72B-Instruct",
-        "Qwen/Qwen2.5-VL-3B-Instruct",
-        "Qwen/Qwen2.5-VL-32B-Instruct",
-        "Qwen/Qwen2.5-VL-72B-Instruct",
-        "Qwen/Qwen3-0.6B",
-        "Qwen/Qwen3-1.7B",
-        "Qwen/Qwen3-4B",
-        "Qwen/Qwen3-8B",
-        "Qwen/Qwen3-14B",
-        "Qwen/Qwen3-32B",
-        "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
-        "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-        "mistralai/Mistral-7B-Instruct-v0.3",
-        "google/gemma-3-4b-it",
-        "google/gemma-3-27b-it",
-        "openai/gpt-oss-20b",
-        "openai/gpt-oss-120b",
-        "deepseek-ai/DeepSeek-R1-0528",
-    ]
-    assert model in supported_models, (
-        f"{model} is not in list of supported TT models")
+    # Optionally register test models if an environment variable is set
+    if os.getenv("VLLM_TT_ENABLE_TEST_MODELS") == "1":
+        ModelRegistry.register_model(
+            "TTDummyT3000MultiProcessModel",
+            "models.vllm_test_utils.t3000_multiproc_test.test_model:DummyT3000MultiProcessModel",
+        )
 
 
 class TTPlatform(Platform):
@@ -163,9 +123,6 @@ class TTPlatform(Platform):
         assert not vllm_config.cache_config.enable_prefix_caching, (
             "Automatic prefix caching is not yet supported for TT backend")
 
-        # Check if model is in list of supported models
-        check_tt_model_supported(vllm_config.model_config.model)
-
         # Import and register models from tt-metal
         register_tt_models()
 
@@ -184,6 +141,17 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+
+        # Verify that the TT architecture is registered in the model registry
+        from vllm import ModelRegistry
+        supported_archs = ModelRegistry.get_supported_archs()
+        if not any(arch_name in supported_archs for arch_name in arch_names):
+            tt_archs = sorted(
+                [arch for arch in supported_archs if arch.startswith("TT")])
+            raise ValueError(
+                f"No model architecture starting with 'TT' is registered for "
+                f"model: '{vllm_config.model_config.model}'. "
+                f"Available TT architectures: {tt_archs}")
 
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config
