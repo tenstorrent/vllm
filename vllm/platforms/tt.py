@@ -24,7 +24,7 @@ else:
 logger = init_logger(__name__)
 
 
-def register_tt_models():
+def register_tt_models(register_test_models=False) -> None:
     from vllm import ModelRegistry
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
@@ -89,11 +89,20 @@ def register_tt_models():
     )
 
     # Optionally register test models if an environment variable is set
-    if os.getenv("VLLM_TT_ENABLE_TEST_MODELS") == "1":
-        ModelRegistry.register_model(
-            "TTDummyT3000MultiProcessModel",
-            "models.vllm_test_utils.t3000_multiproc_test.test_model:DummyT3000MultiProcessModel",
-        )
+    if register_test_models:
+        register_tt_test_models()
+
+
+def register_tt_test_models():
+    """Register non-production TT models which are only used for testing.
+    """
+    from vllm import ModelRegistry
+
+    # Fake model for testing multi-process inference on T3000
+    ModelRegistry.register_model(
+        "TTDummyT3000MultiProcessModel",
+        "models.vllm_test_utils.t3000_multiproc_test.test_model:DummyT3000MultiProcessModel",
+    )
 
 
 class TTPlatform(Platform):
@@ -124,7 +133,13 @@ class TTPlatform(Platform):
             "Automatic prefix caching is not yet supported for TT backend")
 
         # Import and register models from tt-metal
-        register_tt_models()
+        override_tt_config = vllm_config.model_config.override_tt_config
+        register_test_models = False
+        if override_tt_config and "register_test_models" in override_tt_config:
+            register_test_models = override_tt_config["register_test_models"]
+            assert register_test_models in [True, False], \
+                f"Invalid option register_test_models: {register_test_models}"
+        register_tt_models(register_test_models)
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
@@ -148,10 +163,9 @@ class TTPlatform(Platform):
         if not any(arch_name in supported_archs for arch_name in arch_names):
             tt_archs = sorted(
                 [arch for arch in supported_archs if arch.startswith("TT")])
-            raise ValueError(
-                f"No model architecture starting with 'TT' is registered for "
-                f"model: '{vllm_config.model_config.model}'. "
-                f"Available TT architectures: {tt_archs}")
+            raise ValueError(f"No TT model architecture is registered for "
+                             f"model: '{vllm_config.model_config.model}'. "
+                             f"Available TT architectures: {tt_archs}")
 
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config
@@ -160,7 +174,6 @@ class TTPlatform(Platform):
         # TODO move this to tt_model_runner when request validation
         # stops depending on vllm_config
 
-        override_tt_config = vllm_config.model_config.override_tt_config
         if (override_tt_config is not None
                 and "sample_on_device_mode" in override_tt_config):
             sample_on_device_mode = override_tt_config["sample_on_device_mode"]
