@@ -307,7 +307,7 @@ class TTModelRunner:
             "Request can contain multiple inputs, \
             but each input can contain only one image!")
 
-    def _gather_multi_modal_inputs(self, scheduler_output) -> list:
+    def _gather_multi_modal_inputs(self, scheduler_output) -> dict:
         """
         Gather and batch multi-modal inputs from scheduled requests.
         #TODO: Currently only supports image inputs in the "pixel_values" field.
@@ -323,17 +323,15 @@ class TTModelRunner:
         ]
         """
 
-        multi_modal_kwargs_list: list[dict[str, Any]] = []
+        multi_modal_kwargs: MultiModalKwargs = {"pixel_values": [], "image_grid_thw": []}
 
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             req_state = self.requests[req_id]
 
             if not req_state.mm_inputs:
-                multi_modal_kwargs_list.append({
-                    "pixel_values": None,
-                    "image_grid_thw": None
-                })
+                multi_modal_kwargs["pixel_values"].append(None)
+                multi_modal_kwargs["image_grid_thw"].append(None)
                 continue
 
             pv_array = []
@@ -344,13 +342,11 @@ class TTModelRunner:
                 if "image_grid_thw" in mm_input:
                     image_grid_thw_array.append(mm_input["image_grid_thw"])
 
-            multi_modal_kwargs_list.append({
-                "pixel_values":
-                pv_array,
-                "image_grid_thw":
-                image_grid_thw_array
-            })
-        return multi_modal_kwargs_list
+            multi_modal_kwargs["pixel_values"].append(pv_array)
+            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
+
+        print(f"multi_modal_kwargs: {multi_modal_kwargs}")
+        return multi_modal_kwargs
 
     def _prepare_model_inputs(
             self, scheduler_output: "SchedulerOutput") -> TTModelInput:
@@ -450,7 +446,7 @@ class TTModelRunner:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
                 scheduler_output)
         else:
-            multi_modal_kwargs = []
+            multi_modal_kwargs = {}
 
         # If we're not using structured outputs, grammar_bitmask is None
         bitmask = scheduler_output.grammar_bitmask
@@ -819,8 +815,16 @@ class TTModelRunner:
 
         if not is_decode:
             kwargs["prompt_lens"] = model_input.prompt_lens
-            if model_input.multi_modal_kwargs:
-                kwargs["images"] = model_input.multi_modal_kwargs
+            kwargs.update(model_input.multi_modal_kwargs)
+            if len(batch_size_per_dp) > 1:
+                # TODO: the model should only require DP ranks, but passing
+                # "global" user ids instead for backwards compatibility.
+                stride = int(self.scheduler_config.max_num_seqs)
+                empty_slots = []
+                for dp_rank, sz in enumerate(batch_size_per_dp):
+                    for i in range(int(sz)):
+                        empty_slots.append(dp_rank * stride + i)
+                kwargs["empty_slots"] = empty_slots
         else:
             kwargs["start_pos"] = model_input.input_positions
         if self.sample_on_device_mode == "all" or (
@@ -843,7 +847,6 @@ class TTModelRunner:
                 for i, req_id in enumerate(model_input.req_ids):
                     self.requests[req_id].mrope_position_delta = \
                         rope_deltas[i].item()
-                    print(f"rope_deltas[{i}].item(): {rope_deltas[i].item()}")
             else:
                 tt_out = self.model.prefill_forward(**kwargs)
         else:
