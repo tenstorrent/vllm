@@ -1037,6 +1037,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if self.dp_kv_cache:
             # permute the tt_out
             next_token_ids = next_token_ids[self.perm_table_tensor.pop(0)]
+            # TODO(radras)
         return next_token_ids
 
     def _send_async_out(self, sampler_output, async_callback,
@@ -1060,13 +1061,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # TT backend does not support the advanced sampling parameters
         # such as logprobs.
 
-        zero_logprob = Logprob(0.0)
+        logprobs = [Logprob(0.0) for _ in seq_groups]
+        if isinstance(next_token_ids, tuple):
+            logprobs = [Logprob(lp) for lp in next_token_ids[1]]
+            next_token_ids = next_token_ids[0]
+
         sampler_outputs = []
         for batch_idx, seq_id in enumerate(seq_groups):
             next_token_id = int(next_token_ids[batch_idx])
             seq_outputs = [
                 SequenceOutput(seq_id, next_token_id,
-                               {next_token_id: zero_logprob})
+                               {next_token_id: logprobs[batch_idx]})
             ]
             sampler_outputs.append(
                 CompletionSequenceGroupOutput(seq_outputs, None))
