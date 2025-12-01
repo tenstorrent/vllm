@@ -440,7 +440,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         seq_lens: List[int] = []
         block_tables_list: List[List[int]] = []
         seq_groups_list: List[int] = []
-        top_pk_sampling_params: Dict[str, Any] = {}
+        sampling_params_dict: Dict[str, Any] = {}
         multi_modal_kwargs: Dict[str, Any] = {}
         if supports_multimodal(self.model) and is_prompt:
             multi_modal_kwargs = {"images": []}
@@ -586,7 +586,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # that it also supports non-uniform sampling
                 for key in SAMPLING_PARAM_KEYS:
                     value = getattr(sampling_params, key)
-                    top_pk_sampling_params.setdefault(key, []).append(value)
+                    sampling_params_dict.setdefault(key, []).append(value)
 
             else:
                 # uniform sampling - all requests must have same params
@@ -594,11 +594,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     key: getattr(sampling_params, key)
                     for key in SAMPLING_PARAM_KEYS
                 }
-                if len(top_pk_sampling_params) == 0:
-                    top_pk_sampling_params.update(param_bundle)
+                if len(sampling_params_dict) == 0:
+                    sampling_params_dict.update(param_bundle)
                 else:
                     for key, value in param_bundle.items():
-                        if top_pk_sampling_params[key] != value:
+                        if sampling_params_dict[key] != value:
                             # This should never happen, we always fall back
                             # to a different sampling implementation if needed
                             raise ValueError(
@@ -653,14 +653,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         elif (TTPlatform.non_greedy_decoding_on_device
               and perform_device_sampling):
             sampling_metadata = None
-            temp_list = top_pk_sampling_params["temperature"]
-            top_k_list = top_pk_sampling_params["top_k"]
-            top_p_list = top_pk_sampling_params["top_p"]
-            presence_list = top_pk_sampling_params["presence_penalty"]
-            frequency_list = top_pk_sampling_params["frequency_penalty"]
-            repetition_list = top_pk_sampling_params["repetition_penalty"]
-            seed_list = top_pk_sampling_params["seed"]
-            log_probs_list = top_pk_sampling_params["logprobs"]
+            temp_list = sampling_params_dict["temperature"]
+            top_k_list = sampling_params_dict["top_k"]
+            top_p_list = sampling_params_dict["top_p"]
+            presence_list = sampling_params_dict["presence_penalty"]
+            frequency_list = sampling_params_dict["frequency_penalty"]
+            repetition_list = sampling_params_dict["repetition_penalty"]
+            seed_list = sampling_params_dict["seed"]
+            log_probs_list = sampling_params_dict["logprobs"]
 
             # Pad sampling params to max_num_seqs in decode mode for
             # proper permutation
@@ -692,15 +692,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
-                temperature=top_pk_sampling_params["temperature"],
-                top_k=top_pk_sampling_params["top_k"],
-                top_p=top_pk_sampling_params["top_p"],
-                presence_penalty=top_pk_sampling_params["presence_penalty"],
-                frequency_penalty=top_pk_sampling_params["frequency_penalty"],
-                repetition_penalty=top_pk_sampling_params[
+                temperature=sampling_params_dict["temperature"],
+                top_k=sampling_params_dict["top_k"],
+                top_p=sampling_params_dict["top_p"],
+                presence_penalty=sampling_params_dict["presence_penalty"],
+                frequency_penalty=sampling_params_dict["frequency_penalty"],
+                repetition_penalty=sampling_params_dict[
                     "repetition_penalty"],
-                seed=top_pk_sampling_params["seed"],
-                log_probs=top_pk_sampling_params["logprobs"])
+                seed=sampling_params_dict["seed"],
+                log_probs=sampling_params_dict["logprobs"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
