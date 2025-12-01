@@ -1036,8 +1036,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                                                is_tokens=True)
         if self.dp_kv_cache:
             # permute the tt_out
-            next_token_ids = next_token_ids[self.perm_table_tensor.pop(0)]
-            # TODO(radras)
+            perm_table_tensor = self.perm_table_tensor.pop(0)
+            if isinstance(next_token_ids, tuple):
+                next_token_ids = (next_token_ids[0][perm_table_tensor],
+                                  next_token_ids[1][perm_table_tensor])
+            else:
+                next_token_ids = next_token_ids[perm_table_tensor]
         return next_token_ids
 
     def _send_async_out(self, sampler_output, async_callback,
