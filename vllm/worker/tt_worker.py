@@ -618,7 +618,7 @@ def get_mesh_grid(local_dp_rank=0):
 
 def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
     assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
-    mesh_grid = get_mesh_grid(local_dp_rank)
+    mesh_grid = (8, 4) #get_mesh_grid(local_dp_rank)
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
     device_params = device_params_from_override_tt_config(
@@ -635,7 +635,10 @@ def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
     )
     logger.info("multidevice with %d devices and grid %s is created",
                 mesh_device.get_num_devices(), mesh_grid)
-    return mesh_device
+    submesh = mesh_device.create_submeshes(ttnn.MeshShape(8, 1))[0]
+    submesh.reshape(ttnn.MeshShape(1, 8))
+
+    return submesh
 
 
 def close_mesh_device(mesh_device, override_tt_config):
