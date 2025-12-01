@@ -312,14 +312,19 @@ class TTModelRunner:
         Gather and batch multi-modal inputs from scheduled requests.
         #TODO: Currently only supports image inputs in the "pixel_values" field.
 
-        Returns list of dicts per-request:
+        Returns dict, each value is a list of lists of tensors per-request:
         [
           # for requests w/o mm_inputs:
-          {"pixel_values": None, "image_grid_thw": None},
+          {"pixel_values": None,
+           "image_grid_thw": None},
           # for requests w/ single mm_input:
-          {"pixel_values": [pixel_values_1], "image_grid_thw": [grid_thw_1]},
+          {"pixel_values": [[pv_user_1],[pv_user_2]],
+          "image_grid_thw": [[ig_user_1],[ig_user_2]]},
           # for requests w/ multiple mm_inputs:
-          {"pixel_values":[pv2, pv3],"image_grid_thw":[grid_thw_2,grid_thw_3]},
+          {"pixel_values": [[pv_user_1_image_1, pv_user_1_image_2],
+                            [pv_user_2_image_1, pv_user_2_image_2]],
+           "image_grid_thw":[[ig_user_1_image_1, ig_user_1_image_2],
+                             [ig_user_2_image_1, ig_user_2_image_2]]},
         ]
         """
 
@@ -859,16 +864,15 @@ class TTModelRunner:
                 tt_out = self.model.prefill_forward(**kwargs)
         else:
             # TODO: Add encoder-decoder support
+            enc_dec_kwargs: dict[str, Any] = {}
             if self.request_specific_rope:
                 # Gather and pass rope_deltas from prefill step to decode
-                enc_dec_kwargs: dict[str, Optional[list[Any]]] = {
+                enc_dec_kwargs = {
                     "rope_deltas_all_users": [
                         self.requests[req_id].mrope_position_delta
                         for req_id in model_input.req_ids
                     ]
                 }
-            else:
-                enc_dec_kwargs = {}
             tt_out = self.model.decode_forward(**kwargs,
                                                **enc_dec_kwargs,
                                                enable_trace=self.trace_mode,
