@@ -737,11 +737,17 @@ class TTModelRunner:
 
         if self.model_config.is_multimodal_model and not is_decode:
             # Gather multi-modal inputs from all DP ranks
-            multi_modal_kwargs: list[dict[str, Any]] = []
+            multi_modal_kwargs: MultiModalKwargs = {
+                "pixel_values": [],
+                "image_grid_thw": []
+            }
             for mi in inputs:
-                multi_modal_kwargs.extend(mi.multi_modal_kwargs)
+                multi_modal_kwargs["pixel_values"].append(
+                    mi.multi_modal_kwargs["pixel_values"])
+                multi_modal_kwargs["image_grid_thw"].append(
+                    mi.multi_modal_kwargs["image_grid_thw"])
         else:
-            multi_modal_kwargs = []
+            multi_modal_kwargs = {}
 
         # Build req_ids as a list where the value at
         # position i is the req_id with req_id_to_index[req_id] == i
