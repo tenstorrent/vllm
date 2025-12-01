@@ -71,10 +71,6 @@ class TTModelRunner:
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keeping "rope_deltas" between prefill/decode phases.
         self.request_specific_rope = bool(self.model_config.uses_mrope)
-        if self.request_specific_rope:
-            # seq_id -> cached_req_data
-            self.cached_req_data: dict[str, dict[str, Any]] = {}
-            self.previous_req_id_set: set[str] = set()
 
         # Because of multiprocessing, the config-dependent
         # class attributes might not have been set in this process,
@@ -345,7 +341,8 @@ class TTModelRunner:
             for mm_input in req_state.mm_inputs:
                 self._validate_mm_input(mm_input)
                 pv_array.append(mm_input["pixel_values"])
-                image_grid_thw_array.append(mm_input["image_grid_thw"])
+                if "image_grid_thw" in mm_input:
+                    image_grid_thw_array.append(mm_input["image_grid_thw"])
 
             multi_modal_kwargs_list.append({
                 "pixel_values":
@@ -482,17 +479,6 @@ class TTModelRunner:
         req_ids: list[str] = [""] * len(self.input_batch.req_id_to_index)
         for req_id, idx in self.input_batch.req_id_to_index.items():
             req_ids[idx] = req_id
-
-        # Remove cached rope_deltas data for any req_ids
-        # that are not in the current batch
-        if (self.request_specific_rope and not is_prompt
-                and self.cached_req_data):
-            req_ids_to_del: list[str] = []
-            for req_id in self.cached_req_data:
-                if req_id not in req_ids:
-                    req_ids_to_del.append(req_id)
-            for req_id in req_ids_to_del:
-                del self.cached_req_data[req_id]
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -833,16 +819,8 @@ class TTModelRunner:
 
         if not is_decode:
             kwargs["prompt_lens"] = model_input.prompt_lens
-            kwargs["images"] = model_input.multi_modal_kwargs
-            if len(batch_size_per_dp) > 1:
-                # TODO: the model should only require DP ranks, but passing
-                # "global" user ids instead for backwards compatibility.
-                stride = int(self.scheduler_config.max_num_seqs)
-                empty_slots = []
-                for dp_rank, sz in enumerate(batch_size_per_dp):
-                    for i in range(int(sz)):
-                        empty_slots.append(dp_rank * stride + i)
-                kwargs["empty_slots"] = empty_slots
+            if model_input.multi_modal_kwargs:
+                kwargs["images"] = model_input.multi_modal_kwargs
         else:
             kwargs["start_pos"] = model_input.input_positions
         if self.sample_on_device_mode == "all" or (
@@ -863,26 +841,21 @@ class TTModelRunner:
                 tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
                 # Store rope_deltas for each prefilled request
                 for i, req_id in enumerate(model_input.req_ids):
-                    self.cached_req_data[req_id] = {
-                        "rope_deltas": rope_deltas[i].item(),
-                    }
+                    self.requests[req_id].mrope_position_delta = \
+                        rope_deltas[i].item()
+                    print(f"rope_deltas[{i}].item(): {rope_deltas[i].item()}")
             else:
                 tt_out = self.model.prefill_forward(**kwargs)
         else:
             # TODO: Add encoder-decoder support
             if self.request_specific_rope:
                 # Gather and pass rope_deltas from prefill step to decode
-                if any(req_id not in self.previous_req_id_set
-                       for req_id in model_input.req_ids):
-                    enc_dec_kwargs: dict[str, Optional[list[Any]]] = {
-                        "rope_deltas_all_users": [
-                            self.cached_req_data[req_id]["rope_deltas"]
-                            for req_id in model_input.req_ids
-                        ]
-                    }
-                else:
-                    enc_dec_kwargs = {"rope_deltas_all_users": None}
-                self.previous_req_id_set = set(model_input.req_ids)
+                enc_dec_kwargs: dict[str, Optional[list[Any]]] = {
+                    "rope_deltas_all_users": [
+                        self.requests[req_id].mrope_position_delta
+                        for req_id in model_input.req_ids
+                    ]
+                }
             else:
                 enc_dec_kwargs = {}
             tt_out = self.model.decode_forward(**kwargs,
