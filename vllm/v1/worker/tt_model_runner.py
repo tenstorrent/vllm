@@ -41,7 +41,7 @@ class TTModelInput:
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
     tt_sampling_params: Union[TTSamplingParams, list[TTSamplingParams]]
     req_ids: list[str]  # list of request IDs for the batch
-    multi_modal_kwargs: list[dict[str, Any]]
+    multi_modal_kwargs: dict[str, Any]
 
     # always lists: single-element for non-DP, multi-element for DP
     # If not using structured outputs, [None]
@@ -307,7 +307,7 @@ class TTModelRunner:
             "Request can contain multiple inputs, \
             but each input can contain only one image!")
 
-    def _gather_multi_modal_inputs(self, scheduler_output) -> dict:
+    def _gather_multi_modal_inputs(self, scheduler_output) -> dict[str, Any]:
         """
         Gather and batch multi-modal inputs from scheduled requests.
         #TODO: Currently only supports image inputs in the "pixel_values" field.
