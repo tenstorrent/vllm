@@ -68,15 +68,41 @@ def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample
 
 def create_sampling_params(sample_on_device_mode):
     """
-        Called from create_warmup_decode_input_parameters.
-        The function is called for the needs of both v0 and v1.
+        Returns a list of sampling parameter configurations
+        that should be compiled/traced for the model based on device capabilities.
     """
+    # None is for host sampling
+    sampling_configs = [None]
+
     if not sample_on_device_mode:
-        return None
+        return sampling_configs
+    
     if TTPlatform.non_greedy_decoding_on_device:
-        return TTSamplingParams(temperature=1.0, top_k=10, top_p=0.9)
+        
+        # 1. Greedy sampling
+        sampling_configs.append(
+            TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0)
+        )
+        
+        # 2. Non-greedy sampling (one representative example with penalties)
+        sampling_configs.append(
+            TTSamplingParams(
+                temperature=1.0,
+                top_k=10,
+                top_p=0.9,
+                presence_penalty=PADDING_PRESENCE_PENALTY,
+                frequency_penalty=PADDING_FREQUENCY_PENALTY,
+                repetition_penalty=PADDING_REPETITION_PENALTY
+            )
+        )
+        
     else:
-        return TTSamplingParams(temperature=0.0, top_k=1, top_p=0.0)
+        # Basic on-device sampling only supports greedy
+        sampling_configs.append(
+            TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0)
+        )
+    
+    return sampling_configs
 
 def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
     # NOTE: Also called from vLLM v1
@@ -89,6 +115,7 @@ def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
         "sampling_params": sampling_params,
     }
     
+    # it is up to the model to handle the different sampling configurations
     logger.info("Warmup run for prefill started")
     model.warmup_model_prefill(**local_kwargs)
     logger.info("Warmup run for prefill finished")
@@ -104,12 +131,16 @@ def decode_warmup(model, kv_cache, trace_mode, max_batch_size, num_gpu_blocks, s
         "kv_cache": kv_cache,
         "enable_trace": trace_mode,
         "read_from_device": True,
-        "sampling_params": sampling_params,
+        "sampling_params": None, #to be filled
     }
-    logger.info(f"Warmup run for decode with tokens: {tokens.shape}, start_pos: {start_pos.shape}, page_table: {page_table.shape}")
-    logger.info("Warmup run for decode started")
-    model.decode_forward(**local_kwargs)
-    logger.info("Warmup run for decode finished")
+
+    for s in sampling_params:
+        local_kwargs["sampling_params"] = s
+        logger.info(f"Warmup run for decode with tokens: {tokens.shape}, start_pos: {start_pos.shape}, page_table: {page_table.shape}")
+        logger.info(f"Sampling params used for decode warmup: {s}")
+        logger.info("Warmup run for decode started")
+        model.decode_forward(**local_kwargs)
+        logger.info("Warmup run for decode finished")
 
 @dataclass(frozen=True)
 class TTSamplingParams:
