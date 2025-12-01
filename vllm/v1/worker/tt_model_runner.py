@@ -323,7 +323,10 @@ class TTModelRunner:
         ]
         """
 
-        multi_modal_kwargs: MultiModalKwargs = {"pixel_values": [], "image_grid_thw": []}
+        multi_modal_kwargs: MultiModalKwargs = {
+            "pixel_values": [],
+            "image_grid_thw": []
+        }
 
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
@@ -345,7 +348,6 @@ class TTModelRunner:
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
 
-        print(f"multi_modal_kwargs: {multi_modal_kwargs}")
         return multi_modal_kwargs
 
     def _prepare_model_inputs(
