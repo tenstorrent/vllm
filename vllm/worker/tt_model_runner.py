@@ -579,8 +579,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 top_p=sampling_params_dict["top_p"],
                 presence_penalty=sampling_params_dict["presence_penalty"],
                 frequency_penalty=sampling_params_dict["frequency_penalty"],
-                repetition_penalty=sampling_params_dict[
-                    "repetition_penalty"],
+                repetition_penalty=sampling_params_dict["repetition_penalty"],
                 seed=sampling_params_dict["seed"],
                 log_probs=sampling_params_dict["logprobs"])
 
