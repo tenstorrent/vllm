@@ -376,17 +376,16 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     def __del__(self):
         # Delete model runner first in case there are model artifacts
-        # with suppress(AttributeError):
-        # attributes may be already torn down when destructor is called
-        del self.model_runner
+        with suppress(AttributeError):
+            del self.model_runner
 
-        # if self.mesh_device:
-            # close_mesh_device(self.mesh_device,
-            #                     self.model_config.override_tt_config)
-            # del self.mesh_device
+        with suppress(AttributeError):
+            close_mesh_device(self.mesh_device,
+                              self.model_config.override_tt_config)
+            del self.mesh_device
 
-        # if hasattr(super(), '__del__'):
-        #     super().__del__()  # type: ignore
+        with suppress(AttributeError):
+            super().__del__()
 
 
 def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
