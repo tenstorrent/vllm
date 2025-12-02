@@ -70,6 +70,8 @@ class TTModelRunner:
         # Detect if the model has "mrope" rope_scaling type.
         # mrope requires keeping "rope_deltas" between prefill/decode phases.
         self.request_specific_rope = bool(self.model_config.uses_mrope)
+        if self.request_specific_rope:
+            self.previous_req_ids: set[str] = set()
 
         # Because of multiprocessing, the config-dependent
         # class attributes might not have been set in this process,
@@ -853,13 +855,19 @@ class TTModelRunner:
             # TODO: Add encoder-decoder support
             enc_dec_kwargs: dict[str, Any] = {}
             if self.request_specific_rope:
-                # Gather and pass rope_deltas from prefill step to decode
-                enc_dec_kwargs = {
-                    "rope_deltas_all_users": [
-                        self.requests[req_id].mrope_position_delta
-                        for req_id in self.input_batch.req_ids
-                    ]
-                }
+                if any(req_id not in self.previous_req_ids
+                       for req_id in self.input_batch.req_ids):
+                    # Gather and pass rope_deltas from prefill step to decode
+                    enc_dec_kwargs = {
+                        "rope_deltas_all_users": [
+                            self.requests[req_id].mrope_position_delta
+                            for req_id in self.input_batch.req_ids
+                        ]
+                    }
+                else:
+                    enc_dec_kwargs = {"rope_deltas_all_users": None}
+                self.previous_req_ids = set(self.input_batch.req_ids)
+
             tt_out = self.model.decode_forward(**kwargs,
                                                **enc_dec_kwargs,
                                                enable_trace=self.trace_mode,
