@@ -375,8 +375,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             penalties_or_seed_in_batch
                             or current_value is not None)
                     elif key == "logprobs":
-                        assert current_value in [None, 1], (
-                            "Only logprobs=1 supported")
+                        assert current_value in [
+                            None, 1
+                        ], ("Only logprobs=1 supported")
                         current_value = bool(current_value)
                     if key not in param_values:
                         param_values[key] = current_value
