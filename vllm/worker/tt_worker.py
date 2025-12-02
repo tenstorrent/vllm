@@ -388,6 +388,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         if hasattr(super(), '__del__'):
             super().__del__()  # type: ignore
 
+
 def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we 
