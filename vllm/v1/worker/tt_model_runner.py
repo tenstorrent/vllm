@@ -40,7 +40,6 @@ class TTModelInput:
     block_tables: torch.Tensor
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
     tt_sampling_params: Union[TTSamplingParams, list[TTSamplingParams]]
-    req_ids: list[str]  # list of request IDs for the batch
     multi_modal_kwargs: dict[str, Any]
 
     # always lists: single-element for non-DP, multi-element for DP
@@ -310,7 +309,9 @@ class TTModelRunner:
     def _gather_multi_modal_inputs(self, scheduler_output) -> dict[str, Any]:
         """
         Gather and batch multi-modal inputs from scheduled requests.
-        #TODO: Currently only supports image inputs in the "pixel_values" field.
+
+        Currently only supports image inputs in the "pixel_values" and
+        "image_grid_thw" fields.
 
         Returns dict, each value is a list of lists of tensors per-request:
         [
@@ -347,8 +348,8 @@ class TTModelRunner:
             for mm_input in req_state.mm_inputs:
                 self._validate_mm_input(mm_input)
                 pv_array.append(mm_input["pixel_values"])
-                if "image_grid_thw" in mm_input:
-                    image_grid_thw_array.append(mm_input["image_grid_thw"])
+                image_grid_thw_array.append(mm_input.get("image_grid_thw",
+                    None))
 
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
@@ -477,12 +478,6 @@ class TTModelRunner:
                         scheduler_batch_index, :]
             bitmask = reordered_bitmask
 
-        # Build req_ids as a list where the value at
-        # position i is the req_id with req_id_to_index[req_id] == i
-        req_ids: list[str] = [""] * len(self.input_batch.req_id_to_index)
-        for req_id, idx in self.input_batch.req_id_to_index.items():
-            req_ids[idx] = req_id
-
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -490,7 +485,6 @@ class TTModelRunner:
             block_tables=block_tables,
             unpadded_batch_size=num_reqs,
             tt_sampling_params=tt_sampling_params,
-            req_ids=req_ids,
             multi_modal_kwargs=multi_modal_kwargs,
             grammar_bitmask=[bitmask],  # wrap to match DP case
         )
@@ -754,12 +748,6 @@ class TTModelRunner:
         else:
             multi_modal_kwargs = {}
 
-        # Build req_ids as a list where the value at
-        # position i is the req_id with req_id_to_index[req_id] == i
-        req_ids: list[str] = [""] * len(self.input_batch.req_id_to_index)
-        for req_id, idx in self.input_batch.req_id_to_index.items():
-            req_ids[idx] = req_id
-
         if os.environ.get("DP_GATHER_DEBUG") == "1":
             logger.info("batch_size_per_dp=%s", batch_size_per_dp)
         merged = TTModelInput(
@@ -769,7 +757,6 @@ class TTModelRunner:
             block_tables=block_tables,
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=sampling_params_per_dp,
-            req_ids=req_ids,
             multi_modal_kwargs=multi_modal_kwargs,
             grammar_bitmask=grammar_bitmask_list,
         )
@@ -857,7 +844,7 @@ class TTModelRunner:
             if self.request_specific_rope:
                 tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
                 # Store rope_deltas for each prefilled request
-                for i, req_id in enumerate(model_input.req_ids):
+                for i, req_id in enumerate(self.input_batch.req_ids):
                     self.requests[req_id].mrope_position_delta = \
                         rope_deltas[i].item()
             else:
@@ -870,7 +857,7 @@ class TTModelRunner:
                 enc_dec_kwargs = {
                     "rope_deltas_all_users": [
                         self.requests[req_id].mrope_position_delta
-                        for req_id in model_input.req_ids
+                        for req_id in self.input_batch.req_ids
                     ]
                 }
             tt_out = self.model.decode_forward(**kwargs,
