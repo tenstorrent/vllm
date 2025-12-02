@@ -348,8 +348,8 @@ class TTModelRunner:
             for mm_input in req_state.mm_inputs:
                 self._validate_mm_input(mm_input)
                 pv_array.append(mm_input["pixel_values"])
-                image_grid_thw_array.append(mm_input.get("image_grid_thw",
-                    None))
+                image_grid_thw_array.append(
+                    mm_input.get("image_grid_thw", None))
 
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
