@@ -67,7 +67,7 @@ class TTSamplingParams:
     frequency_penalty: Optional[Union[float, List[float]]] = 0.0
     repetition_penalty: Optional[Union[float, List[float]]] = 1.0
     seed: Optional[Union[int, List[Optional[int]]]] = 0
-    log_probs: Optional[Union[bool, List[bool]]] = False
+    enable_log_probs: Optional[Union[bool, List[bool]]] = False
 
 
 @dataclass(frozen=True)
@@ -570,7 +570,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 frequency_penalty=frequency_list,
                 repetition_penalty=repetition_list,
                 seed=seed_list,
-                log_probs=log_probs_list)
+                enable_log_probs=log_probs_list)
         else:
             sampling_metadata = None
             tt_sampling_params = TTSamplingParams(
@@ -581,7 +581,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 frequency_penalty=sampling_params_dict["frequency_penalty"],
                 repetition_penalty=sampling_params_dict["repetition_penalty"],
                 seed=sampling_params_dict["seed"],
-                log_probs=sampling_params_dict["logprobs"])
+                enable_log_probs=sampling_params_dict["logprobs"])
 
         # Remove cached encoder-decoder data
         # for any seq ids that are not in the current batch
@@ -1227,7 +1227,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                 frequency_penalty=permuted_frequency,
                                 repetition_penalty=permuted_repetition,
                                 seed=permuted_seed,
-                                log_probs=permuted_log_probs)
+                                enable_log_probs=permuted_log_probs)
 
             tt_out = self.model.decode_forward(**execute_model_kwargs,
                                                **enc_dec_kwargs,
