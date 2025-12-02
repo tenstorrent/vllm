@@ -1183,6 +1183,9 @@ class TTModelRunner:
                 # _prepare_model_inputs; for DP after inputs are gathered).
                 kwargs["reset_batch"] = model_input.reset_batch
 
+            joint_bitmask = self.prepare_bitmask_for_device(is_decode, batch_size_per_dp, model_input.grammar_bitmask)
+            kwargs["bitmask"] = joint_bitmask
+
         # Execute model
         if not is_decode:
             if self.request_specific_rope:
@@ -1380,6 +1383,32 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp
+
+    def prepare_bitmask_for_device(
+            self, is_decode: bool, batch_size_per_dp: list[int],
+            grammar_bitmask_list: list[Optional[torch.Tensor]]
+    ) -> torch.Tensor:
+        """Join the bitmasks from all DP ranks to match tokens shape"""
+
+        has_any_structured = any(grammar_bitmask_list)
+        if not has_any_structured:
+            return None
+
+        # The bitmasks are already padded is we are in decode
+        # so we just need to turn none into ones
+
+        to_concat = []
+        for dp_rank, sz in enumerate(batch_size_per_dp):
+            if grammar_bitmask_list[dp_rank] is not None:
+                to_concat.append(grammar_bitmask_list[dp_rank])
+            else:
+                length = self.scheduler_config.max_num_seqs if is_decode else sz
+                dummy = torch.zeros((length, self.bitmask_size), dtype=torch.int32)
+                dummy = torch.bitwise_not(dummy)
+                to_concat.append(dummy)
+
+        joint_bitmask = torch.cat(to_concat, dim=0)
+        return joint_bitmask
 
     def apply_grammar_bitmask(self, logits: torch.Tensor,
                               grammar_bitmask: torch.Tensor) -> None:
