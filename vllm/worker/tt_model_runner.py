@@ -370,11 +370,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         penalties_or_seed_in_batch = (
                             penalties_or_seed_in_batch
                             or current_value != PENALTY_PARAM_DEFAULTS[key])
-                    elif key == "seed":
-                        penalties_or_seed_in_batch = (
-                            penalties_or_seed_in_batch
-                            or current_value is not None)
-                    elif key == "logprobs":
+                    elif key == "seed" or key == "logprobs":
                         penalties_or_seed_in_batch = (
                             penalties_or_seed_in_batch
                             or current_value is not None)
