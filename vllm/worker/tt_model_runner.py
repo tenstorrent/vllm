@@ -370,7 +370,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         non_default_sampling_params_in_batch = (
                             non_default_sampling_params_in_batch
                             or current_value != PENALTY_PARAM_DEFAULTS[key])
-                    elif key == "seed" or key == "logprobs":
+                    elif key in ["seed", "logprobs"]:
                         non_default_sampling_params_in_batch = (
                             non_default_sampling_params_in_batch
                             or current_value is not None)
