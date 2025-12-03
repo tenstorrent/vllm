@@ -66,7 +66,7 @@ def register_tt_models(register_test_models=False) -> None:
     else:
         raise ValueError(
             f"Unsupported TT Qwen3 version: {qwen3_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy]")
+            "pick one of [tt_transformers, qwen3_32b_galaxy]")
     
     ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen3_text)
 
