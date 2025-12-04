@@ -1390,7 +1390,7 @@ class TTModelRunner:
     ) -> torch.Tensor:
         """Join the bitmasks from all DP ranks to match tokens shape"""
 
-        has_any_structured = any(grammar_bitmask_list)
+        has_any_structured = any(x is not None for x in grammar_bitmask_list)
         if not has_any_structured:
             return None
 
