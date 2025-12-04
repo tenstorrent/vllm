@@ -35,24 +35,30 @@ class XlaQKVParallelLinear(nn.Module):
         self.k_bias: Optional[Parameter]
         self.v_bias: Optional[Parameter]
         self._load_weights_from_qkv_linear(qkv_linear)
+        self._move_tensors_to_xla()
         if mesh is not None:
             self._shard_weight(mesh)
 
-    def _shard_weight(self, mesh: "xs.Mesh"):
+    def _move_tensors_to_xla(self):
         self.q_weight = Parameter(self.q_weight.to('xla'), requires_grad=False)
         self.k_weight = Parameter(self.k_weight.to('xla'), requires_grad=False)
         self.v_weight = Parameter(self.v_weight.to('xla'), requires_grad=False)
+        if self.q_bias is not None:
+            assert self.k_bias is not None and self.v_bias is not None, \
+                "QKVParallelLinear should have q, k, and v biases together."
+            self.q_bias = Parameter(self.q_bias.to('xla'), requires_grad=False)
+            self.k_bias = Parameter(self.k_bias.to('xla'), requires_grad=False)
+            self.v_bias = Parameter(self.v_bias.to('xla'), requires_grad=False)
+
+    def _shard_weight(self, mesh: "xs.Mesh"):
         xs.mark_sharding(self.q_weight, mesh, ('x', None))
         xs.mark_sharding(self.k_weight, mesh, ('x', None))
         xs.mark_sharding(self.v_weight, mesh, ('x', None))
         if self.q_bias is not None:
             assert self.k_bias is not None and self.v_bias is not None, \
                 "QKVParallelLinear should have q, k, and v biases together."
-            self.q_bias = Parameter(self.q_bias.to('xla'), requires_grad=False)
             xs.mark_sharding(self.q_bias, mesh, ('x', ))
-            self.k_bias = Parameter(self.k_bias.to('xla'), requires_grad=False)
             xs.mark_sharding(self.k_bias, mesh, ('x', ))
-            self.v_bias = Parameter(self.v_bias.to('xla'), requires_grad=False)
             xs.mark_sharding(self.v_bias, mesh, ('x', ))
 
     def _load_weights_from_qkv_linear(self, qkv_linear: nn.Module):
@@ -112,7 +118,8 @@ class XlaQKVParallelLinear(nn.Module):
 def partition_column_parallel_linear(layer: torch.nn.Module,
                                      mesh: xs.Mesh) -> torch.nn.Module:
     assert isinstance(layer, ColumnParallelLinear)
-    xs.mark_sharding(layer.weight, mesh, ('x', None))
+    if mesh is not None:
+        xs.mark_sharding(layer.weight, mesh, ('x', None))
     logger.debug("Applied column-parallel sharding to %s", layer)
     return layer
 
@@ -120,7 +127,8 @@ def partition_column_parallel_linear(layer: torch.nn.Module,
 def partition_row_parallel_linear(layer: torch.nn.Module,
                                   mesh: xs.Mesh) -> torch.nn.Module:
     assert isinstance(layer, RowParallelLinear)
-    xs.mark_sharding(layer.weight, mesh, (None, 'x'))
+    if mesh is not None:
+        xs.mark_sharding(layer.weight, mesh, (None, 'x'))
     logger.debug("Applied row-parallel sharding to %s", layer)
     return layer
 
