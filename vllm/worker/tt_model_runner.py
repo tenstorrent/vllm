@@ -542,7 +542,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             frequency_list = sampling_params_dict["frequency_penalty"]
             repetition_list = sampling_params_dict["repetition_penalty"]
             seed_list = sampling_params_dict["seed"]
-            log_probs_list = sampling_params_dict["logprobs"]
+
+            for lp in sampling_params_dict["logprobs"]:
+                assert lp in [None, 1], (
+                    "TT device sampling only supports logprobs=None or 1")
+            log_probs_list = [bool(lp) for lp in sampling_params_dict["logprobs"]]
 
             # Pad sampling params to max_num_seqs in decode mode for
             # proper permutation
