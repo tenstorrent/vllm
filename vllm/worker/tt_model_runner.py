@@ -1383,6 +1383,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         tt_out = tt_out[perm_table_tensor]
 
         if model_input.compat_sampling_used:
+            # discarding dummy logprobs
+            if isinstance(tt_out, tuple):
+                tt_out, _ = tt_out
+
             # compat sampling is only supported on host
             tt_logits = tt_out[:model_input.unpadded_batch_size,
                                -1, :]  # [unpadded batch, vocab]
