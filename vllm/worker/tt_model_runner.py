@@ -1275,6 +1275,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             return sampler_output
         else:
             if not model_input.perform_device_sampling:
+                # discarding dummy logprobs
+                tt_out, _ = tt_out
+
                 # unpadded batch, vocab of last token
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
                 assert model_input.tt_sampling_params is not None
