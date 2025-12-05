@@ -1371,7 +1371,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = self.model.process_decode_output_host(
                     tt_out, is_tokens=model_input.perform_device_sampling)
                 if self.dp_kv_cache:
-                    tt_out = tt_out[perm_table_tensor]
+                    if isinstance(tt_out, tuple):
+                        logits, logprobs = tt_out
+                        logits = logits[perm_table_tensor]
+                        logprobs = logprobs[perm_table_tensor]
+                        tt_out = (logits, logprobs)
+                    else:
+                        tt_out = tt_out[perm_table_tensor]
 
         if model_input.compat_sampling_used:
             # compat sampling is only supported on host
