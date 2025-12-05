@@ -1338,7 +1338,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                             for i in inverse_perm_indices
                         ]
                         permuted_log_probs = [
-                            tt_sampling_params.log_probs[i]
+                            tt_sampling_params.enable_log_probs[i]
                             for i in inverse_perm_indices
                         ]
                         execute_model_kwargs[
