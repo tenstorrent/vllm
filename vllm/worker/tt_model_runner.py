@@ -1396,7 +1396,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             if not model_input.perform_device_sampling:
                 # discarding dummy logprobs
-                tt_out, _ = tt_out
+                if isinstance(tt_out, tuple):
+                    tt_out, _ = tt_out
 
                 # unpadded batch, vocab of last token
                 next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
