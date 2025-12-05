@@ -874,7 +874,8 @@ class TTModelRunner:
                                                read_from_device=True)
             # tt_out is a tuple of (logits, logprobs)
             # v1 currently doesn't handle logprobs from TT models
-            tt_out, _ = tt_out
+            if isinstance(tt_out, tuple):
+                tt_out = tt_out[0]
 
         # The model input we got here may come from
         # concatenating multiple DP ranks.
