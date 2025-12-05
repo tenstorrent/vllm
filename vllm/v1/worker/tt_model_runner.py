@@ -393,89 +393,19 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
-        print("=== InputBatch Contents ===")
-        print("PROMPT" if is_prompt else "DECODE")
-        print(f"max_num_reqs: {input_batch.max_num_reqs}")
-
-        print("\ntoken_ids_cpu:")
-        print(f"  shape: {input_batch.token_ids_cpu.shape}")
-        print(f"  contents:\n{input_batch.token_ids_cpu}")
-
-        print("\nnum_tokens:")
-        print(f"  shape: {input_batch.num_tokens.shape}")
-        print(f"  contents:\n{input_batch.num_tokens}")
-
-        print("\nnum_prompt_tokens:")
-        print(f"  shape: {input_batch.num_prompt_tokens.shape}")
-        print(f"  contents:\n{input_batch.num_prompt_tokens}")
-
-        print("\nnum_computed_tokens_cpu:")
-        print(f"  shape: {input_batch.num_computed_tokens_cpu.shape}")
-        print(f"  contents:\n{input_batch.num_computed_tokens_cpu}")
-
-        print("\nblock_table.block_tables:")
-        print(f"  length: {len(input_batch.block_table.block_tables)}")
-        for i, bt in enumerate(input_batch.block_table.block_tables):
-            cpu_tensor = bt.get_cpu_tensor()
-            print(f"    block_tables[{i}].get_cpu_tensor().shape: {cpu_tensor.shape}")
-            print(f"    block_tables[{i}].get_cpu_tensor() contents:\n{cpu_tensor}")
-
-        # Check if any value repeats in the block table more than once
-        import numpy as np
-        # Use the get_cpu_tensor() method from the first BlockTable to get its tensor, then flatten
-        block_table_flat = np.concatenate([
-            bt.get_cpu_tensor().flatten()
-            for bt in input_batch.block_table.block_tables
-        ])
-        unique, counts = np.unique(block_table_flat, return_counts=True)
-        # Ignore the value 0
-        mask = (unique != 0) & (counts > 1)
-        repeats = unique[mask]
-        if repeats.size > 0:
-            print(f"Yay! The following values appear more than once in the block table: {repeats}")
-        else:
-            print("No repeated values found in the block table.")
-
-        print("\n_req_ids:")
-        print(f"  contents: {input_batch._req_ids}")
-
-        print("\nreq_id_to_index:")
-        print(f"  contents: {input_batch.req_id_to_index}")
-
-        print("==========================")
         if is_prompt:
             # Assert no running requests
             assert (
                 len(scheduler_output.scheduled_cached_reqs.req_ids) == 0
             ), "Currently only supporting all prefills or all decodes in batch"
 
-            # max_prompt_tokens = max(input_batch.num_prompt_tokens[:num_reqs])
-            # input_tokens = input_batch.token_ids_cpu_tensor[:num_reqs, :
-            #                                                 max_prompt_tokens]
-            # prompt_lens = input_batch.num_prompt_tokens[:num_reqs]
-
             # num_computed_tokens for each request is the input position
+            # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[:num_reqs]
-    
-            # Calculate how many tokens each request needs to compute
-            num_tokens_to_compute = (
-                input_batch.num_prompt_tokens[:num_reqs] - input_positions
-            )
-
-            # Find max tokens to compute across batch
-            max_tokens_to_compute = int(num_tokens_to_compute.max())
-
-            # Extract only the tokens that need to be computed
-            input_tokens = torch.zeros((num_reqs, max_tokens_to_compute), dtype=input_batch.token_ids_cpu_tensor.dtype)
-            prompt_lens = []
-            for req_idx in range(num_reqs):
-                start_idx = input_positions[req_idx]
-                end_idx = start_idx + num_tokens_to_compute[req_idx]
-                req_tokens = input_batch.token_ids_cpu_tensor[req_idx, start_idx:end_idx]
-                num_tokens = len(req_tokens)
-                input_tokens[req_idx, :num_tokens] = req_tokens
-                prompt_lens.append(int(num_tokens_to_compute[req_idx]))
-
+            max_prompt_tokens = max(input_batch.num_prompt_tokens[:num_reqs])
+            input_tokens = input_batch.token_ids_cpu_tensor[:num_reqs, :
+                                                            max_prompt_tokens]
+            prompt_lens = input_batch.num_prompt_tokens[:num_reqs]
         else:
             input_positions = torch.from_numpy(
                 input_batch.num_tokens[:num_reqs] - 1)
