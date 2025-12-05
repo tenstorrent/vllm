@@ -104,10 +104,10 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
     
     return sampling_configs
 
-def prefill_warmup(model, kv_cache, trace_prefill_mode, max_batch_size) -> None:
+def prefill_warmup(model, kv_cache, trace_prefill_mode, max_batch_size, data_parallel_size = 1) -> None:
     # NOTE: Also called from vLLM v1
 
-    sampling_params = create_sampling_params(TTPlatform.sample_on_device_mode, max_batch_size)
+    sampling_params = create_sampling_params(TTPlatform.sample_on_device_mode, max_batch_size * data_parallel_size)
     
     local_kwargs = {
         "kv_cache": kv_cache,
