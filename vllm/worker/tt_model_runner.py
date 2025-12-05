@@ -63,10 +63,10 @@ def create_warmup_decode_input_parameters(max_batch_size, num_gpu_blocks, sample
     tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
     start_pos = torch.zeros(max_batch_size, dtype=torch.int32)
     page_table = torch.zeros(max_batch_size, num_gpu_blocks, dtype=torch.int32)
-    sampling_params = create_sampling_params(sample_on_device_mode)
+    sampling_params = create_sampling_params(sample_on_device_mode, max_batch_size)
     return tokens, start_pos, page_table, sampling_params
 
-def create_sampling_params(sample_on_device_mode):
+def create_sampling_params(sample_on_device_mode, max_batch_size):
     """
         Returns a list of sampling parameter configurations
         that should be compiled/traced for the model based on device capabilities.
@@ -87,12 +87,12 @@ def create_sampling_params(sample_on_device_mode):
         # 2. Non-greedy sampling (one representative example with penalties)
         sampling_configs.append(
             TTSamplingParams(
-                temperature=1.0,
-                top_k=10,
-                top_p=0.9,
-                presence_penalty=PADDING_PRESENCE_PENALTY,
-                frequency_penalty=PADDING_FREQUENCY_PENALTY,
-                repetition_penalty=PADDING_REPETITION_PENALTY
+                temperature=[1.0]*max_batch_size,
+                top_k=[10]*max_batch_size,
+                top_p=[0.9]*max_batch_size,
+                presence_penalty=[1.2]*max_batch_size,
+                frequency_penalty=[1.2]*max_batch_size,
+                repetition_penalty=[1.5]*max_batch_size
             )
         )
         
@@ -104,10 +104,10 @@ def create_sampling_params(sample_on_device_mode):
     
     return sampling_configs
 
-def prefill_warmup(model, kv_cache, trace_prefill_mode) -> None:
+def prefill_warmup(model, kv_cache, trace_prefill_mode, max_batch_size) -> None:
     # NOTE: Also called from vLLM v1
 
-    sampling_params = create_sampling_params(TTPlatform.sample_on_device_mode)
+    sampling_params = create_sampling_params(TTPlatform.sample_on_device_mode, max_batch_size)
     
     local_kwargs = {
         "kv_cache": kv_cache,
@@ -1375,5 +1375,5 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
 
     def warmup_model(self, kv_cache) -> None:
-        prefill_warmup(self.model, kv_cache, self.trace_prefill_mode)
+        prefill_warmup(self.model, kv_cache, self.trace_prefill_mode, self.scheduler_config.max_num_seqs)
         decode_warmup(self.model, kv_cache, self.trace_mode, self.scheduler_config.max_num_seqs, self.cache_config.num_gpu_blocks, self.sample_on_device_mode)
