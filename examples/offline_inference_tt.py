@@ -262,6 +262,7 @@ def run_inference(
         "num_scheduler_steps": num_scheduler_steps,
         "disable_async_output_proc": disable_async_output_proc,
         "data_parallel_size": data_parallel_size,
+        "enable_prefix_caching": True,
     }
 
     try:
@@ -375,6 +376,8 @@ def run_inference(
         llm = LLM(**engine_kw_args)
         if not measure_perf:
             generate_tokens(llm, prompts, sampling_params, print_output=True)
+            print("Sending the second prompt!")
+            generate_tokens(llm, prompts[0:3], sampling_params, print_output=True)
         else:
             max_model_len = llm.llm_engine.model_config.max_model_len
             check_valid_perf_prompt_len(max_model_len, perf_prompt_len, sampling_params)
