@@ -71,11 +71,10 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
         Returns a list of sampling parameter configurations
         that should be compiled/traced for the model based on device capabilities.
     """
-    # None is for host sampling
-    sampling_configs = [None]
-
     if not sample_on_device_mode:
-        return sampling_configs
+        return [None]
+
+    sampling_configs = []
     
     if TTPlatform.non_greedy_decoding_on_device:
         
@@ -101,6 +100,8 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
         sampling_configs.append(
             TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0)
         )
+
+    sampling_configs.append(None)
     
     return sampling_configs
 
