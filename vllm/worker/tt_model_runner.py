@@ -69,8 +69,10 @@ def create_warmup_decode_input_parameters(
     tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
     start_pos = torch.zeros(max_batch_size, dtype=torch.int32)
     page_table = torch.zeros(max_batch_size, num_gpu_blocks, dtype=torch.int32)
-    sampling_params = create_sampling_params(sample_on_device_mode,
-                                             max_batch_size)
+    sampling_params = create_sampling_params(
+        sample_on_device_mode,
+        max_batch_size
+    )
     return tokens, start_pos, page_table, sampling_params
 
 
@@ -93,12 +95,15 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
 
         # 2. Non-greedy sampling (one representative example with penalties)
         sampling_configs.append(
-            TTSamplingParams(temperature=[1.0] * max_batch_size,
-                             top_k=[10] * max_batch_size,
-                             top_p=[0.9] * max_batch_size,
-                             presence_penalty=[1.2] * max_batch_size,
-                             frequency_penalty=[1.2] * max_batch_size,
-                             repetition_penalty=[1.5] * max_batch_size))
+            TTSamplingParams(
+                temperature=[1.0] * max_batch_size,
+                top_k=[10] * max_batch_size,
+                top_p=[0.9] * max_batch_size,
+                presence_penalty=[1.2] * max_batch_size,
+                frequency_penalty=[1.2] * max_batch_size,
+                repetition_penalty=[1.5] * max_batch_size
+            )
+        )
 
     else:
         # Basic on-device sampling only supports greedy
@@ -110,15 +115,18 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
     return sampling_configs
 
 
-def prefill_warmup(model,
-                   kv_cache,
-                   trace_prefill_mode,
-                   max_batch_size,
-                   data_parallel_size=1):
+def prefill_warmup(
+    model,
+    kv_cache,
+    trace_prefill_mode,
+    max_batch_size,
+    data_parallel_size=1
+):
     # NOTE: Also called from vLLM v1
 
     sampling_params = create_sampling_params(
-        TTPlatform.sample_on_device_mode, max_batch_size * data_parallel_size)
+        TTPlatform.sample_on_device_mode, max_batch_size * data_parallel_size
+    )
 
     local_kwargs = {
         "kv_cache": kv_cache,
@@ -133,18 +141,26 @@ def prefill_warmup(model,
 
 
 def decode_warmup(model,
-                  kv_cache,
-                  trace_mode,
-                  max_batch_size,
-                  num_gpu_blocks,
-                  sample_on_device_mode,
-                  data_parallel_size=1):
+    kv_cache,
+    trace_mode,
+    max_batch_size,
+    num_gpu_blocks,
+    sample_on_device_mode,
+    data_parallel_size=1
+):
     # NOTE: Also called from vLLM v1
 
-    (tokens, start_pos, page_table,
-     sampling_params) = create_warmup_decode_input_parameters(
-         max_batch_size, num_gpu_blocks, sample_on_device_mode,
-         data_parallel_size)
+    (
+        tokens,
+        start_pos,
+        page_table,
+        sampling_params
+    ) = create_warmup_decode_input_parameters(
+        max_batch_size,
+        num_gpu_blocks,
+        sample_on_device_mode,
+        data_parallel_size
+    )
 
     local_kwargs = {
         "tokens": tokens,
@@ -299,7 +315,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.trace_prefill_mode = trace_prefill_mode
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
         logger.info(
-            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, sample_on_device_mode=%s",
+            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
+            "sample_on_device_mode=%s",
             self.trace_mode,
             self.trace_prefill_mode,
             self.sample_on_device_mode,
@@ -1400,10 +1417,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
 
     def warmup_model(self, kv_cache) -> None:
-        prefill_warmup(self.model, kv_cache, self.trace_prefill_mode,
-                       self.scheduler_config.max_num_seqs)
+        prefill_warmup(
+            self.model,
+            kv_cache,
+            self.trace_prefill_mode,
+            self.scheduler_config.max_num_seqs
+        )
 
-        decode_warmup(self.model, kv_cache, self.trace_mode,
-                      self.scheduler_config.max_num_seqs,
-                      self.cache_config.num_gpu_blocks,
-                      self.sample_on_device_mode)
+        decode_warmup(
+            self.model,
+            kv_cache,
+            self.trace_mode,
+            self.scheduler_config.max_num_seqs,
+            self.cache_config.num_gpu_blocks,
+            self.sample_on_device_mode
+        )
