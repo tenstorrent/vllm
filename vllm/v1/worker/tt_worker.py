@@ -44,20 +44,12 @@ class TTWorker(WorkerBase):
         # Whether to use ttnn tracing for model execution
         override_tt_config = self.model_config.override_tt_config
         trace_key = "trace_mode"
-        self.trace_mode = True
+        self.trace_mode = "decode_only"
         if override_tt_config and trace_key in override_tt_config:
-            assert override_tt_config[trace_key] in [True, False], \
+            assert override_tt_config[trace_key] \
+            in ["decode_only", "all", "none"], \
                 f"Invalid {trace_key}: {override_tt_config[trace_key]}"
             self.trace_mode = override_tt_config[trace_key]
-
-        trace_prefill_key = "trace_prefill_mode"
-        self.trace_prefill_mode = True
-        if override_tt_config and trace_prefill_key in override_tt_config:
-            assert override_tt_config[trace_prefill_key] in [True, False], \
-                f"Invalid {trace_prefill_key}: \
-                {override_tt_config[trace_prefill_key]}"
-
-            self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
         enable_model_warmup = "enable_model_warmup"
         self.enable_model_warmup = True
@@ -88,7 +80,6 @@ class TTWorker(WorkerBase):
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
-            trace_prefill_mode=self.trace_prefill_mode,
             enable_model_warmup=self.enable_model_warmup,
         )
 

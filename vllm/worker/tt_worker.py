@@ -157,20 +157,12 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # Whether to use ttnn tracing for model execution
         override_tt_config = self.model_config.override_tt_config
         trace_key = "trace_mode"
-        self.trace_mode = True
+        self.trace_mode = "all"
         if override_tt_config and trace_key in override_tt_config:
-            assert override_tt_config[trace_key] in [True, False], \
+            assert override_tt_config[trace_key] \
+            in ["decode_only", "all", "none"], \
                 f"Invalid {trace_key}: {override_tt_config[trace_key]}"
             self.trace_mode = override_tt_config[trace_key]
-
-        trace_prefill_key = "trace_prefill_mode"
-        self.trace_prefill_mode = True
-        if override_tt_config and trace_prefill_key in override_tt_config:
-            assert override_tt_config[trace_prefill_key] in [True, False], \
-                f"Invalid {trace_prefill_key}: \
-                {override_tt_config[trace_prefill_key]}"
-
-            self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
         enable_model_warmup = "enable_model_warmup"
         self.enable_model_warmup = True
@@ -184,7 +176,6 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=vllm_config,
             trace_mode=self.trace_mode,
-            trace_prefill_mode=self.trace_prefill_mode,
             enable_model_warmup=self.enable_model_warmup,
         )
 
@@ -581,7 +572,7 @@ def reset_fabric(override_tt_config, num_devices):
 def device_params_from_override_tt_config(override_tt_config, trace_mode):
     device_params = {}
 
-    if trace_mode:
+    if trace_mode in ["all", "decode_only"]:
         # Set the most common value as default, override later
         device_params["trace_region_size"] = 50000000
         if override_tt_config and "trace_region_size" in override_tt_config:

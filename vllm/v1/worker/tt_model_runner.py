@@ -54,8 +54,7 @@ class TTModelRunner:
         self,
         vllm_config: VllmConfig,
         mesh_device: ttnn.MeshDevice,
-        trace_mode: bool,
-        trace_prefill_mode: bool,
+        trace_mode: str,
         enable_model_warmup: bool,
     ):
         self.vllm_config = vllm_config
@@ -86,16 +85,14 @@ class TTModelRunner:
 
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
-        self.trace_prefill_mode = trace_prefill_mode
         self.enable_model_warmup = enable_model_warmup
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
         logger.info(
-            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
+            "TTModelRunner: trace_mode=%s, "
             "sample_on_device_mode=%s, enable_model_warmup=%s",
             self.trace_mode,
-            self.trace_prefill_mode,
             self.sample_on_device_mode,
             self.enable_model_warmup,
         )
@@ -823,7 +820,7 @@ class TTModelRunner:
         }
 
         if not is_decode:
-            kwargs["enable_trace"] = self.trace_prefill_mode
+            kwargs["enable_trace"] = (self.trace_mode == "all")
             kwargs["prompt_lens"] = model_input.prompt_lens
             kwargs.update(model_input.multi_modal_kwargs)
             if len(batch_size_per_dp) > 1:
@@ -876,9 +873,10 @@ class TTModelRunner:
                     enc_dec_kwargs = {"rope_deltas_all_users": None}
                 self.previous_req_ids = set(self.input_batch.req_ids)
 
+            enable_trace = self.trace_mode in ["all", "decode_only"]
             tt_out = self.model.decode_forward(**kwargs,
                                                **enc_dec_kwargs,
-                                               enable_trace=self.trace_mode,
+                                               enable_trace=enable_trace,
                                                read_from_device=True)
 
         # The model input we got here may come from
@@ -983,10 +981,13 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
-        prefill_warmup(self.model, self.kv_caches, self.trace_prefill_mode,
+        trace_prefill_mode = self.trace_mode in ["all"]
+        prefill_warmup(self.model, self.kv_caches, trace_prefill_mode,
                        self.scheduler_config.max_num_seqs,
                        self.parallel_config.data_parallel_size)
-        decode_warmup(self.model, self.kv_caches, self.trace_mode,
+
+        trace_decode_mode = self.trace_mode in ["all", "decode_only"]
+        decode_warmup(self.model, self.kv_caches, trace_decode_mode,
                       self.scheduler_config.max_num_seqs,
                       self.max_num_blocks_per_req, self.sample_on_device_mode,
                       self.parallel_config.data_parallel_size)

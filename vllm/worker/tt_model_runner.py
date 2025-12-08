@@ -134,7 +134,7 @@ def prefill_warmup(model,
 
 def decode_warmup(model,
                   kv_cache,
-                  trace_mode,
+                  trace_decode_mode,
                   max_batch_size,
                   num_gpu_blocks,
                   sample_on_device_mode,
@@ -151,7 +151,7 @@ def decode_warmup(model,
         "start_pos": start_pos,
         "page_table": page_table,
         "kv_cache": kv_cache,
-        "enable_trace": trace_mode,
+        "enable_trace": trace_decode_mode,
         "read_from_device": True,
         "sampling_params": None,  #to be filled
     }
@@ -279,8 +279,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        trace_mode: bool = True,
-        trace_prefill_mode: bool = True,
+        trace_mode: str = "all",
         enable_model_warmup: bool = True,
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
@@ -297,14 +296,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # whether to use ttnn tracing for model execution
         self.trace_mode = trace_mode
-        self.trace_prefill_mode = trace_prefill_mode
         self.enable_model_warmup = enable_model_warmup
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
         logger.info(
-            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
+            "TTModelRunner: trace_mode=%s, "
             "sample_on_device_mode=%s, enable_model_warmup=%s",
             self.trace_mode,
-            self.trace_prefill_mode,
             self.sample_on_device_mode,
             self.enable_model_warmup,
         )
@@ -809,7 +806,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             # Pad block_tables to max num blocks
             # so ttnn tracing can work (requires constant shape)
-            if self.trace_mode:
+            if self.trace_mode in ["all", "decode_only"]:
                 block_tables = torch.cat([
                     block_tables,
                     torch.zeros(block_tables.shape[0],
@@ -1108,7 +1105,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             **(model_input.multi_modal_kwargs or {}),
         }
         if not is_decode:
-            execute_model_kwargs["enable_trace"] = self.trace_prefill_mode
+            execute_model_kwargs["enable_trace"] = (self.trace_mode == "all")
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
@@ -1335,9 +1332,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                 repetition_penalty=permuted_repetition,
                                 seed=permuted_seed)
 
+            enable_trace = self.trace_mode in ["all", "decode_only"]
             tt_out = self.model.decode_forward(**execute_model_kwargs,
                                                **enc_dec_kwargs,
-                                               enable_trace=self.trace_mode,
+                                               enable_trace=enable_trace,
                                                read_from_device=False)
             if use_async_out_proc:
                 # trigger output processor on host while device is executing
@@ -1404,10 +1402,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
 
     def warmup_model(self, kv_cache) -> None:
-        prefill_warmup(self.model, kv_cache, self.trace_prefill_mode,
+        trace_prefill_mode = self.trace_mode in ["all"]
+        prefill_warmup(self.model, kv_cache, trace_prefill_mode,
                        self.scheduler_config.max_num_seqs)
 
-        decode_warmup(self.model, kv_cache, self.trace_mode,
+        trace_decode_mode = self.trace_mode in ["all", "decode_only"]
+        decode_warmup(self.model, kv_cache, trace_decode_mode,
                       self.scheduler_config.max_num_seqs,
                       self.cache_config.num_gpu_blocks,
                       self.sample_on_device_mode)
