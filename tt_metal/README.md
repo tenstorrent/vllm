@@ -87,7 +87,7 @@ MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 - `sample_on_device_mode`: ["all", "decode_only"]
 - `trace_mode`: [true, false]
 - `trace_prefill_mode`: [true, false], default: true (If true, use tracing in prefill)
-- `vllm_warmup_model`: [true, false], default: true (If true, warmup the model before vLLM sends healthy signal)
+- `enable_model_warmup`: [true, false], default: true (If true, warmup the model before vLLM sends healthy signal)
 - `trace_region_size`: [default: 25000000]
 - `worker_l1_size`
 - `l1_small_size`
