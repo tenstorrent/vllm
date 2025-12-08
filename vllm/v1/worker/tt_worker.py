@@ -49,12 +49,14 @@ class TTWorker(WorkerBase):
             assert override_tt_config[trace_key] in [True, False], \
                 f"Invalid {trace_key}: {override_tt_config[trace_key]}"
             self.trace_mode = override_tt_config[trace_key]
-        
+
         trace_prefill_key = "trace_prefill_mode"
         self.trace_prefill_mode = True
         if override_tt_config and trace_prefill_key in override_tt_config:
             assert override_tt_config[trace_prefill_key] in [True, False], \
-                f"Invalid {trace_prefill_key}: {override_tt_config[trace_prefill_key]}"
+                f"Invalid {trace_prefill_key}: \
+                {override_tt_config[trace_prefill_key]}"
+
             self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
     def init_device(self) -> None:
