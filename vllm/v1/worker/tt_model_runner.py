@@ -56,6 +56,7 @@ class TTModelRunner:
         mesh_device: ttnn.MeshDevice,
         trace_mode: bool,
         trace_prefill_mode: bool,
+        vllm_warmup_model: bool,
     ):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -86,15 +87,18 @@ class TTModelRunner:
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.trace_prefill_mode = trace_prefill_mode
+        self.vllm_warmup_model = vllm_warmup_model
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
         logger.info(
             "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
             "sample_on_device_mode=%s",
+            "vllm_warmup_model=%s",
             self.trace_mode,
             self.trace_prefill_mode,
             self.sample_on_device_mode,
+            self.vllm_warmup_model,
         )
 
         # req_id -> (input_id -> encoder_output)
@@ -980,6 +984,9 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
+        if not self.vllm_warmup_model:
+            logger.warning("Skipping model warmup")
+            return
         prefill_warmup(self.model, self.kv_caches, self.trace_prefill_mode,
                        self.scheduler_config.max_num_seqs,
                        self.parallel_config.data_parallel_size)

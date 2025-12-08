@@ -281,6 +281,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         vllm_config: VllmConfig,
         trace_mode: bool = True,
         trace_prefill_mode: bool = True,
+        vllm_warmup_model: bool = True,
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
 
@@ -297,13 +298,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # whether to use ttnn tracing for model execution
         self.trace_mode = trace_mode
         self.trace_prefill_mode = trace_prefill_mode
+        self.vllm_warmup_model = vllm_warmup_model
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
         logger.info(
             "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
             "sample_on_device_mode=%s",
+            "vllm_warmup_model=%s",
             self.trace_mode,
             self.trace_prefill_mode,
             self.sample_on_device_mode,
+            self.vllm_warmup_model,
         )
 
         # If sampling on device and in decode, delay reading the token

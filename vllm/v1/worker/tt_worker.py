@@ -59,6 +59,15 @@ class TTWorker(WorkerBase):
 
             self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
+        vllm_warmup_model = "vllm_warmup_model"
+        self.vllm_warmup_model = True
+        if override_tt_config and vllm_warmup_model in override_tt_config:
+            assert override_tt_config[vllm_warmup_model] in [True, False], \
+                f"Invalid {vllm_warmup_model}: \
+                {override_tt_config[vllm_warmup_model]}"
+
+            self.vllm_warmup_model = override_tt_config[vllm_warmup_model]
+
     def init_device(self) -> None:
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         # Open mesh only on local DP rank 0 (device ranks).
@@ -80,6 +89,7 @@ class TTWorker(WorkerBase):
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
             trace_prefill_mode=self.trace_prefill_mode,
+            vllm_warmup_model=self.vllm_warmup_model,
         )
 
     def load_model(self):
