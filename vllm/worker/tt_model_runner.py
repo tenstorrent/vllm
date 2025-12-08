@@ -83,7 +83,7 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
     if not sample_on_device_mode:
         return [None]
 
-    sampling_configs = []
+    sampling_configs: List[Any] = []
 
     if TTPlatform.non_greedy_decoding_on_device:
 
