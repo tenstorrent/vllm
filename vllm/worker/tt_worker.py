@@ -173,6 +173,7 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
         vllm_warmup_model = "vllm_warmup_model"
+        self.vllm_warmup_model = True
         if override_tt_config and vllm_warmup_model in override_tt_config:
             assert override_tt_config[vllm_warmup_model] in [True, False], \
                 f"Invalid {vllm_warmup_model}: \

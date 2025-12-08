@@ -93,8 +93,7 @@ class TTModelRunner:
 
         logger.info(
             "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
-            "sample_on_device_mode=%s",
-            "vllm_warmup_model=%s",
+            "sample_on_device_mode=%s, vllm_warmup_model=%s",
             self.trace_mode,
             self.trace_prefill_mode,
             self.sample_on_device_mode,
