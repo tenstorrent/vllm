@@ -44,7 +44,7 @@ class TTWorker(WorkerBase):
         # Whether to use ttnn tracing for model execution
         override_tt_config = self.model_config.override_tt_config
         trace_key = "trace_mode"
-        self.trace_mode = "decode_only"
+        self.trace_mode = "all"
         if override_tt_config and trace_key in override_tt_config:
             assert override_tt_config[trace_key] \
             in ["decode_only", "all", "none"], \
