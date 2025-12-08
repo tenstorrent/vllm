@@ -172,20 +172,20 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
             self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
-        vllm_warmup_model = "vllm_warmup_model"
-        self.vllm_warmup_model = True
-        if override_tt_config and vllm_warmup_model in override_tt_config:
-            assert override_tt_config[vllm_warmup_model] in [True, False], \
-                f"Invalid {vllm_warmup_model}: \
-                {override_tt_config[vllm_warmup_model]}"
+        enable_model_warmup = "enable_model_warmup"
+        self.enable_model_warmup = True
+        if override_tt_config and enable_model_warmup in override_tt_config:
+            assert override_tt_config[enable_model_warmup] in [True, False], \
+                f"Invalid {enable_model_warmup}: \
+                {override_tt_config[enable_model_warmup]}"
 
-            self.vllm_warmup_model = override_tt_config[vllm_warmup_model]
+            self.enable_model_warmup = override_tt_config[enable_model_warmup]
 
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=vllm_config,
             trace_mode=self.trace_mode,
             trace_prefill_mode=self.trace_prefill_mode,
-            vllm_warmup_model=self.vllm_warmup_model,
+            enable_model_warmup=self.enable_model_warmup,
         )
 
         self.cache_engine: TTCacheEngine
@@ -257,7 +257,10 @@ class TTWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         self._init_cache_engine()
 
-        self.model_runner.warmup_model(self.kv_cache)
+        if self.enable_model_warmup:
+            self.model_runner.warmup_model(self.kv_cache)
+        else:
+            logger.warning("Skipping model warmup")
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None

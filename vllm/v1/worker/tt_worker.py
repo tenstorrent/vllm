@@ -59,14 +59,14 @@ class TTWorker(WorkerBase):
 
             self.trace_prefill_mode = override_tt_config[trace_prefill_key]
 
-        vllm_warmup_model = "vllm_warmup_model"
-        self.vllm_warmup_model = True
-        if override_tt_config and vllm_warmup_model in override_tt_config:
-            assert override_tt_config[vllm_warmup_model] in [True, False], \
-                f"Invalid {vllm_warmup_model}: \
-                {override_tt_config[vllm_warmup_model]}"
+        enable_model_warmup = "enable_model_warmup"
+        self.enable_model_warmup = True
+        if override_tt_config and enable_model_warmup in override_tt_config:
+            assert override_tt_config[enable_model_warmup] in [True, False], \
+                f"Invalid {enable_model_warmup}: \
+                {override_tt_config[enable_model_warmup]}"
 
-            self.vllm_warmup_model = override_tt_config[vllm_warmup_model]
+            self.enable_model_warmup = override_tt_config[enable_model_warmup]
 
     def init_device(self) -> None:
         local_dp_rank = self.parallel_config.data_parallel_rank_local
@@ -89,7 +89,7 @@ class TTWorker(WorkerBase):
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
             trace_prefill_mode=self.trace_prefill_mode,
-            vllm_warmup_model=self.vllm_warmup_model,
+            enable_model_warmup=self.enable_model_warmup,
         )
 
     def load_model(self):
@@ -169,6 +169,9 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def compile_or_warm_up_model(self) -> None:
+        if self.enable_model_warmup:
+            logger.warning("Skipping model warmup")
+            return
         local_rank = self.parallel_config.data_parallel_rank_local
         if local_rank == 0:
             self.model_runner.warmup_model()
