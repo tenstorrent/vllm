@@ -19,7 +19,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
-from vllm.worker.tt_model_runner import TTSamplingParams, decode_warmup, prefill_warmup, sample_tokens
+from vllm.worker.tt_model_runner import (TTSamplingParams, decode_warmup,
+                                         prefill_warmup, sample_tokens)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -89,7 +90,8 @@ class TTModelRunner:
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
         logger.info(
-            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, sample_on_device_mode=%s",
+            "TTModelRunner: trace_mode=%s, trace_prefill_mode=%s, "
+            "sample_on_device_mode=%s",
             self.trace_mode,
             self.trace_prefill_mode,
             self.sample_on_device_mode,
@@ -978,5 +980,10 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
-        prefill_warmup(self.model, self.kv_caches, self.trace_prefill_mode, self.scheduler_config.max_num_seqs, self.parallel_config.data_parallel_size)
-        decode_warmup(self.model, self.kv_caches, self.trace_mode, self.scheduler_config.max_num_seqs, self.max_num_blocks_per_req, self.sample_on_device_mode, self.parallel_config.data_parallel_size)
+        prefill_warmup(self.model, self.kv_caches, self.trace_prefill_mode,
+                       self.scheduler_config.max_num_seqs,
+                       self.parallel_config.data_parallel_size)
+        decode_warmup(self.model, self.kv_caches, self.trace_mode,
+                      self.scheduler_config.max_num_seqs,
+                      self.max_num_blocks_per_req, self.sample_on_device_mode,
+                      self.parallel_config.data_parallel_size)
