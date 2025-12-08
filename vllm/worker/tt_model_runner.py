@@ -1404,6 +1404,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         return torch.tensor(next_token_ids, dtype=torch.int32, device="cpu")
 
     def warmup_model(self, kv_cache) -> None:
+        if not self.vllm_warmup_model:
+            logger.warning("Skipping model warmup")
+            return
+
         prefill_warmup(self.model, kv_cache, self.trace_prefill_mode,
                        self.scheduler_config.max_num_seqs)
 
