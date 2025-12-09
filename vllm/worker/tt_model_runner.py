@@ -1069,8 +1069,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     ) -> SamplerOutput:
         # Minimal code to construct the sampler outputs,
         # based on tpu_model_runner.py
-        # TT backend does not support the advanced sampling parameters
-        # such as logprobs.
 
         logprobs = [Logprob(0.0) for _ in seq_groups]
         if isinstance(next_token_ids, tuple):
