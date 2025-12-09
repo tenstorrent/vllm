@@ -662,7 +662,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             seed_list = sampling_params_dict["seed"]
 
             # Currently supporting only logprobs=None or 1
-            # Generic logprobs support tracked here 
+            # Generic logprobs support tracked here
             # https://github.com/tenstorrent/tt-metal/issues/34080
             for lp in sampling_params_dict["logprobs"]:
                 assert lp in [
