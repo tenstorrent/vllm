@@ -448,7 +448,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         decode_prompt_tokens: List[List[int]] = []
         decode_output_tokens: List[List[int]] = []
         penalties_requested = False
-        non_default_sampling_params_in_batch = False
+        override_sampling_params_in_batch = False
 
         # create seq_groups_list before any cleanup to active batch slots
         for seq_group_metadata in seq_group_metadata_list:
@@ -485,12 +485,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 for key in SAMPLING_PARAM_KEYS:
                     current_value = getattr(sampling_params, key)
                     if key in PENALTY_PARAM_DEFAULTS:
-                        non_default_sampling_params_in_batch = (
-                            non_default_sampling_params_in_batch
+                        override_sampling_params_in_batch = (
+                            override_sampling_params_in_batch
                             or current_value != PENALTY_PARAM_DEFAULTS[key])
                     elif key in ["seed", "logprobs"]:
-                        non_default_sampling_params_in_batch = (
-                            non_default_sampling_params_in_batch
+                        override_sampling_params_in_batch = (
+                            override_sampling_params_in_batch
                             or current_value is not None)
                     if key not in param_values:
                         param_values[key] = current_value
@@ -511,7 +511,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             perform_device_sampling = False
             # Host sampling only supports uniform params and no penalties/seed
-            if not uniform_sampling or non_default_sampling_params_in_batch:
+            if not uniform_sampling or override_sampling_params_in_batch:
                 compat_sampling_used = True
 
         for seq_group_metadata in seq_group_metadata_list:
