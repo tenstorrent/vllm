@@ -160,7 +160,7 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def compile_or_warm_up_model(self) -> None:
-        if self.enable_model_warmup:
+        if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return
         local_rank = self.parallel_config.data_parallel_rank_local
