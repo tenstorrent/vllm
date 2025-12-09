@@ -55,12 +55,12 @@ class TTWorker(WorkerBase):
         self.enable_model_warmup = True
         if override_tt_config and enable_model_warmup_key in override_tt_config:
             assert override_tt_config[enable_model_warmup_key] \
-                in [True, False], \
+                in ["true", "false"], \
                 f"Invalid {enable_model_warmup_key}: \
                 {override_tt_config[enable_model_warmup_key]}"
 
             self.enable_model_warmup = override_tt_config[
-                enable_model_warmup_key]
+                enable_model_warmup_key] == "true"
 
     def init_device(self) -> None:
         local_dp_rank = self.parallel_config.data_parallel_rank_local
