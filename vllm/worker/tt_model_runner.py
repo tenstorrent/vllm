@@ -1070,10 +1070,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # Minimal code to construct the sampler outputs,
         # based on tpu_model_runner.py
 
-        logprobs = [Logprob(0.0) for _ in seq_groups]
         if isinstance(next_token_ids, tuple):
             logprobs = [Logprob(lp) for lp in next_token_ids[1]]
             next_token_ids = next_token_ids[0]
+        else:
+            logprobs = [Logprob(0.0) for _ in seq_groups]
 
         sampler_outputs = []
         for batch_idx, seq_id in enumerate(seq_groups):
