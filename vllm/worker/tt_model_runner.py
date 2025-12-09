@@ -379,6 +379,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.empty_slots = list(range(self.scheduler_config.max_num_seqs))
             self.seq_groups_to_batch_slot: Dict[int, int] = {}
             if self.async_read_decode:
+                # queue of perm tables for each decode step
                 self.perm_table_tensor: List[torch.Tensor] = []
 
         self.prev_seq_ids_tensor = torch.ones(
@@ -1045,7 +1046,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         next_token_ids = self.model.process_decode_output_host(next_token_ids,
                                                                is_tokens=True)
         if self.dp_kv_cache:
-            # permute the tt_out
+            # permute the tt_out with corresponding perm table for this step
             perm_table_tensor = self.perm_table_tensor.pop(0)
             if isinstance(next_token_ids, tuple):
                 next_token_ids = (next_token_ids[0][perm_table_tensor],
