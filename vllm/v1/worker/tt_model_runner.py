@@ -820,7 +820,7 @@ class TTModelRunner:
         }
 
         if not is_decode:
-            kwargs["enable_trace"] = (self.trace_mode == "all")
+            kwargs["enable_trace"] = self.trace_mode in ["all"]
             kwargs["prompt_lens"] = model_input.prompt_lens
             kwargs.update(model_input.multi_modal_kwargs)
             if len(batch_size_per_dp) > 1:
