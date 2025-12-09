@@ -971,6 +971,20 @@ class DPEngineCoreProc(EngineCoreProc):
 
             self.dlog = dlog_logger
 
+            # For multi-host, assume DP world is evenly split into mpi_world
+            # groups and device DP ranks are the first rank in each group.
+            mpi_world = int(
+                os.environ.get("OMPI_COMM_WORLD_SIZE",
+                               os.environ.get("PMI_SIZE", "1")))
+            world = vllm_config.parallel_config.data_parallel_size
+            if world > vllm_config.parallel_config.data_parallel_size_local:
+                assert mpi_world > 1, (
+                    "MPI world not detected, required for DP gather on multi-host"
+                )
+            self.dp_device_ranks = [
+                i * (world // mpi_world) for i in range(mpi_world)
+            ]
+
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(vllm_config, local_client, handshake_address,
@@ -1022,12 +1036,21 @@ class DPEngineCoreProc(EngineCoreProc):
                 f"base value: \"{os.getenv(device_control_env_var)}\"") from e
 
         self.dp_rank = dp_rank
-        self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
+        if self.requires_gather:
+            # Use normal init to support rooted collectives like gather.
+            self.dp_group = vllm_config.parallel_config.normal_init_dp_group()
+        else:
+            self.dp_group = vllm_config.parallel_config.stateless_init_dp_group(
+            )
 
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
-            stateless_destroy_torch_distributed_process_group(dp_group)
+            if self.requires_gather:
+                # Normal group: use standard destroy
+                dist.destroy_process_group(dp_group)
+            else:
+                stateless_destroy_torch_distributed_process_group(dp_group)
 
     def add_request(self, request: EngineCoreRequest):
         if self.has_coordinator and request.current_wave != self.current_wave:
@@ -1132,7 +1155,11 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def reinitialize_distributed(
             self, reconfig_request: ReconfigureDistributedRequest) -> None:
-        stateless_destroy_torch_distributed_process_group(self.dp_group)
+        if self.requires_gather:
+            # Normal group: use standard destroy
+            dist.destroy_process_group(self.dp_group)
+        else:
+            stateless_destroy_torch_distributed_process_group(self.dp_group)
         self.shutdown()
 
         parallel_config = self.vllm_config.parallel_config
@@ -1151,7 +1178,11 @@ class DPEngineCoreProc(EngineCoreProc):
             reconfig_request.new_data_parallel_master_port
         if reconfig_request.new_data_parallel_rank != -2:
             self.dp_rank = parallel_config.data_parallel_rank
-            self.dp_group = parallel_config.stateless_init_dp_group()
+            if self.requires_gather:
+                # Use normal init to support rooted collectives like gather.
+                self.dp_group = parallel_config.normal_init_dp_group()
+            else:
+                self.dp_group = parallel_config.stateless_init_dp_group()
         reconfig_request.new_data_parallel_master_port = \
             parallel_config.data_parallel_master_port
 
@@ -1178,6 +1209,7 @@ class DPEngineCoreProc(EngineCoreProc):
         parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
+        local_rank = parallel_config.data_parallel_rank_local
         world = parallel_config.data_parallel_size
 
         local_has_requests = scheduler_output is not None
@@ -1206,70 +1238,100 @@ class DPEngineCoreProc(EngineCoreProc):
                 "build_dp_decode_gather_input",
                 args=(local_input, max_blocks_decode))[0]
 
-            # Decode: use all_gather_into_tensor with fixed-shape inputs.
+            # Decode: use gather with fixed-shape inputs.
             int_local = tensorized_input["int_inputs"]  # 1D int32
             float_local = tensorized_input["float_inputs"]  # 1D float32
-            int_out_1d = torch.empty(int_local.numel() * world,
-                                     dtype=int_local.dtype)
-            float_out_1d = torch.empty(float_local.numel() * world,
-                                       dtype=float_local.dtype)
-            # Stateless DP group doesn't support rooted collectives, otherwise
-            # this could be gather instead of all_gather.
-            dist.all_gather_into_tensor(int_out_1d, int_local, group=group)
-            dist.all_gather_into_tensor(float_out_1d, float_local, group=group)
+            if local_rank == 0:
+                gather_list_int = [
+                    torch.empty_like(int_local) for _ in range(world)
+                ]
+                gather_list_float = [
+                    torch.empty_like(float_local) for _ in range(world)
+                ]
+            else:
+                gather_list_int = None
+                gather_list_float = None
 
-            int_inputs = int_out_1d.view(world, -1)
-            float_inputs = float_out_1d.view(world, -1)
+            # Only ranks with local rank 0 (device ranks) need inputs.
+            for dst in self.dp_device_ranks:
+                dist.gather(int_local, gather_list_int, dst=dst, group=group)
+                dist.gather(float_local,
+                            gather_list_float,
+                            dst=dst,
+                            group=group)
 
-            if parallel_config.data_parallel_rank_local == 0:
+            if local_rank == 0:
+                int_inputs = torch.stack(gather_list_int)
+                float_inputs = torch.stack(gather_list_float)
                 gathered_inputs = {
                     "int_inputs": int_inputs,
                     "float_inputs": float_inputs,
                 }
 
-            # has_structured_inputs is always last element of int_inputs
-            has_structured_inputs = int_inputs[:, -1]
-            if any(has_structured_inputs > 0):
+            # Check if we need bitmasks: has_structured_inputs is always last element of int_local
+            # Check locally first, then use all_reduce to determine if any rank has structured inputs
+            local_has_structured = int_local[-1] > 0
+            has_structured_t = torch.tensor([1 if local_has_structured else 0],
+                                            dtype=torch.int32)
+            dist.all_reduce(has_structured_t,
+                            op=dist.ReduceOp.MAX,
+                            group=group)
+            needs_bitmasks = has_structured_t.item() > 0
+
+            if needs_bitmasks:
+                # All ranks build their local bitmask
                 local_bitmask = self.model_executor.collective_rpc(
                     "build_padded_bitmasks", args=(local_input, ))[0]
                 local_bitmask = local_bitmask.contiguous().view(-1)
-                bitmask_out_1d = torch.empty(local_bitmask.numel() * world,
-                                             dtype=local_bitmask.dtype)
-                dist.all_gather_into_tensor(bitmask_out_1d,
-                                            local_bitmask,
-                                            group=group)
-                bitmasks = bitmask_out_1d.view(world, -1)
-                if parallel_config.data_parallel_rank_local == 0:
+
+                # Prepare gather list (only local rank 0 needs output)
+                if local_rank == 0:
+                    gather_list_bitmask = [
+                        torch.empty_like(local_bitmask) for _ in range(world)
+                    ]
+                else:
+                    gather_list_bitmask = None
+                for dst in self.dp_device_ranks:
+                    dist.gather(local_bitmask,
+                                gather_list_bitmask,
+                                dst=dst,
+                                group=group)
+
+                if local_rank == 0:
+                    bitmasks = torch.stack(gather_list_bitmask)
                     gathered_inputs["bitmasks"] = bitmasks
 
         else:
-            # Prefill: use object all_gather with variable sized inputs.
-            gathered_inputs = [None for _ in range(world)]  # type: ignore
-            dist.all_gather_object(gathered_inputs, local_input, group=group)
+            # Prefill: use gather_object with variable sized inputs (only local rank 0 receives).
+            gathered_inputs = None
+            if local_rank == 0:
+                gathered_inputs = [None for _ in range(world)]  # type: ignore
+            for dst in self.dp_device_ranks:
+                dist.gather_object(local_input,
+                                   gathered_inputs,
+                                   dst=dst,
+                                   group=group)
         self.dlog("after_inputs_gather")
 
         # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
-        if parallel_config.data_parallel_rank_local == 0 and (is_decode or any(
-                x is not None for x in gathered_inputs)):
+        if local_rank == 0 and (is_decode or any(x is not None
+                                                 for x in gathered_inputs)):
             send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp",
                 args=(gathered_inputs, is_decode, max_blocks_decode))[0]
             assert isinstance(send_tensor, torch.Tensor)
-            # Only global DP rank 0 contributes results; other
-            # designated ranks zero-out before the SUM all_reduce.
-            if rank != 0:
-                send_tensor.zero_()
         else:
             B = self.vllm_config.scheduler_config.max_num_seqs
             # Currently only supporting 1 output token per request.
             send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
 
-        # Stateless DP group doesn't support rooted collectives, otherwise
-        # this could be scatter instead of all_reduce.
-        # Rank 0 contributes the full tensor; others contribute zeros.
-        input_tensor = send_tensor.contiguous()
-        dist.all_reduce(input_tensor, op=dist.ReduceOp.SUM, group=group)
-        my_ids = input_tensor[rank]
+        # Global rank 0 scatters results to all ranks
+        my_ids = torch.empty_like(send_tensor[0])  # Shape (B, 1)
+        scatter_list = None
+        if rank == 0:
+            # Prepare scatter list: split send_tensor along first dimension
+            scatter_list = [send_tensor[i] for i in range(world)]
+        dist.scatter(my_ids, scatter_list, src=0, group=group)
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
         # If rank had scheduled tokens, apply results locally and return output
