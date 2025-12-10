@@ -3,6 +3,7 @@
 
 import dataclasses
 from dataclasses import dataclass
+from itertools import product
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
 import torch
@@ -88,35 +89,26 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
     sampling_configs: List[Any] = []
 
     if TTPlatform.non_greedy_decoding_on_device:
-        sampling_configs.append(
-            TTSamplingParams(temperature=[1.0] * max_batch_size,
-                             top_k=[10] * max_batch_size,
-                             top_p=[0.9] * max_batch_size,
-                             presence_penalty=[1.2] * max_batch_size,
-                             frequency_penalty=[1.2] * max_batch_size,
-                             repetition_penalty=[1.5] * max_batch_size,
-                             enable_log_probs=[True] * max_batch_size))  
+        for penalties, log_probs in product(
+            [True, False], repeat=2
+        ):
+            presence_penalty = [1.2] * max_batch_size if penalties else None
+            frequency_penalty = [1.2] * max_batch_size if penalties else None
+            repetition_penalty = [1.5] * max_batch_size if penalties else None
+            enable_log_probs = [log_probs] * max_batch_size
 
-        sampling_configs.append(
-            TTSamplingParams(temperature=[1.0] * max_batch_size,
-                             top_k=[10] * max_batch_size,
-                             top_p=[0.9] * max_batch_size,
-                             presence_penalty=[1.2] * max_batch_size,
-                             frequency_penalty=[1.2] * max_batch_size,
-                             repetition_penalty=[1.5] * max_batch_size))
+            sampling_configs.append(
+                TTSamplingParams(temperature=[1.0] * max_batch_size,
+                                top_k=[10] * max_batch_size,
+                                top_p=[0.9] * max_batch_size,
+                                presence_penalty=presence_penalty,
+                                frequency_penalty=frequency_penalty,
+                                repetition_penalty=repetition_penalty,
+                                enable_log_probs=enable_log_probs))
 
-        sampling_configs.append(
-            TTSamplingParams(temperature=0.0, 
-                             top_k=1, 
-                             top_p=1.0, 
-                             enable_log_probs=True))
-
-        sampling_configs.append(
-            TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0))
-    else:
-        # Basic on-device sampling only supports greedy
-        sampling_configs.append(
-            TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0))
+    # Basic on-device sampling only supports greedy
+    sampling_configs.append(
+        TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0))
 
     sampling_configs.append(None)
 
