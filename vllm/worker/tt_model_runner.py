@@ -668,7 +668,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             # https://github.com/tenstorrent/tt-metal/issues/34080
             for lp in sampling_params_dict["logprobs"]:
                 assert lp in [
-                    None, 1
+                    None, 1, True
                 ], ("TT device sampling only supports logprobs=None or 1")
             log_probs_list = [
                 bool(lp) for lp in sampling_params_dict["logprobs"]
