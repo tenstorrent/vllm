@@ -971,19 +971,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
             self.dlog = dlog_logger
 
-            # For multi-host, assume DP world is evenly split into mpi_world
-            # groups and device DP ranks are the first rank in each group.
-            mpi_world = int(
-                os.environ.get("OMPI_COMM_WORLD_SIZE",
-                               os.environ.get("PMI_SIZE", "1")))
-            world = vllm_config.parallel_config.data_parallel_size
-            if world > vllm_config.parallel_config.data_parallel_size_local:
-                assert mpi_world > 1, (
-                    "MPI not detected, required for DP gather on multi-host")
-            self.dp_device_ranks = [
-                i * (world // mpi_world) for i in range(mpi_world)
-            ]
-
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(vllm_config, local_client, handshake_address,
@@ -998,6 +985,33 @@ class DPEngineCoreProc(EngineCoreProc):
         pid = os.getpid()
         _add_prefix(sys.stdout, process_name, pid)
         _add_prefix(sys.stderr, process_name, pid)
+
+    def _init_dp_group(self, parallel_config: ParallelConfig) -> None:
+        """Initialize DP group and store device ranks if requires_gather.
+        """
+        if self.requires_gather:
+            # Use normal init to support rooted collectives like gather.
+            self.dp_group = parallel_config.normal_init_dp_group()
+
+            # Get device ranks (local_dp_rank==0) using all-gather
+            local_dp_rank = parallel_config.data_parallel_rank_local
+            dp_size = parallel_config.data_parallel_size
+            local_dp_rank_tensor = torch.tensor([local_dp_rank],
+                                                dtype=torch.int32,
+                                                device="cpu")
+            gathered_local_ranks = [
+                torch.zeros(1, dtype=torch.int32) for _ in range(dp_size)
+            ]
+            dist.all_gather(gathered_local_ranks,
+                            local_dp_rank_tensor,
+                            group=self.dp_group)
+            self.dp_device_ranks = [
+                i for i, rank_tensor in enumerate(gathered_local_ranks)
+                if rank_tensor.item() == 0
+            ]
+            logger.debug("DP device ranks: %s", self.dp_device_ranks)
+        else:
+            self.dp_group = parallel_config.stateless_init_dp_group()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
 
@@ -1035,12 +1049,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 f"base value: \"{os.getenv(device_control_env_var)}\"") from e
 
         self.dp_rank = dp_rank
-        if self.requires_gather:
-            # Use normal init to support rooted collectives like gather.
-            self.dp_group = vllm_config.parallel_config.normal_init_dp_group()
-        else:
-            self.dp_group = vllm_config.parallel_config.stateless_init_dp_group(
-            )
+        self._init_dp_group(vllm_config.parallel_config)
 
     def shutdown(self):
         super().shutdown()
@@ -1177,11 +1186,7 @@ class DPEngineCoreProc(EngineCoreProc):
             reconfig_request.new_data_parallel_master_port
         if reconfig_request.new_data_parallel_rank != -2:
             self.dp_rank = parallel_config.data_parallel_rank
-            if self.requires_gather:
-                # Use normal init to support rooted collectives like gather.
-                self.dp_group = parallel_config.normal_init_dp_group()
-            else:
-                self.dp_group = parallel_config.stateless_init_dp_group()
+            self._init_dp_group(parallel_config)
         reconfig_request.new_data_parallel_master_port = \
             parallel_config.data_parallel_master_port
 
