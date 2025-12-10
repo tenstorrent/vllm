@@ -88,12 +88,15 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
     sampling_configs: List[Any] = []
 
     if TTPlatform.non_greedy_decoding_on_device:
-
-        # 1. Greedy sampling
         sampling_configs.append(
-            TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0))
+            TTSamplingParams(temperature=[1.0] * max_batch_size,
+                             top_k=[10] * max_batch_size,
+                             top_p=[0.9] * max_batch_size,
+                             presence_penalty=[1.2] * max_batch_size,
+                             frequency_penalty=[1.2] * max_batch_size,
+                             repetition_penalty=[1.5] * max_batch_size,
+                             enable_log_probs=[True] * max_batch_size))  
 
-        # 2. Non-greedy sampling (one representative example with penalties)
         sampling_configs.append(
             TTSamplingParams(temperature=[1.0] * max_batch_size,
                              top_k=[10] * max_batch_size,
@@ -102,6 +105,14 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
                              frequency_penalty=[1.2] * max_batch_size,
                              repetition_penalty=[1.5] * max_batch_size))
 
+        sampling_configs.append(
+            TTSamplingParams(temperature=0.0, 
+                             top_k=1, 
+                             top_p=1.0, 
+                             enable_log_probs=True))
+
+        sampling_configs.append(
+            TTSamplingParams(temperature=0.0, top_k=1, top_p=1.0))
     else:
         # Basic on-device sampling only supports greedy
         sampling_configs.append(
