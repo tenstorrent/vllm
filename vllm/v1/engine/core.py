@@ -987,7 +987,8 @@ class DPEngineCoreProc(EngineCoreProc):
         _add_prefix(sys.stderr, process_name, pid)
 
     def _init_dp_group(self, parallel_config: ParallelConfig) -> None:
-        """Initialize DP group and store device ranks if requires_gather.
+        """Initialize DP group in self.dp_group. For DP gather execution, also
+        store the device ranks (local_dp_rank==0) in self.dp_device_ranks.
         """
         if self.requires_gather:
             # Use normal init to support rooted collectives like gather.
@@ -1250,7 +1251,7 @@ class DPEngineCoreProc(EngineCoreProc):
             # Decode: use gather with fixed-shape inputs.
             int_local = tensorized_input["int_inputs"]  # 1D int32
             float_local = tensorized_input["float_inputs"]  # 1D float32
-            
+
             # Only ranks with local rank 0 (device ranks) need inputs.
             gathered_inputs_int = None
             gathered_inputs_float = None
@@ -1265,7 +1266,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Only the destination rank should provide a gather_list.
                 # Non-destination ranks must pass None.
                 gather_list_int = gathered_inputs_int if rank == dst else None
-                gather_list_float = gathered_inputs_float if rank == dst else None
+                gather_list_float = (gathered_inputs_float
+                                     if rank == dst else None)
                 dist.gather(int_local, gather_list_int, dst=dst, group=group)
                 dist.gather(float_local,
                             gather_list_float,
