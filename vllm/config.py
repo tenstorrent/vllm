@@ -2042,6 +2042,9 @@ class ParallelConfig:
         groups. Use this function only when you need gather/scatter
         operations (rooted collectives) which stateless groups don't
         support, and don't need to support multiple independent groups.
+        Multiple groups are needed when workers initialize TP/PP groups
+        (via normal torch dist init) and engine-level DP groups are created
+        independently.
         """
         import torch.distributed as dist
         from torch.distributed import DistNetworkError
