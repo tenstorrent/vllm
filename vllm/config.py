@@ -2031,15 +2031,17 @@ class ParallelConfig:
 
     def normal_init_dp_group(self) -> "ProcessGroup":
         """
-        Initialize a normal torch.distributed process group for data parallelism.
-        Uses torch.distributed.init_process_group() which supports all collectives
-        including gather/scatter. Unlike stateless_init_dp_group(), this requires
-        torch.distributed to not be already initialized.
+        Initialize a normal torch.distributed process group for data
+        parallelism. Uses torch.distributed.init_process_group() which
+        supports all collectives including gather/scatter. Unlike
+        stateless_init_dp_group(), this requires torch.distributed to not
+        be already initialized.
         
-        Note: stateless_init_dp_group() is used by default because it doesn't pollute
-        global state and supports multiple independent groups. Use this function only
-        when you need gather/scatter operations (rooted collectives) which stateless
-        groups don't support, and don't need to support multiple independent groups.
+        Note: stateless_init_dp_group() is used by default because it
+        doesn't pollute global state and supports multiple independent
+        groups. Use this function only when you need gather/scatter
+        operations (rooted collectives) which stateless groups don't
+        support, and don't need to support multiple independent groups.
         """
         import torch.distributed as dist
         from torch.distributed import DistNetworkError
@@ -2048,13 +2050,15 @@ class ParallelConfig:
 
         if dist.is_initialized():
             raise RuntimeError(
-                "torch.distributed is already initialized. normal_init_dp_group() "
-                "requires torch.distributed to not be initialized. Use "
-                "stateless_init_dp_group() instead if you need to create a DP group "
-                "when torch.distributed is already initialized.")
+                "torch.distributed is already initialized. "
+                "normal_init_dp_group() requires torch.distributed to not "
+                "be initialized. Use stateless_init_dp_group() instead if "
+                "you need to create a DP group when torch.distributed is "
+                "already initialized.")
 
-        # Initialize normally. Retry on port conflicts (EADDRINUSE) which can occur
-        # due to race conditions when multiple processes pick the same port.
+        # Initialize normally. Retry on port conflicts (EADDRINUSE) which
+        # can occur due to race conditions when multiple processes pick the
+        # same port.
         max_retries = 5
         last_exc: Optional[Exception] = None
         for _ in range(max_retries):
