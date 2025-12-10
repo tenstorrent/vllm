@@ -979,8 +979,7 @@ class DPEngineCoreProc(EngineCoreProc):
             world = vllm_config.parallel_config.data_parallel_size
             if world > vllm_config.parallel_config.data_parallel_size_local:
                 assert mpi_world > 1, (
-                    "MPI world not detected, required for DP gather on multi-host"
-                )
+                    "MPI not detected, required for DP gather on multi-host")
             self.dp_device_ranks = [
                 i * (world // mpi_world) for i in range(mpi_world)
             ]
@@ -1223,20 +1222,25 @@ class DPEngineCoreProc(EngineCoreProc):
         is_decode = self._dp_gather_forced_mode == 0
 
         # Build local dp model input (or None).
-        local_input, local_max_blocks = self.model_executor.collective_rpc(
+        all_local_inputs = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
+        local_input, local_max_blocks, local_has_structured = all_local_inputs
         max_blocks_decode = None  # Only used for decode.
+        any_structured_inputs = False  # Only used for decode.
 
         if is_decode:
-            # Gather max blocks from all ranks.
-            max_blocks_t = torch.tensor([local_max_blocks], dtype=torch.int32)
-            dist.all_reduce(max_blocks_t, op=dist.ReduceOp.MAX, group=group)
-            max_blocks_decode = int(max_blocks_t.item())
+            # Gather max blocks and has_structured from all ranks.
+            input_info_t = torch.tensor(
+                [local_max_blocks, local_has_structured], dtype=torch.int32)
+            dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
+            max_blocks_decode = int(input_info_t[0].item())
+            any_structured_inputs = input_info_t[1].item() > 0
 
             # Build tensorized gather input for decode.
             tensorized_input = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
-                args=(local_input, max_blocks_decode))[0]
+                args=(local_input, max_blocks_decode,
+                      any_structured_inputs))[0]
 
             # Decode: use gather with fixed-shape inputs.
             int_local = tensorized_input["int_inputs"]  # 1D int32
@@ -1268,41 +1272,9 @@ class DPEngineCoreProc(EngineCoreProc):
                     "float_inputs": float_inputs,
                 }
 
-            # Check if we need bitmasks: has_structured_inputs is always last element of int_local
-            # Check locally first, then use all_reduce to determine if any rank has structured inputs
-            local_has_structured = int_local[-1] > 0
-            has_structured_t = torch.tensor([1 if local_has_structured else 0],
-                                            dtype=torch.int32)
-            dist.all_reduce(has_structured_t,
-                            op=dist.ReduceOp.MAX,
-                            group=group)
-            needs_bitmasks = has_structured_t.item() > 0
-
-            if needs_bitmasks:
-                # All ranks build their local bitmask
-                local_bitmask = self.model_executor.collective_rpc(
-                    "build_padded_bitmasks", args=(local_input, ))[0]
-                local_bitmask = local_bitmask.contiguous().view(-1)
-
-                # Prepare gather list (only local rank 0 needs output)
-                if local_rank == 0:
-                    gather_list_bitmask = [
-                        torch.empty_like(local_bitmask) for _ in range(world)
-                    ]
-                else:
-                    gather_list_bitmask = None
-                for dst in self.dp_device_ranks:
-                    dist.gather(local_bitmask,
-                                gather_list_bitmask,
-                                dst=dst,
-                                group=group)
-
-                if local_rank == 0:
-                    bitmasks = torch.stack(gather_list_bitmask)
-                    gathered_inputs["bitmasks"] = bitmasks
-
         else:
-            # Prefill: use gather_object with variable sized inputs (only local rank 0 receives).
+            # Prefill: use gather_object with variable sized inputs
+            # (only local rank 0 receives).
             gathered_inputs = None
             if local_rank == 0:
                 gathered_inputs = [None for _ in range(world)]  # type: ignore
@@ -1314,11 +1286,14 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dlog("after_inputs_gather")
 
         # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
-        if local_rank == 0 and (is_decode or any(x is not None
-                                                 for x in gathered_inputs)):
+        if local_rank == 0 and (is_decode or
+                                (isinstance(gathered_inputs, list)
+                                 and any(x is not None
+                                         for x in gathered_inputs))):
             send_tensor = self.model_executor.collective_rpc(
                 "concat_and_execute_dp",
-                args=(gathered_inputs, is_decode, max_blocks_decode))[0]
+                args=(gathered_inputs, is_decode, max_blocks_decode,
+                      any_structured_inputs))[0]
             assert isinstance(send_tensor, torch.Tensor)
         else:
             B = self.vllm_config.scheduler_config.max_num_seqs
