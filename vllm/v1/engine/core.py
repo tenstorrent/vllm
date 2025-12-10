@@ -1009,7 +1009,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 i for i, rank_tensor in enumerate(gathered_local_ranks)
                 if rank_tensor.item() == 0
             ]
-            logger.debug("DP device ranks: %s", self.dp_device_ranks)
+            logger.info("DP device ranks: %s", self.dp_device_ranks)
         else:
             self.dp_group = parallel_config.stateless_init_dp_group()
 
