@@ -1250,19 +1250,22 @@ class DPEngineCoreProc(EngineCoreProc):
             # Decode: use gather with fixed-shape inputs.
             int_local = tensorized_input["int_inputs"]  # 1D int32
             float_local = tensorized_input["float_inputs"]  # 1D float32
+            
+            # Only ranks with local rank 0 (device ranks) need inputs.
+            gathered_inputs_int = None
+            gathered_inputs_float = None
             if local_rank == 0:
-                gather_list_int = [
+                gathered_inputs_int = [
                     torch.empty_like(int_local) for _ in range(world)
                 ]
-                gather_list_float = [
+                gathered_inputs_float = [
                     torch.empty_like(float_local) for _ in range(world)
                 ]
-            else:
-                gather_list_int = None
-                gather_list_float = None
-
-            # Only ranks with local rank 0 (device ranks) need inputs.
             for dst in self.dp_device_ranks:
+                # Only the destination rank should provide a gather_list.
+                # Non-destination ranks must pass None.
+                gather_list_int = gathered_inputs_int if rank == dst else None
+                gather_list_float = gathered_inputs_float if rank == dst else None
                 dist.gather(int_local, gather_list_int, dst=dst, group=group)
                 dist.gather(float_local,
                             gather_list_float,
@@ -1270,8 +1273,8 @@ class DPEngineCoreProc(EngineCoreProc):
                             group=group)
 
             if local_rank == 0:
-                int_inputs = torch.stack(gather_list_int)
-                float_inputs = torch.stack(gather_list_float)
+                int_inputs = torch.stack(gathered_inputs_int)
+                float_inputs = torch.stack(gathered_inputs_float)
                 gathered_inputs = {
                     "int_inputs": int_inputs,
                     "float_inputs": float_inputs,
@@ -1284,8 +1287,11 @@ class DPEngineCoreProc(EngineCoreProc):
             if local_rank == 0:
                 gathered_inputs = [None for _ in range(world)]  # type: ignore
             for dst in self.dp_device_ranks:
+                # Only the destination rank should provide a gather_list.
+                # Non-destination ranks must pass None.
+                gather_list = gathered_inputs if rank == dst else None
                 dist.gather_object(local_input,
-                                   gathered_inputs,
+                                   gather_list,
                                    dst=dst,
                                    group=group)
         self.dlog("after_inputs_gather")
