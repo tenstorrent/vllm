@@ -346,8 +346,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
     def _num_devices(self) -> int:
         num_devices = self.vllm_config.device_config.num_devices
         data_parallel = 1
-        if "data_parallel" in self.model_config.override_tt_config:
-            data_parallel = self.model_config.override_tt_config["data_parallel"]
+        if self.model_config.override_tt_config:
+            data_parallel = self.model_config.override_tt_config.get(
+                "data_parallel", 1)
         return num_devices // data_parallel
 
     def load_model(self) -> None:
