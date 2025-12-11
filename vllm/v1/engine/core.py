@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import pickle
 import queue
 import signal
 import sys
@@ -1306,7 +1307,6 @@ class DPEngineCoreProc(EngineCoreProc):
                                dst=0,
                                group=group)
             if len(self.dp_device_ranks) > 1:
-                import pickle
                 if rank == 0:
                     # Rank 0 sends gathered list to other device ranks only.
                     pickled_data = pickle.dumps(gathered_inputs)
