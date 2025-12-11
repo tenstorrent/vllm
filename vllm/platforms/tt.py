@@ -290,7 +290,16 @@ class TTPlatform(Platform):
                     f"{cls.device_name}")
 
     @staticmethod
-    def compat_sampling_required(sampling_params) -> bool:
+    def compat_sampling_required(sampling_params, vllm_config) -> bool:
+        if sampling_params.logprobs is not None:
+            num_devices = vllm_config.device_config.num_devices
+            data_parallel = 1
+            if "data_parallel" in vllm_config.override_tt_config:
+                data_parallel = vllm_config.override_tt_config["data_parallel"]
+            
+            if num_devices // data_parallel == 1:
+                return True
+
         # all of the following sampling params require compat sampling
         return (sampling_params.min_p != 0.0
                 or (sampling_params.bad_words is not None
