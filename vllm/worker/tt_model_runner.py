@@ -3,6 +3,7 @@
 
 import dataclasses
 from dataclasses import dataclass
+from functools import cached_property
 from itertools import product
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
@@ -341,6 +342,14 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # SamplingMetadata.selected_token_indices logic.
         self.sampler = get_sampler()
 
+    @cached_property
+    def _num_devices(self) -> int:
+        num_devices = self.vllm_config.device_config.num_devices
+        data_parallel = 1
+        if "data_parallel" in self.model_config.override_tt_config:
+            data_parallel = self.model_config.override_tt_config["data_parallel"]
+        return num_devices // data_parallel
+
     def load_model(self) -> None:
         # Note: using custom TT loader
         # instead of selecting from default vllm loaders
@@ -482,7 +491,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # If any request in the batch requires compat sampling
                 # individually, enable compat sampling for the batch
                 if TTPlatform.compat_sampling_required(
-                        sampling_params, self.vllm_config):
+                        sampling_params, self._num_devices):
                     compat_sampling_used = True
                     break
                 for key in SAMPLING_PARAM_KEYS:
