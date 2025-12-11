@@ -1388,6 +1388,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         if model_input.compat_sampling_used:
             # discarding dummy logprobs
+            # refactor to create response object tracked here
+            # https://github.com/tenstorrent/tt-metal/issues/34215
             if isinstance(tt_out, tuple):
                 tt_out, _ = tt_out
 
