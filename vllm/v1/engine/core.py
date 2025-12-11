@@ -1252,50 +1252,80 @@ class DPEngineCoreProc(EngineCoreProc):
             int_local = tensorized_input["int_inputs"]  # 1D int32
             float_local = tensorized_input["float_inputs"]  # 1D float32
 
-            # Only ranks with local rank 0 (device ranks) need inputs.
-            gathered_inputs_int = None
-            gathered_inputs_float = None
-            if local_rank == 0:
-                gathered_inputs_int = [
-                    torch.empty_like(int_local) for _ in range(world)
-                ]
-                gathered_inputs_float = [
-                    torch.empty_like(float_local) for _ in range(world)
-                ]
-            for dst in self.dp_device_ranks:
-                # Only the destination rank should provide a gather_list.
-                # Non-destination ranks must pass None.
-                gather_list_int = gathered_inputs_int if rank == dst else None
-                gather_list_float = (gathered_inputs_float
-                                     if rank == dst else None)
-                dist.gather(int_local, gather_list_int, dst=dst, group=group)
-                dist.gather(float_local,
-                            gather_list_float,
-                            dst=dst,
-                            group=group)
+            # Only rank 0 needs buffers for the gather operation.
+            # Pre-allocate stacked tensors and create list views for gather.
+            stacked_int = None
+            stacked_float = None
+            gather_list_int = None
+            gather_list_float = None
+            if rank == 0:
+                stacked_int = torch.empty((world, *int_local.shape),
+                                          dtype=int_local.dtype)
+                stacked_float = torch.empty((world, *float_local.shape),
+                                            dtype=float_local.dtype)
+                gather_list_int = [stacked_int[i] for i in range(world)]
+                gather_list_float = [stacked_float[i] for i in range(world)]
+
+            # Gather to rank 0, then send to other device ranks (local rank 0).
+            # Note: if num device ranks == num world ranks, then this could be
+            # all_gather but we usually have device ranks << world.
+            dist.gather(int_local, gather_list_int, dst=0, group=group)
+            dist.gather(float_local, gather_list_float, dst=0, group=group)
+            if len(self.dp_device_ranks) > 1:
+                if rank == 0:
+                    # Rank 0 sends stacked tensors to other device ranks.
+                    for dst in self.dp_device_ranks[1:]:
+                        dist.send(stacked_int, dst=dst, group=group)
+                        dist.send(stacked_float, dst=dst, group=group)
+                elif local_rank == 0:  # other device ranks
+                    # Other device ranks receive from rank 0.
+                    stacked_int = torch.empty((world, *int_local.shape),
+                                              dtype=int_local.dtype)
+                    stacked_float = torch.empty((world, *float_local.shape),
+                                                dtype=float_local.dtype)
+                    dist.recv(stacked_int, src=0, group=group)
+                    dist.recv(stacked_float, src=0, group=group)
 
             if local_rank == 0:
-                int_inputs = torch.stack(gathered_inputs_int)
-                float_inputs = torch.stack(gathered_inputs_float)
                 gathered_inputs = {
-                    "int_inputs": int_inputs,
-                    "float_inputs": float_inputs,
+                    "int_inputs": stacked_int,
+                    "float_inputs": stacked_float,
                 }
 
         else:
-            # Prefill: use gather_object with variable sized inputs
-            # (only local rank 0 receives).
+            # Prefill: use gather_object with variable sized inputs.
             gathered_inputs = None
-            if local_rank == 0:
+            if rank == 0:
                 gathered_inputs = [None for _ in range(world)]  # type: ignore
-            for dst in self.dp_device_ranks:
-                # Only the destination rank should provide a gather_list.
-                # Non-destination ranks must pass None.
-                gather_list = gathered_inputs if rank == dst else None
-                dist.gather_object(local_input,
-                                   gather_list,
-                                   dst=dst,
-                                   group=group)
+
+            # Gather to rank 0, then send to other device ranks (local rank 0).
+            # Note: if num device ranks == num world ranks, then this could be
+            # all_gather_object but we usually have device ranks << world.
+            dist.gather_object(local_input,
+                               gathered_inputs,
+                               dst=0,
+                               group=group)
+            if len(self.dp_device_ranks) > 1:
+                import pickle
+                if rank == 0:
+                    # Rank 0 sends gathered list to other device ranks only.
+                    pickled_data = pickle.dumps(gathered_inputs)
+                    object_tensor = torch.frombuffer(pickled_data,
+                                                     dtype=torch.uint8)
+                    size_tensor = torch.tensor([object_tensor.numel()],
+                                               dtype=torch.long)
+                    for dst in self.dp_device_ranks[1:]:
+                        dist.send(size_tensor, dst=dst, group=group)
+                        dist.send(object_tensor, dst=dst, group=group)
+                elif local_rank == 0:  # other device ranks
+                    # Other device ranks receive from rank 0.
+                    size_tensor = torch.zeros(1, dtype=torch.long)
+                    dist.recv(size_tensor, src=0, group=group)
+                    object_tensor = torch.empty(size_tensor.item(),
+                                                dtype=torch.uint8)
+                    dist.recv(object_tensor, src=0, group=group)
+                    gathered_inputs = pickle.loads(
+                        object_tensor.numpy().tobytes())
         self.dlog("after_inputs_gather")
 
         # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
