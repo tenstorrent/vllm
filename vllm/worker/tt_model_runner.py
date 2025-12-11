@@ -90,6 +90,9 @@ def create_sampling_params(sample_on_device_mode, max_batch_size):
     sampling_configs: List[Any] = []
 
     if TTPlatform.non_greedy_decoding_on_device:
+        # We need to capture traces for all combinations of isolated parameters
+        # Leaving the model to do lazy trace capture causes hangs
+        # https://github.com/tenstorrent/vllm/issues/274
         for penalties, log_probs in product([True, False], repeat=2):
             presence_penalty = [1.2] * max_batch_size if penalties else None
             frequency_penalty = [1.2] * max_batch_size if penalties else None
