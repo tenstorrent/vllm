@@ -494,8 +494,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 sampling_params = seq_group_metadata.sampling_params
                 # If any request in the batch requires compat sampling
                 # individually, enable compat sampling for the batch
-                if TTPlatform.compat_sampling_required(
-                        sampling_params, self._num_devices):
+                if TTPlatform.compat_sampling_required(sampling_params,
+                                                       self._num_devices):
                     compat_sampling_used = True
                     break
                 for key in SAMPLING_PARAM_KEYS:
