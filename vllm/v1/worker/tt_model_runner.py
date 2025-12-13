@@ -985,6 +985,7 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
+        return
         trace_prefill_mode = self.trace_mode in ["all"]
         prefill_warmup(self.model, self.kv_caches, trace_prefill_mode,
                        self.scheduler_config.max_num_seqs,
