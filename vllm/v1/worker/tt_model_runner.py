@@ -615,7 +615,7 @@ class TTModelRunner:
 
         input_tokens_list: list[torch.Tensor] = []
         block_tables_list: list[torch.Tensor] = []
-        input_positions_list: list[torch.Tensor] = []  # (decode only)
+        input_positions_list: list[torch.Tensor] = []  # (position for decode, prefix cache for prefill)
         prompt_lens_list: list[np.ndarray] = []  # (prefill only)
         batch_size_per_dp: list[int] = []
         sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
@@ -732,7 +732,7 @@ class TTModelRunner:
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
-            input_positions = 0
+            input_positions = [int(pos) for pos in input_positions_list]
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
 
         input_tokens = torch.cat(input_tokens_list, dim=0)
