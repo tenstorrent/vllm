@@ -1564,10 +1564,6 @@ class EngineArgs:
                         "disabling it for V1 backend.")
             self.enable_chunked_prefill = False
 
-            # logger.info("Prefix caching is not yet supported for TT devices; "
-            #             "disabling it for V1 backend.")
-            # self.enable_prefix_caching = False
-
         if not self.enable_chunked_prefill:
             self.max_num_batched_tokens = model_config.max_model_len
 

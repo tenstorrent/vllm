@@ -648,7 +648,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_prefix_caching",
         action="store_true",
-        help="Enable prefix caching",
+        help="Enable prefix caching \
+(use with --prompts_json tt_metal/prompts_overlapping.json to test the feature)",
     )
 
     args = parser.parse_args()
