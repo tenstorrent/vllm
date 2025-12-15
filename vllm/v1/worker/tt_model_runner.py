@@ -722,6 +722,7 @@ class TTModelRunner:
                     input_tokens_list.append(toks)
                     prompt_lens_list.append(mi.prompt_lens)
                     block_tables_list.append(pad_block_tables(mi.block_tables))
+                    input_positions_list.append(mi.input_positions)
 
                 # We know it's not a list here before concatenation
                 unpadded_batch_size: int = cast(
@@ -732,7 +733,7 @@ class TTModelRunner:
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
-            input_positions = [int(pos) for pos in input_positions_list]
+            input_positions = input_positions_list
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
 
         input_tokens = torch.cat(input_tokens_list, dim=0)
