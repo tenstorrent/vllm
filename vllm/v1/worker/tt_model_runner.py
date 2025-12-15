@@ -615,7 +615,8 @@ class TTModelRunner:
 
         input_tokens_list: list[torch.Tensor] = []
         block_tables_list: list[torch.Tensor] = []
-        input_positions_list: list[torch.Tensor] = []  # (position for decode, prefix cache for prefill)
+        input_positions_list: list[torch.Tensor] = [
+            ]  # (position for decode, prefix cache for prefill)
         prompt_lens_list: list[np.ndarray] = []  # (prefill only)
         batch_size_per_dp: list[int] = []
         sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
