@@ -734,7 +734,7 @@ class TTModelRunner:
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
-            input_positions = torch.cat(input_positions_list, dim=0)
+            input_positions = np.concatenate(input_positions_list, axis=0)
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
 
         input_tokens = torch.cat(input_tokens_list, dim=0)
