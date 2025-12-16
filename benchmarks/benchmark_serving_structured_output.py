@@ -670,6 +670,8 @@ async def benchmark(
 
 
 def evaluate(ret, args):
+    print(f"evaluate: ret: {ret}")
+    print(f"evaluate: args: {args}")
     def _eval_correctness_json(expected, actual):
         # extract json string from string using regex
         import regex as re
