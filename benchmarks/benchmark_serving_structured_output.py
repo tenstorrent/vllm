@@ -804,6 +804,9 @@ def main(args: argparse.Namespace):
 
     goodput_config_dict = check_goodput_args(args)
 
+    for i, req in enumerate(input_requests):
+        print(f"Input Request {i}: {req}")
+
     benchmark_result, ret = asyncio.run(
         benchmark(
             backend=backend,

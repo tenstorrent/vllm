@@ -143,9 +143,6 @@ class TTPlatform(Platform):
                 == 1), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, (
             "LoRA is not supported for TT backend")
-        assert not (vllm_config.cache_config.enable_prefix_caching
-                    and vllm_config.cache_config.sliding_window is not None), (
-                        "Prefix caching is not supported with sliding window")
 
         # Import and register models from tt-metal
         override_tt_config = vllm_config.model_config.override_tt_config
@@ -231,10 +228,10 @@ class TTPlatform(Platform):
         # must perform local import to get around circular import
         from vllm.model_executor.model_loader.utils import (
             get_model_architecture)
+        model_class, _ = get_model_architecture(vllm_config.model_config)
 
         # infer if non-greedy decoding is supported on-device
         # based on model implementation, and update platform
-        model_class, _ = get_model_architecture(vllm_config.model_config)
         # TODO: this should come from the class itself as an attribute
         cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
         if model_class.__module__.startswith(
@@ -244,6 +241,16 @@ class TTPlatform(Platform):
         if model_class.__module__.startswith(
                 "models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
+
+        allowed_prefix_caching_model = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
+        if vllm_config.cache_config.enable_prefix_caching:
+            if not model_class.__module__.startswith(allowed_prefix_caching_model):
+                vllm_config.cache_config.enable_prefix_caching = False
+                logger.warning(
+                    "Prefix caching is not supported for {model_class.__module__}, "
+                    "disabling it"
+                )
+
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
