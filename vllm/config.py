@@ -2328,11 +2328,13 @@ class SchedulerConfig:
     """Apply a delay (of delay factor multiplied by previous
     prompt latency) before scheduling next prompt."""
 
-    input_queue_batching_delay: float = 0.0005  # 0.5ms
+    input_queue_batching_delay: float = 0.002  # 2ms
     """Delay in seconds to wait before processing queued requests to allow
-    more requests to arrive and be batched together. Only applies when there
-    are no running requests and the waiting queue hasn't reached max_num_seqs.
-    Set to 0 to disable batching delays. Only used in V1."""
+    more requests to arrive and be batched together. The delay is applied
+    after processing initial requests and reapplied after each additional
+    request that arrives, up to max_num_seqs. Only applies when there are no
+    running requests and the waiting queue hasn't reached max_num_seqs. Set to
+    0 to disable batching delays. Only used in V1."""
 
     enable_chunked_prefill: SkipValidation[bool] = None  # type: ignore
     """If True, prefill requests can be chunked based

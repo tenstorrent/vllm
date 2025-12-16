@@ -752,7 +752,7 @@ class EngineCoreProc(EngineCore):
             if delay <= 0:
                 return False
             num_running, num_waiting = self.scheduler.get_request_counts()
-            has_running = self.engines_running or num_running > 0
+            has_running = num_running > 0
             max_batch_waiting = (
                 num_waiting >= self.vllm_config.scheduler_config.max_num_seqs)
             return not has_running and not max_batch_waiting
