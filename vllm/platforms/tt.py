@@ -143,6 +143,9 @@ class TTPlatform(Platform):
                 == 1), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, (
             "LoRA is not supported for TT backend")
+        assert not (vllm_config.cache_config.enable_prefix_caching and
+                    vllm_config.cache_config.sliding_window is not None), (
+                        "Prefix caching is not supported with sliding window")
 
         # Import and register models from tt-metal
         override_tt_config = vllm_config.model_config.override_tt_config
