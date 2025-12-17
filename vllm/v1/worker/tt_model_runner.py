@@ -182,9 +182,9 @@ class TTModelRunner:
                                                       num_layers)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
-        """Update the cached states and the persistent batch with the 
+        """Update the cached states and the persistent batch with the
         scheduler output.
-        The updated states are used in `_prepare_model_inputs` to create the 
+        The updated states are used in `_prepare_model_inputs` to create the
         input tensors for the model.
         Based on _update_states for GPU/TPU backends.
         """
@@ -505,7 +505,7 @@ class TTModelRunner:
         Update internal state with the scheduler output and build
         TTModelInput without executing the model.
         Returns None if there is no scheduled work in this step.
-        
+
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """

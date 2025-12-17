@@ -250,13 +250,14 @@ class TTPlatform(Platform):
                 "disabling it")
 
         if vllm_config.cache_config.enable_prefix_caching:
-            allowed_prefix_caching_model = (
-                "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM")
+            allowed_prefix_caching_module = (
+                "models.tt_transformers.tt.generator_vllm")
             if not model_class.__module__.startswith(
-                    allowed_prefix_caching_model):
+                    allowed_prefix_caching_module):
                 vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning("Prefix caching is not supported for ",
-                               " {model_class.__module__}, disabling it")
+                logger.warning(
+                    f"Prefix caching is not supported for "
+                    f"{model_class.__module__}, disabling it")
 
         logger.info(f"Prefix caching is enabled: \
             {vllm_config.cache_config.enable_prefix_caching}, \
