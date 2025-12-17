@@ -765,8 +765,10 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-            # Optionally add a delay to allow more requests to arrive
-            if _should_add_queue_delay():
+            # Optionally add a delay to allow more requests to arrive.
+            # Don't add delays beyond the initial delay if there are more
+            # requests in the queue.
+            if self.input_queue.empty() and _should_add_queue_delay():
                 time.sleep(delay)
 
     def _process_engine_step(self) -> bool:
