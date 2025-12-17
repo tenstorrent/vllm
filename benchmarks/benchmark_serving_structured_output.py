@@ -670,8 +670,6 @@ async def benchmark(
 
 
 def evaluate(ret, args):
-    print(f"evaluate: ret: {ret}")
-    print(f"evaluate: args: {args}")
     def _eval_correctness_json(expected, actual):
         # extract json string from string using regex
         import regex as re
@@ -803,9 +801,6 @@ def main(args: argparse.Namespace):
     input_requests = sample_requests(tokenizer, args)
 
     goodput_config_dict = check_goodput_args(args)
-
-    for i, req in enumerate(input_requests):
-        print(f"Input Request {i}: {req}")
 
     benchmark_result, ret = asyncio.run(
         benchmark(

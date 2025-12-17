@@ -256,12 +256,8 @@ class TTPlatform(Platform):
                     allowed_prefix_caching_module):
                 vllm_config.cache_config.enable_prefix_caching = False
                 logger.warning(
-                    f"Prefix caching is not supported for "
-                    f"{model_class.__module__}, disabling it")
-
-        logger.info(f"Prefix caching is enabled: \
-            {vllm_config.cache_config.enable_prefix_caching}, \
-            model class: {model_class.__module__}")
+                    "Prefix caching is not supported in TT backend for %s, "
+                    "disabling it", model_class.__module__)
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
