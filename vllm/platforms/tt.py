@@ -242,6 +242,14 @@ class TTPlatform(Platform):
                 "models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
 
+        if not envs.VLLM_USE_V1:
+            if vllm_config.cache_config.enable_prefix_caching:
+                vllm_config.cache_config.enable_prefix_caching = False
+                logger.warning(
+                    "Prefix caching is not supported for V0 TT backend, "
+                    "disabling it"
+                )
+
         allowed_prefix_caching_model = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
         if vllm_config.cache_config.enable_prefix_caching:
             if not model_class.__module__.startswith(allowed_prefix_caching_model):
