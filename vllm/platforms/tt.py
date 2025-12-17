@@ -242,23 +242,25 @@ class TTPlatform(Platform):
                 "models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
 
-        if not envs.VLLM_USE_V1:
-            if vllm_config.cache_config.enable_prefix_caching:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported for V0 TT backend, "
-                    "disabling it"
-                )
+        if (vllm_config.cache_config.enable_prefix_caching
+                and not envs.VLLM_USE_V1):
+            vllm_config.cache_config.enable_prefix_caching = False
+            logger.warning(
+                "Prefix caching is not supported for V0 TT backend, "
+                "disabling it")
 
-        allowed_prefix_caching_model = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
         if vllm_config.cache_config.enable_prefix_caching:
-            if not model_class.__module__.startswith(allowed_prefix_caching_model):
+            allowed_prefix_caching_model = (
+                "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM")
+            if not model_class.__module__.startswith(
+                    allowed_prefix_caching_model):
                 vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported for {model_class.__module__}, "
-                    "disabling it"
-                )
+                logger.warning("Prefix caching is not supported for ",
+                               " {model_class.__module__}, disabling it")
 
+        logger.info(f"Prefix caching is enabled: \
+            {vllm_config.cache_config.enable_prefix_caching}, \
+            model class: {model_class.__module__}")
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
