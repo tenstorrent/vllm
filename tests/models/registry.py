@@ -135,6 +135,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
                                    trust_remote_code=True),
     "AquilaForCausalLM": _HfExamplesInfo("BAAI/AquilaChat2-7B",
                                          trust_remote_code=True),
+    "AllamForCausalLM": _HfExamplesInfo("humain-ai/ALLaM-7B-Instruct-preview"),
     "ArceeForCausalLM": _HfExamplesInfo("arcee-ai/AFM-4.5B-Base",
                                         is_available_online=False),
     "ArcticForCausalLM": _HfExamplesInfo("Snowflake/snowflake-arctic-instruct",
@@ -174,6 +175,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "Exaone4ForCausalLM": _HfExamplesInfo("LGAI-EXAONE/EXAONE-4.0-32B"),  # noqa: E501
     "Fairseq2LlamaForCausalLM": _HfExamplesInfo("mgleize/fairseq2-dummy-Llama-3.2-1B"),  # noqa: E501
     "FalconForCausalLM": _HfExamplesInfo("tiiuae/falcon-7b"),
+    "Falcon3ForCausalLM": _HfExamplesInfo("tiiuae/falcon-rw-1b"),
     "FalconH1ForCausalLM":_HfExamplesInfo("tiiuae/Falcon-H1-0.5B-Base",
                                           min_transformers_version="4.53"),
     "GemmaForCausalLM": _HfExamplesInfo("google/gemma-1.1-2b-it"),
