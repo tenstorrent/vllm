@@ -161,6 +161,8 @@ def decode_warmup(model,
         "enable_trace": trace_decode_mode,
         "read_from_device": True,
         "sampling_params": None,  #to be filled
+        "reset_inputs": True, 
+
     }
 
     for s in sampling_params:
@@ -1464,8 +1466,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         prefill_warmup(self.model, kv_cache, trace_prefill_mode,
                        self.scheduler_config.max_num_seqs)
 
-        trace_decode_mode = self.trace_mode in ["all", "decode_only"]
-        decode_warmup(self.model, kv_cache, trace_decode_mode,
-                      self.scheduler_config.max_num_seqs,
-                      self.cache_config.num_gpu_blocks,
-                      self.sample_on_device_mode)
+        # trace_decode_mode = self.trace_mode in ["all", "decode_only"]
+        # decode_warmup(self.model, kv_cache, trace_decode_mode,
+        #               self.scheduler_config.max_num_seqs,
+        #               self.cache_config.num_gpu_blocks,
+        #               self.sample_on_device_mode)
