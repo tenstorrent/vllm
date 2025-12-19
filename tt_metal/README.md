@@ -36,7 +36,7 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
     export VLLM_TARGET_DEVICE="tt" && source $PYTHON_ENV_DIR/bin/activate
     ```
 
-2. Ensure that the `PYTHONPATH` environment variable contains the path to tt-metal (should already have been done when installing tt-metal).
+2. Ensure that the `PYTHONPATH` environment variable contains the path to tt-metal (should already have been set when installing tt-metal).
 
 ## Accessing the Meta-Llama Hugging Face Models
 
