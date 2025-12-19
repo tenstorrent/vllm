@@ -30,7 +30,7 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
     ```
 
 **To activate the vLLM+tt-metal environment (after the first time):**
-1. Set `VLLM_TARGET_DEVICE` and activate virtual environment if using one (where `PYTHON_ENV_DIR` contains the path to the python virtual environment):
+1. Set `VLLM_TARGET_DEVICE` and activate virtual environment if using one (where `PYTHON_ENV_DIR` is set to the path of the python virtual environment):
 
     ```sh
     export VLLM_TARGET_DEVICE="tt" && source $PYTHON_ENV_DIR/bin/activate
