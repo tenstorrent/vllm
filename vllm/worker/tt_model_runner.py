@@ -1402,6 +1402,11 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         tt_out = tt_out[perm_table_tensor]
 
         if model_input.compat_sampling_used:
+            if not is_decode:
+                logger.info("Compat for prefill used")
+            if is_decode:
+                logger.info("Compat for decode used")
+
             # discarding dummy logprobs
             # refactor to create response object tracked here
             # https://github.com/tenstorrent/tt-metal/issues/34215
