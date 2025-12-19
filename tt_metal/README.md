@@ -10,7 +10,7 @@
 
 ## vLLM and TT-Metal Branches
 For the latest versions of vLLM and tt-metal, git-checkout the following branches in each repo separately:
-- vLLM branch: [dev](https://github.com/tenstorrent/vllm/tree/dev) (do not commit to this branch)
+- vLLM branch: [dev](https://github.com/tenstorrent/vllm/tree/dev) (PRs must be submitted to this branch)
 - tt-metal branch: [main](https://github.com/tenstorrent/tt-metal)
 
 >[!NOTE]
