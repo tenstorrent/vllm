@@ -531,6 +531,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 compat_sampling_used = True
 
         for seq_group_metadata in seq_group_metadata_list:
+            sampling_params = seq_group_metadata.sampling_params
+            penalties_requested = penalties_requested or (
+                sampling_params.presence_penalty != PADDING_PRESENCE_PENALTY or
+                sampling_params.frequency_penalty != PADDING_FREQUENCY_PENALTY
+                or sampling_params.repetition_penalty
+                != PADDING_REPETITION_PENALTY)
+            if penalties_requested:
+                break
+
+
+        for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
             seq_id = seq_ids[0]
             if self.dp_kv_cache:
@@ -543,11 +554,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             sampling_params = seq_group_metadata.sampling_params
 
-            penalties_requested = penalties_requested or (
-                sampling_params.presence_penalty != PADDING_PRESENCE_PENALTY or
-                sampling_params.frequency_penalty != PADDING_FREQUENCY_PENALTY
-                or sampling_params.repetition_penalty
-                != PADDING_REPETITION_PENALTY)
             if is_prompt:
                 # tokens
                 prompt_tokens = seq_data.get_token_ids()
