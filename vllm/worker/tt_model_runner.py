@@ -558,12 +558,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 # tokens
                 prompt_tokens = seq_data.get_token_ids()
                 input_tokens_list.append(prompt_tokens)
-                if penalties_requested:
-                    # TODO maybe just grab input tokens?
-                    # need prefill tokens to create prompt histogram for penalties
-                    decode_prompt_tokens.append(list(prompt_tokens))
-                    # no output tokens yet during prefill
-                    decode_output_tokens.append([])
             else:
                 # tokens
                 generation_token = seq_data.get_last_token_id()
@@ -636,8 +630,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         prompt_tokens_tensor: Optional[torch.Tensor] = None
         output_tokens_tensor: Optional[torch.Tensor] = None
         reset_batch: bool = True
-        # Build prompt/output token tensors for penalties during both prefill and decode
-        if penalties_requested and perform_device_sampling:
+        # TODO: Prefill batches still need output token histograms for
+        # repetition_penalty support (tenstorrent/tt-metal#32025).
+        if (not is_prompt and penalties_requested and perform_device_sampling):
             prompt_tokens_tensor = make_tensor_with_pad(decode_prompt_tokens,
                                                         dtype=torch.int32,
                                                         device="cpu",
