@@ -78,11 +78,3 @@ def tt_server(tt_server_url):
             )
     
     return ServerWrapper(tt_server_url)
-
-
-@pytest.fixture(scope="session")
-def tt_client(tt_server):
-    """
-    Session-scoped OpenAI client for making requests to the TT server.
-    """
-    return tt_server.get_client()

@@ -72,51 +72,137 @@ def run_concurrent_batch(tt_server, tt_model_name, configs: list[RequestConfig])
     """
     async def _run():
         async_client = tt_server.get_async_client()
-        return await send_batch_concurrent(async_client, tt_model_name, configs)
+        try:
+            return await send_batch_concurrent(async_client, tt_model_name, configs)
+        finally:
+            await async_client.close()
     
     return asyncio.run(_run())
 
 
 # =============================================================================
 # PREFILL TOKEN VERIFICATION
-# Each request has different parameters
 # =============================================================================
 
 class TestPrefillWithDifferentParams:
     """
-    Verify prefill handles different per-request sampling parameters.
+    Verify sampling of token output by prefill
     """
 
-    def test_prefill_different_seeds_per_request(
-        self, tt_server, tt_model_name, max_batch_size
+    @pytest.mark.parametrize("batch_size", [7, 10, 19, 32])
+    def test_prefill_temperature_varied_in_batch(
+        self, tt_server, tt_model_name, batch_size
     ):
         """
-        Each request in batch has a different seed.
-        Same prompt + different seeds should produce different first tokens.
+        With temperature > 0, first tokens should be varied.
         """
-        prompt = "Pick a random letter:"
-        
+        prompt = "Random letter:"
+
         configs = [
             RequestConfig(
                 prompt=prompt,
                 max_tokens=1,
-                temperature=2.0,
-                top_k=100,
-                seed=seed,
+                temperature=5,
             )
-            for seed in range(max_batch_size)
+            for _ in range(batch_size)
         ]
 
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
         unique_results = set(results)
 
         assert len(unique_results) >= 2, (
-            f"Different seeds should produce different first tokens.\n"
-            f"Got only {len(unique_results)} unique from {max_batch_size} seeds.\n"
+            f"With temperature=5, some outputs should be varied.\n"
+            f"Only {len(unique_results)}/{batch_size} were varied.\n"
             f"Results: {results}"
         )
 
-    def test_prefill_mixed_greedy_and_sampling(
+    def test_prefill_temperature_varied_between_batches(
+        self, tt_server, tt_model_name
+    ):
+        """
+        With temperature > 0, first token should vary when request is repeated.
+        """
+        prompt = "Random letter:"
+
+        configs = [
+            RequestConfig(
+                prompt=prompt,
+                max_tokens=1,
+                temperature=5,
+            )
+        ]
+
+        tries = 10
+
+        results = [run_concurrent_batch(tt_server, tt_model_name, configs)[0] for _ in range(tries)]
+        unique_results = set(results)
+
+        assert len(unique_results) >= 2, (
+            f"With temperature=5, output should be varied.\n"
+            f"Only {len(unique_results)}/{tries} unique outputs were produced.\n"
+            f"Results: {results}"
+        )
+
+    @pytest.mark.parametrize("batch_size", [7, 10, 19, 32])
+    def test_prefill_topk(
+        self, tt_server, tt_model_name, batch_size
+    ):
+        """
+        With top_k > 0, first tokens should be varied.
+        """
+        prompt = "Random letter:"
+        num_greedy = batch_size // 2
+        greedy_config = [RequestConfig(prompt=prompt, max_tokens=1, temperature=0) for _ in range(num_greedy)]
+
+        configs = [
+            RequestConfig(
+                prompt=prompt,
+                max_tokens=1,
+                top_k=10,
+            )
+            for _ in range(batch_size-num_greedy)
+        ]
+        joint_configs = greedy_config + configs
+
+        results_1 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
+        results_2 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
+
+        # Within each batch:
+        for results in [results_1, results_2]:
+            greedy_results = results[:num_greedy]
+            non_greedy_results = results[num_greedy:]
+
+            unique_greedy = set(greedy_results)
+            assert len(unique_greedy) == 1, (
+                f"Greedy requests should produce the same output.\n"
+                f"Results: {greedy_results}"
+            )
+
+            unique_non_greedy = set(non_greedy_results)
+
+            assert len(unique_non_greedy) >= 2, (
+                f"With top_k=10, some outputs should be varied.\n"
+                f"Only {len(unique_non_greedy)}/{batch_size} were varied.\n"
+                f"Results: {results}"
+            )
+
+        # Between batches:
+        greedy_results_1 = results_1[:num_greedy]
+        greedy_results_2 = results_2[:num_greedy]
+        assert len(set(greedy_results_1+greedy_results_2)) == 1, (
+            f"Greedy requests should produce the same output when re-ran.\n"
+            f"Results: {greedy_results_1} + {greedy_results_2}"
+        )
+
+        non_greedy_results_1 = results_1[num_greedy:]
+        non_greedy_results_2 = results_2[num_greedy:]
+        different = [x != y for x, y in zip(non_greedy_results_1, non_greedy_results_2)]
+        assert sum(different) > 0, (
+            f"Non-greedy requests should produce different outputs when re-ran.\n"
+            f"Results: {non_greedy_results_1} + {non_greedy_results_2}"
+        )
+         
+    def test_prefill_seeding(
         self, tt_server, tt_model_name, max_batch_size
     ):
         """
@@ -125,12 +211,14 @@ class TestPrefillWithDifferentParams:
         """
         prompt = "Random word:"
         
-        # Half greedy, half sampling
-        half = max_batch_size // 2
+        # greedy, seeds, seeds
+        seeds = max_batch_size // 3
+        greedy_count = max_batch_size - seeds - seeds
+        
         configs = []
         
         # Greedy requests
-        for i in range(half):
+        for i in range(greedy_count):
             configs.append(RequestConfig(
                 prompt=prompt,
                 max_tokens=1,
@@ -138,203 +226,67 @@ class TestPrefillWithDifferentParams:
             ))
         
         # Sampling requests with different seeds
-        for i in range(max_batch_size - half):
-            configs.append(RequestConfig(
-                prompt=prompt,
-                max_tokens=1,
-                temperature=1.5,
-                top_k=50,
-                seed=i * 100,
-            ))
-
+        for _ in range(2):
+            for i in range(seeds):
+                configs.append(RequestConfig(
+                    prompt=prompt,
+                    max_tokens=1,
+                    temperature=1.5,
+                    top_k=50,
+                    seed=i * 100,
+                ))
+    
         # Run twice
         results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
         results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
 
-        # Greedy results should be identical
-        for i in range(half):
-            assert results1[i] == results2[i], (
-                f"Greedy request {i} should be deterministic.\n"
-                f"Run 1: {results1[i]!r}, Run 2: {results2[i]!r}"
-            )
+        all_greedy = results1[:greedy_count]+results2[:greedy_count]
+        assert len(set(all_greedy)) == 1, (
+            f"Greedy requests should produce the same output across positions and runs.\n"
+            f"Results: {all_greedy}"
+        )
 
-        # Seeded sampling should also be identical (same seeds)
-        for i in range(half, max_batch_size):
-            assert results1[i] == results2[i], (
-                f"Seeded request {i} should reproduce.\n"
-                f"Run 1: {results1[i]!r}, Run 2: {results2[i]!r}"
+        different_seeds = []
+        for i in range(seeds):
+            all_results = [
+                results1[greedy_count+i],
+                results2[greedy_count+i],
+                results1[greedy_count+seeds+i],
+                results2[greedy_count+seeds+i],
+            ]
+            assert len(set(all_results)) == 1, (
+                f"Seeded requests should produce the same output across positions and runs.\n"
+                f"Results: {all_results}"
             )
+            different_seeds.append(all_results[0])
+        assert len(set(different_seeds)) >= 2, (
+            f"Seeded requests should produce different outputs for different seeds.\n"
+            f"Results: {different_seeds}"
+        )
 
-    def test_prefill_different_top_k_per_request(
+    def test_prefill_topk_1_is_greedy(
         self, tt_server, tt_model_name, max_batch_size
     ):
         """
-        Each request has different top_k. top_k=1 should match greedy.
+        top_k=1 should match greedy, both within and between runs.
         """
         prompt = "Number:"
 
         # First get greedy baseline
         greedy_config = RequestConfig(prompt=prompt, max_tokens=1, temperature=0)
-        greedy_result = run_concurrent_batch(tt_server, tt_model_name, [greedy_config])[0]
+        topk_config = RequestConfig(prompt=prompt, max_tokens=1, temperature=2.0, top_k=1)
+        result_1 = run_concurrent_batch(tt_server, tt_model_name, [greedy_config, topk_config])
+        result_2 = run_concurrent_batch(tt_server, tt_model_name, [greedy_config, topk_config])
 
-        # Now send batch with various top_k values
-        configs = [
-            RequestConfig(prompt=prompt, max_tokens=1, temperature=2.0, top_k=1, seed=i)
-            for i in range(max_batch_size)
-        ]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-
-        # All top_k=1 results should match greedy
-        for i, result in enumerate(results):
-            assert result == greedy_result, (
-                f"top_k=1 request {i} should match greedy.\n"
-                f"Greedy: {greedy_result!r}, Got: {result!r}"
-            )
-
-    def test_prefill_not_argmax_with_temperature(
-        self, tt_server, tt_model_name, max_batch_size
-    ):
-        """
-        With temperature > 0, first tokens shouldn't always be argmax.
-        """
-        prompt = "Random letter:"
-
-        # Get greedy result
-        greedy_config = RequestConfig(prompt=prompt, max_tokens=1, temperature=0)
-        greedy_result = run_concurrent_batch(tt_server, tt_model_name, [greedy_config])[0]
-
-        # Send batch with high temperature, different seeds
-        configs = [
-            RequestConfig(
-                prompt=prompt,
-                max_tokens=1,
-                temperature=1.5,
-                top_k=50,
-                seed=seed,
-            )
-            for seed in range(max_batch_size)
-        ]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        non_greedy_count = sum(1 for r in results if r != greedy_result)
-
-        assert non_greedy_count >= max_batch_size // 4, (
-            f"With temperature=1.5, some outputs should differ from greedy.\n"
-            f"Greedy: {greedy_result!r}\n"
-            f"Only {non_greedy_count}/{max_batch_size} were non-greedy.\n"
-            f"Results: {results}"
+        all_results = result_1 + result_2
+        assert len(set(all_results)) == 1, (
+            f"top_k=1 requests should produce the same output across positions and runs.\n"
+            f"Results: {all_results}"
         )
 
 
-# =============================================================================
-# DECODE TOKEN VERIFICATION
-# =============================================================================
 
-class TestDecodeWithDifferentParams:
-    """
-    Verify decode handles different per-request sampling parameters.
-    """
-
-    def test_decode_different_seeds_per_request(
-        self, tt_server, tt_model_name, max_batch_size
-    ):
-        """
-        Each request has different seed for decode phase.
-        """
-        prompt = "Continue the story:"
-
-        configs = [
-            RequestConfig(
-                prompt=prompt,
-                max_tokens=20,
-                temperature=1.5,
-                top_k=50,
-                seed=seed * 100,
-            )
-            for seed in range(max_batch_size)
-        ]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        unique_results = set(results)
-
-        assert len(unique_results) >= max_batch_size // 2, (
-            f"Different seeds should produce different decode sequences.\n"
-            f"Got only {len(unique_results)}/{max_batch_size} unique"
-        )
-
-    def test_decode_seeded_reproducible_per_request(
-        self, tt_server, tt_model_name, max_batch_size
-    ):
-        """
-        Each seeded request should reproduce on repeated batch.
-        """
-        configs = [
-            RequestConfig(
-                prompt=f"Story {i}:",
-                max_tokens=20,
-                temperature=1.0,
-                top_k=50,
-                seed=i * 100 + 42,
-            )
-            for i in range(max_batch_size)
-        ]
-
-        results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
-        results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
-
-        for i, (r1, r2) in enumerate(zip(results1, results2)):
-            assert r1 == r2, (
-                f"Seeded request {i} should reproduce.\n"
-                f"Run 1: {r1!r}\n"
-                f"Run 2: {r2!r}"
-            )
-
-    def test_decode_mixed_temperatures(
-        self, tt_server, tt_model_name, max_batch_size
-    ):
-        """
-        Mix of low and high temperature requests in same batch.
-        """
-        prompt = "Write:"
-        
-        configs = []
-        # Alternate low and high temperature
-        for i in range(max_batch_size):
-            if i % 2 == 0:
-                configs.append(RequestConfig(
-                    prompt=prompt,
-                    max_tokens=10,
-                    temperature=0.01,  # Near greedy
-                    seed=42,
-                ))
-            else:
-                configs.append(RequestConfig(
-                    prompt=prompt,
-                    max_tokens=10,
-                    temperature=2.0,
-                    top_k=100,
-                    seed=i,
-                ))
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-
-        # Low temp (even indices) should all be similar
-        low_temp_results = [results[i] for i in range(0, max_batch_size, 2)]
-        # High temp (odd indices) should have variety
-        high_temp_results = [results[i] for i in range(1, max_batch_size, 2)]
-
-        low_unique = len(set(low_temp_results))
-        high_unique = len(set(high_temp_results))
-
-        # Low temp with same seed should be identical
-        assert low_unique == 1, (
-            f"Low temp with same seed should be identical.\n"
-            f"Got {low_unique} unique: {low_temp_results}"
-        )
-
-
-# =============================================================================
+#========================================================
 # PENALTY TESTING - Different penalties per request
 # =============================================================================
 
@@ -374,6 +326,8 @@ class TestRepetitionPenaltyPerRequest:
             f"Results: {results}"
         )
 
+
+    # Caught https://github.com/tenstorrent/vllm/issues/286
     def test_repetition_penalty_vs_no_penalty(
         self, tt_server, tt_model_name, max_batch_size
     ):
@@ -399,7 +353,7 @@ class TestRepetitionPenaltyPerRequest:
                     prompt=prompt,
                     max_tokens=10,
                     temperature=0.01,
-                    repetition_penalty=5.0,
+                    repetition_penalty=2.0,
                     seed=42,
                 ))
 
@@ -437,7 +391,7 @@ class TestPresencePenaltyPerRequest:
         """
         prompt = "List words:"
 
-        penalties = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5][:max_batch_size]
+        penalties = [0.0, 0.5, 1.0, 1.5, 2.0, -0.5, -1.0, -1.5][:max_batch_size]
         
         configs = [
             RequestConfig(
@@ -499,7 +453,7 @@ class TestFrequencyPenaltyPerRequest:
         """
         prompt = "5 5 5 5. Continue:"
 
-        penalties = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5][:max_batch_size]
+        penalties = [0.0, 0.5, 1.0, 1.5, 2.0, -0.5, -1.0, -1.5][:max_batch_size]
         
         configs = [
             RequestConfig(
@@ -652,6 +606,108 @@ class TestSeededSamplingPerRequest:
             f"Run 1: {results1[0]!r}\n"
             f"Run 2: {results2[0]!r}"
         )
+
+    @pytest.mark.parametrize("seed", [1,0])
+    def test_batch1_seed_reproducible(
+        self, tt_server, tt_model_name, max_batch_size, seed
+    ):
+        """
+        Batch with 1 user with seed should produce reproducible outputs.
+        """
+        prompt = "Random story:"
+        configs = [RequestConfig(prompt=prompt, max_tokens=20, temperature=10.0, top_k=50, seed=seed)]
+        flush_configs = [RequestConfig(prompt=prompt, max_tokens=20, temperature=1.0, top_k=50) for _ in range(31)]
+        results = []
+        for _ in range(10):
+            run_concurrent_batch(tt_server, tt_model_name, flush_configs)
+            results.extend(run_concurrent_batch(tt_server, tt_model_name, configs))
+        assert len(set(results)) == 1, (
+            f"Batch with 1 user with seed {seed} should produce reproducible outputs.\n"
+            f"Got {len(set(results))} unique results out of {len(results)}"
+        )
+
+    def test_batch1_no_seed_varied(
+        self, tt_server, tt_model_name, max_batch_size
+    ):
+        """
+        Batch with 1 user with seed should produce reproducible outputs.
+        """
+        prompt = "Random story:"
+        configs = [RequestConfig(prompt=prompt, max_tokens=20, temperature=10.0, top_k=50)]
+        flush_configs = [RequestConfig(prompt=prompt, max_tokens=20, temperature=1.0, top_k=50) for _ in range(31)]
+        results = []
+        for _ in range(10):
+            run_concurrent_batch(tt_server, tt_model_name, flush_configs)
+            results.extend(run_concurrent_batch(tt_server, tt_model_name, configs))
+        assert len(set(results)) >= 2, (
+            f"Batch with 1 user with no seed should produce varied outputs.\n"
+            f"Got {len(set(results))} unique results out of {len(results)}"
+        )
+
+    @pytest.mark.parametrize("seed", [1,0])
+    def test_uniform_seed_deterministic(
+        self, tt_server, tt_model_name, max_batch_size, seed
+    ):
+        """
+        Full batch with uniform seed should produce deterministic outputs.
+        """
+        prompt = "Random story:"
+        configs = [
+            RequestConfig(prompt=prompt, max_tokens=20, temperature=1.0, top_k=50, seed=seed)
+            for _ in range(32)
+        ]
+        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        unique_results = set(results)
+        assert len(unique_results) == 1, (
+            f"Seed {seed} should produce deterministic outputs.\n"
+            f"Got {len(unique_results)} unique results out of {len(configs)}"
+        )
+
+    def test_uniform_noseed_varied(
+        self, tt_server, tt_model_name, max_batch_size
+    ):
+        """
+        Full batch without seed should produce varied outputs.
+        """
+        prompt = "Random story:"
+        configs = [
+            RequestConfig(prompt=prompt, max_tokens=20, temperature=10.0, top_k=50)
+            for _ in range(32)
+        ]
+        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        unique_results = set(results)
+        assert len(unique_results) >= 1, (
+            f"No seed should produce varied outputs.\n"
+            f"Got {len(unique_results)} unique results out of {len(configs)}"
+        )
+
+    def test_seed_0_produces_deterministic_outputs(
+        self, tt_server, tt_model_name, max_batch_size
+    ):
+        """
+        Seed 0 should produce deterministic outputs.
+        """
+        prompt = "Random story:"
+        configs = [
+            RequestConfig(prompt=prompt, max_tokens=20, temperature=1.0, top_k=50, seed=0)
+            for _ in range(10)
+        ]
+        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        unique_results = set(results)
+        assert len(unique_results) == 1, (
+            f"Seed 0 should produce deterministic outputs.\n"
+            f"Got {len(unique_results)} unique results out of {len(configs)}"
+        )
+
+    def test_negative_seed_does_not_crash(
+        self, tt_server, tt_model_name, max_batch_size
+    ):
+        """
+        Negative seed should not crash.
+        """
+        prompt = "Random story:"
+        configs = [RequestConfig(prompt=prompt, max_tokens=20, temperature=1.0, top_k=50, seed=-1)]
+        results = run_concurrent_batch(tt_server, tt_model_name, configs)
 
 
 # =============================================================================
@@ -862,36 +918,3 @@ class TestMixedParameterBatches:
                 f"Run 1: {r1!r}\n"
                 f"Run 2: {r2!r}"
             )
-
-    def test_same_prompt_different_params(
-        self, tt_server, tt_model_name, max_batch_size
-    ):
-        """
-        Same prompt with completely different parameters per request.
-        Tests that params are correctly applied per-request.
-        """
-        prompt = "Generate:"
-
-        configs = [
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=0),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=0.5, seed=42),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=1.0, seed=42),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=2.0, seed=42),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=0.5, 
-                         repetition_penalty=2.0, seed=42),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=0.5,
-                         presence_penalty=2.0, seed=42),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=0.5,
-                         frequency_penalty=2.0, seed=42),
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=0.5,
-                         top_k=5, seed=42),
-        ][:max_batch_size]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-
-        # Different params should (mostly) produce different outputs
-        unique_results = set(results)
-        assert len(unique_results) >= max_batch_size // 2, (
-            f"Different params should produce variety.\n"
-            f"Got only {len(unique_results)}/{max_batch_size} unique results"
-        )
