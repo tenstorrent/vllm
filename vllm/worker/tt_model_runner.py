@@ -398,7 +398,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         self.prev_seq_ids_tensor = torch.ones(
             self.scheduler_config.max_num_seqs) * -1
-        self.other_reset_batch = True
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -841,7 +840,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     torch.zeros(batch_pad_len, dtype=torch.int32, device="cpu")
                 ])
 
-            reset_batch = torch.any(seq_ids_tensor != self.prev_seq_ids_tensor) or self.other_reset_batch
+            reset_batch = torch.any(seq_ids_tensor != self.prev_seq_ids_tensor)
             self.prev_seq_ids_tensor = seq_ids_tensor
 
             # Pad block_tables to max num blocks
@@ -1155,9 +1154,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if not is_decode:
             execute_model_kwargs["enable_trace"] = self.trace_mode in ["all"]
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
-            # in prefill, reset_batch is implied if device sampling
-            if model_input.perform_device_sampling:
-                self.other_reset_batch = True
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
             # Only needed when sampling on device:
