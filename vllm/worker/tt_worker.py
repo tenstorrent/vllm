@@ -430,10 +430,14 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
     num_devices_per_model = (device_config.num_devices // data_parallel)
 
-    if (("Llama-3.1-8B" in model_config.model or "Mistral-7B"
-         in model_config.model or "gemma-3-4b" in model_config.model)
-            and num_devices_per_model == 1 and is_wormhole):
-        # Llama8B, Mistral7B, and gemma3-4b on N150
+    if ("Llama-3.1-8B" in model_config.model and num_devices_per_model == 1
+            and is_wormhole):
+        # Llama8B on N150
+        max_tokens_all_users = 32768
+    elif (("Mistral-7B" in model_config.model
+           or "gemma-3-4b" in model_config.model)
+          and num_devices_per_model == 1 and is_wormhole):
+        # Mistral7B, and gemma3-4b on N150
         max_tokens_all_users = 65536
     elif (("DeepSeek-R1-Distill-Qwen-14B" in model_config.model
            or "Qwen2.5-14B" in model_config.model)
