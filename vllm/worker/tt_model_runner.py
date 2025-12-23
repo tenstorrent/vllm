@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import product
@@ -11,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import ttnn
-import os
 from transformers import TopPLogitsWarper
 
 from vllm.attention.backends.abstract import AttentionBackend
@@ -379,10 +379,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # TODO: Extend this to support other DP models
 
         if ("Llama" in self.model_config.model
-                and "70B" in self.model_config.model
-                and self.device_config.num_devices == 32) or is_dp:
-            self.dp_kv_cache = True
-        elif os.getenv("TT_QWEN3_TEXT_VER", None) == "qwen3_32b_galaxy":
+                and "70B" in self.model_config.model and
+                self.device_config.num_devices == 32) or is_dp or os.getenv(
+                    "TT_QWEN3_TEXT_VER", None) == "qwen3_32b_galaxy":
             self.dp_kv_cache = True
         else:
             self.dp_kv_cache = False
