@@ -259,6 +259,16 @@ class TTPlatform(Platform):
                     "Prefix caching is not supported in TT backend for %s, "
                     "disabling it", model_class.__module__)
 
+        if vllm_config.cache_config.enable_prefix_caching:
+            # Check if the model architecture uses sliding window
+            uses_sliding_window = (
+                vllm_config.model_config.get_sliding_window() is not None)
+            if uses_sliding_window:
+                vllm_config.cache_config.enable_prefix_caching = False
+                logger.warning(
+                    "Prefix caching is not supported in TT backend for models "
+                    "with sliding window, disabling it")
+
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
         # V1 support on TT is experimental.
