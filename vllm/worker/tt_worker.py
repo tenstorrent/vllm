@@ -428,27 +428,27 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
             data_parallel = model_config.override_tt_config["data_parallel"]
 
     is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
-    num_devices_per_model = (device_config.num_devices // data_parallel)
+    devices_per_dp_cache = (device_config.num_devices // data_parallel)
 
-    if ("Llama-3.1-8B" in model_config.model and num_devices_per_model == 1
+    if ("Llama-3.1-8B" in model_config.model and devices_per_dp_cache == 1
             and is_wormhole):
         # Llama8B on N150
         max_tokens_all_users = 32768
     elif (("Mistral-7B" in model_config.model
-           or "gemma-3-4b" in model_config.model)
-          and num_devices_per_model == 1 and is_wormhole):
+           or "gemma-3-4b" in model_config.model) and devices_per_dp_cache == 1
+          and is_wormhole):
         # Mistral7B, and gemma3-4b on N150
         max_tokens_all_users = 65536
     elif (("DeepSeek-R1-Distill-Qwen-14B" in model_config.model
            or "Qwen2.5-14B" in model_config.model)
-          and num_devices_per_model == 2 and is_wormhole):
+          and devices_per_dp_cache == 2 and is_wormhole):
         # Qwen2.5-14B on N300
         max_tokens_all_users = 65536
-    elif ("Llama-3.2-90B" in model_config.model and num_devices_per_model == 8
+    elif ("Llama-3.2-90B" in model_config.model and devices_per_dp_cache == 8
           and is_wormhole):
         # Llama90B on WH T3K
         max_tokens_all_users = 65536
-    elif ("Qwen2.5-VL-72B" in model_config.model and num_devices_per_model == 8
+    elif ("Qwen2.5-VL-72B" in model_config.model and devices_per_dp_cache == 8
           and is_wormhole):
         # Qwen2.5-VL-72B on WH T3K
         max_tokens_all_users = 65536
