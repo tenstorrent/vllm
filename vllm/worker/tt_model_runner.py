@@ -540,7 +540,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if penalties_requested:
                 break
 
-
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
             seq_id = seq_ids[0]
