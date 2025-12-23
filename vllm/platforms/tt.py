@@ -317,14 +317,41 @@ class TTPlatform(Platform):
     ) -> None:
         """Raises if this request is unsupported on this platform"""
 
-        if isinstance(params, SamplingParams):
-            if params.best_of is not None:
+        if not isinstance(params, SamplingParams):
+            return
+
+        dev = cls.device_name
+
+        if params.best_of is not None:
+            raise ValueError(f"Not yet supporting best_of on {dev}")
+        if params.prompt_logprobs is not None:
+            raise ValueError(f"Not yet supporting prompt_logprobs on "
+                             f"{dev}")
+
+        if envs.VLLM_USE_V1:
+            if params.min_p != 0.0:
+                raise ValueError(f"Not yet supporting min_p on {dev} in V1")
+            if params.bad_words is not None and len(params.bad_words) > 0:
                 raise ValueError(
-                    f"Currently not supporting best_of on {cls.device_name}")
+                    f"Not yet supporting bad_words on {dev} in V1")
             if params.prompt_logprobs is not None:
                 raise ValueError(
-                    f"Currently not supporting prompt_logprobs on "
-                    f"{cls.device_name}")
+                    f"Not yet supporting prompt_logprobs on {dev} in V1")
+            if params.logits_processors is not None:
+                raise ValueError(
+                    f"Not yet supporting logits_processors on {dev} in V1")
+            if params.guided_decoding is not None:
+                raise ValueError(
+                    f"Not yet supporting guided_decoding on {dev} in V1")
+            if params.logit_bias is not None:
+                raise ValueError(
+                    f"Not yet supporting logit_bias on {dev} in V1")
+            if params.allowed_token_ids is not None:
+                raise ValueError(
+                    f"Not yet supporting allowed_token_ids on {dev} in V1")
+            if params.min_tokens != 0:
+                raise ValueError(
+                    f"Not yet supporting min_tokens on {dev} in V1")
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
