@@ -352,6 +352,19 @@ class TTPlatform(Platform):
             if params.min_tokens != 0:
                 raise ValueError(
                     f"Not yet supporting min_tokens on {dev} in V1")
+            if params.logprobs is not None:
+                raise ValueError(f"Not yet supporting logprobs on {dev} in V1")
+            if params.presence_penalty != 0.0:
+                raise ValueError(
+                    f"Not yet supporting presence_penalty on {dev} in V1")
+            if params.frequency_penalty != 0.0:
+                raise ValueError(
+                    f"Not yet supporting frequency_penalty on {dev} in V1")
+            if params.repetition_penalty != 1.0:
+                raise ValueError(
+                    f"Not yet supporting repetition_penalty on {dev} in V1")
+            if params.seed is not None:
+                raise ValueError(f"Not yet supporting seed on {dev} in V1")
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
