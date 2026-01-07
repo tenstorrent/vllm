@@ -183,7 +183,8 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
 
 
 def create_non_uniform_sampling_params(num_prompts, max_tokens, ignore_eos):
-    """Create a list of non-uniform sampling params varying top_k, top_p, temperature."""
+    """Create a list of non-uniform sampling params varying top_k, top_p,
+    temperature."""
     sampling_params_list = []
     for i in range(num_prompts):
         # Vary top_k, top_p, and temperature only
@@ -358,11 +359,13 @@ def run_inference(
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))
-        
+
         # Create non-uniform sampling params if requested
         if non_uniform_sampling:
             num_prompts = len(prompts)
-            sampling_params = create_non_uniform_sampling_params(num_prompts, max_tokens, ignore_eos)
+            sampling_params = create_non_uniform_sampling_params(
+                num_prompts, max_tokens, ignore_eos
+            )
             print(f"Created {len(sampling_params)} non-uniform sampling params")
     else:
         assert perf_prompt_len is not None, (
@@ -370,7 +373,7 @@ def run_inference(
         )
         print("Measuring performance with dummy prompts of length", perf_prompt_len)
         print("Generating prompts with output length", max_tokens)
-        
+
         total_batch_size = max_seqs_in_batch * data_parallel_size
 
         # Prompt token ids (dummy prompts)
@@ -699,8 +702,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--non_uniform_sampling",
         action="store_true",
-        help="Use non-uniform sampling params (vary top_k, top_p, temperature per prompt). "
-        "Cannot be used with --greedy_sampling, --test_increasing_seq_lens, or --measure_perf",
+        help=(
+            "Use non-uniform sampling params (vary top_k, top_p, "
+            "temperature per prompt). Cannot be used with --greedy_sampling, "
+            "--test_increasing_seq_lens, or --measure_perf"
+        ),
     )
 
     args = parser.parse_args()
