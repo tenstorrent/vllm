@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import torch
@@ -34,9 +34,13 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class TTSamplingParams:
-    temperature: torch.Tensor
-    top_k: torch.Tensor
-    top_p: torch.Tensor
+    """Sampling parameters for TT model execution.
+    
+    Host sampling uses tensors, while on-device sampling uses lists.
+    """
+    temperature: Union[torch.Tensor, list[float]]
+    top_k: Union[torch.Tensor, list[int]]
+    top_p: Union[torch.Tensor, list[float]]
 
 
 @dataclass(frozen=True)
@@ -824,6 +828,7 @@ class TTModelRunner:
         # TODO: Also if logprobs is not None and devices_per_dp_cache == 1,
         # logprobs on device is not supported
         # (https://github.com/tenstorrent/tt-metal/issues/34077).
+        assert isinstance(sampling_params.temperature, torch.Tensor)
         all_greedy = (sampling_params.temperature == 0.0).all().item()
         params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
             all_greedy)
@@ -874,7 +879,13 @@ class TTModelRunner:
         perform_device_sampling = self.check_perform_device_sampling(
             sampling_params, is_decode)
         if perform_device_sampling:
-            kwargs["sampling_params"] = sampling_params
+            # On-device sampling currently needs sampling param attributes to
+            # be lists instead of tensors.
+            kwargs["sampling_params"] = TTSamplingParams(
+                **{
+                    field.name: getattr(sampling_params, field.name).tolist()
+                    for field in fields(sampling_params)
+                })
 
         # Execute model
         if not is_decode:
@@ -961,6 +972,9 @@ class TTModelRunner:
 
                 # Extract sampling params for this DP rank from concatenated
                 # tensors.
+                assert isinstance(sampling_params.temperature, torch.Tensor)
+                assert isinstance(sampling_params.top_k, torch.Tensor)
+                assert isinstance(sampling_params.top_p, torch.Tensor)
                 temperature = sampling_params.temperature[start:start + sz]
                 top_k = sampling_params.top_k[start:start + sz]
                 top_p = sampling_params.top_p[start:start + sz]
