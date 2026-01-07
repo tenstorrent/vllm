@@ -251,7 +251,7 @@ class TTPlatform(Platform):
 
         # Get model capabilities from the class
         model_capabilities: Optional[dict] = getattr(model_class,
-                                                     "_model_capabilities",
+                                                     "model_capabilities",
                                                      None)
 
         if vllm_config.cache_config.enable_prefix_caching:
@@ -274,6 +274,10 @@ class TTPlatform(Platform):
                     logger.warning(
                         "Prefix caching is not supported in TT backend for "
                         "models with sliding window, disabling it")
+
+        logger.info(
+            "Automatic prefix caching is ", "enabled"
+            if vllm_config.cache_config.enable_prefix_caching else "disabled")
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
