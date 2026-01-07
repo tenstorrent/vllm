@@ -22,7 +22,7 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 ## Environment Creation
 
 **To create the vLLM+tt-metal environment (first time):**
-1. Install tt-metal following the instructions in [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) (build and create the virtual environment if [installing tt-metal from source](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md#source)). Ensure that the necessary environment variables for running tt-metal tests were set.  
+1. Install tt-metal following the instructions in [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) (build and create the virtual environment if [installing tt-metal from source](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md#source)). Ensure that the necessary environment variables for running tt-metal tests were set.
 2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM (Note: `dev` is the main vLLM branch):
 
     ```sh
@@ -47,7 +47,7 @@ To run Meta-Llama-3.1/3.2, it is required to have access to the model on Hugging
    - Llama-3.2-Vision: [https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
 2. Once you have received access, create and copy your access token from the settings tab on Hugging Face.
 3. Run this code in python and paste your access token:
-  
+
     ```python
     from huggingface_hub import login
     login()
@@ -216,6 +216,29 @@ Finally, send a request to the server:
 ```bash
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" --data-binary @server-instruct-mm-prompt.json
 ```
+
+## Benchmarking
+
+Offline benchmarking is done by passing `--measure_perf` to the `offline_inference_tt.py` script (see above).
+
+Client-server benchmarking can be done with `vllm bench serve`
+CLI command after starting the server (see above).
+Example usage:
+
+```bash
+vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --num-prompts 10
+```
+
+Check `vllm/vllm/benchmarks/serve.py` for all parameters.
+
+### Benchmarking Automatic Prefix Caching
+
+Offline test of automatic prefix caching is done with a dedicated script. Example:
+```bash
+VLLM_USE_V1=1 HF_MODEL=meta-llama/Llama-3.1-8B-Instruct MESH_DEVICE=N300 python benchmarks/benchmark_prefix_caching.py --model meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-num-seqs 32 --num_scheduler_steps 1 --block-size 64 --num-prompts 1 --repeat-count <X> --input-length-range 128:1024
+```
+Here the `--repeat-count` parameter specifies how many times each prompt will be repeated.
+Vary this value together with `--input-length-range` and `--num-prompts` to see the effect of prefix caching.
 
 ## Running on Multi-Host Systems (V1 only)
 To run offline inference or a server on a multi-host system, vLLM needs to be launched from the host that has MPI rank 0 (determined from the rankfile). Underneath the hood, the `tt-run` utility from tt-metal will be used to spawn MPI processes on each host. For example, for offline inference on 2 Wormhole Galaxy hosts with DP=2 (distributed across hosts):

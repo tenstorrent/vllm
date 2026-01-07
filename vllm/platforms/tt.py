@@ -250,7 +250,7 @@ class TTPlatform(Platform):
                 "disabling it")
 
         # Get model capabilities from the class
-        model_capabilities:dict = getattr(model_class, "_model_capabilities", None)
+        model_capabilities: dict | None = getattr(model_class, "_model_capabilities", None)
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
