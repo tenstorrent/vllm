@@ -249,25 +249,30 @@ class TTPlatform(Platform):
                 "Prefix caching is not supported for V0 TT backend, "
                 "disabling it")
 
+        # Get model capabilities from the class
+        model_capabilities:dict = getattr(model_class, "_model_capabilities", None)
+
         if vllm_config.cache_config.enable_prefix_caching:
-            allowed_prefix_caching_module = (
-                "models.tt_transformers.tt.generator_vllm")
-            if not model_class.__module__.startswith(
-                    allowed_prefix_caching_module):
+            # Check prefix caching support from capabilities (default to False)
+            supports_prefix_caching = (
+                model_capabilities.get("supports_prefix_caching", False)
+                if model_capabilities else False
+            )
+
+            if not supports_prefix_caching:
                 vllm_config.cache_config.enable_prefix_caching = False
                 logger.warning(
                     "Prefix caching is not supported in TT backend for %s, "
                     "disabling it", model_class.__module__)
-
-        if vllm_config.cache_config.enable_prefix_caching:
-            # Check if the model architecture uses sliding window
-            uses_sliding_window = (
-                vllm_config.model_config.get_sliding_window() is not None)
-            if uses_sliding_window:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported in TT backend for models "
-                    "with sliding window, disabling it")
+            else:
+                # Check if the model architecture uses sliding window
+                uses_sliding_window = (
+                    vllm_config.model_config.get_sliding_window() is not None)
+                if uses_sliding_window:
+                    vllm_config.cache_config.enable_prefix_caching = False
+                    logger.warning(
+                        "Prefix caching is not supported in TT backend for models "
+                        "with sliding window, disabling it")
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
