@@ -234,9 +234,11 @@ Check `vllm/vllm/benchmarks/serve.py` for all parameters.
 ### Benchmarking Automatic Prefix Caching
 
 Offline test of automatic prefix caching is done with a dedicated script. Example:
+
 ```bash
 VLLM_USE_V1=1 HF_MODEL=meta-llama/Llama-3.1-8B-Instruct MESH_DEVICE=N300 python benchmarks/benchmark_prefix_caching.py --model meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-num-seqs 32 --num_scheduler_steps 1 --block-size 64 --num-prompts 1 --repeat-count <X> --input-length-range 128:1024
 ```
+
 Here the `--repeat-count` parameter specifies how many times each prompt will be repeated.
 Vary this value together with `--input-length-range` and `--num-prompts` to see the effect of prefix caching.
 
