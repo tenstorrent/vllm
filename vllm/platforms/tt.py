@@ -331,9 +331,6 @@ class TTPlatform(Platform):
             if params.bad_words is not None and len(params.bad_words) > 0:
                 raise ValueError(
                     f"Not yet supporting bad_words on {dev} in V1")
-            if params.prompt_logprobs is not None:
-                raise ValueError(
-                    f"Not yet supporting prompt_logprobs on {dev} in V1")
             if params.logits_processors is not None:
                 raise ValueError(
                     f"Not yet supporting logits_processors on {dev} in V1")
