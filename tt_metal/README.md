@@ -6,6 +6,7 @@
 - [Preparing the TT-Metal Models](#preparing-the-tt-metal-models)
 - [Running the Offline Inference Example](#running-the-offline-inference-example)
 - [Running the Server Example](#running-the-server-example)
+- [Benchmarking](#benchmarking)
 - [Running on Multi-Host Systems (V1 only)](#running-on-multi-host-systems-v1-only)
 
 ## vLLM and TT-Metal Branches
@@ -227,7 +228,6 @@ Example usage:
 
 ```bash
 vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct \
-            --num-prompts 10 \
             --dataset-name random \
             --random-input-len 128 \
             --random-output-len 128 \
@@ -238,7 +238,7 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct \
 
 Check `vllm/vllm/benchmarks/serve.py` for all parameters.
 
-### Benchmarking Automatic Prefix Caching
+### Benchmarking Automatic Prefix Caching (V1 only)
 
 Offline test of automatic prefix caching is done with a dedicated script. Example:
 
@@ -249,8 +249,7 @@ VLLM_USE_V1=1 HF_MODEL=meta-llama/Llama-3.1-8B-Instruct MESH_DEVICE=N300 python 
 Here the `--repeat-count` parameter specifies how many times each prompt will be repeated.
 Vary this value together with `--input-length-range` and `--num-prompts` to see the effect of prefix caching.
 
-For client-server benchmarking, `vllm bench serve` command can be used with `--random-prefix-len <N>` parameter
-to prepend fixed prefix to each prompt
+For client-server benchmarking, the `vllm bench serve` command can be used with `--random-prefix-len <N>` to prepend fixed prefix tokens to each prompt.
 
 ## Running on Multi-Host Systems (V1 only)
 To run offline inference or a server on a multi-host system, vLLM needs to be launched from the host that has MPI rank 0 (determined from the rankfile). Underneath the hood, the `tt-run` utility from tt-metal will be used to spawn MPI processes on each host. For example, for offline inference on 2 Wormhole Galaxy hosts with DP=2 (distributed across hosts):
