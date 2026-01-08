@@ -162,6 +162,7 @@ class TTModelRunner:
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
+            vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[kv_cache_spec.block_size],
         )
 

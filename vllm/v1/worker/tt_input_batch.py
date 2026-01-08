@@ -69,9 +69,11 @@ class InputBatch:
             max_num_reqs: int,
             max_model_len: int,
             max_num_batched_tokens: int,
+            vocab_size: int,
             block_sizes: list[int],  # The block_size of each kv cache group
     ):
         self.max_num_reqs = max_num_reqs
+        self.vocab_size = vocab_size
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -153,7 +155,12 @@ class InputBatch:
         assert sampling_params is not None, "pooling requests not supported yet"
         self.sampling.temperature[req_index] = sampling_params.temperature
         self.sampling.top_p[req_index] = sampling_params.top_p
-        self.sampling.top_k[req_index] = sampling_params.top_k
+        top_k = sampling_params.top_k
+        if not (0 < top_k < self.vocab_size):
+            # Normalize top_k <= 0 or >= vocab_size to vocab_size
+            # (consider all tokens)
+            top_k = self.vocab_size
+        self.sampling.top_k[req_index] = top_k
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
