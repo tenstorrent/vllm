@@ -337,9 +337,6 @@ class TTPlatform(Platform):
             if params.logits_processors is not None:
                 raise ValueError(
                     f"Not yet supporting logits_processors on {dev} in V1")
-            if params.guided_decoding is not None:
-                raise ValueError(
-                    f"Not yet supporting guided_decoding on {dev} in V1")
             if params.logit_bias is not None:
                 raise ValueError(
                     f"Not yet supporting logit_bias on {dev} in V1")
