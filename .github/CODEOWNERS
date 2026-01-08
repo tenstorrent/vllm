@@ -60,7 +60,7 @@ mkdocs.yaml @hmellor
 /examples/server_example_tt.py @skhorasganiTT @ppetrovicTT
 /requirements/tt* @skhorasganiTT @ppetrovicTT
 /tt_metal @skhorasganiTT
-/vllm/platforms/tt.py @skhorasganiTT @tchedaTT
+/vllm/platforms/tt.py @skhorasganiTT @tchedaTT @viktorpusTT
 /vllm/model_executor/model_loader/tt_loader.py @skhorasganiTT
 
 # V0
@@ -69,8 +69,8 @@ mkdocs.yaml @hmellor
 
 # V1
 /vllm/v1/worker/tt_worker.py @skhorasganiTT @tchedaTT @ppetrovicTT
-/vllm/v1/worker/tt_model_runner.py @skhorasganiTT @tchedaTT @ppetrovicTT
-/vllm/v1/worker/tt_input_batch.py @skhorasganiTT @tchedaTT @ppetrovicTT
+/vllm/v1/worker/tt_model_runner.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
+/vllm/v1/worker/tt_input_batch.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
 /vllm/v1/core/sched/ascend_scheduler.py @skhorasganiTT @tchedaTT
 /vllm/v1/engine/core.py @skhorasganiTT @tchedaTT
 /vllm/v1/engine/utils.py @skhorasganiTT
