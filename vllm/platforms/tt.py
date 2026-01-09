@@ -276,8 +276,10 @@ class TTPlatform(Platform):
                         "models with sliding window, disabling it")
 
         logger.info(
-            "Automatic prefix caching is ", "enabled"
-            if vllm_config.cache_config.enable_prefix_caching else "disabled")
+            "Automatic prefix caching is %s",
+            "enabled"
+            if vllm_config.cache_config.enable_prefix_caching else "disabled",
+        )
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
