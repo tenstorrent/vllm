@@ -314,10 +314,10 @@ class TTPlatform(Platform):
     ) -> None:
         """Raises if this request is unsupported on this platform"""
 
-        if not isinstance(params, SamplingParams):
-            return
-
         dev = cls.device_name
+
+        if isinstance(params, PoolingParams):
+            raise NotImplementedError(f"Not yet supporting pooling for {dev}")
 
         if params.best_of is not None:
             raise ValueError(f"Not yet supporting best_of on {dev}")

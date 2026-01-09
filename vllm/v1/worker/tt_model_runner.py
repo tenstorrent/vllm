@@ -823,6 +823,8 @@ class TTModelRunner:
         if not want_device_sampling:
             return False
 
+        # Currently requests with logprobs / penalties will fail on request
+        # validation, but once supported, the TODOs below will be relevant.
         # TODO: Also if penalties or logprobs are not None,
         # TTPlatform.non_greedy_decoding_on_device must be True
         # (model limitations).
@@ -926,7 +928,7 @@ class TTModelRunner:
             if isinstance(tt_out, tuple):
                 tt_out = tt_out[0]
 
-        return self._sample_with_model_output(
+        return self._get_output_tokens(
             tt_out=tt_out,
             sampling_params=sampling_params,
             model_input=model_input,
@@ -935,7 +937,7 @@ class TTModelRunner:
             is_decode=is_decode,
         )
 
-    def _sample_with_model_output(
+    def _get_output_tokens(
         self,
         tt_out: torch.Tensor,
         sampling_params: TTSamplingParams,
