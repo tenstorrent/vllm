@@ -240,7 +240,16 @@ Check `vllm/vllm/benchmarks/serve.py` for all parameters.
 
 ### Benchmarking Automatic Prefix Caching (V1 only)
 
-Offline test of automatic prefix caching is done with a dedicated script. Example:
+Both the [Offline Inference Example](#running-the-offline-inference-example)
+and the [Server Example](#running-the-server-example) enable
+prefix caching for the inference, if supported by the model.
+
+To trigger this feature, you also need prompts that share prefixes.
+One option for offline inference is to provide custom prompt file
+to the `offline_inference_tt.py` script,
+for example `--prompts_json tt_metal/prompts_overlapping.json`
+
+There is also a dedicated script for offline testing of prefix caching. Example:
 
 ```bash
 VLLM_USE_V1=1 HF_MODEL=meta-llama/Llama-3.1-8B-Instruct MESH_DEVICE=N300 python benchmarks/benchmark_prefix_caching.py --model meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-num-seqs 32 --num_scheduler_steps 1 --block-size 64 --num-prompts 1 --repeat-count <X> --input-length-range 128:1024

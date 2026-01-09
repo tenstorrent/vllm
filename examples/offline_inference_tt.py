@@ -644,10 +644,11 @@ if __name__ == "__main__":
         help="KV cache block size",
     )
     parser.add_argument(
-        "--enable_prefix_caching",
-        action="store_true",
-        help="Enable prefix caching \
-(use with --prompts_json tt_metal/prompts_overlapping.json to test the feature)",
+        "--disable_prefix_caching",
+        dest="enable_prefix_caching",
+        action="store_false",
+        help="Disable prefix caching",
+        default=True,
     )
 
     args = parser.parse_args()
