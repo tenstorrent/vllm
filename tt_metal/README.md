@@ -245,7 +245,7 @@ and the [Server Example](#running-the-server-example) enable
 prefix caching for the inference, if supported by the model.
 
 To trigger this feature, you also need prompts that share prefixes.
-One option for offline inference is to provide custom prompt file
+One option for offline inference is to provide a custom prompt file
 to the `offline_inference_tt.py` script,
 for example `--prompts_json tt_metal/prompts_overlapping.json`
 
