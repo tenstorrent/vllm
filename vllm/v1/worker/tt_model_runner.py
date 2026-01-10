@@ -41,6 +41,11 @@ class TTSamplingParams:
     temperature: Union[torch.Tensor, list[float]]
     top_k: Union[torch.Tensor, list[int]]
     top_p: Union[torch.Tensor, list[float]]
+    presence_penalty: Optional[Union[torch.Tensor, list[float]]] = None
+    frequency_penalty: Optional[Union[torch.Tensor, list[float]]] = None
+    repetition_penalty: Optional[Union[torch.Tensor, list[float]]] = None
+    seed: Optional[Union[torch.Tensor, list[Optional[int]]]] = None
+    enable_log_probs: Optional[Union[torch.Tensor, list[bool]]] = None
 
 
 @dataclass(frozen=True)
@@ -886,7 +891,9 @@ class TTModelRunner:
             # be lists instead of tensors.
             kwargs["sampling_params"] = TTSamplingParams(
                 **{
-                    field.name: getattr(sampling_params, field.name).tolist()
+                    field.name:
+                    (getattr(sampling_params, field.name).tolist() if getattr(
+                        sampling_params, field.name) is not None else None)
                     for field in fields(sampling_params)
                 })
 
