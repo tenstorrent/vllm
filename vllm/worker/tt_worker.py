@@ -578,6 +578,8 @@ def reset_fabric(override_tt_config, num_devices):
 def device_params_from_override_tt_config(override_tt_config, trace_mode):
     device_params = {}
 
+    device_params["num_command_queues"] = 2
+
     if trace_mode in ["all", "decode_only"]:
         # Set the most common value as default, override later
         device_params["trace_region_size"] = 50000000
