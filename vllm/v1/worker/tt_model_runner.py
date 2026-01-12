@@ -746,11 +746,16 @@ class TTModelRunner:
                 "pixel_values": [],
                 "image_grid_thw": []
             }
+            pixel_values = []
+            image_grid_thw = []
             for mi in inputs:
-                multi_modal_kwargs["pixel_values"].append(
-                    mi.multi_modal_kwargs["pixel_values"])
-                multi_modal_kwargs["image_grid_thw"].append(
-                    mi.multi_modal_kwargs["image_grid_thw"])
+                if mi is not None:
+                    for pv in mi.multi_modal_kwargs["pixel_values"]:
+                        pixel_values.append(pv)
+                    for ig in mi.multi_modal_kwargs["image_grid_thw"]:
+                        image_grid_thw.append(ig)
+            multi_modal_kwargs["pixel_values"] = pixel_values
+            multi_modal_kwargs["image_grid_thw"] = image_grid_thw
         else:
             multi_modal_kwargs = {}
 
