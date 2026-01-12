@@ -31,6 +31,9 @@ import numpy as np
 
 logger = init_logger(__name__)
 
+# Maximum top_k value for on-device sampling
+MAX_K = 32
+
 
 @dataclass(frozen=True)
 class TTSamplingParams:
@@ -889,13 +892,19 @@ class TTModelRunner:
         if perform_device_sampling:
             # On-device sampling currently needs sampling param attributes to
             # be lists instead of tensors.
-            kwargs["sampling_params"] = TTSamplingParams(
-                **{
-                    field.name:
-                    (getattr(sampling_params, field.name).tolist() if getattr(
-                        sampling_params, field.name) is not None else None)
-                    for field in fields(sampling_params)
-                })
+            sampling_param_dict = {
+                field.name:
+                (getattr(sampling_params, field.name).tolist() if getattr(
+                    sampling_params, field.name) is not None else None)
+                for field in fields(sampling_params)
+            }
+            # Cap top_k values to MAX_K for on-device sampling due to
+            # https://github.com/tenstorrent/tt-metal/issues/35661
+            if sampling_param_dict["top_k"] is not None:
+                sampling_param_dict["top_k"] = [
+                    min(k, MAX_K) for k in sampling_param_dict["top_k"]
+                ]
+            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
 
         # Execute model
         if not is_decode:
