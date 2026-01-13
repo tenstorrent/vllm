@@ -30,6 +30,8 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
     source tt_metal/install-vllm-tt.sh
     ```
 
+> **Note for developers**: Optionally install pre-commit hooks for linting, formatting, and static type checking on commits by running `pre-commit install`.
+
 **To activate the vLLM+tt-metal environment (after the first time):**
 1. Set `VLLM_TARGET_DEVICE` and activate virtual environment if using one (where `PYTHON_ENV_DIR` is set to the path of the python virtual environment):
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import torch
@@ -18,9 +18,11 @@ from vllm.utils import LayerBlockType, cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
+from vllm.v1.sample.logits_processor import LogitsProcessorManager
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
-from vllm.worker.tt_model_runner import (TTSamplingParams, decode_warmup,
-                                         prefill_warmup, sample_tokens)
+from vllm.worker.tt_model_runner import decode_warmup, prefill_warmup
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -29,18 +31,34 @@ import numpy as np
 
 logger = init_logger(__name__)
 
+# Maximum top_k value for on-device sampling
+MAX_K = 32
+
+
+@dataclass(frozen=True)
+class TTSamplingParams:
+    """Sampling parameters for TT model execution.
+    
+    Host sampling uses tensors, while on-device sampling uses lists.
+    """
+    temperature: Union[torch.Tensor, list[float]]
+    top_k: Union[torch.Tensor, list[int]]
+    top_p: Union[torch.Tensor, list[float]]
+    presence_penalty: Optional[Union[torch.Tensor, list[float]]] = None
+    frequency_penalty: Optional[Union[torch.Tensor, list[float]]] = None
+    repetition_penalty: Optional[Union[torch.Tensor, list[float]]] = None
+    seed: Optional[Union[torch.Tensor, list[Optional[int]]]] = None
+    enable_log_probs: Optional[Union[torch.Tensor, list[bool]]] = None
+
 
 @dataclass(frozen=True)
 class TTModelInput:
-    """
-    Used by the TTModelRunner.
-    """
     input_tokens: torch.Tensor
     input_positions: torch.Tensor
     prompt_lens: Optional[list[int]]
     block_tables: torch.Tensor
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
-    tt_sampling_params: Union[TTSamplingParams, list[TTSamplingParams]]
+    tt_sampling_params: TTSamplingParams
     multi_modal_kwargs: dict[str, Any]
 
     # always lists: single-element for non-DP, multi-element for DP
@@ -110,6 +128,11 @@ class TTModelRunner:
         self.structured_output_arange = torch.arange(0, 32)
         self.bitmask_size = cdiv(self.model_config.get_vocab_size(), 32)
 
+        # Sampler for sampling on host when device sampling is not supported.
+        # Only used by device ranks (local dp rank 0).
+        if self.parallel_config.data_parallel_rank_local == 0:
+            self.host_sampler = Sampler()
+
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(vllm_config=self.vllm_config,
@@ -147,6 +170,7 @@ class TTModelRunner:
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
+            vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[kv_cache_spec.block_size],
         )
 
@@ -393,6 +417,7 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
+        sampling_params = input_batch.sampling
         if is_prompt:
             # Assert no running requests
             assert (
@@ -432,31 +457,19 @@ class TTModelRunner:
                                 block_tables.shape[1],
                                 dtype=torch.int32)
                 ])
+                # Pad sampling parameters with default values
+                sampling_params.pad_with_defaults(num_reqs)
 
-        # Sampling-related.
-        temperature = input_batch.sampling.temperature_cpu[:num_reqs]
-        top_p = input_batch.sampling.top_p_cpu[:num_reqs]
-        top_k = input_batch.sampling.top_k_cpu[:num_reqs]
-        if not np.all(temperature == temperature[0]):
-            logger.warning(
-                "Currently only supporting same temperature for all "
-                "sequences in batch, falling back to first sequence's "
-                "temperature (%s)", temperature[0])
-        if not np.all(top_k == top_k[0]):
-            logger.warning(
-                "Currently only supporting same top_k"
-                "for all sequences in batch, "
-                "falling back to first sequence's top_k (%s)", top_k[0])
-        if not np.all(top_p == top_p[0]):
-            logger.warning(
-                "Currently only supporting same top_p"
-                "for all sequences in batch, "
-                "falling back to first sequence's top_p (%s)", top_p[0])
-        tt_sampling_params = TTSamplingParams(
-            temperature=float(temperature[0]),
-            top_k=int(top_k[0]),
-            top_p=float(top_p[0]),
-        )
+        # Extract sampling parameters after all padding is complete.
+        # For prefill mode: slice to num_reqs (no padding needed).
+        # For decode mode: use full padded tensors for constant shape.
+        sampling_param_dict = {
+            name:
+            getattr(sampling_params, name)[:num_reqs]
+            if is_prompt else getattr(sampling_params, name)
+            for name in sampling_params.sampling_param_names
+        }
+        tt_sampling_params = TTSamplingParams(**sampling_param_dict)
 
         if self.model_config.is_multimodal_model and is_prompt:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
@@ -538,9 +551,12 @@ class TTModelRunner:
             block_tables = torch.zeros((max_batch, max_blocks_decode_batch),
                                        dtype=torch.int32)
             unpadded_batch_size = torch.tensor([0], dtype=torch.int32)
-            temperature = torch.tensor([-1.0], dtype=torch.float32)
-            top_k = torch.tensor([-1], dtype=torch.int32)
-            top_p = torch.tensor([-1.0], dtype=torch.float32)
+            # Create default sampling parameter tensors (max_batch sized)
+            sampling_default_tensors = (
+                self.input_batch.sampling.create_default_tensors())
+            temperature = sampling_default_tensors["temperature"]
+            top_k = sampling_default_tensors["top_k"]
+            top_p = sampling_default_tensors["top_p"]
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -554,15 +570,13 @@ class TTModelRunner:
                                 dtype=block_tables.dtype)
                 ],
                                          dim=1)
-            # We know these are not a list here before concatenation
             unpadded_batch_size = torch.tensor(
                 [cast(int, model_input.unpadded_batch_size)],
                 dtype=torch.int32)
-            sp: TTSamplingParams = model_input.tt_sampling_params
-
-            temperature = torch.tensor([sp.temperature], dtype=torch.float32)
-            top_k = torch.tensor([sp.top_k], dtype=torch.int32)
-            top_p = torch.tensor([sp.top_p], dtype=torch.float32)
+            sampling_params: TTSamplingParams = model_input.tt_sampling_params
+            temperature = sampling_params.temperature
+            top_k = sampling_params.top_k
+            top_p = sampling_params.top_p
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
@@ -572,7 +586,7 @@ class TTModelRunner:
                 positions.contiguous().view(-1),  # B
                 block_tables.contiguous().view(-1),  # B*W
                 unpadded_batch_size.contiguous().view(-1),  # 1
-                top_k.contiguous().view(-1),  # 1
+                top_k.contiguous().view(-1),  # B
             ],
             dim=0).contiguous()
 
@@ -591,8 +605,8 @@ class TTModelRunner:
 
         float_inputs = torch.cat(
             [
-                temperature.contiguous().view(-1),  # 1
-                top_p.contiguous().view(-1),  # 1
+                temperature.contiguous().view(-1),  # B
+                top_p.contiguous().view(-1),  # B
             ],
             dim=0).contiguous()
 
@@ -619,8 +633,11 @@ class TTModelRunner:
         ]  # (position for decode, prefix cache for prefill)
         prompt_lens_list: list[np.ndarray] = []  # (prefill only)
         batch_size_per_dp: list[int] = []
-        sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
         grammar_bitmask_list = []
+        # Sampling parameters
+        temperature_list: list[torch.Tensor] = []
+        top_k_list: list[torch.Tensor] = []
+        top_p_list: list[torch.Tensor] = []
 
         # Need to pad block tables to global max num blocks for constant shape.
         def pad_block_tables(block_tables):
@@ -637,10 +654,10 @@ class TTModelRunner:
 
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
-            # Ints: [toks(B), positions(B), block_tables(B*W), bs(1), top_k(1)]
+            # Ints: [toks(B), positions(B), block_tables(B*W), bs(1), top_k(B)]
             #   - If any_structured_inputs, also has at the end of the list:
             #     [has_structured_inputs(1), bitmasks(B*bitmask_size)]
-            # Floats: [temperature(1), top_p(1)]
+            # Floats: [temperature(B), top_p(B)]
             assert max_blocks_decode_batch is not None, (
                 "max_blocks_decode_batch must be provided for decode")
             B = int(self.scheduler_config.max_num_seqs)
@@ -660,8 +677,9 @@ class TTModelRunner:
                 off += stride
                 batch_size = int(int_inputs[off].item())
                 off += 1
-                top_k = int(int_inputs[off].item())
-                off += 1
+                stride = B
+                top_k = int_inputs[off:off + stride].view(B)
+                off += stride
                 if any_structured_inputs:
                     has_structured_input = int(int_inputs[off].item())
                     off += 1
@@ -675,21 +693,22 @@ class TTModelRunner:
                 else:
                     bitmasks = None
 
-                temperature = float(float_inputs[0].item())
-                top_p = float(float_inputs[1].item())
+                off = 0
+                stride = B
+                temperature = float_inputs[off:off + stride].view(B)
+                off += stride
+                top_p = float_inputs[off:off + stride].view(B)
+                off += stride
 
                 input_tokens_list.append(tokens)
                 input_positions_list.append(positions)
                 block_tables_list.append(pad_block_tables(block_tables))
                 batch_size_per_dp.append(batch_size)
-                if batch_size > 0:
-                    sampling_params_per_dp.append(
-                        TTSamplingParams(temperature=temperature,
-                                         top_k=top_k,
-                                         top_p=top_p))
-                else:
-                    sampling_params_per_dp.append(None)
                 grammar_bitmask_list.append(bitmasks)
+                # Sampling parameters
+                temperature_list.append(temperature)
+                top_k_list.append(top_k)
+                top_p_list.append(top_p)
 
             input_positions = torch.cat(input_positions_list, dim=0)
             prompt_lens = None
@@ -725,12 +744,16 @@ class TTModelRunner:
                     block_tables_list.append(pad_block_tables(mi.block_tables))
                     input_positions_list.append(mi.input_positions)
 
+                    # Extract sampling parameter tensors from TTSamplingParams
+                    sp = mi.tt_sampling_params
+                    temperature_list.append(sp.temperature)
+                    top_k_list.append(sp.top_k)
+                    top_p_list.append(sp.top_p)
+
                 # We know it's not a list here before concatenation
                 unpadded_batch_size: int = cast(
                     int, mi.unpadded_batch_size) if mi else 0
                 batch_size_per_dp.append(unpadded_batch_size)
-                sampling_params_per_dp.append(
-                    mi.tt_sampling_params if mi else None)
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
@@ -739,6 +762,16 @@ class TTModelRunner:
 
         input_tokens = torch.cat(input_tokens_list, dim=0)
         block_tables = torch.cat(block_tables_list, dim=0)
+
+        # Concatenate sampling parameter tensors across DP ranks
+        temperature = torch.cat(temperature_list, dim=0)
+        top_k = torch.cat(top_k_list, dim=0)
+        top_p = torch.cat(top_p_list, dim=0)
+        tt_sampling_params = TTSamplingParams(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
 
         if self.model_config.is_multimodal_model and not is_decode:
             # Gather multi-modal inputs from all DP ranks
@@ -767,7 +800,7 @@ class TTModelRunner:
             prompt_lens=prompt_lens,
             block_tables=block_tables,
             unpadded_batch_size=batch_size_per_dp,
-            tt_sampling_params=sampling_params_per_dp,
+            tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             grammar_bitmask=grammar_bitmask_list,
         )
@@ -796,6 +829,27 @@ class TTModelRunner:
         output = self.generate_runner_output(sampled_token_ids)
         return output
 
+    def check_perform_device_sampling(self, sampling_params: TTSamplingParams,
+                                      is_decode: bool) -> bool:
+        want_device_sampling = self.sample_on_device_mode == "all" or (
+            self.sample_on_device_mode == "decode_only" and is_decode)
+        if not want_device_sampling:
+            return False
+
+        # Currently requests with logprobs / penalties will fail on request
+        # validation, but once supported, the TODOs below will be relevant.
+        # TODO: Also if penalties or logprobs are not None,
+        # TTPlatform.non_greedy_decoding_on_device must be True
+        # (model limitations).
+        # TODO: Also if logprobs is not None and devices_per_dp_cache == 1,
+        # logprobs on device is not supported
+        # (https://github.com/tenstorrent/tt-metal/issues/34077).
+        assert isinstance(sampling_params.temperature, torch.Tensor)
+        all_greedy = (sampling_params.temperature == 0.0).all().item()
+        params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
+            all_greedy)
+        return params_device_supported
+
     def execute_with_model_input(
         self,
         model_input: TTModelInput,
@@ -813,10 +867,6 @@ class TTModelRunner:
         if not any(bs > 0 for bs in batch_size_per_dp):
             return [torch.tensor([], dtype=torch.int32)
                     ] * len(batch_size_per_dp)
-
-        sampling_params_per_dp = model_input.tt_sampling_params
-        if not isinstance(sampling_params_per_dp, list):
-            sampling_params_per_dp = [sampling_params_per_dp]
 
         kwargs = {
             "tokens": model_input.input_tokens,
@@ -839,17 +889,27 @@ class TTModelRunner:
                 kwargs["empty_slots"] = empty_slots
 
         kwargs["start_pos"] = model_input.input_positions
-        if self.sample_on_device_mode == "all" or (
-                self.sample_on_device_mode == "decode_only" and is_decode):
-            # Check that sampling params are the same for all DP ranks.
-            # TODO: Remove this restriction and concat sampling params in
-            # concat_dp_model_inputs once models can support mixed params.
-            non_none_params = [
-                sp for sp in sampling_params_per_dp if sp is not None
-            ]
-            assert all(sp == non_none_params[0] for sp in non_none_params), (
-                "Sampling params must be the same for all active DP ranks")
-            kwargs["sampling_params"] = non_none_params[0]
+
+        # Sampling decision
+        sampling_params = model_input.tt_sampling_params
+        perform_device_sampling = self.check_perform_device_sampling(
+            sampling_params, is_decode)
+        if perform_device_sampling:
+            # On-device sampling currently needs sampling param attributes to
+            # be lists instead of tensors.
+            sampling_param_dict = {
+                field.name:
+                (getattr(sampling_params, field.name).tolist() if getattr(
+                    sampling_params, field.name) is not None else None)
+                for field in fields(sampling_params)
+            }
+            # Cap top_k values to MAX_K for on-device sampling due to
+            # https://github.com/tenstorrent/tt-metal/issues/35661
+            if sampling_param_dict["top_k"] is not None:
+                sampling_param_dict["top_k"] = [
+                    min(k, MAX_K) for k in sampling_param_dict["top_k"]
+                ]
+            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
 
         # Execute model
         if not is_decode:
@@ -879,6 +939,7 @@ class TTModelRunner:
                 self.previous_req_ids = set(self.input_batch.req_ids)
 
             enable_trace = self.trace_mode in ["all", "decode_only"]
+            # In the DP case, the model outputs for all ranks are concatenated.
             tt_out = self.model.decode_forward(**kwargs,
                                                **enc_dec_kwargs,
                                                enable_trace=enable_trace,
@@ -888,9 +949,30 @@ class TTModelRunner:
             if isinstance(tt_out, tuple):
                 tt_out = tt_out[0]
 
-        # The model input we got here may come from
-        # concatenating multiple DP ranks.
-        # We need to split the data back before sampling.
+        return self._get_output_tokens(
+            tt_out=tt_out,
+            sampling_params=sampling_params,
+            model_input=model_input,
+            batch_size_per_dp=batch_size_per_dp,
+            perform_device_sampling=perform_device_sampling,
+            is_decode=is_decode,
+        )
+
+    def _get_output_tokens(
+        self,
+        tt_out: torch.Tensor,
+        sampling_params: TTSamplingParams,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+        perform_device_sampling: bool,
+        is_decode: bool,
+    ) -> list[torch.Tensor]:
+        """Return sampled tokens per DP rank using concatenated model
+        outputs.
+        
+        If perform_device_sampling is True, tokens are already sampled on
+        device. Otherwise, sample on host using host_sampler.
+        """
         sampled_token_ids_per_dp: list[torch.Tensor] = []
 
         start = 0
@@ -898,10 +980,11 @@ class TTModelRunner:
             if sz <= 0:
                 sampled_token_ids_per_dp.append(
                     torch.tensor([], dtype=torch.int32))
+                if is_decode:
+                    # Fixed stride segments per DP rank for decode
+                    start += self.scheduler_config.max_num_seqs
                 continue
-            if (not self.sample_on_device_mode
-                    or (self.sample_on_device_mode == "decode_only"
-                        and not is_decode)):
+            if not perform_device_sampling:
                 logits = tt_out[start:start + sz, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
@@ -911,8 +994,45 @@ class TTModelRunner:
                     grammar_bitmask = grammar_bitmask[:sz, :]
                     self.apply_grammar_bitmask(logits, grammar_bitmask)
 
-                next_token_ids = sample_tokens(logits,
-                                               sampling_params_per_dp[dp_rank])
+                # Extract sampling params for this DP rank from concatenated
+                # tensors.
+                assert isinstance(sampling_params.temperature, torch.Tensor)
+                assert isinstance(sampling_params.top_k, torch.Tensor)
+                assert isinstance(sampling_params.top_p, torch.Tensor)
+                temperature = sampling_params.temperature[start:start + sz]
+                top_k = sampling_params.top_k[start:start + sz]
+                top_p = sampling_params.top_p[start:start + sz]
+
+                # Determine if all greedy (temperature == 0.0) or all random
+                all_greedy = (temperature == 0.0).all().item()
+                all_random = (temperature != 0.0).all().item()
+
+                # Create SamplingMetadata for this DP rank
+                # TODO: support generators, logprobs, penalties, etc.
+                sampling_metadata = SamplingMetadata(
+                    temperature=temperature if not all_greedy else None,
+                    all_greedy=all_greedy,
+                    all_random=all_random,
+                    top_p=top_p,
+                    top_k=top_k,
+                    generators={},
+                    max_num_logprobs=None,
+                    no_penalties=True,
+                    prompt_token_ids=None,
+                    frequency_penalties=torch.tensor([]),
+                    presence_penalties=torch.tensor([]),
+                    repetition_penalties=torch.tensor([]),
+                    output_token_ids=[],
+                    allowed_token_ids_mask=None,
+                    bad_words_token_ids={},
+                    logitsprocs=LogitsProcessorManager(),
+                )
+
+                sampler_output = self.host_sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
+                next_token_ids = sampler_output.sampled_token_ids
             else:  # sample on device
                 # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start:start + sz]

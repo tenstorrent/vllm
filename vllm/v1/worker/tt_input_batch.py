@@ -11,11 +11,54 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
 class SamplingInputBatch:
+    # Default values for padding sampling parameters in decode mode.
+    DEFAULTS = {
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+    }
 
     def __init__(self, max_num_reqs: int):
-        self.temperature_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.top_p_cpu = np.empty(max_num_reqs, dtype=np.float32)
-        self.top_k_cpu = np.empty(max_num_reqs, dtype=np.int32)
+        self.max_num_reqs = max_num_reqs
+        # Initialize sampling parameter tensors with default values.
+        default_tensors = self.create_default_tensors()
+        # Set attributes explicitly for each parameter.
+        self.temperature = default_tensors["temperature"]
+        self.top_p = default_tensors["top_p"]
+        self.top_k = default_tensors["top_k"]
+        # Asserting that all defaults have corresponding attributes.
+        for name in self.DEFAULTS:
+            assert hasattr(
+                self,
+                name), (f"Missing attribute '{name}' in SamplingInputBatch")
+        self.sampling_param_names = list(self.DEFAULTS.keys())
+
+    def pad_with_defaults(self, num_reqs: int) -> None:
+        """Pad sampling parameters with default values for indices >=
+        num_reqs."""
+        for name in self.sampling_param_names:
+            param_tensor = getattr(self, name)
+            default_value = self.DEFAULTS[name]
+            param_tensor[num_reqs:] = default_value
+
+    def create_default_tensors(self) -> dict[str, torch.Tensor]:
+        """Create tensors filled with default values for all parameters in
+        DEFAULTS."""
+        # Map Python types to PyTorch dtypes
+        # Note: torch.full infers dtype, but int defaults to int64, so we
+        # explicitly specify int32.
+        dtype_map = {
+            float: torch.float32,
+            int: torch.int32,
+            bool: torch.bool,
+        }
+        result: dict[str, torch.Tensor] = {}
+        for name, default_value in self.DEFAULTS.items():
+            dtype = dtype_map[type(default_value)]
+            result[name] = torch.full((self.max_num_reqs, ),
+                                      default_value,
+                                      dtype=dtype)
+        return result
 
 
 class InputBatch:
@@ -26,9 +69,11 @@ class InputBatch:
             max_num_reqs: int,
             max_model_len: int,
             max_num_batched_tokens: int,
+            vocab_size: int,
             block_sizes: list[int],  # The block_size of each kv cache group
     ):
         self.max_num_reqs = max_num_reqs
+        self.vocab_size = vocab_size
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -108,9 +153,14 @@ class InputBatch:
         # Sampling-related.
         sampling_params = request.sampling_params
         assert sampling_params is not None, "pooling requests not supported yet"
-        self.sampling.temperature_cpu[req_index] = sampling_params.temperature
-        self.sampling.top_p_cpu[req_index] = sampling_params.top_p
-        self.sampling.top_k_cpu[req_index] = sampling_params.top_k
+        self.sampling.temperature[req_index] = sampling_params.temperature
+        self.sampling.top_p[req_index] = sampling_params.top_p
+        top_k = sampling_params.top_k
+        if not (0 < top_k < self.vocab_size):
+            # Normalize top_k <= 0 or >= vocab_size to vocab_size
+            # (consider all tokens)
+            top_k = self.vocab_size
+        self.sampling.top_k[req_index] = top_k
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -171,12 +221,10 @@ class InputBatch:
 
             # Sampling-related.
             sampling = self.sampling
-            sampling.temperature_cpu[empty_index] = sampling.temperature_cpu[
+            sampling.temperature[empty_index] = sampling.temperature[
                 last_req_index]
-            sampling.top_p_cpu[empty_index] = sampling.top_p_cpu[
-                last_req_index]
-            sampling.top_k_cpu[empty_index] = sampling.top_k_cpu[
-                last_req_index]
+            sampling.top_p[empty_index] = sampling.top_p[last_req_index]
+            sampling.top_k[empty_index] = sampling.top_k[last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1

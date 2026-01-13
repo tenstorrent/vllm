@@ -9,17 +9,16 @@ import torch
 import vllm.envs as envs
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 
 from .interface import Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.pooling_params import PoolingParams
 else:
     ModelConfig = None
     VllmConfig = None
-    PoolingParams = None
 
 logger = init_logger(__name__)
 
@@ -283,16 +282,13 @@ class TTPlatform(Platform):
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
-        # V1 support on TT is experimental.
-        # Allow users to opt in, but give a warning.
+        # Allow users to opt in to V1 for TT backend.
         if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
             if model_config.is_encoder_decoder:
                 raise ValueError(
                     "VLLM_USE_V1=1 was set but encoder-decoder models aren't "
                     "yet supported in V1 for TT")
-            logger.warning(
-                "Enabling V1 since VLLM_USE_V1=1, however V1 is still "
-                "experimental for TT backend.")
+            logger.warning("Enabling V1 since VLLM_USE_V1=1")
             return envs.VLLM_USE_V1
         return False
 
@@ -317,14 +313,48 @@ class TTPlatform(Platform):
     ) -> None:
         """Raises if this request is unsupported on this platform"""
 
-        if isinstance(params, SamplingParams):
-            if params.best_of is not None:
+        dev = cls.device_name
+
+        if isinstance(params, PoolingParams):
+            raise NotImplementedError(f"Not yet supporting pooling for {dev}")
+
+        if params.best_of is not None:
+            raise ValueError(f"Not yet supporting best_of on {dev}")
+        if params.prompt_logprobs is not None:
+            raise ValueError(f"Not yet supporting prompt_logprobs on "
+                             f"{dev}")
+
+        if envs.VLLM_USE_V1:
+            if params.min_p != 0.0:
+                raise ValueError(f"Not yet supporting min_p on {dev} in V1")
+            if params.bad_words is not None and len(params.bad_words) > 0:
                 raise ValueError(
-                    f"Currently not supporting best_of on {cls.device_name}")
-            if params.prompt_logprobs is not None:
+                    f"Not yet supporting bad_words on {dev} in V1")
+            if params.logits_processors is not None:
                 raise ValueError(
-                    f"Currently not supporting prompt_logprobs on "
-                    f"{cls.device_name}")
+                    f"Not yet supporting logits_processors on {dev} in V1")
+            if params.logit_bias is not None:
+                raise ValueError(
+                    f"Not yet supporting logit_bias on {dev} in V1")
+            if params.allowed_token_ids is not None:
+                raise ValueError(
+                    f"Not yet supporting allowed_token_ids on {dev} in V1")
+            if params.min_tokens != 0:
+                raise ValueError(
+                    f"Not yet supporting min_tokens on {dev} in V1")
+            if params.logprobs is not None:
+                raise ValueError(f"Not yet supporting logprobs on {dev} in V1")
+            if params.presence_penalty != 0.0:
+                raise ValueError(
+                    f"Not yet supporting presence_penalty on {dev} in V1")
+            if params.frequency_penalty != 0.0:
+                raise ValueError(
+                    f"Not yet supporting frequency_penalty on {dev} in V1")
+            if params.repetition_penalty != 1.0:
+                raise ValueError(
+                    f"Not yet supporting repetition_penalty on {dev} in V1")
+            if params.seed is not None:
+                raise ValueError(f"Not yet supporting seed on {dev} in V1")
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:

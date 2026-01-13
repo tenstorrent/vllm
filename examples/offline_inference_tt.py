@@ -182,6 +182,23 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
     return inputs
 
 
+def create_non_uniform_sampling_params(num_prompts, max_tokens, ignore_eos):
+    """Create a list of non-uniform sampling params varying top_k, top_p,
+    temperature."""
+    sampling_params_list = []
+    for i in range(num_prompts):
+        # Vary top_k, top_p, and temperature only
+        sp = SamplingParams(
+            max_tokens=max_tokens,
+            ignore_eos=ignore_eos,
+            top_k=5 + (i % 5) * 2,  # Vary top_k: 5, 7, 9, 11, 13
+            top_p=0.7 + (i % 3) * 0.1,  # Vary top_p: 0.7, 0.8, 0.9
+            temperature=0.2 + (i % 4) * 0.2,  # Vary temperature: 0.2, 0.4, 0.6, 0.8
+        )
+        sampling_params_list.append(sp)
+    return sampling_params_list
+
+
 def run_seq_len_tests(engine_kw_args, sampling_params):
     """
     Test generation of a few simple counting prompts
@@ -236,6 +253,7 @@ def run_inference(
     data_parallel_size=1,
     block_size=64,
     enable_prefix_caching=False,
+    non_uniform_sampling=False,
 ):
     if multi_modal:
         supported_models = [
@@ -250,6 +268,18 @@ def run_inference(
 
     if data_parallel_size > 1:
         assert envs.VLLM_USE_V1, "Data parallel size > 1 is only supported with V1"
+
+    # Validate non_uniform_sampling is not used with incompatible options
+    if non_uniform_sampling:
+        assert not greedy_sampling, (
+            "non_uniform_sampling cannot be used with greedy_sampling option"
+        )
+        assert not test_increasing_seq_lens, (
+            "non_uniform_sampling cannot be used with test_increasing_seq_lens option"
+        )
+        assert not measure_perf, (
+            "non_uniform_sampling cannot be used with measure_perf option"
+        )
 
     # LLM args
     engine_kw_args = {
@@ -286,13 +316,17 @@ def run_inference(
             max_tokens=max_tokens, ignore_eos=ignore_eos, temperature=0.0
         )
     else:
-        sampling_params = SamplingParams(
-            max_tokens=max_tokens,
-            ignore_eos=ignore_eos,
-            top_k=10,
-            top_p=0.9,
-            temperature=1.0,
-        )
+        if non_uniform_sampling:
+            # Non-uniform sampling params will be created after prompts are loaded
+            sampling_params = None
+        else:
+            sampling_params = SamplingParams(
+                max_tokens=max_tokens,
+                ignore_eos=ignore_eos,
+                top_k=10,
+                top_p=0.9,
+                temperature=1.0,
+            )
 
     if test_increasing_seq_lens:
         assert not measure_perf, (
@@ -325,6 +359,14 @@ def run_inference(
         if num_repeat_prompts is not None:
             prompts = prompts * num_repeat_prompts
         print("Number of prompts:", len(prompts))
+
+        # Create non-uniform sampling params if requested
+        if non_uniform_sampling:
+            num_prompts = len(prompts)
+            sampling_params = create_non_uniform_sampling_params(
+                num_prompts, max_tokens, ignore_eos
+            )
+            print(f"Created {len(sampling_params)} non-uniform sampling params")
     else:
         assert perf_prompt_len is not None, (
             "perf_prompt_len is required to generate dummy prompts"
@@ -332,12 +374,14 @@ def run_inference(
         print("Measuring performance with dummy prompts of length", perf_prompt_len)
         print("Generating prompts with output length", max_tokens)
 
+        total_batch_size = max_seqs_in_batch * data_parallel_size
+
         # Prompt token ids (dummy prompts)
         prompt_token_ids_user = [0] * perf_prompt_len
         if not multi_modal:
             prompts = [
                 {"prompt_token_ids": prompt_token_ids_user}
-                for _ in range(max_seqs_in_batch * data_parallel_size)
+                for _ in range(total_batch_size)
             ]
         else:
             if "Llama-3.2" in model:
@@ -361,16 +405,21 @@ def run_inference(
                     "prompt_token_ids": prompt_token_ids_user,
                     "multi_modal_data": {"image": rand_img},
                 }
-                for _ in range(max_seqs_in_batch)
+                for _ in range(total_batch_size)
             ]
 
-        # Sampling params
-        sampling_params = (
-            sampling_params[:max_seqs_in_batch]
-            if isinstance(sampling_params, list)
-            else sampling_params
+    # Validate sampling params size matches prompts size
+    if non_uniform_sampling:
+        assert isinstance(sampling_params, list), (
+            "sampling_params must be a list when non_uniform_sampling is enabled"
         )
-        sampling_params.max_tokens = max_tokens
+    if isinstance(sampling_params, list):
+        num_prompts = len(prompts)
+        if len(sampling_params) != num_prompts:
+            raise ValueError(
+                f"Size of sampling_params ({len(sampling_params)}) must match "
+                f"size of prompts ({num_prompts})"
+            )
 
     # Create and run LLM
     if not async_engine:
@@ -650,6 +699,15 @@ if __name__ == "__main__":
         help="Disable prefix caching",
         default=True,
     )
+    parser.add_argument(
+        "--non_uniform_sampling",
+        action="store_true",
+        help=(
+            "Use non-uniform sampling params (vary top_k, top_p, "
+            "temperature per prompt). Cannot be used with --greedy_sampling, "
+            "--test_increasing_seq_lens, or --measure_perf"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -675,4 +733,5 @@ if __name__ == "__main__":
         data_parallel_size=args.data_parallel_size,
         block_size=args.block_size,
         enable_prefix_caching=args.enable_prefix_caching,
+        non_uniform_sampling=args.non_uniform_sampling,
     )
