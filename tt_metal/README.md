@@ -262,6 +262,15 @@ Vary this value together with `--input-length-range` and `--num-prompts` to see 
 
 For client-server benchmarking, the `vllm bench serve` command can be used with `--random-prefix-len <N>` to prepend fixed prefix tokens to each prompt.
 
+## Testing
+To run sampling tests, first start a vllm server as usual, then run (substituting the address and model name):
+```
+pytest vllm/tests/tt -v \
+--tt-server-url=http://localhost:8000 \
+--tt-model-name=meta-llama/Llama-3.1-8B
+```
+
+
 ## Running on Multi-Host Systems (V1 only)
 To run offline inference or a server on a multi-host system, vLLM needs to be launched from the host that has MPI rank 0 (determined from the rankfile). Underneath the hood, the `tt-run` utility from tt-metal will be used to spawn MPI processes on each host. For example, for offline inference on 2 Wormhole Galaxy hosts with DP=2 (distributed across hosts):
 
