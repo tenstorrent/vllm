@@ -9,6 +9,10 @@ import torch
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+# Sentinel value for None seed. vLLM treats -1 as equivalent to None
+# (see SamplingParams.__post_init__), so we use -1 as the sentinel.
+SEED_NONE_SENTINEL = -1
+
 
 class SamplingInputBatch:
     # Default values for padding sampling parameters in decode mode.
@@ -16,6 +20,10 @@ class SamplingInputBatch:
         "temperature": 0.0,
         "top_k": 1,
         "top_p": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": SEED_NONE_SENTINEL,  # Sentinel represents None (no seed)
     }
 
     def __init__(self, max_num_reqs: int):
@@ -26,6 +34,10 @@ class SamplingInputBatch:
         self.temperature = default_tensors["temperature"]
         self.top_p = default_tensors["top_p"]
         self.top_k = default_tensors["top_k"]
+        self.presence_penalty = default_tensors["presence_penalty"]
+        self.frequency_penalty = default_tensors["frequency_penalty"]
+        self.repetition_penalty = default_tensors["repetition_penalty"]
+        self.seed = default_tensors["seed"]
         # Asserting that all defaults have corresponding attributes.
         for name in self.DEFAULTS:
             assert hasattr(
@@ -161,6 +173,16 @@ class InputBatch:
             # (consider all tokens)
             top_k = self.vocab_size
         self.sampling.top_k[req_index] = top_k
+        self.sampling.presence_penalty[req_index] = (
+            sampling_params.presence_penalty)
+        self.sampling.frequency_penalty[req_index] = (
+            sampling_params.frequency_penalty)
+        self.sampling.repetition_penalty[req_index] = (
+            sampling_params.repetition_penalty)
+        # Store seed, using sentinel value for None
+        self.sampling.seed[req_index] = (sampling_params.seed
+                                         if sampling_params.seed is not None
+                                         else SEED_NONE_SENTINEL)
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -225,6 +247,13 @@ class InputBatch:
                 last_req_index]
             sampling.top_p[empty_index] = sampling.top_p[last_req_index]
             sampling.top_k[empty_index] = sampling.top_k[last_req_index]
+            sampling.presence_penalty[empty_index] = (
+                sampling.presence_penalty[last_req_index])
+            sampling.frequency_penalty[empty_index] = (
+                sampling.frequency_penalty[last_req_index])
+            sampling.repetition_penalty[empty_index] = (
+                sampling.repetition_penalty[last_req_index])
+            sampling.seed[empty_index] = sampling.seed[last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
@@ -232,3 +261,54 @@ class InputBatch:
         # Trim lists to the batch size.
         del self._req_ids[self.num_reqs:]
         del self.req_output_token_ids[self.num_reqs:]
+
+    def make_prompt_token_ids_tensor(self) -> torch.Tensor:
+        """Create a tensor of prompt token IDs, padded with -1.
+
+        NOTE: TT device sampling relies on -1 as the padding sentinel.
+        If these tokens are passed to the host sampler for penalties, they must
+        be canonicalized (cast to int64 and -1 replaced with vocab_size) before
+        scatter operations.
+        """
+        max_prompt_len = self.num_prompt_tokens[:self.num_reqs].max()
+        prompt_token_ids_tensor = torch.full(
+            (self.num_reqs, max_prompt_len),
+            -1,
+            device="cpu",
+            dtype=torch.int32,
+        )
+        prompt_token_ids = prompt_token_ids_tensor.numpy()
+        prompt_token_ids[:] = self.token_ids_cpu[:self.
+                                                 num_reqs, :max_prompt_len]
+        # Pad with -1 for positions beyond actual prompt length
+        for i in range(self.num_reqs):
+            prompt_token_ids[i, self.num_prompt_tokens[i]:] = -1
+        return prompt_token_ids_tensor
+
+    def make_output_token_ids_tensor(self) -> torch.Tensor:
+        """Create a tensor of output token IDs, padded with -1.
+
+        NOTE: TT device sampling relies on -1 as the padding sentinel.
+        If these tokens are used by the host sampler penalties logic, -1 padding
+        should be removed/handled before use.
+        """
+        output_lens = (self.num_tokens[:self.num_reqs] -
+                       self.num_prompt_tokens[:self.num_reqs])
+        max_output_len = int(output_lens.max()) if self.num_reqs > 0 else 0
+
+        output_token_ids_tensor = torch.full(
+            (self.num_reqs, max_output_len),
+            -1,
+            device="cpu",
+            dtype=torch.int32,
+        )
+        output_token_ids = output_token_ids_tensor.numpy()
+        # Copy output tokens from token_ids_cpu
+        for i in range(self.num_reqs):
+            prompt_len = self.num_prompt_tokens[i]
+            total_len = self.num_tokens[i]
+            output_len = total_len - prompt_len
+            if output_len > 0:
+                output_token_ids[i, :output_len] = self.token_ids_cpu[
+                    i, prompt_len:total_len]
+        return output_token_ids_tensor

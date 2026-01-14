@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import suppress
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
@@ -12,9 +12,8 @@ from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.tt_model_runner import TTModelRunner
+from vllm.v1.worker.tt_model_runner import TTModelInput, TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm.worker.tt_model_runner import TTModelInput
 from vllm.worker.tt_worker import (close_mesh_device, get_mesh_grid,
                                    get_num_available_blocks_tt,
                                    open_mesh_device)
@@ -185,27 +184,34 @@ class TTWorker(WorkerBase):
 
     def build_dp_model_input(
         self, scheduler_output: Optional["SchedulerOutput"]
-    ) -> tuple[Optional[TTModelInput], int, int]:
+    ) -> tuple[Optional[TTModelInput], int, int, int]:
         """Called by each DP rank to build model input from scheduler output.
+        Returns: (model_input, max_blocks, has_structured_input, has_penalties)
         """
         model_input = None
+        has_penalties = 0
         if scheduler_output is not None:
             model_input = self.model_runner.build_model_input(scheduler_output)
+            if model_input is not None:
+                # Check if any request has penalties
+                has_penalties = int(
+                    model_input.tt_sampling_params.has_penalties)
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = int(
             model_input.grammar_bitmask[0] is not None) if model_input else 0
-        return model_input, max_blocks, has_structured_input
+        return model_input, max_blocks, has_structured_input, has_penalties
 
     def build_dp_decode_gather_input(
             self, model_input: Optional[TTModelInput],
-            max_blocks_decode_batch: int,
-            any_structured_inputs: bool) -> dict[str, torch.Tensor]:
+            max_blocks_decode_batch: int, any_structured_inputs: bool,
+            any_penalties_inputs: bool) -> dict[str, Any]:
         return self.model_runner.build_dp_decode_gather_input(
-            model_input, max_blocks_decode_batch, any_structured_inputs)
+            model_input, max_blocks_decode_batch, any_structured_inputs,
+            any_penalties_inputs)
 
     def concat_and_execute_dp(self, inputs: Union[list[Optional[TTModelInput]],
-                                                  dict[str, torch.Tensor]],
-                              is_decode: bool,
+                                                  dict[str,
+                                                       Any]], is_decode: bool,
                               max_blocks_decode_batch: Optional[int],
                               any_structured_inputs: bool) -> torch.Tensor:
         """Called by TT device ranks (local DP rank 0) to concatenate DP-sized
