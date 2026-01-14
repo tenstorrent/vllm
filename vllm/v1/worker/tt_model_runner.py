@@ -81,6 +81,13 @@ class TTModelInput:
     prompt_tokens: Optional[torch.Tensor] = None
     output_tokens: Optional[torch.Tensor] = None
 
+    # Decode-only: `batch_id_tensor` encodes the padded (max_num_seqs) decode
+    # batch layout for this rank. `reset_batch` is derived
+    # from it and indicates the layout changed since the previous step (used by
+    # on-device sampling).
+    batch_id_tensor: Optional[torch.Tensor] = None
+    reset_batch: bool = False
+
 
 class TTModelRunner:
 
@@ -145,10 +152,48 @@ class TTModelRunner:
         self.vocab_size = self.model_config.get_vocab_size()
         self.bitmask_size = cdiv(self.vocab_size, 32)
 
+        # State for detecting changes in decode batch layout when sampling is
+        # performed on device.
+        self._prev_batch_id_tensor: Optional[torch.Tensor] = None
+        self._req_id_to_int: dict[str, int] = {}
+        self._next_req_int: int = 1  # 0 reserved for padding
+
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
         if self.parallel_config.data_parallel_rank_local == 0:
             self.host_sampler = Sampler()
+
+    def _encode_req_ids(self, req_ids: list[str],
+                        total_size: int) -> torch.Tensor:
+        """Encode req_ids into a fixed-size tensor (0 used for padding)."""
+        ids: list[int] = []
+        for rid in req_ids:
+            val = self._req_id_to_int.get(rid)
+            if val is None:
+                val = self._next_req_int
+                self._req_id_to_int[rid] = val
+                self._next_req_int += 1
+            ids.append(val)
+        if len(ids) < total_size:
+            ids.extend([0] * (total_size - len(ids)))
+        else:
+            ids = ids[:total_size]
+        return torch.tensor(ids, dtype=torch.int32, device="cpu")
+
+    def _compute_reset_batch(self, batch_id_tensor: torch.Tensor) -> bool:
+        """Return True iff batch_id_tensor differs from previous step."""
+        if self._prev_batch_id_tensor is None:
+            reset = True
+        else:
+            # batch_id_tensor must be padded to max total batch size.
+            assert self._prev_batch_id_tensor.shape == batch_id_tensor.shape, (
+                "reset_batch: batch_id_tensor shape changed from "
+                f"{tuple(self._prev_batch_id_tensor.shape)} to "
+                f"{tuple(batch_id_tensor.shape)}")
+            reset = torch.any(
+                batch_id_tensor != self._prev_batch_id_tensor).item()
+        self._prev_batch_id_tensor = batch_id_tensor.clone()
+        return bool(reset)
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
@@ -448,12 +493,20 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[:num_reqs, :
                                                             max_prompt_tokens]
             prompt_lens = input_batch.num_prompt_tokens[:num_reqs]
+            batch_id_tensor = None
+            reset_batch = False
         else:
             input_positions = torch.from_numpy(
                 input_batch.num_tokens[:num_reqs] - 1)
             input_tokens = input_batch.token_ids_cpu_tensor[
                 torch.arange(num_reqs), input_positions].view(-1, 1)
             prompt_lens = None
+            batch_id_tensor = self._encode_req_ids(self.input_batch.req_ids,
+                                                   input_batch.max_num_reqs)
+            # Compute reset_batch on every rank. For DP, EngineCore will
+            # all-reduce this flag across ranks and use it to gate any extra
+            # token transfers for when sampling with penalties.
+            reset_batch = self._compute_reset_batch(batch_id_tensor)
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad batch to max_num_reqs.
@@ -553,6 +606,8 @@ class TTModelRunner:
             grammar_bitmask=[bitmask],  # wrap to match DP case
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
+            batch_id_tensor=batch_id_tensor,
+            reset_batch=reset_batch,
         )
 
     def build_model_input(
@@ -594,6 +649,7 @@ class TTModelRunner:
 
         max_batch = int(self.scheduler_config.max_num_seqs)
         if model_input is None:
+            batch_id_tensor = torch.zeros((max_batch, ), dtype=torch.int32)
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
             positions = torch.full((max_batch, ), -1, dtype=torch.int32)
             block_tables = torch.zeros((max_batch, max_blocks_decode_batch),
@@ -610,6 +666,7 @@ class TTModelRunner:
             repetition_penalty = sampling_default_tensors["repetition_penalty"]
             seed = sampling_default_tensors["seed"]
         else:
+            batch_id_tensor = model_input.batch_id_tensor
             tokens = model_input.input_tokens
             positions = model_input.input_positions
             block_tables = model_input.block_tables
@@ -638,6 +695,7 @@ class TTModelRunner:
         # B = max batch size, W = max_num_blocks_per_req.
         int_inputs = torch.cat(
             [
+                batch_id_tensor.contiguous().view(-1),  # B
                 tokens.contiguous().view(-1),  # B
                 positions.contiguous().view(-1),  # B
                 block_tables.contiguous().view(-1),  # B*W
@@ -700,6 +758,8 @@ class TTModelRunner:
             Only provided when there are requests with penalties.
             One dict per DP rank, each with keys "prompt_tokens" and
             "output_tokens" (tensors padded with -1).
+          - "reset_batch": bool indicating whether the batch layout changed 
+            since the previous step.
         """
 
         input_tokens_list: list[torch.Tensor] = []
@@ -717,6 +777,8 @@ class TTModelRunner:
         frequency_penalty_list: list[torch.Tensor] = []
         repetition_penalty_list: list[torch.Tensor] = []
         seed_list: list[torch.Tensor] = []
+        merged_batch_id_tensor = None
+        reset_batch = False
 
         # Need to pad block tables to global max num blocks for constant shape.
         def pad_block_tables(block_tables):
@@ -733,8 +795,8 @@ class TTModelRunner:
 
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
-            # Ints: [toks(B), positions(B), block_tables(B*W), bs(1), top_k(B),
-            #        seed(B)]
+            # Ints: [batch_id_tensor(B), toks(B), positions(B),
+            #        block_tables(B*W), bs(1), top_k(B), seed(B)]
             #   - If any_structured_inputs, also has at the end of the list:
             #     [has_structured_inputs(1), bitmasks(B*bitmask_size)]
             # Floats: [temperature(B), top_p(B), presence_penalty(B),
@@ -743,10 +805,15 @@ class TTModelRunner:
                 "max_blocks_decode_batch must be provided for decode")
             B = int(self.scheduler_config.max_num_seqs)
             W = max_blocks_decode_batch
+            batch_id_tensors: list[torch.Tensor] = []
+            reset_batch = inputs["reset_batch"]
             for batch_num, (int_inputs, float_inputs) in enumerate(
                     zip(inputs["int_inputs"], inputs["float_inputs"])):
                 # Slices
                 off = 0
+                stride = B
+                batch_id_tensor = int_inputs[off:off + stride].view(B)
+                off += stride
                 stride = B
                 tokens = int_inputs[off:off + stride].view(B, 1)
                 off += stride
@@ -789,6 +856,7 @@ class TTModelRunner:
                 repetition_penalty = float_inputs[off:off + stride].view(B)
                 off += stride
 
+                batch_id_tensors.append(batch_id_tensor)
                 input_tokens_list.append(tokens)
                 input_positions_list.append(positions)
                 block_tables_list.append(pad_block_tables(block_tables))
@@ -805,6 +873,7 @@ class TTModelRunner:
 
             input_positions = torch.cat(input_positions_list, dim=0)
             prompt_lens = None
+            merged_batch_id_tensor = torch.cat(batch_id_tensors, dim=0)
         else:
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
@@ -955,6 +1024,8 @@ class TTModelRunner:
             grammar_bitmask=grammar_bitmask_list,
             prompt_tokens=prompt_tokens_tensor,
             output_tokens=output_tokens_tensor,
+            batch_id_tensor=merged_batch_id_tensor,
+            reset_batch=reset_batch,
         )
         return merged
 
@@ -1073,6 +1144,13 @@ class TTModelRunner:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
+
+            # For decode on-device sampling, signal whether the decode batch
+            # layout changed since the previous step.
+            if is_decode:
+                # reset_batch is precomputed (for non-DP in
+                # _prepare_model_inputs; for DP after inputs are gathered).
+                kwargs["reset_batch"] = model_input.reset_batch
 
         # Execute model
         if not is_decode:
