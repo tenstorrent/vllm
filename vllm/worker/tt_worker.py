@@ -452,9 +452,6 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
           and is_wormhole):
         # Qwen2.5-VL-72B on WH T3K
         max_tokens_all_users = 65536
-    elif "gpt-oss" in model_config.model:
-        # gpt-oss on Galaxy and T3K
-        max_tokens_all_users = 1024
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
     else:
