@@ -356,3 +356,17 @@ extend-ignore-re = []
 windo = "windo"
 
 [tool.typos.type.vimscript.extend-words]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu-only" }
+
+# Install torch only from from cpu-only index
+# explicit here means packages in tool.uv.sources must specifically
+# request this index if they would like to use it. The only thing
+# we want to use from it is the torch package. We had issues with certain
+# packages not falling back to PyPI. Some of those packages didn't have the
+# version we needed
+[[tool.uv.index]]
+name = "pytorch-cpu-only"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
