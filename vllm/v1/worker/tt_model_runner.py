@@ -82,7 +82,7 @@ class TTModelInput:
     output_tokens: Optional[torch.Tensor] = None
 
     # Decode-only: `batch_id_tensor` encodes the padded (max_num_seqs) decode
-    # batch layout for this rank. `reset_batch` is derived
+    # batch layout per DP rank. `reset_batch` is derived
     # from it and indicates the layout changed since the previous step (used by
     # on-device sampling).
     batch_id_tensor: Optional[torch.Tensor] = None
