@@ -62,6 +62,12 @@ class TTSamplingParams:
         has_repetition = (self.repetition_penalty != 1.0).any().item()
         return has_presence or has_frequency or has_repetition
 
+    @property
+    def all_greedy(self) -> bool:
+        """True if all requests are greedy decoding (temperature == 0.0)."""
+        assert isinstance(self.temperature, torch.Tensor)
+        return bool((self.temperature == 0.0).all().item())
+
 
 @dataclass(frozen=True)
 class TTModelInput:
@@ -72,6 +78,9 @@ class TTModelInput:
     unpadded_batch_size: Union[int, list[int]]  # List is used for DP
     tt_sampling_params: TTSamplingParams
     multi_modal_kwargs: dict[str, Any]
+
+    # For DP gather, this is true only if all ranks can sample on device.
+    perform_device_sampling: bool
 
     # always lists: single-element for non-DP, multi-element for DP
     # If not using structured outputs, [None]
@@ -540,6 +549,8 @@ class TTModelRunner:
             for name in sampling_params.sampling_param_names
         }
         tt_sampling_params = TTSamplingParams(**sampling_param_dict)
+        perform_device_sampling = self.check_perform_device_sampling(
+            tt_sampling_params, is_decode=not is_prompt)
 
         if self.model_config.is_multimodal_model and is_prompt:
             multi_modal_kwargs = self._gather_multi_modal_inputs(
@@ -603,6 +614,7 @@ class TTModelRunner:
             unpadded_batch_size=num_reqs,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
+            perform_device_sampling=perform_device_sampling,
             grammar_bitmask=[bitmask],  # wrap to match DP case
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
@@ -758,8 +770,9 @@ class TTModelRunner:
             Only provided when there are requests with penalties.
             One dict per DP rank, each with keys "prompt_tokens" and
             "output_tokens" (tensors padded with -1).
-          - "reset_batch": bool indicating whether the batch layout changed 
+          - "reset_batch": bool for if the batch layout changed
             since the previous step.
+          - "all_sample_device": bool for if all ranks can sample on device.
         """
 
         input_tokens_list: list[torch.Tensor] = []
@@ -807,6 +820,7 @@ class TTModelRunner:
             W = max_blocks_decode_batch
             batch_id_tensors: list[torch.Tensor] = []
             reset_batch = inputs["reset_batch"]
+            perform_device_sampling = inputs["all_sample_device"]
             for batch_num, (int_inputs, float_inputs) in enumerate(
                     zip(inputs["int_inputs"], inputs["float_inputs"])):
                 # Slices
@@ -878,6 +892,10 @@ class TTModelRunner:
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
                 raise ValueError("All inputs are None; nothing to concatenate")
+
+            # Check if all ranks can sample on device.
+            perform_device_sampling = all(mi.perform_device_sampling
+                                          for mi in active_inputs)
 
             # Determine max token width across slots.
             max_tok_width = 0
@@ -1023,6 +1041,7 @@ class TTModelRunner:
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
+            perform_device_sampling=perform_device_sampling,
             grammar_bitmask=grammar_bitmask_list,
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
@@ -1061,18 +1080,16 @@ class TTModelRunner:
         if not want_device_sampling:
             return False
 
-        # Currently requests with logprobs / penalties will fail on request
+        # Currently requests with logprobs fail on request
         # validation, but once supported, the TODOs below will be relevant.
-        # TODO: Also if penalties or logprobs are not None,
+        # TODO: Also if logprobs are not None,
         # TTPlatform.non_greedy_decoding_on_device must be True
         # (model limitations).
         # TODO: Also if logprobs is not None and devices_per_dp_cache == 1,
         # logprobs on device is not supported
         # (https://github.com/tenstorrent/tt-metal/issues/34077).
-        assert isinstance(sampling_params.temperature, torch.Tensor)
-        all_greedy = (sampling_params.temperature == 0.0).all().item()
         params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
-            all_greedy)
+            sampling_params.all_greedy and not sampling_params.has_penalties)
         return params_device_supported
 
     def execute_with_model_input(
@@ -1117,8 +1134,7 @@ class TTModelRunner:
 
         # Sampling decision
         sampling_params = model_input.tt_sampling_params
-        perform_device_sampling = self.check_perform_device_sampling(
-            sampling_params, is_decode)
+        perform_device_sampling = model_input.perform_device_sampling
         if perform_device_sampling:
             # On-device sampling currently needs sampling param attributes to
             # be lists instead of tensors.

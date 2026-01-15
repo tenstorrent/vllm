@@ -1255,25 +1255,31 @@ class DPEngineCoreProc(EngineCoreProc):
         all_local_inputs = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
         (local_input, local_max_blocks, local_has_structured,
-         local_has_penalties, local_reset_batch) = all_local_inputs
+         local_has_penalties, local_reset_batch,
+         local_can_sample_device) = all_local_inputs
         max_blocks_decode = None  # Only used for decode.
         any_structured_inputs = False  # Only used for decode.
 
         if is_decode:
-            # Gather max_blocks, has_structured, has_penalties, and reset_batch
-            # from all ranks.
-            input_info_t = torch.tensor([
-                local_max_blocks,
-                local_has_structured,
-                local_has_penalties,
-                local_reset_batch,
-            ],
-                                        dtype=torch.int32)
+            # Gather max_blocks, has_structured, has_penalties, reset_batch,
+            # and cannot_sample_on_device from all ranks.
+            input_info_t = torch.tensor(
+                [
+                    local_max_blocks,
+                    local_has_structured,
+                    local_has_penalties,
+                    local_reset_batch,
+                    # Invert so we can use MAX reduction and still compute
+                    # "all ranks can sample on device".
+                    1 - local_can_sample_device,
+                ],
+                dtype=torch.int32)
             dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
             max_blocks_decode = int(input_info_t[0].item())
             any_structured_inputs = input_info_t[1].item() > 0
             any_penalties_inputs = input_info_t[2].item() > 0
             any_reset_batch = input_info_t[3].item() > 0
+            all_sample_device = input_info_t[4].item() == 0
 
             # Build tensorized gather input for decode.
             decode_inputs = self.model_executor.collective_rpc(
@@ -1320,9 +1326,10 @@ class DPEngineCoreProc(EngineCoreProc):
                     dist.recv(stacked_float, src=0, group=group)
 
             # Gather prompt/output tokens only when they are needed (penalties)
-            # and the decode batch layout changed.
+            # and (if sampling on host or the decode batch layout changed).
             gathered_tokens_inputs = None
-            if any_penalties_inputs and any_reset_batch:
+            if any_penalties_inputs and (not all_sample_device
+                                         or any_reset_batch):
                 # Gather token dicts (containing tensors) to rank 0
                 if rank == 0:
                     gathered_tokens_inputs = [None for _ in range(world)]
@@ -1359,6 +1366,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     "float_inputs": stacked_float,
                     "sampling_tokens_inputs": gathered_tokens_inputs,
                     "reset_batch": any_reset_batch,
+                    "all_sample_device": all_sample_device,
                 }
 
         else:

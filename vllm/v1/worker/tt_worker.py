@@ -184,14 +184,15 @@ class TTWorker(WorkerBase):
 
     def build_dp_model_input(
         self, scheduler_output: Optional["SchedulerOutput"]
-    ) -> tuple[Optional[TTModelInput], int, int, int, int]:
+    ) -> tuple[Optional[TTModelInput], int, int, int, int, int]:
         """Called by each DP rank to build model input from scheduler output.
         Returns: (model_input, max_blocks, has_structured_input, has_penalties,
-        reset_batch)
+        reset_batch, can_sample_device)
         """
         model_input = None
         has_penalties = 0
         reset_batch = 0
+        can_sample_device = 1
         if scheduler_output is not None:
             model_input = self.model_runner.build_model_input(scheduler_output)
             if model_input is not None:
@@ -199,6 +200,7 @@ class TTWorker(WorkerBase):
                 has_penalties = int(
                     model_input.tt_sampling_params.has_penalties)
                 reset_batch = int(model_input.reset_batch)
+                can_sample_device = int(model_input.perform_device_sampling)
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = int(
             model_input.grammar_bitmask[0] is not None) if model_input else 0
@@ -208,6 +210,7 @@ class TTWorker(WorkerBase):
             has_structured_input,
             has_penalties,
             reset_batch,
+            can_sample_device,
         )
 
     def build_dp_decode_gather_input(
