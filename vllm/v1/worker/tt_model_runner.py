@@ -967,8 +967,8 @@ class TTModelRunner:
             multi_modal_kwargs = {}
 
         # Extract prompt and output tokens for decode with sampling penalties
-        prompt_tokens_tensor = None
-        output_tokens_tensor = None
+        prompt_tokens = None
+        output_tokens = None
         sampling_tokens_inputs = inputs.get(
             "sampling_tokens_inputs") if is_decode else None
         if sampling_tokens_inputs:
@@ -977,24 +977,26 @@ class TTModelRunner:
             max_output_len = 0
             for rank_tokens_dict in sampling_tokens_inputs:
                 if rank_tokens_dict is not None:
-                    prompt_tokens = rank_tokens_dict.get("prompt_tokens")
-                    output_tokens = rank_tokens_dict.get("output_tokens")
-                    if prompt_tokens is not None:
-                        assert output_tokens is not None
+                    rank_prompt_tokens = rank_tokens_dict.get("prompt_tokens")
+                    rank_output_tokens = rank_tokens_dict.get("output_tokens")
+                    if rank_prompt_tokens is not None:
+                        assert rank_output_tokens is not None
                         max_prompt_len = max(max_prompt_len,
-                                             prompt_tokens.shape[1])
+                                             rank_prompt_tokens.shape[1])
                         max_output_len = max(max_output_len,
-                                             output_tokens.shape[1])
+                                             rank_output_tokens.shape[1])
 
             # Create tensors with shape (max_num_reqs * DP_size, max_len)
             max_num_reqs = int(self.scheduler_config.max_num_seqs)
             total_batch_size = max_num_reqs * len(sampling_tokens_inputs)
 
             # Create prompt and output tokens tensors
-            prompt_tokens_tensor = torch.full(
-                (total_batch_size, max_prompt_len), -1, dtype=torch.int32)
-            output_tokens_tensor = torch.full(
-                (total_batch_size, max_output_len), -1, dtype=torch.int32)
+            prompt_tokens = torch.full((total_batch_size, max_prompt_len),
+                                       -1,
+                                       dtype=torch.int32)
+            output_tokens = torch.full((total_batch_size, max_output_len),
+                                       -1,
+                                       dtype=torch.int32)
             for rank_idx, rank_tokens_dict in enumerate(
                     sampling_tokens_inputs):
                 if rank_tokens_dict is not None:
@@ -1004,12 +1006,12 @@ class TTModelRunner:
                     if rank_prompt_tokens is not None:
                         assert rank_output_tokens is not None
                         end_idx = start_idx + rank_prompt_tokens.shape[0]
-                        prompt_tokens_tensor[
-                            start_idx:end_idx, :rank_prompt_tokens.
-                            shape[1]] = (rank_prompt_tokens)
-                        output_tokens_tensor[
-                            start_idx:end_idx, :rank_output_tokens.
-                            shape[1]] = (rank_output_tokens)
+                        prompt_padded_len = rank_prompt_tokens.shape[1]
+                        output_padded_len = rank_output_tokens.shape[1]
+                        prompt_tokens[start_idx:end_idx, :
+                                      prompt_padded_len] = rank_prompt_tokens
+                        output_tokens[start_idx:end_idx, :
+                                      output_padded_len] = rank_output_tokens
 
         if os.environ.get("DP_GATHER_DEBUG") == "1":
             logger.info("batch_size_per_dp=%s", batch_size_per_dp)
@@ -1022,8 +1024,8 @@ class TTModelRunner:
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             grammar_bitmask=grammar_bitmask_list,
-            prompt_tokens=prompt_tokens_tensor,
-            output_tokens=output_tokens_tensor,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
             batch_id_tensor=merged_batch_id_tensor,
             reset_batch=reset_batch,
         )

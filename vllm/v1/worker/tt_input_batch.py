@@ -270,7 +270,8 @@ class InputBatch:
         be canonicalized (cast to int64 and -1 replaced with vocab_size) before
         scatter operations.
         """
-        max_prompt_len = self.num_prompt_tokens[:self.num_reqs].max()
+        max_prompt_len = (self.num_prompt_tokens[:self.num_reqs].max()
+                          if self.num_reqs > 0 else 0)
         prompt_token_ids_tensor = torch.full(
             (self.num_reqs, max_prompt_len),
             -1,
