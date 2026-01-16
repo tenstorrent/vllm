@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import openai
 import pytest
 
@@ -49,20 +51,22 @@ def tt_server(tt_server_url):
     Returns a simple object with get_async_client() method
     to match the interface expected by tests.
     """
+
     class ServerWrapper:
+
         def __init__(self, base_url: str):
             self.base_url = base_url.rstrip("/")
-        
+
         def get_async_client(self):
             return openai.AsyncOpenAI(
                 base_url=f"{self.base_url}/v1",
                 api_key="dummy",  # vLLM doesn't require a real key
             )
-        
+
         def get_client(self):
             return openai.OpenAI(
                 base_url=f"{self.base_url}/v1",
                 api_key="dummy",
             )
-    
+
     return ServerWrapper(tt_server_url)
