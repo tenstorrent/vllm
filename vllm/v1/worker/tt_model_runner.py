@@ -775,24 +775,6 @@ class TTModelRunner:
           - "all_sample_device": bool for if all ranks can sample on device.
         """
 
-        input_tokens_list: list[torch.Tensor] = []
-        block_tables_list: list[torch.Tensor] = []
-        input_positions_list: list[torch.Tensor] = [
-        ]  # (position for decode, prefix cache for prefill)
-        prompt_lens_list: list[np.ndarray] = []  # (prefill only)
-        batch_size_per_dp: list[int] = []
-        grammar_bitmask_list = []
-        # Sampling parameters
-        temperature_list: list[torch.Tensor] = []
-        top_k_list: list[torch.Tensor] = []
-        top_p_list: list[torch.Tensor] = []
-        presence_penalty_list: list[torch.Tensor] = []
-        frequency_penalty_list: list[torch.Tensor] = []
-        repetition_penalty_list: list[torch.Tensor] = []
-        seed_list: list[torch.Tensor] = []
-        merged_batch_id_tensor = None
-        reset_batch = False
-
         # Need to pad block tables to global max num blocks for constant shape.
         def pad_block_tables(block_tables):
             max_bt_width = self.max_num_blocks_per_req
@@ -818,77 +800,108 @@ class TTModelRunner:
                 "max_blocks_decode_batch must be provided for decode")
             B = int(self.scheduler_config.max_num_seqs)
             W = max_blocks_decode_batch
-            batch_id_tensors: list[torch.Tensor] = []
             reset_batch = inputs["reset_batch"]
             perform_device_sampling = inputs["all_sample_device"]
-            for batch_num, (int_inputs, float_inputs) in enumerate(
-                    zip(inputs["int_inputs"], inputs["float_inputs"])):
-                # Slices
-                off = 0
-                stride = B
-                batch_id_tensor = int_inputs[off:off + stride].view(B)
-                off += stride
-                stride = B
-                tokens = int_inputs[off:off + stride].view(B, 1)
-                off += stride
-                stride = B
-                positions = int_inputs[off:off + stride].view(B)
-                off += stride
-                stride = B * W
-                block_tables = int_inputs[off:off + stride].view(B, W)
-                off += stride
-                batch_size = int(int_inputs[off].item())
+            stacked_int: torch.Tensor = inputs["int_inputs"]
+            stacked_float: torch.Tensor = inputs["float_inputs"]
+            assert isinstance(stacked_int, torch.Tensor) and stacked_int.dim(
+            ) == 2, "decode expects stacked int_inputs of shape [world, -1]"
+            assert isinstance(stacked_float,
+                              torch.Tensor) and stacked_float.dim() == 2, (
+                                  "decode expects stacked float_inputs "
+                                  "of shape [world, -1]")
+            world = int(stacked_int.shape[0])
+            total_B = world * B
+
+            # Slice views out of the stacked gather buffers (no per-rank
+            # Python lists, no torch.cat). Layout is constant for fixed B.
+            off = 0
+            merged_batch_id_tensor = stacked_int[:,
+                                                 off:off + B].reshape(total_B)
+            off += B
+            input_tokens = stacked_int[:, off:off + B].reshape(total_B, 1)
+            off += B
+            input_positions = stacked_int[:, off:off + B].reshape(total_B)
+            off += B
+
+            max_bt_width = self.max_num_blocks_per_req
+            if max_bt_width < W:
+                raise ValueError(f"max_blocks_decode_batch={W} exceeds "
+                                 f"max_num_blocks_per_req={max_bt_width}")
+            block_tables_raw = stacked_int[:, off:off + B * W].reshape(
+                total_B, W)
+            off += B * W
+            if max_bt_width == W:
+                block_tables = block_tables_raw
+            else:
+                # Pad to constant width expected by TT backend.
+                # Use new_zeros to match dtype/device of gathered tensors.
+                block_tables = block_tables_raw.new_zeros(
+                    (total_B, max_bt_width))
+                block_tables[:, :W] = block_tables_raw
+
+            bs_tensor = stacked_int[:, off]
+            off += 1
+            batch_size_per_dp = bs_tensor.tolist()
+
+            top_k = stacked_int[:, off:off + B].reshape(total_B)
+            off += B
+            seed = stacked_int[:, off:off + B].reshape(total_B)
+            off += B
+
+            # Optional structured inputs: keep as list[Optional[tensor]]
+            # per DP rank to match prefill behavior.
+            grammar_bitmask_list = []
+            if any_structured_inputs:
+                has_structured = stacked_int[:, off]
                 off += 1
-                stride = B
-                top_k = int_inputs[off:off + stride].view(B)
-                off += stride
-                seed = int_inputs[off:off + stride].view(B)
-                off += stride
-                if any_structured_inputs:
-                    has_structured_input = int(int_inputs[off].item())
-                    off += 1
-                    stride = B * self.bitmask_size
-                    if has_structured_input > 0:
-                        bitmasks = int_inputs[off:off + stride].view(
-                            B, self.bitmask_size)
+                bitmasks = stacked_int[:, off:off +
+                                       (B * self.bitmask_size)].reshape(
+                                           world, B, self.bitmask_size)
+                off += B * self.bitmask_size
+                for r in range(world):
+                    if int(has_structured[r].item()) > 0:
+                        grammar_bitmask_list.append(bitmasks[r])
                     else:
-                        bitmasks = None
-                    off += stride
-                else:
-                    bitmasks = None
+                        grammar_bitmask_list.append(None)
+            else:
+                grammar_bitmask_list = [None] * world
 
-                off = 0
-                stride = B
-                temperature = float_inputs[off:off + stride].view(B)
-                off += stride
-                top_p = float_inputs[off:off + stride].view(B)
-                off += stride
-                presence_penalty = float_inputs[off:off + stride].view(B)
-                off += stride
-                frequency_penalty = float_inputs[off:off + stride].view(B)
-                off += stride
-                repetition_penalty = float_inputs[off:off + stride].view(B)
-                off += stride
+            off_f = 0
+            temperature = stacked_float[:, off_f:off_f + B].reshape(total_B)
+            off_f += B
+            top_p = stacked_float[:, off_f:off_f + B].reshape(total_B)
+            off_f += B
+            presence_penalty = stacked_float[:,
+                                             off_f:off_f + B].reshape(total_B)
+            off_f += B
+            frequency_penalty = stacked_float[:,
+                                              off_f:off_f + B].reshape(total_B)
+            off_f += B
+            repetition_penalty = stacked_float[:, off_f:off_f +
+                                               B].reshape(total_B)
+            off_f += B
 
-                batch_id_tensors.append(batch_id_tensor)
-                input_tokens_list.append(tokens)
-                input_positions_list.append(positions)
-                block_tables_list.append(pad_block_tables(block_tables))
-                batch_size_per_dp.append(batch_size)
-                grammar_bitmask_list.append(bitmasks)
-                # Sampling parameters
-                temperature_list.append(temperature)
-                top_k_list.append(top_k)
-                top_p_list.append(top_p)
-                presence_penalty_list.append(presence_penalty)
-                frequency_penalty_list.append(frequency_penalty)
-                repetition_penalty_list.append(repetition_penalty)
-                seed_list.append(seed)
-
-            input_positions = torch.cat(input_positions_list, dim=0)
             prompt_lens = None
-            merged_batch_id_tensor = torch.cat(batch_id_tensors, dim=0)
         else:
+            input_tokens_list: list[torch.Tensor] = []
+            block_tables_list: list[torch.Tensor] = []
+            input_positions_list: list[torch.Tensor] = [
+            ]  # (prefix cache positions for prefill)
+            prompt_lens_list: list[np.ndarray] = []
+            batch_size_per_dp = []
+            grammar_bitmask_list = []
+            # Sampling parameters
+            temperature_list: list[torch.Tensor] = []
+            top_k_list: list[torch.Tensor] = []
+            top_p_list: list[torch.Tensor] = []
+            presence_penalty_list: list[torch.Tensor] = []
+            frequency_penalty_list: list[torch.Tensor] = []
+            repetition_penalty_list: list[torch.Tensor] = []
+            seed_list: list[torch.Tensor] = []
+            merged_batch_id_tensor = None
+            reset_batch = False
+
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
                 raise ValueError("All inputs are None; nothing to concatenate")
@@ -941,20 +954,20 @@ class TTModelRunner:
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
+            input_tokens = torch.cat(input_tokens_list, dim=0)
             input_positions = np.concatenate(input_positions_list, axis=0)
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
+            block_tables = torch.cat(block_tables_list, dim=0)
 
-        input_tokens = torch.cat(input_tokens_list, dim=0)
-        block_tables = torch.cat(block_tables_list, dim=0)
+            # Concatenate sampling parameter tensors across DP ranks
+            temperature = torch.cat(temperature_list, dim=0)
+            top_k = torch.cat(top_k_list, dim=0)
+            top_p = torch.cat(top_p_list, dim=0)
+            presence_penalty = torch.cat(presence_penalty_list, dim=0)
+            frequency_penalty = torch.cat(frequency_penalty_list, dim=0)
+            repetition_penalty = torch.cat(repetition_penalty_list, dim=0)
+            seed = torch.cat(seed_list, dim=0)
 
-        # Concatenate sampling parameter tensors across DP ranks
-        temperature = torch.cat(temperature_list, dim=0)
-        top_k = torch.cat(top_k_list, dim=0)
-        top_p = torch.cat(top_p_list, dim=0)
-        presence_penalty = torch.cat(presence_penalty_list, dim=0)
-        frequency_penalty = torch.cat(frequency_penalty_list, dim=0)
-        repetition_penalty = torch.cat(repetition_penalty_list, dim=0)
-        seed = torch.cat(seed_list, dim=0)
         tt_sampling_params = TTSamplingParams(
             temperature=temperature,
             top_k=top_k,
