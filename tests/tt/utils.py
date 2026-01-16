@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 from dataclasses import dataclass
+from typing import Union
 
 
 @dataclass
@@ -10,9 +11,9 @@ class RequestConfig:
     prompt: str
     max_tokens: int = 10
     temperature: float = 1.0
-    top_k: int | None = None
+    top_k: Union[int, None] = None
     top_p: float = 1.0
-    seed: int | None = None
+    seed: Union[int, None] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0

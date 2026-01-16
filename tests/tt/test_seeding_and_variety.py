@@ -121,7 +121,7 @@ class TestSeedingAndVariety:
         results2 = run_concurrent_batch(tt_server, tt_model_name,
                                         shuffled_configs)
 
-        results_per_seed = [[] for _ in range(max_batch_size)]
+        results_per_seed: list[list[str]] = [[] for _ in range(max_batch_size)]
         for i in range(max_batch_size):
             results_per_seed[i].append(results1[i])
         for i, result in enumerate(results2):
