@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Union
 
 
 @dataclass
@@ -21,7 +21,7 @@ class RequestConfig:
 
 async def send_request(async_client, model: str, config: RequestConfig):
     """Send a single async request with its own parameters."""
-    extra_body = {}
+    extra_body: dict[str, Any] = {}
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
     if config.repetition_penalty != 1.0:
