@@ -68,7 +68,9 @@ class TestBatchIsolation:
             if configs[i].temperature == 0 or configs[i].seed is not None:
                 assert r1 == r2, (
                     f"Request {i} should be deterministic/reproducible.\n"
-                    f"Config: temp={configs[i].temperature}, seed={configs[i].seed}\n"
+                    f"Config:"
+                    f"temp={configs[i].temperature},"
+                    f"seed={configs[i].seed}\n"
                     f"Run 1: {r1!r}\n"
                     f"Run 2: {r2!r}")
 

@@ -43,9 +43,8 @@ class TestSeedingAndVariety:
         # This tests both prefill and decode
         all_greedy = results1[:greedy_count] + results2[:greedy_count]
         assert_deterministic(
-            all_greedy,
-            "Greedy requests should produce the same output across positions and runs."
-        )
+            all_greedy, "Greedy requests should produce the same output"
+            "across positions and runs.")
 
         # Check answers overall
         different_seeds = []
@@ -58,14 +57,14 @@ class TestSeedingAndVariety:
             ]
             assert_deterministic(
                 results_for_seed,
-                "Seeded requests should produce the same output across positions and runs."
-            )
+                "Seeded requests should produce the same output"
+                "across positions and runs.")
             different_seeds.append(results_for_seed[0])
         expected_variety = seeds // 3
         assert_varied(
             different_seeds, expected_variety,
-            "Seeded requests should produce different outputs for different seeds."
-        )
+            "Seeded requests should produce different outputs"
+            "for different seeds.")
 
         # Check first tokens to make sure prefill is varied
         prefill_different_seeds = [x[:1] for x in different_seeds]
@@ -245,7 +244,7 @@ class TestSeedingAndVariety:
                           top_k=50,
                           seed=-1)
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        _ = run_concurrent_batch(tt_server, tt_model_name, configs)
 
     @pytest.mark.parametrize("batch_size", [7, 10, 19, 32, 37])
     def test_temperature_varied_in_batch(self, tt_server, tt_model_name,
@@ -369,6 +368,5 @@ class TestSeedingAndVariety:
 
         all_results = result_1 + result_2
         assert_deterministic(
-            all_results,
-            "top_k=1 requests should produce the same output across positions and runs."
-        )
+            all_results, "top_k=1 requests should produce the same output"
+            "across positions and runs.")
