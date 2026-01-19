@@ -1255,14 +1255,16 @@ class DPEngineCoreProc(EngineCoreProc):
         all_local_inputs = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
         (local_input, local_max_blocks, local_has_structured,
-         local_has_penalties, local_reset_batch,
-         local_can_sample_device) = all_local_inputs
+         local_has_penalties, local_reset_batch, local_can_sample_device,
+         local_max_logprobs) = all_local_inputs
         max_blocks_decode = None  # Only used for decode.
         any_structured_inputs = False  # Only used for decode.
+        any_logprobs_inputs = False
+        max_num_logprobs = None
 
         if is_decode:
             # Gather max_blocks, has_structured, has_penalties, reset_batch,
-            # and cannot_sample_on_device from all ranks.
+            # cannot_sample_on_device, and max_num_logprobs from all ranks.
             input_info_t = torch.tensor(
                 [
                     local_max_blocks,
@@ -1272,6 +1274,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     # Invert so we can use MAX reduction and still compute
                     # "all ranks can sample on device".
                     1 - local_can_sample_device,
+                    local_max_logprobs,
                 ],
                 dtype=torch.int32)
             dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
@@ -1280,6 +1283,8 @@ class DPEngineCoreProc(EngineCoreProc):
             any_penalties_inputs = input_info_t[2].item() > 0
             any_reset_batch = input_info_t[3].item() > 0
             all_sample_device = input_info_t[4].item() == 0
+            max_num_logprobs = int(input_info_t[5].item())
+            any_logprobs_inputs = max_num_logprobs >= 0
 
             # Build tensorized gather input for decode.
             decode_inputs = self.model_executor.collective_rpc(
@@ -1371,6 +1376,11 @@ class DPEngineCoreProc(EngineCoreProc):
 
         else:
             # Prefill: use gather_object with variable sized inputs.
+            logprobs_info_t = torch.tensor([local_max_logprobs],
+                                           dtype=torch.int32)
+            dist.all_reduce(logprobs_info_t, op=dist.ReduceOp.MAX, group=group)
+            max_num_logprobs = int(logprobs_info_t[0].item())
+            any_logprobs_inputs = max_num_logprobs >= 0
             gathered_inputs = None
             if rank == 0:
                 gathered_inputs = [None for _ in range(world)]  # type: ignore
@@ -1405,19 +1415,26 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dlog("after_inputs_gather")
 
         # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
+        B = self.vllm_config.scheduler_config.max_num_seqs
         if local_rank == 0 and (is_decode or
                                 (isinstance(gathered_inputs, list)
                                  and any(x is not None
                                          for x in gathered_inputs))):
-            send_tensor = self.model_executor.collective_rpc(
+            send_result = self.model_executor.collective_rpc(
                 "concat_and_execute_dp",
                 args=(gathered_inputs, is_decode, max_blocks_decode,
                       any_structured_inputs))[0]
+            if isinstance(send_result, dict):
+                send_tensor = send_result["token_ids"]
+                send_logprobs = send_result.get("logprobs")
+            else:
+                send_tensor = send_result
+                send_logprobs = None
             assert isinstance(send_tensor, torch.Tensor)
         else:
-            B = self.vllm_config.scheduler_config.max_num_seqs
             # Currently only supporting 1 output token per request.
             send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
+            send_logprobs = None
 
         # Global rank 0 scatters results to all ranks
         my_ids = torch.empty_like(send_tensor[0])  # Shape (B, 1)
@@ -1426,12 +1443,53 @@ class DPEngineCoreProc(EngineCoreProc):
             # Prepare scatter list: split send_tensor along first dimension
             scatter_list = [send_tensor[i] for i in range(world)]
         dist.scatter(my_ids, scatter_list, src=0, group=group)
+        my_logprobs = None
+        if any_logprobs_inputs:
+            if rank == 0:
+                assert send_logprobs is not None, (
+                    "logprobs requested but not returned by TT worker")
+                lp_token_ids = send_logprobs["logprob_token_ids"]
+                lp_logprobs = send_logprobs["logprobs"]
+                lp_ranks = send_logprobs["selected_token_ranks"]
+            else:
+                lp_token_ids = torch.empty(
+                    (world, B, max_num_logprobs + 1), dtype=torch.int32)
+                lp_logprobs = torch.empty(
+                    (world, B, max_num_logprobs + 1), dtype=torch.float32)
+                lp_ranks = torch.empty((world, B), dtype=torch.int32)
+            lp_token_ids_local = torch.empty_like(lp_token_ids[0])
+            lp_logprobs_local = torch.empty_like(lp_logprobs[0])
+            lp_ranks_local = torch.empty_like(lp_ranks[0])
+            if rank == 0:
+                scatter_lp_token_ids = [
+                    lp_token_ids[i] for i in range(world)
+                ]
+                scatter_lp_logprobs = [lp_logprobs[i] for i in range(world)]
+                scatter_lp_ranks = [lp_ranks[i] for i in range(world)]
+            else:
+                scatter_lp_token_ids = None
+                scatter_lp_logprobs = None
+                scatter_lp_ranks = None
+            dist.scatter(lp_token_ids_local,
+                         scatter_lp_token_ids,
+                         src=0,
+                         group=group)
+            dist.scatter(lp_logprobs_local,
+                         scatter_lp_logprobs,
+                         src=0,
+                         group=group)
+            dist.scatter(lp_ranks_local, scatter_lp_ranks, src=0, group=group)
+            my_logprobs = {
+                "logprob_token_ids": lp_token_ids_local,
+                "logprobs": lp_logprobs_local,
+                "selected_token_ranks": lp_ranks_local,
+            }
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
         # If rank had scheduled tokens, apply results locally and return output
         if local_has_requests:
             output = self.model_executor.collective_rpc(
-                "apply_dp_execution_result", args=(my_ids, ))[0]
+                "apply_dp_execution_result", args=(my_ids, my_logprobs))[0]
             return output
         else:
             return EMPTY_MODEL_RUNNER_OUTPUT

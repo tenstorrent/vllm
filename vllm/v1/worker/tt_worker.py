@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.worker.tt_model_runner import TTModelInput, TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.worker.tt_worker import (close_mesh_device, get_mesh_grid,
@@ -184,21 +184,27 @@ class TTWorker(WorkerBase):
 
     def build_dp_model_input(
         self, scheduler_output: Optional["SchedulerOutput"]
-    ) -> tuple[Optional[TTModelInput], int, int, int, int, int]:
+    ) -> tuple[Optional[TTModelInput], int, int, int, int, int, int]:
         """Called by each DP rank to build model input from scheduler output.
         Returns: (model_input, max_blocks, has_structured_input, has_penalties,
-        reset_batch, can_sample_device)
+        reset_batch, can_sample_device, max_num_logprobs)
         """
         model_input = None
         has_penalties = 0
         reset_batch = 0
         can_sample_device = 1
+        max_num_logprobs = -1
         if scheduler_output is not None:
             model_input = self.model_runner.build_model_input(scheduler_output)
             if model_input is not None:
                 # Check if any request has penalties
                 has_penalties = int(
                     model_input.tt_sampling_params.has_penalties)
+                max_num_logprobs = (
+                    model_input.tt_sampling_params.max_num_logprobs()
+                    if model_input.tt_sampling_params is not None else None)
+                max_num_logprobs = (
+                    max_num_logprobs if max_num_logprobs is not None else -1)
                 reset_batch = int(model_input.reset_batch)
                 can_sample_device = int(model_input.perform_device_sampling)
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
@@ -211,6 +217,7 @@ class TTWorker(WorkerBase):
             has_penalties,
             reset_batch,
             can_sample_device,
+            max_num_logprobs,
         )
 
     def build_dp_decode_gather_input(
@@ -225,10 +232,11 @@ class TTWorker(WorkerBase):
                                                   dict[str,
                                                        Any]], is_decode: bool,
                               max_blocks_decode_batch: Optional[int],
-                              any_structured_inputs: bool) -> torch.Tensor:
+                              any_structured_inputs: bool) -> dict[str, Any]:
         """Called by TT device ranks (local DP rank 0) to concatenate DP-sized
-        inputs and execute. Returns a stacked tensor
-        [world, max_num_seqs, 1] of sampled ids.
+        inputs and execute. Returns dict with:
+          - "token_ids": stacked tensor [world, max_num_seqs, 1] of sampled ids.
+          - "logprobs": optional dict of stacked logprobs tensors.
         Each DP slice is right-padded with zeros to max_num_seqs; empty entries
         are zeros. Same behavior for both prefill and decode."""
 
@@ -237,8 +245,9 @@ class TTWorker(WorkerBase):
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
         merged = self.model_runner.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch, any_structured_inputs)
-        sampled_token_ids_per_dp: list[
-            torch.Tensor] = self.model_runner.execute_with_model_input(merged)
+        (sampled_token_ids_per_dp,
+         logprobs_tensors_per_dp) = self.model_runner.execute_with_model_input(
+             merged)
 
         # Pad each DP result to uniform shape for tensor all_gather.
         world = self.parallel_config.data_parallel_size
@@ -260,16 +269,59 @@ class TTWorker(WorkerBase):
                     ],
                                           dim=0)
             sampled_token_ids_per_dp[dp_rank] = token_ids
-        return torch.stack(sampled_token_ids_per_dp)  # [world, B, 1]
+
+        logprobs_payload = None
+        max_num_logprobs = merged.tt_sampling_params.max_num_logprobs()
+        if max_num_logprobs is not None:
+            logprobs_width = max_num_logprobs + 1
+            logprob_token_ids = torch.zeros((world, B, logprobs_width),
+                                            dtype=torch.int32)
+            logprobs = torch.zeros((world, B, logprobs_width),
+                                   dtype=torch.float32)
+            selected_token_ranks = torch.zeros((world, B), dtype=torch.int32)
+            for dp_rank, logprob_tensors in enumerate(
+                    logprobs_tensors_per_dp):
+                if logprob_tensors is None:
+                    continue
+                num_rows = logprob_tensors.logprob_token_ids.shape[0]
+                if num_rows == 0:
+                    continue
+                logprob_token_ids[dp_rank, :num_rows, :] = (
+                    logprob_tensors.logprob_token_ids)
+                logprobs[dp_rank, :num_rows, :] = logprob_tensors.logprobs
+                selected_token_ranks[dp_rank, :num_rows] = (
+                    logprob_tensors.selected_token_ranks)
+            logprobs_payload = {
+                "logprob_token_ids": logprob_token_ids,
+                "logprobs": logprobs,
+                "selected_token_ranks": selected_token_ranks,
+            }
+
+        return {
+            "token_ids": torch.stack(sampled_token_ids_per_dp),
+            "logprobs": logprobs_payload,
+        }
 
     def apply_dp_execution_result(
-            self, sampled_token_ids: torch.Tensor) -> ModelRunnerOutput:
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs_tensors: Optional[dict[str, torch.Tensor]] = None,
+    ) -> ModelRunnerOutput:
         """Called by each DP rank to apply sampled tokens to internal caches.
         """
         # Trim to active local batch size to drop padding rows.
         num_reqs = self.model_runner.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
-        return self.model_runner.generate_runner_output(sampled_token_ids)
+        logprobs = None
+        if logprobs_tensors is not None:
+            logprobs = LogprobsTensors(
+                logprob_token_ids=logprobs_tensors["logprob_token_ids"][:num_reqs],
+                logprobs=logprobs_tensors["logprobs"][:num_reqs],
+                selected_token_ranks=logprobs_tensors[
+                    "selected_token_ranks"][:num_reqs],
+            )
+        return self.model_runner.generate_runner_output(sampled_token_ids,
+                                                        logprobs)
 
     # ---- Destructor (used to close devices) ----
 

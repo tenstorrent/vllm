@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 # Sentinel value for None seed. vLLM treats -1 as equivalent to None
 # (see SamplingParams.__post_init__), so we use -1 as the sentinel.
 SEED_NONE_SENTINEL = -1
+LOGPROBS_NONE_SENTINEL = -1
 
 
 class SamplingInputBatch:
@@ -24,6 +25,8 @@ class SamplingInputBatch:
         "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
         "seed": SEED_NONE_SENTINEL,  # Sentinel represents None (no seed)
+        # Sentinel represents None (no logprobs requested)
+        "logprobs": LOGPROBS_NONE_SENTINEL,
     }
 
     def __init__(self, max_num_reqs: int):
@@ -38,6 +41,7 @@ class SamplingInputBatch:
         self.frequency_penalty = default_tensors["frequency_penalty"]
         self.repetition_penalty = default_tensors["repetition_penalty"]
         self.seed = default_tensors["seed"]
+        self.logprobs = default_tensors["logprobs"]
         # Asserting that all defaults have corresponding attributes.
         for name in self.DEFAULTS:
             assert hasattr(
@@ -183,6 +187,9 @@ class InputBatch:
         self.sampling.seed[req_index] = (sampling_params.seed
                                          if sampling_params.seed is not None
                                          else SEED_NONE_SENTINEL)
+        logprobs = sampling_params.logprobs
+        self.sampling.logprobs[req_index] = (
+            int(logprobs) if logprobs is not None else LOGPROBS_NONE_SENTINEL)
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
@@ -254,6 +261,7 @@ class InputBatch:
             sampling.repetition_penalty[empty_index] = (
                 sampling.repetition_penalty[last_req_index])
             sampling.seed[empty_index] = sampling.seed[last_req_index]
+            sampling.logprobs[empty_index] = sampling.logprobs[last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
