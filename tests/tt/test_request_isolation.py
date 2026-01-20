@@ -79,9 +79,10 @@ class TestBatchIsolation:
         results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
 
         # Shuffle configs and results1 together for the second run
-        paired = list(zip(configs, results1))
-        random.shuffle(paired)
-        configs, results1 = zip(*paired)
+        indices = list(range(len(configs)))
+        random.shuffle(indices)
+        configs = [configs[i] for i in indices]
+        results1 = [results1[i] for i in indices]
 
         results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
 
