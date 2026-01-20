@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import random
+
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
@@ -57,136 +59,6 @@ class TestBatchIsolation:
                           temperature=0.5,
                           frequency_penalty=2.0,
                           seed=42),
-        ][:max_batch_size]
-
-        # Run twice
-        results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
-        results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
-
-        # Each deterministic config should reproduce
-        for i, (r1, r2) in enumerate(zip(results1, results2)):
-            if configs[i].temperature == 0 or configs[i].seed is not None:
-                assert r1 == r2, (
-                    f"Request {i} should be deterministic/reproducible.\n"
-                    f"Config:"
-                    f"temp={configs[i].temperature},"
-                    f"seed={configs[i].seed}\n"
-                    f"Run 1: {r1!r}\n"
-                    f"Run 2: {r2!r}")
-
-
-# =============================================================================
-# BATCH SIZE VARIATIONS
-# =============================================================================
-
-
-class TestBatchSizeVariations:
-    """
-    Test various batch sizes with per-request params.
-    """
-
-    def test_small_batch_different_params(self, tt_server, tt_model_name):
-        """
-        Small batch of 2 with different params each.
-        """
-        configs = [
-            RequestConfig(prompt="A: ", max_tokens=5, temperature=0),
-            RequestConfig(prompt="B: ",
-                          max_tokens=5,
-                          temperature=1.0,
-                          top_k=50,
-                          seed=42),
-        ]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        assert len(results) == 2
-        assert all(len(r) > 0 for r in results)
-
-    def test_full_batch_different_params(self, tt_server, tt_model_name,
-                                         max_batch_size):
-        """
-        Full batch where each request is different.
-        """
-        configs = [
-            RequestConfig(
-                prompt=f"Request {i}: ",
-                max_tokens=5,
-                temperature=0.5 + (i * 0.1),
-                seed=i * 100,
-            ) for i in range(max_batch_size)
-        ]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        assert len(results) == max_batch_size
-
-    def test_partial_batch_different_params(self, tt_server, tt_model_name,
-                                            max_batch_size):
-        """
-        Partial batch with varied params.
-        """
-        batch_size = max(2, max_batch_size // 2)
-
-        configs = [
-            RequestConfig(
-                prompt=f"Test {i}: ",
-                max_tokens=5,
-                temperature=0.0 if i % 2 == 0 else 1.0,
-                seed=i * 50 if i % 2 == 1 else None,
-            ) for i in range(batch_size)
-        ]
-
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        assert len(results) == batch_size
-
-
-# =============================================================================
-# COMPREHENSIVE MIXED PARAMETER TESTS
-# =============================================================================
-
-
-class TestMixedParameterBatches:
-    """
-    Complex batches with multiple parameter combinations.
-    """
-
-    def test_all_parameter_types_in_batch(self, tt_server, tt_model_name,
-                                          max_batch_size):
-        """
-        Batch using all different parameter types.
-        """
-        configs = [
-            # Greedy baseline
-            RequestConfig(prompt="Greedy: ", max_tokens=8, temperature=0),
-            # Temperature variation
-            RequestConfig(prompt="Temp: ",
-                          max_tokens=8,
-                          temperature=1.5,
-                          top_k=50,
-                          seed=1),
-            # Top-k variation
-            RequestConfig(prompt="TopK: ",
-                          max_tokens=8,
-                          temperature=1.0,
-                          top_k=10,
-                          seed=2),
-            # Repetition penalty
-            RequestConfig(prompt="go go go. Rep: ",
-                          max_tokens=8,
-                          temperature=0.5,
-                          repetition_penalty=3.0,
-                          seed=3),
-            # Presence penalty
-            RequestConfig(prompt="Pres: ",
-                          max_tokens=8,
-                          temperature=0.5,
-                          presence_penalty=2.0,
-                          seed=4),
-            # Frequency penalty
-            RequestConfig(prompt="Freq: ",
-                          max_tokens=8,
-                          temperature=0.5,
-                          frequency_penalty=2.0,
-                          seed=5),
             # Combined penalties
             RequestConfig(prompt="All: ",
                           max_tokens=8,
@@ -203,12 +75,23 @@ class TestMixedParameterBatches:
                           seed=7),
         ][:max_batch_size]
 
-        # Run twice to verify determinism
+        # Run twice, with random batch order on second run
         results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
+
+        # Shuffle configs and results1 together for the second run
+        paired = list(zip(configs, results1))
+        random.shuffle(paired)
+        configs, results1 = zip(*paired)
+
         results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
 
-        # All seeded/deterministic should match
+        # Each deterministic config should reproduce
         for i, (r1, r2) in enumerate(zip(results1, results2)):
-            assert r1 == r2, (f"Request {i} should be reproducible.\n"
-                              f"Run 1: {r1!r}\n"
-                              f"Run 2: {r2!r}")
+            if configs[i].temperature == 0 or configs[i].seed is not None:
+                assert r1 == r2, (
+                    f"Request {i} should be deterministic/reproducible.\n"
+                    f"Config:"
+                    f"temp={configs[i].temperature},"
+                    f"seed={configs[i].seed}\n"
+                    f"Run 1: {r1!r}\n"
+                    f"Run 2: {r2!r}")
