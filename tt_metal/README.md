@@ -7,6 +7,7 @@
 - [Running the Offline Inference Example](#running-the-offline-inference-example)
 - [Running the Server Example](#running-the-server-example)
 - [Benchmarking](#benchmarking)
+- [Testing Sampling Parameters](#testing-sampling-parameters)
 - [Running on Multi-Host Systems (V1 only)](#running-on-multi-host-systems-v1-only)
 
 ## vLLM and TT-Metal Branches
@@ -262,13 +263,11 @@ Vary this value together with `--input-length-range` and `--num-prompts` to see 
 
 For client-server benchmarking, the `vllm bench serve` command can be used with `--random-prefix-len <N>` to prepend fixed prefix tokens to each prompt.
 
-## Testing
+## Testing Sampling Parameters
 To run sampling tests, first start a vllm server as usual, then run (substituting the address and model name):
 
-```
-pytest vllm/tests/tt -v \
---tt-server-url=http://localhost:8000 \
---tt-model-name=meta-llama/Llama-3.1-8B
+```sh
+pytest tests/tt -v --tt-server-url=http://localhost:8000 --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ## Running on Multi-Host Systems (V1 only)
