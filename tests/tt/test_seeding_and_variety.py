@@ -291,7 +291,7 @@ class TestSeedingAndVariety:
 
     @pytest.mark.parametrize("batch_size", [15, 19, 32])
     def test_topk(self, tt_server, tt_model_name, batch_size):
-        prompt = "Random letter a-z: \n Answer: "
+        prompt = "<question>Random letter a-z:</question><answer>"
         num_greedy = batch_size // 2
         greedy_config = [
             RequestConfig(prompt=prompt, max_tokens=10, temperature=0)
@@ -302,7 +302,7 @@ class TestSeedingAndVariety:
             RequestConfig(prompt=prompt,
                           max_tokens=10,
                           top_k=10,
-                          temperature=10)
+                          temperature=50)
             for _ in range(batch_size - num_greedy)
         ]
         joint_configs = greedy_config + topk_configs
