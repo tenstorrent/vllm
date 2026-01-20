@@ -22,8 +22,8 @@ def pytest_addoption(parser):
         "--tt-max-num-seqs",
         action="store",
         type=int,
-        default=8,
-        help="Max batch size for testing (default: 8)",
+        default=32,
+        help="Max batch size for testing (default: 32)",
     )
 
 
