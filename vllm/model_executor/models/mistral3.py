@@ -40,6 +40,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.tokenizer import (
+    MistralTokenizer,
+    cached_tokenizer_from_config,
+)
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -48,7 +52,11 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsPP,
 )
-from .pixtral import PixtralHFEncoderInfo, PixtralHFVisionModel
+from .pixtral import (
+    PixtralHFEncoderInfo,
+    PixtralHFVisionModel,
+    PixtralProcessorAdapter,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -254,7 +262,15 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 
 class Mistral3ProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
-        return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
+        # Check which tokenizer is being used
+        tokenizer = cached_tokenizer_from_config(self.ctx.model_config)
+        
+        if isinstance(tokenizer, MistralTokenizer):
+            # Use PixtralProcessorAdapter for MistralTokenizer (--tokenizer-mode mistral)
+            return PixtralProcessorAdapter(tokenizer)
+        else:
+            # Use HuggingFace PixtralProcessor for HF tokenizers
+            return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
 
 
 class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo]):
