@@ -143,6 +143,28 @@ class PixtralProcessorAdapter:
     def patch_size(self) -> int:
         return self.image_processor.mm_config.image_patch_size
 
+    # String token properties for compatibility with HF PixtralProcessor interface
+    @property
+    def image_token(self) -> str:
+        return "[IMG]"
+
+    @property
+    def image_break_token(self) -> str:
+        return "[IMG_BREAK]"
+
+    @property
+    def image_end_token(self) -> str:
+        return "[IMG_END]"
+
+    # Aliases for HF PixtralProcessor compatibility (uses _token_id suffix)
+    @property
+    def image_break_token_id(self) -> int:
+        return self.image_break_id
+
+    @property
+    def image_end_token_id(self) -> int:
+        return self.image_end_id
+
     def __call__(
         self,
         text: TextInput | list[TextInput] | None = None,

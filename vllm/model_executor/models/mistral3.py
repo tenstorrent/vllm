@@ -320,11 +320,12 @@ class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         hf_config = self.info.get_hf_config()
         tokenizer = self.info.get_tokenizer()
-        vocab = tokenizer.get_vocab()
 
-        image_break_id = vocab[processor.image_break_token]
+        # Use processor properties directly to get token IDs
+        # (works for both HF PixtralProcessor and PixtralProcessorAdapter)
+        image_break_id = processor.image_break_token_id
         image_token_id = hf_config.image_token_index
-        image_end_id = vocab[processor.image_end_token]
+        image_end_id = processor.image_end_token_id
 
         assert isinstance(hf_config.vision_config, PixtralVisionConfig)
         encoder_info = PixtralHFEncoderInfo(hf_config)
