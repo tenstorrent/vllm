@@ -434,6 +434,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
             and is_wormhole):
         # Llama8B on N150
         max_tokens_all_users = 32768
+    elif ("Qwen3-8B" in model_config.model and devices_per_dp_cache == 1
+          and is_wormhole):
+        # Qwen3-8B on N150 (same constraint as Llama8B-N150)
+        max_tokens_all_users = 32768
     elif (("Mistral-7B" in model_config.model
            or "gemma-3-4b" in model_config.model) and devices_per_dp_cache == 1
           and is_wormhole):
