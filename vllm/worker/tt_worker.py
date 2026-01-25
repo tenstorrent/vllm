@@ -443,10 +443,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
           and is_wormhole):
         # Mistral7B, and gemma3-4b on N150
         max_tokens_all_users = 65536
-    elif (("DeepSeek-R1-Distill-Qwen-14B" in model_config.model
-           or "Qwen2.5-14B" in model_config.model 
-           or "gemma-3-4b" in model_config.model)
-          and devices_per_dp_cache == 2 and is_wormhole):
+    elif (
+        ("DeepSeek-R1-Distill-Qwen-14B" in model_config.model or "Qwen2.5-14B"
+         in model_config.model or "gemma-3-4b" in model_config.model)
+            and devices_per_dp_cache == 2 and is_wormhole):
         # Qwen2.5-14B and gemma3-4b on N300
         max_tokens_all_users = 65536
     elif ("Llama-3.2-90B" in model_config.model and devices_per_dp_cache == 8
