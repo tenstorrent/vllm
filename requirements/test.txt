@@ -993,7 +993,7 @@ sentence-transformers==3.2.1
     # via
     #   -r requirements/test.in
     #   mteb
-sentencepiece==0.2.0
+sentencepiece==0.2.1
     # via mistral-common
 setuptools==77.0.3
     # via
