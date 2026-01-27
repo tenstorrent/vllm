@@ -117,6 +117,11 @@ def register_tt_test_models():
         "models.vllm_test_utils.t3000_multiproc_test.test_model:DummyT3000MultiProcessModel",
     )
 
+    # Fake model which does nothing, for measuring vLLM host overheads
+    ModelRegistry.register_model(
+        "TTDummyNoOpModel",
+        "models.vllm_test_utils.no_op_test.test_model:DummyNoOpModel",
+    )
 
 class TTPlatform(Platform):
     _enum = PlatformEnum.TT
