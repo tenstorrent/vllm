@@ -141,12 +141,11 @@ class TTModelRunner:
         self.vocab_size = self.model_config.get_vocab_size()
         self.bitmask_size = cdiv(self.vocab_size, 32)
 
-        # Whether persistent batch layout changed in the most recent
-        # `_update_states` call (removals/additions/condense).
-        # Used to compute decode `reset_batch` for on-device sampling.
-        self._persistent_batch_layout_changed: bool = True
-        # Ensure the first decode step sets reset_batch=True.
-        self._decode_reset_initialized: bool = False
+        # For on-device decode sampling, we must signal if the padded decode
+        # batch layout changed since the *previous decode step*. Layout can
+        # change during prefill steps (e.g. new requests added), so we keep a
+        # sticky flag and clear it only after a decode input consumes it.
+        self._decode_layout_changed_since_last_decode: bool = True
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -353,7 +352,10 @@ class TTModelRunner:
         if removed_req_indices:
             self.input_batch.condense(removed_req_indices)
             persistent_batch_layout_changed = True
-        self._persistent_batch_layout_changed = persistent_batch_layout_changed
+        # Mark decode layout changed if persistent batch changed. This is
+        # sticky across steps and will be consumed by the next decode batch.
+        if persistent_batch_layout_changed:
+            self._decode_layout_changed_since_last_decode = True
 
     def _validate_mm_input(self, mm_input: MultiModalKwargs) -> None:
         """Validate multi-modal input supports only single images."""
@@ -467,9 +469,8 @@ class TTModelRunner:
             prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
-            reset_batch = (self._persistent_batch_layout_changed
-                           or not self._decode_reset_initialized)
-            self._decode_reset_initialized = True
+            reset_batch = self._decode_layout_changed_since_last_decode
+            self._decode_layout_changed_since_last_decode = False
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad batch to max_num_reqs.
