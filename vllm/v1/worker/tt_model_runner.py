@@ -444,7 +444,7 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
-        sampling_params = input_batch.sampling
+        sample_params = input_batch.sampling
         if is_prompt:
             # Assert no running requests
             assert (
@@ -491,29 +491,28 @@ class TTModelRunner:
                                 dtype=torch.int32)
                 ])
                 # Pad sampling parameters with default values
-                sampling_params.pad_with_defaults(num_reqs)
+                sample_params.pad_with_defaults(num_reqs)
 
         if is_prompt:
             tt_sampling_params = TTSamplingParams(
-                temperature=sampling_params.temperature[:num_reqs],
-                top_k=sampling_params.top_k[:num_reqs],
-                top_p=sampling_params.top_p[:num_reqs],
-                presence_penalty=sampling_params.presence_penalty[:num_reqs],
-                frequency_penalty=sampling_params.frequency_penalty[:num_reqs],
-                repetition_penalty=sampling_params.
-                repetition_penalty[:num_reqs],
-                seed=sampling_params.seed[:num_reqs],
+                temperature=sample_params.temperature[:num_reqs],
+                top_k=sample_params.top_k[:num_reqs],
+                top_p=sample_params.top_p[:num_reqs],
+                presence_penalty=sample_params.presence_penalty[:num_reqs],
+                frequency_penalty=sample_params.frequency_penalty[:num_reqs],
+                repetition_penalty=sample_params.repetition_penalty[:num_reqs],
+                seed=sample_params.seed[:num_reqs],
                 enable_log_probs=None,
             )
         else:
             tt_sampling_params = TTSamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                presence_penalty=sampling_params.presence_penalty,
-                frequency_penalty=sampling_params.frequency_penalty,
-                repetition_penalty=sampling_params.repetition_penalty,
-                seed=sampling_params.seed,
+                temperature=sample_params.temperature,
+                top_k=sample_params.top_k,
+                top_p=sample_params.top_p,
+                presence_penalty=sample_params.presence_penalty,
+                frequency_penalty=sample_params.frequency_penalty,
+                repetition_penalty=sample_params.repetition_penalty,
+                seed=sample_params.seed,
                 enable_log_probs=None,
             )
         perform_device_sampling = self.check_perform_device_sampling(
