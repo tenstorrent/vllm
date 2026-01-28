@@ -539,8 +539,8 @@ class TTModelRunner:
                 (batch_length, grammar_bitmask_length), dtype=torch.int32)
             reordered_bitmask = torch.bitwise_not(reordered_bitmask)
             structured_request_ids = scheduler_output.structured_output_request_ids  # noqa: E501
-            for req_id, persistent_batch_index in self.input_batch.req_id_to_index.items(  # noqa: E501
-            ):
+            for req_id, persistent_batch_index in (
+                    input_batch.req_id_to_index.items()):
                 if req_id in structured_request_ids:
                     scheduler_batch_index = structured_request_ids[req_id]
                     reordered_bitmask[persistent_batch_index, :] = bitmask[
@@ -552,8 +552,8 @@ class TTModelRunner:
         prompt_tokens = None
         output_tokens = None
         if (not input_batch.no_penalties) and not is_prompt:
-            prompt_tokens = self.input_batch.make_prompt_token_ids_tensor()
-            output_tokens = self.input_batch.make_output_token_ids_tensor()
+            prompt_tokens = input_batch.make_prompt_token_ids_tensor()
+            output_tokens = input_batch.make_output_token_ids_tensor()
 
             # Pad batch to max_num_reqs for non-DP case (don't send padding for
             # DP to reduce overhead from gathering inputs to rank 0).

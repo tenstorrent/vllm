@@ -203,7 +203,6 @@ class InputBatch:
                                          else SEED_NONE_SENTINEL)
 
         # Update fast-path bookkeeping sets.
-        #
         # NOTE: Use `discard()` because `req_id` can be reused (abort+resubmit)
         # and slots can be overwritten.
         if sampling_params.temperature == 0.0:
