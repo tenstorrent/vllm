@@ -18,6 +18,8 @@ from vllm.worker.tt_worker import (close_mesh_device, get_mesh_grid,
                                    get_num_available_blocks_tt,
                                    open_mesh_device)
 
+import time
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -173,7 +175,10 @@ class TTWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
         assert self.is_driver_worker, "There should only be one Worker for TT"
+        # start_time = time.perf_counter()
         output = self.model_runner.execute_model(scheduler_output)
+        # execute_model_time = time.perf_counter() - start_time
+        # logger.info(f"execute_model_time (ms): {execute_model_time * 1000}")
         return output
 
     def check_health(self) -> None:

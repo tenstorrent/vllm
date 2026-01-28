@@ -260,97 +260,112 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        
+        # start_step_time = time.perf_counter()
 
-        # For gathered DP execution, agree on mode BEFORE any early returns,
-        # and only apply it if we will schedule locally.
-        forced_mode: Optional[int] = None
-        requires_gather = hasattr(self,
-                                  "requires_gather") and self.requires_gather
-        if requires_gather:
-            assert hasattr(self, "dp_max_consec_decodes")
-            assert hasattr(self, "dp_decode_streak")
-            assert hasattr(self, "dlog")
-            assert hasattr(self, "dp_group")
-            # Check if any rank has work before doing intent all_reduce.
-            local_has_requests = 1 if self.scheduler.has_requests() else 0
-            has_requests_t = torch.tensor([local_has_requests],
-                                          dtype=torch.int32)
-            try:
-                dist.all_reduce(has_requests_t,
-                                op=dist.ReduceOp.SUM,
-                                group=self.dp_group)
-            except RuntimeError as e:
-                # During shutdown, peers may close connections mid-collective.
-                # Exit gracefully to allow coordinated shutdown.
-                if "Connection closed by peer" in str(e):
-                    logger.debug(
-                        "Collective failed during shutdown, exiting gracefully"
-                    )
-                    raise SystemExit() from e
-                raise
-            if int(has_requests_t.item()) == 0:
-                # No rank has work, return early without scheduling.
-                return {}, False
+        # # For gathered DP execution, agree on mode BEFORE any early returns,
+        # # and only apply it if we will schedule locally.
+        # forced_mode: Optional[int] = None
+        # requires_gather = hasattr(self,
+        #                           "requires_gather") and self.requires_gather
+        # if requires_gather:
+        #     assert hasattr(self, "dp_max_consec_decodes")
+        #     assert hasattr(self, "dp_decode_streak")
+        #     assert hasattr(self, "dlog")
+        #     assert hasattr(self, "dp_group")
+        #     # Check if any rank has work before doing intent all_reduce.
+        #     local_has_requests = 1 if self.scheduler.has_requests() else 0
+        #     has_requests_t = torch.tensor([local_has_requests],
+        #                                   dtype=torch.int32)
+        #     try:
+        #         dist.all_reduce(has_requests_t,
+        #                         op=dist.ReduceOp.SUM,
+        #                         group=self.dp_group)
+        #     except RuntimeError as e:
+        #         # During shutdown, peers may close connections mid-collective.
+        #         # Exit gracefully to allow coordinated shutdown.
+        #         if "Connection closed by peer" in str(e):
+        #             logger.debug(
+        #                 "Collective failed during shutdown, exiting gracefully"
+        #             )
+        #             raise SystemExit() from e
+        #         raise
+        #     if int(has_requests_t.item()) == 0:
+        #         # No rank has work, return early without scheduling.
+        #         return {}, False
 
-            # Max-consecutive-decoding guard: if there are waiting prefills
-            # and we decoded for dp_max_consec_decodes steps consecutively,
-            # force one prefill step. Otherwise, prefer decode while running.
-            # Can't automatically set intent to be prefill if there are any
-            # waiting requests since we could get stuck in a loop where intent
-            # is prefill but it doesn't get scheduled.
-            has_running = bool(getattr(self.scheduler, "running", []))
-            has_waiting = bool(getattr(self.scheduler, "waiting", False))
-            must_prefill = (
-                has_waiting and self.dp_decode_streak  # type: ignore[has-type]
-                >= self.dp_max_consec_decodes)
-            local_prefill_intent = 1 if (
-                has_waiting and (must_prefill or not has_running)) else 0
-            intent_tensor = torch.tensor([local_prefill_intent],
-                                         dtype=torch.int32)
-            self.dlog("before_intent_allreduce intent_tensor=%s",
-                      intent_tensor)
-            dist.all_reduce(intent_tensor,
-                            op=dist.ReduceOp.MAX,
-                            group=self.dp_group)
-            forced_mode = int(intent_tensor.item())  # 1=prefill, 0=decode
-            self.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
-            # Record forced_mode so it can be used by _execute_model_dp_gather.
-            self._dp_gather_forced_mode = forced_mode
+        #     # Max-consecutive-decoding guard: if there are waiting prefills
+        #     # and we decoded for dp_max_consec_decodes steps consecutively,
+        #     # force one prefill step. Otherwise, prefer decode while running.
+        #     # Can't automatically set intent to be prefill if there are any
+        #     # waiting requests since we could get stuck in a loop where intent
+        #     # is prefill but it doesn't get scheduled.
+        #     has_running = bool(getattr(self.scheduler, "running", []))
+        #     has_waiting = bool(getattr(self.scheduler, "waiting", False))
+        #     must_prefill = (
+        #         has_waiting and self.dp_decode_streak  # type: ignore[has-type]
+        #         >= self.dp_max_consec_decodes)
+        #     local_prefill_intent = 1 if (
+        #         has_waiting and (must_prefill or not has_running)) else 0
+        #     intent_tensor = torch.tensor([local_prefill_intent],
+        #                                  dtype=torch.int32)
+        #     self.dlog("before_intent_allreduce intent_tensor=%s",
+        #               intent_tensor)
+        #     dist.all_reduce(intent_tensor,
+        #                     op=dist.ReduceOp.MAX,
+        #                     group=self.dp_group)
+        #     forced_mode = int(intent_tensor.item())  # 1=prefill, 0=decode
+        #     self.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
+        #     # Record forced_mode so it can be used by _execute_model_dp_gather.
+        #     self._dp_gather_forced_mode = forced_mode
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            if requires_gather:
-                # Enter DP-gather every iteration to keep collectives ordered.
-                _ = self.execute_model(None)  # type: ignore[arg-type]
+            # if requires_gather:
+            #     # Enter DP-gather every iteration to keep collectives ordered.
+            #     _ = self.execute_model(None)  # type: ignore[arg-type]
             return {}, False
 
-        # Apply the forced mode only for ranks that will call schedule().
-        if requires_gather and forced_mode is not None:
-            set_mode = getattr(self.scheduler, "set_forced_mode", None)
-            if callable(set_mode):
-                set_mode(forced_mode)
+        # # Apply the forced mode only for ranks that will call schedule().
+        # if requires_gather and forced_mode is not None:
+        #     set_mode = getattr(self.scheduler, "set_forced_mode", None)
+        #     if callable(set_mode):
+        #         set_mode(forced_mode)
 
+        # start_time = time.perf_counter()
         scheduler_output = self.scheduler.schedule()
+        # schedule_time = time.perf_counter() - start_time
 
-        if requires_gather and forced_mode is not None:
-            # Reset forced mode after scheduling to leave no residual state.
-            set_mode = getattr(self.scheduler, "set_forced_mode", None)
-            if callable(set_mode):
-                set_mode(None)
+        # if requires_gather and forced_mode is not None:
+        #     # Reset forced mode after scheduling to leave no residual state.
+        #     set_mode = getattr(self.scheduler, "set_forced_mode", None)
+        #     if callable(set_mode):
+        #         set_mode(None)
 
-            # Update decode streak: increment only when decode scheduled tokens;
-            # reset to 0 when prefill runs OR when nothing was scheduled.
-            if (scheduler_output.total_num_scheduled_tokens > 0
-                    and forced_mode == 0):
-                self.dp_decode_streak += 1  # type: ignore[has-type]
-            else:
-                self.dp_decode_streak = 0
+        #     # Update decode streak: increment only when decode scheduled tokens;
+        #     # reset to 0 when prefill runs OR when nothing was scheduled.
+        #     if (scheduler_output.total_num_scheduled_tokens > 0
+        #             and forced_mode == 0):
+        #         self.dp_decode_streak += 1  # type: ignore[has-type]
+        #     else:
+        #         self.dp_decode_streak = 0
 
+        # start_time = time.perf_counter()
         model_output = self.execute_model(scheduler_output)
+        # execute_model_time = time.perf_counter() - start_time
+        
+        # start_time = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
-
+        # update_from_output_time = time.perf_counter() - start_time
+        
+        # step_time = time.perf_counter() - start_step_time
+        # logger.info(f"schedule_time (ms): {schedule_time * 1000}")
+        # logger.info(f"execute_model_time (ms): {execute_model_time * 1000}")
+        # logger.info(f"update_from_output_time (ms): {update_from_output_time * 1000}")
+        # step_time = time.perf_counter() - start_step_time
+        # logger.info(f"step_time (ms): {step_time * 1000}")
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
 
@@ -716,7 +731,10 @@ class EngineCoreProc(EngineCore):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
+            start_time = time.perf_counter()
             self._process_input_queue()
+            process_input_queue_time = time.perf_counter() - start_time
+            # logger.info(f"process_input_queue_time (ms): {process_input_queue_time * 1000}")
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
 
@@ -775,11 +793,16 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        start_total_step = time.perf_counter()
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
+        # start_put_output_time = time.perf_counter()
         for output in (outputs.items() if outputs else ()):
             self.output_queue.put_nowait(output)
-
+        # put_output_time = time.perf_counter() - start_put_output_time
+        # logger.info(f"put_output_time (ms): {put_output_time * 1000}")
+        total_step_time = time.perf_counter() - start_total_step
+        logger.info(f"total_step_time (ms): {total_step_time * 1000}")
         return model_executed
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
