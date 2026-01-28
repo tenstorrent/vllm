@@ -89,6 +89,12 @@ class InputBatch:
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
+        # Sampling fast-path bookkeeping (track by req_id like GPUInputBatch).
+        # These are used to answer common "batch-wide" queries in O(1).
+        self.random_reqs: set[str] = set()
+        self.presence_penalties_reqs: set[str] = set()
+        self.frequency_penalties_reqs: set[str] = set()
+        self.repetition_penalties_reqs: set[str] = set()
 
         # TODO(woosuk): This buffer could be too large if max_model_len is big.
         # Find a way to reduce the CPU memory usage.
@@ -126,6 +132,18 @@ class InputBatch:
     @property
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
+
+    @property
+    def all_greedy(self) -> bool:
+        """True iff all active requests are greedy (temperature == 0.0)."""
+        return len(self.random_reqs) == 0
+
+    @property
+    def no_penalties(self) -> bool:
+        """True iff no active request has sampling penalties."""
+        return (len(self.presence_penalties_reqs) == 0
+                and len(self.frequency_penalties_reqs) == 0
+                and len(self.repetition_penalties_reqs) == 0)
 
     def add_request(
         self,
@@ -184,6 +202,27 @@ class InputBatch:
                                          if sampling_params.seed is not None
                                          else SEED_NONE_SENTINEL)
 
+        # Update fast-path bookkeeping sets.
+        #
+        # NOTE: Use `discard()` because `req_id` can be reused (abort+resubmit)
+        # and slots can be overwritten.
+        if sampling_params.temperature == 0.0:
+            self.random_reqs.discard(req_id)
+        else:
+            self.random_reqs.add(req_id)
+        if sampling_params.presence_penalty == 0.0:
+            self.presence_penalties_reqs.discard(req_id)
+        else:
+            self.presence_penalties_reqs.add(req_id)
+        if sampling_params.frequency_penalty == 0.0:
+            self.frequency_penalties_reqs.discard(req_id)
+        else:
+            self.frequency_penalties_reqs.add(req_id)
+        if sampling_params.repetition_penalty == 1.0:
+            self.repetition_penalties_reqs.discard(req_id)
+        else:
+            self.repetition_penalties_reqs.add(req_id)
+
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
 
@@ -192,6 +231,12 @@ class InputBatch:
             return None
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
+
+        # Update fast-path bookkeeping sets.
+        self.random_reqs.discard(req_id)
+        self.presence_penalties_reqs.discard(req_id)
+        self.frequency_penalties_reqs.discard(req_id)
+        self.repetition_penalties_reqs.discard(req_id)
 
         return req_index
 
@@ -206,6 +251,10 @@ class InputBatch:
             # The batched states are empty.
             self._req_ids.clear()
             self.req_output_token_ids.clear()
+            self.random_reqs.clear()
+            self.presence_penalties_reqs.clear()
+            self.frequency_penalties_reqs.clear()
+            self.repetition_penalties_reqs.clear()
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices

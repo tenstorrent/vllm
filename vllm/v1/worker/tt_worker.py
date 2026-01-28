@@ -196,9 +196,8 @@ class TTWorker(WorkerBase):
         if scheduler_output is not None:
             model_input = self.model_runner.build_model_input(scheduler_output)
             if model_input is not None:
-                # Check if any request has penalties
                 has_penalties = int(
-                    model_input.tt_sampling_params.has_penalties)
+                    not self.model_runner.input_batch.no_penalties)
                 reset_batch = int(model_input.reset_batch)
                 can_sample_device = int(model_input.perform_device_sampling)
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
