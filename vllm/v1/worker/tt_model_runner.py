@@ -1403,40 +1403,49 @@ class TTModelRunner:
     def generate_runner_output(self, sampled_token_ids: torch.Tensor):
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
-        assert sampled_token_ids.shape[0] == self.input_batch.num_reqs, (
+        num_reqs = self.input_batch.num_reqs
+        assert sampled_token_ids.shape[0] == num_reqs, (
             f"Number of request outputs {sampled_token_ids.shape[0]} != "
-            f"number of requests in input batch {self.input_batch.num_reqs}")
+            f"number of requests in input batch {num_reqs}")
         num_out_tokens = sampled_token_ids.shape[1]
         assert num_out_tokens == 1, "Currently only supporting 1 output token"
-        for req_idx, sampled_ids in enumerate(sampled_token_ids):
-            start_idx = self.input_batch.num_tokens[req_idx]
-            end_idx = start_idx + num_out_tokens
-            assert end_idx <= self.model_config.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.model_config.max_model_len}")
 
-            # Update persistent batch
-            self.input_batch.token_ids_cpu[req_idx,
-                                           start_idx:end_idx] = sampled_ids
-            self.input_batch.num_tokens[req_idx] = end_idx
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
 
-            # Update request state
-            req_id = self.input_batch.req_ids[req_idx]
-            req_state = self.requests[req_id]
-            req_state.output_token_ids.extend(sampled_ids)
+        # Vectorized update of persistent batch token storage.
+        start_idxs = self.input_batch.num_tokens[:num_reqs]
+        end_idxs = start_idxs + 1
+        max_end = int(end_idxs.max()) if num_reqs > 0 else 0
+        assert max_end <= self.model_config.max_model_len, (
+            "Sampled token IDs exceed the max model length. "
+            f"Total number of tokens: {max_end} > max_model_len: "
+            f"{self.model_config.max_model_len}")
+
+        rows = np.arange(num_reqs)
+        self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
+        self.input_batch.num_tokens[:num_reqs] = end_idxs
+
+        # Update request state (output token lists) without dict lookups.
+        # NOTE: `InputBatch.req_output_token_ids[i]` is a direct reference to
+        # the underlying `CachedRequestState.output_token_ids` list (stored in
+        # `self.requests[req_id]`). Appending here updates request state too,
+        # while avoiding a per-request dict lookup.
+        sampled_token_ids_list_1d = sampled_token_ids_np.tolist()
+        for req_idx in range(num_reqs):
+            output_token_ids = self.input_batch.req_output_token_ids[req_idx]
+            assert output_token_ids is not None
+            output_token_ids.append(sampled_token_ids_list_1d[req_idx])
 
         # Empty prompt log probs
-        prompt_logprobs_dict: dict[str, Optional[LogprobsTensors]] = {}
-        for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
-            prompt_logprobs_dict[req_id] = None
+        prompt_logprobs_dict: dict[str, Optional[LogprobsTensors]] = (
+            dict.fromkeys(self.input_batch.req_ids[:num_reqs], None))
 
         # Note: currently does not support speculative decoding, log probs,
         # or pooling.
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=sampled_token_ids.tolist(),
+            sampled_token_ids=[[t] for t in sampled_token_ids_list_1d],
             spec_token_ids=None,
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
