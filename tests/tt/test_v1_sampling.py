@@ -19,7 +19,7 @@ class TestV1Sampling:
     Verify v1 sampling parameters work correctly via the OpenAI API.
     """
 
-    @pytest.mark.parametrize("batch_fraction", [0, 0.5, 1])
+    @pytest.mark.parametrize("batch_fraction", [0, 0.5, 1, 1.5])
     def test_logprobs(self, tt_server, tt_model_name, max_batch_size,
                       batch_fraction):
         """Test logprobs parameter returns actual logprobs data.
@@ -80,6 +80,15 @@ class TestV1Sampling:
         """Test min_p parameter (smoke test - verifies it doesn't error)."""
         configs = [
             RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.1),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.2),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.3),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.4),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.5),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.6),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.7),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.8),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.9),
+            RequestConfig(prompt="Random: ", max_tokens=10, min_p=1.0),
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
         assert len(results) == len(configs)
@@ -111,6 +120,14 @@ class TestV1Sampling:
         configs = [
             RequestConfig(prompt="Logit bias: ", max_tokens=10,
                           logit_bias={1: 0.1}),
+            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+                          logit_bias={4: 0.2}),
+            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+                          logit_bias={2: 0.3}),
+            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+                          logit_bias={16: 0.4}),
+            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+                          logit_bias={7: 0.5}),
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
         assert len(results) == len(configs)
@@ -121,12 +138,23 @@ class TestV1Sampling:
         configs = [
             RequestConfig(prompt="Allowed: ", max_tokens=10,
                           allowed_token_ids=[1, 2, 3]),
+            RequestConfig(prompt="Allowed: ", max_tokens=10,
+                          allowed_token_ids=[4, 5, 6]),
+            RequestConfig(prompt="Allowed: ", max_tokens=10,
+                          allowed_token_ids=[7, 8, 9]),
+            RequestConfig(prompt="Allowed: ", max_tokens=10,
+                          allowed_token_ids=[10, 11, 12]),
+            RequestConfig(prompt="Allowed: ", max_tokens=10,
+                          allowed_token_ids=[13, 14, 15]),
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
         assert len(results) == len(configs)
         # With only 3 allowed tokens, output should be limited
-        assert results[0] is not None, \
-            "should produce output with allowed_token_ids"
+        for i, result in enumerate(results):
+            assert result is not None, \
+                f"should produce output for request {i}"
+            assert len(result) > 0, \
+                f"should produce non-empty output for request {i}"
 
     def test_min_tokens(self, tt_server, tt_model_name, max_batch_size):
         """Test min_tokens parameter ensures minimum output length."""
