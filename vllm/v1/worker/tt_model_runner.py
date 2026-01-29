@@ -448,10 +448,17 @@ class TTModelRunner:
         is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
         sample_params = input_batch.sampling
         if is_prompt:
-            # Assert no running requests
-            assert (
-                len(scheduler_output.scheduled_cached_reqs.req_ids) == 0
-            ), "Currently only supporting all prefills or all decodes in batch"
+            # NOTE: In SchedulerOutput, "cached" means "request data already
+            # cached on the worker", not necessarily "decode". During a prefill
+            # step we can legitimately see cached requests if they are resumed
+            # from preemption (still prefill work).
+            cached = scheduler_output.scheduled_cached_reqs
+            if cached.num_reqs > 0:
+                any_running = any(not x
+                                  for x in cached.resumed_from_preemption)
+                assert not any_running, (
+                    "Prefill batch should not include decode/running cached "
+                    "requests (resumed_from_preemption=False).")
 
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
