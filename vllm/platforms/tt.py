@@ -123,6 +123,7 @@ def register_tt_test_models():
         "models.vllm_test_utils.no_op_test.test_model:DummyNoOpModel",
     )
 
+
 class TTPlatform(Platform):
     _enum = PlatformEnum.TT
     device_name: str = "tt"
