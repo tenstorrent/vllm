@@ -142,10 +142,10 @@ class InputBatch:
         self.batch_update_builder = BatchUpdateBuilder()
 
         # Define logits processors.
-        self.logitsprocs = init_builtin_logitsprocs(
-            pin_memory_available=False,
-            max_num_reqs=max_num_reqs + 1,
-            device=torch.device("cpu"))
+        self.logitsprocs = init_builtin_logitsprocs(pin_memory_available=False,
+                                                    max_num_reqs=max_num_reqs +
+                                                    1,
+                                                    device=torch.device("cpu"))
 
         # Allowed token IDs tracking
         self.has_allowed_token_ids: set[str] = set()
@@ -282,11 +282,10 @@ class InputBatch:
             if self.allowed_token_ids_mask is None:
                 # Lazy allocation for this tensor, which can be large.
                 # True means we fill with -inf (disallowed).
-                self.allowed_token_ids_mask = torch.zeros(
-                    self.max_num_reqs,
-                    self.vocab_size,
-                    dtype=torch.bool,
-                    device="cpu")
+                self.allowed_token_ids_mask = torch.zeros(self.max_num_reqs,
+                                                          self.vocab_size,
+                                                          dtype=torch.bool,
+                                                          device="cpu")
             self.allowed_token_ids_mask[req_index] = True
             # False means we don't fill with -inf (allowed).
             self.allowed_token_ids_mask[req_index][
@@ -353,7 +352,8 @@ class InputBatch:
 
             # Track the move for logits processors
             self.batch_update_builder.moved.append(
-                (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL))
+                (last_req_index, empty_index,
+                 MoveDirectionality.UNIDIRECTIONAL))
 
             # Swap the states.
             req_id = self._req_ids[last_req_index]
@@ -405,8 +405,7 @@ class InputBatch:
             # Move allowed_token_ids_mask row
             if self.allowed_token_ids_mask is not None:
                 self.allowed_token_ids_mask[
-                    empty_index] = self.allowed_token_ids_mask[
-                        last_req_index]
+                    empty_index] = self.allowed_token_ids_mask[last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1

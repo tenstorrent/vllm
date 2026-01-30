@@ -1255,8 +1255,8 @@ class DPEngineCoreProc(EngineCoreProc):
         all_local_inputs = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
         (local_input, local_max_blocks, local_has_structured,
-         local_has_penalties, local_reset_batch,
-         local_can_sample_device, local_needs_logprobs) = all_local_inputs
+         local_has_penalties, local_reset_batch, local_can_sample_device,
+         local_needs_logprobs) = all_local_inputs
         max_blocks_decode = None  # Only used for decode.
         any_structured_inputs = False  # Only used for decode.
         any_needs_logprobs = False
@@ -1481,15 +1481,16 @@ class DPEngineCoreProc(EngineCoreProc):
         if any_needs_logprobs:
             my_logprobs: list = [None]
             logprobs_scatter_list = logprobs_per_dp if rank == 0 else None
-            dist.scatter_object_list(my_logprobs, logprobs_scatter_list,
-                                     src=0, group=group)
+            dist.scatter_object_list(my_logprobs,
+                                     logprobs_scatter_list,
+                                     src=0,
+                                     group=group)
             my_logprobs_val = my_logprobs[0]
 
         # If rank had scheduled tokens, apply results locally and return output
         if local_has_requests:
             output = self.model_executor.collective_rpc(
-                "apply_dp_execution_result",
-                args=(my_ids, my_logprobs_val))[0]
+                "apply_dp_execution_result", args=(my_ids, my_logprobs_val))[0]
             return output
         else:
             return EMPTY_MODEL_RUNNER_OUTPUT

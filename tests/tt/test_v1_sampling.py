@@ -9,8 +9,9 @@ which are configured via their respective sampling parameters.
 This has been added to V1 since the version we have checked out.
 """
 
-import pytest
 import string
+
+import pytest
 
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
@@ -42,17 +43,20 @@ class TestV1Sampling:
             num_requests = 1
         else:
             num_requests = max(1, int(max_batch_size * batch_fraction))
-        
+
         # Use return_tokens_as_token_ids to ensure unique keys in top_logprobs
         # dict. Without this, different token IDs that decode to the same
         # string would collide, reducing the count below num_logprobs.
         configs = [
-            RequestConfig(prompt=f"Count from {i}: ", max_tokens=10,
+            RequestConfig(prompt=f"Count from {i}: ",
+                          max_tokens=10,
                           logprobs=num_logprobs,
                           return_tokens_as_token_ids=True)
             for i in range(num_requests)
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs,
+        results = run_concurrent_batch(tt_server,
+                                       tt_model_name,
+                                       configs,
                                        return_full_response=True)
         assert len(results) == len(configs)
 
@@ -114,20 +118,23 @@ class TestV1Sampling:
         bad_words = ["hello", "Hello", "hi", "Hi", "hey", "Hey"]
         configs = [
             # Run multiple times with high temperature to increase coverage
-            RequestConfig(prompt="Say hello to me", max_tokens=20,
-                          bad_words=bad_words, temperature=1.0, seed=i)
-            for i in range(5)
+            RequestConfig(prompt="Say hello to me",
+                          max_tokens=20,
+                          bad_words=bad_words,
+                          temperature=1.0,
+                          seed=i) for i in range(5)
         ]
         # bad_words is only available in chat completions API
-        results = run_concurrent_batch(tt_server, tt_model_name, configs,
+        results = run_concurrent_batch(tt_server,
+                                       tt_model_name,
+                                       configs,
                                        use_chat=True)
         assert len(results) == len(configs)
 
         for i, text in enumerate(results):
             # Extract words by splitting and stripping punctuation
-            words = [word.strip(string.punctuation)
-                     for word in text.split()]
-            
+            words = [word.strip(string.punctuation) for word in text.split()]
+
             # Check if any bad word appears as a whole word (case-insensitive)
             for bad_word in bad_words:
                 assert bad_word not in words, \
@@ -136,15 +143,20 @@ class TestV1Sampling:
     def test_logit_bias(self, tt_server, tt_model_name, max_batch_size):
         """Test logit_bias parameter (smoke test - verifies it doesn't error)."""
         configs = [
-            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+            RequestConfig(prompt="Logit bias: ",
+                          max_tokens=10,
                           logit_bias={1: 0.1}),
-            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+            RequestConfig(prompt="Logit bias: ",
+                          max_tokens=10,
                           logit_bias={4: 0.2}),
-            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+            RequestConfig(prompt="Logit bias: ",
+                          max_tokens=10,
                           logit_bias={2: 0.3}),
-            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+            RequestConfig(prompt="Logit bias: ",
+                          max_tokens=10,
                           logit_bias={16: 0.4}),
-            RequestConfig(prompt="Logit bias: ", max_tokens=10,
+            RequestConfig(prompt="Logit bias: ",
+                          max_tokens=10,
                           logit_bias={7: 0.5}),
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
@@ -154,15 +166,20 @@ class TestV1Sampling:
     def test_allowed_token_ids(self, tt_server, tt_model_name, max_batch_size):
         """Test allowed_token_ids parameter (smoke test)."""
         configs = [
-            RequestConfig(prompt="Allowed: ", max_tokens=10,
+            RequestConfig(prompt="Allowed: ",
+                          max_tokens=10,
                           allowed_token_ids=[1, 2, 3]),
-            RequestConfig(prompt="Allowed: ", max_tokens=10,
+            RequestConfig(prompt="Allowed: ",
+                          max_tokens=10,
                           allowed_token_ids=[4, 5, 6]),
-            RequestConfig(prompt="Allowed: ", max_tokens=10,
+            RequestConfig(prompt="Allowed: ",
+                          max_tokens=10,
                           allowed_token_ids=[7, 8, 9]),
-            RequestConfig(prompt="Allowed: ", max_tokens=10,
+            RequestConfig(prompt="Allowed: ",
+                          max_tokens=10,
                           allowed_token_ids=[10, 11, 12]),
-            RequestConfig(prompt="Allowed: ", max_tokens=10,
+            RequestConfig(prompt="Allowed: ",
+                          max_tokens=10,
                           allowed_token_ids=[13, 14, 15]),
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
@@ -179,9 +196,13 @@ class TestV1Sampling:
         min_tokens = 5
         configs = [
             # Use a prompt that might naturally produce short output
-            RequestConfig(prompt="Say OK.", max_tokens=20, min_tokens=min_tokens),
+            RequestConfig(prompt="Say OK.",
+                          max_tokens=20,
+                          min_tokens=min_tokens),
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs,
+        results = run_concurrent_batch(tt_server,
+                                       tt_model_name,
+                                       configs,
                                        return_full_response=True)
         assert len(results) == len(configs)
 

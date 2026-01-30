@@ -223,11 +223,10 @@ class TTWorker(WorkerBase):
             model_input, max_blocks_decode_batch, any_structured_inputs,
             any_penalties_inputs)
 
-    def concat_and_execute_dp(self, inputs: Union[list[Optional[TTModelInput]],
-                                                  dict[str,
-                                                       Any]], is_decode: bool,
-                              max_blocks_decode_batch: Optional[int],
-                              any_structured_inputs: bool) -> tuple[torch.Tensor, list]:
+    def concat_and_execute_dp(
+            self, inputs: Union[list[Optional[TTModelInput]], dict[str, Any]],
+            is_decode: bool, max_blocks_decode_batch: Optional[int],
+            any_structured_inputs: bool) -> tuple[torch.Tensor, list]:
         """Called by TT device ranks (local DP rank 0) to concatenate DP-sized
         inputs and execute. Returns a tuple of:
         - stacked tensor [world, max_num_seqs, 1] of sampled ids
