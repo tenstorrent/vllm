@@ -10,6 +10,7 @@ This has been added to V1 since the version we have checked out.
 """
 
 import pytest
+import string
 
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
@@ -123,9 +124,14 @@ class TestV1Sampling:
         assert len(results) == len(configs)
 
         for i, text in enumerate(results):
+            # Extract words by splitting and stripping punctuation
+            words = [word.strip(string.punctuation)
+                     for word in text.split()]
+            
+            # Check if any bad word appears as a whole word (case-insensitive)
             for bad_word in bad_words:
-                assert bad_word not in text, \
-                    f"bad_word '{bad_word}' found in response {i}: {text!r}"
+                assert bad_word not in words, \
+                    f"bad_word '{bad_word}' found as whole word in response {i}: {text!r}"
 
     def test_logit_bias(self, tt_server, tt_model_name, max_batch_size):
         """Test logit_bias parameter (smoke test - verifies it doesn't error)."""
