@@ -1190,7 +1190,7 @@ class TTModelRunner:
         # Also, only the sampled token's logprob is returned on device, not the top-k alternatives.
         # On single device, logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
-        if input_batch.num_logprobs and (num_devices == 1 or input_batch.num_logprobs > 1):
+        if input_batch.num_logprobs and (num_devices == 1 or any(x>1 for x in input_batch.num_logprobs.values())):
             return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True for random sampling,
