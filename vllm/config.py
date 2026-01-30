@@ -14,6 +14,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import (MISSING, Field, asdict, field, fields, is_dataclass,
                          replace)
+from datetime import timedelta
 from functools import cached_property
 from importlib.util import find_spec
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Literal, Optional,
@@ -2070,6 +2071,7 @@ class ParallelConfig:
             try:
                 dist.init_process_group(backend="gloo",
                                         init_method=init_method,
+                                        timeout=timedelta(hours=2),
                                         rank=self.data_parallel_rank,
                                         world_size=self.data_parallel_size)
                 # Return the default process group

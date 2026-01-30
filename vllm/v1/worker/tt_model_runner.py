@@ -1086,6 +1086,7 @@ class TTModelRunner:
         if not any(bs > 0 for bs in batch_size_per_dp):
             return [torch.tensor([], dtype=torch.int32)
                     ] * len(batch_size_per_dp)
+        debug_investigation = os.environ.get("TT_DEBUG_INVESTIGATION") == "1"
 
         kwargs = {
             "tokens": model_input.input_tokens,
@@ -1097,6 +1098,8 @@ class TTModelRunner:
             kwargs["enable_trace"] = self.trace_mode in ["all"]
             kwargs["prompt_lens"] = model_input.prompt_lens
             kwargs.update(model_input.multi_modal_kwargs)
+            empty_slots = None
+            stride = None
             if len(batch_size_per_dp) > 1:
                 # TODO: the model should only require DP ranks, but passing
                 # "global" user ids instead for backwards compatibility.
@@ -1106,8 +1109,52 @@ class TTModelRunner:
                     for i in range(int(sz)):
                         empty_slots.append(dp_rank * stride + i)
                 kwargs["empty_slots"] = empty_slots
+            if debug_investigation and not getattr(self, "_debug_inv_exec_prefill", False):
+                self._debug_inv_exec_prefill = True
+                pos_t = model_input.input_positions
+                if not isinstance(pos_t, torch.Tensor):
+                    pos_t = torch.as_tensor(pos_t)
+                pos_min = int(pos_t.min().item()) if pos_t.numel() else 0
+                pos_max = int(pos_t.max().item()) if pos_t.numel() else 0
+                empty_summary = None
+                if empty_slots is not None:
+                    empty_summary = {
+                        "len": len(empty_slots),
+                        "min": int(min(empty_slots)) if empty_slots else None,
+                        "max": int(max(empty_slots)) if empty_slots else None,
+                        "head": [int(x) for x in empty_slots[: min(16, len(empty_slots))]],
+                    }
+                logger.info(
+                    "[INV] execute_with_model_input(prefill): tokens_shape=%s positions[min,max]=(%s,%s) batch_size_per_dp=%s unpadded_batch_size=%s page_table_shape=%s stride=%s empty_slots=%s",
+                    tuple(model_input.input_tokens.shape),
+                    pos_min,
+                    pos_max,
+                    batch_size_per_dp,
+                    model_input.unpadded_batch_size,
+                    None if model_input.block_tables is None else tuple(model_input.block_tables.shape),
+                    stride,
+                    empty_summary,
+                )
 
+        if self.scheduler_config is not None and hasattr(self.scheduler_config, "max_num_seqs"):
+            kwargs["global_stride"] = int(self.scheduler_config.max_num_seqs)
         kwargs["start_pos"] = model_input.input_positions
+        if debug_investigation and is_decode and not getattr(self, "_debug_inv_exec_decode", False):
+            self._debug_inv_exec_decode = True
+            pos_t = model_input.input_positions
+            if not isinstance(pos_t, torch.Tensor):
+                pos_t = torch.as_tensor(pos_t)
+            pos_min = int(pos_t.min().item()) if pos_t.numel() else 0
+            pos_max = int(pos_t.max().item()) if pos_t.numel() else 0
+            logger.info(
+                "[INV] execute_with_model_input(decode): tokens_shape=%s positions[min,max]=(%s,%s) batch_size_per_dp=%s unpadded_batch_size=%s page_table_shape=%s",
+                tuple(model_input.input_tokens.shape),
+                pos_min,
+                pos_max,
+                batch_size_per_dp,
+                model_input.unpadded_batch_size,
+                None if model_input.block_tables is None else tuple(model_input.block_tables.shape),
+            )
 
         # Sampling decision
         sampling_params = model_input.tt_sampling_params
