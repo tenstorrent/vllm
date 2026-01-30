@@ -597,8 +597,8 @@ class TTModelRunner:
         if not input_batch.no_allowed_token_ids:
             if input_batch.allowed_token_ids_mask is not None:
                 allowed_token_ids_mask = (
-                    input_batch.allowed_token_ids_mask[:input_batch.num_reqs]
-                    .clone())
+                    input_batch.allowed_token_ids_mask[:input_batch.
+                                                       num_reqs].clone())
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -749,16 +749,16 @@ class TTModelRunner:
         host_only_params = None
         if model_input is not None:
             host_only_params = {
-                "allowed_token_ids_mask": (
-                    model_input.allowed_token_ids_mask_list[0]
-                    if model_input.allowed_token_ids_mask_list else None),
-                "bad_words_token_ids": (
-                    model_input.bad_words_token_ids_list[0]
-                    if model_input.bad_words_token_ids_list else {}),
-                "max_num_logprobs": model_input.max_num_logprobs,
-                "logitsprocs": (
-                    model_input.logitsprocs_list[0]
-                    if model_input.logitsprocs_list else None),
+                "allowed_token_ids_mask":
+                (model_input.allowed_token_ids_mask_list[0]
+                 if model_input.allowed_token_ids_mask_list else None),
+                "bad_words_token_ids":
+                (model_input.bad_words_token_ids_list[0]
+                 if model_input.bad_words_token_ids_list else {}),
+                "max_num_logprobs":
+                model_input.max_num_logprobs,
+                "logitsprocs": (model_input.logitsprocs_list[0]
+                                if model_input.logitsprocs_list else None),
             }
 
         result = {
@@ -1004,14 +1004,13 @@ class TTModelRunner:
                 # Collect host-only params per rank
                 if mi is not None:
                     allowed_token_ids_mask_list.append(
-                        mi.allowed_token_ids_mask_list[0]
-                        if mi.allowed_token_ids_mask_list else None)
+                        mi.allowed_token_ids_mask_list[0] if mi.
+                        allowed_token_ids_mask_list else None)
                     bad_words_token_ids_list.append(
-                        mi.bad_words_token_ids_list[0]
-                        if mi.bad_words_token_ids_list else {})
-                    logitsprocs_list.append(
-                        mi.logitsprocs_list[0]
-                        if mi.logitsprocs_list else None)
+                        mi.bad_words_token_ids_list[0] if mi.
+                        bad_words_token_ids_list else {})
+                    logitsprocs_list.append(mi.logitsprocs_list[0] if mi.
+                                            logitsprocs_list else None)
                     if mi.max_num_logprobs is not None:
                         if max_num_logprobs is None:
                             max_num_logprobs = mi.max_num_logprobs
@@ -1155,7 +1154,8 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         # Only 1 DP rank here
-        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input(model_input)
+        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input(
+            model_input)
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
@@ -1178,7 +1178,8 @@ class TTModelRunner:
         has_always_host_only_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.bad_words_token_ids  # bad_words set
-            or input_batch.logitsprocs.has_active_processors()  # min_p, logit_bias, min_tokens
+            or input_batch.logitsprocs.has_active_processors(
+            )  # min_p, logit_bias, min_tokens
         )
         if has_always_host_only_params:
             return False
@@ -1187,7 +1188,8 @@ class TTModelRunner:
         # Also, only the sampled token's logprob is returned on device, not the top-k alternatives.
         # On single device, logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
-        if input_batch.num_logprobs and (num_devices == 1 or any(x>1 for x in input_batch.num_logprobs.values())):
+        if input_batch.num_logprobs and (num_devices == 1 or any(
+                x > 1 for x in input_batch.num_logprobs.values())):
             return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True for random sampling,
@@ -1460,7 +1462,8 @@ class TTModelRunner:
                 if (model_input.allowed_token_ids_mask_list
                         and model_input.allowed_token_ids_mask_list[dp_rank]
                         is not None):
-                    rank_mask = model_input.allowed_token_ids_mask_list[dp_rank]
+                    rank_mask = model_input.allowed_token_ids_mask_list[
+                        dp_rank]
                     # Slice to actual batch size for this rank
                     allowed_token_ids_mask = rank_mask[:sz]
 
@@ -1472,8 +1475,8 @@ class TTModelRunner:
 
                 logitsprocs = (model_input.logitsprocs_list[dp_rank]
                                if model_input.logitsprocs_list
-                               and model_input.logitsprocs_list[dp_rank] is not None
-                               else LogitsProcessorManager())
+                               and model_input.logitsprocs_list[dp_rank]
+                               is not None else LogitsProcessorManager())
 
                 # Create SamplingMetadata for this DP rank
                 sampling_metadata = SamplingMetadata(
@@ -1515,10 +1518,14 @@ class TTModelRunner:
 
                     # Create LogprobsTensors with only sampled token info
                     # Shape: [sz, 1] for token_ids and logprobs
-                    logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
-                    logprobs_values = sampled_log_probs.unsqueeze(-1).to(torch.float32)
+                    logprob_token_ids = next_token_ids.unsqueeze(-1).to(
+                        torch.int32)
+                    logprobs_values = sampled_log_probs.unsqueeze(-1).to(
+                        torch.float32)
                     # Rank is unknown with device sampling, use -1 to indicate
-                    selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
+                    selected_token_ranks = torch.full((sz, ),
+                                                      -1,
+                                                      dtype=torch.int32)
 
                     logprobs_tensors = LogprobsTensors(
                         logprob_token_ids=logprob_token_ids,

@@ -29,7 +29,9 @@ class RequestConfig:
     # (min_p, logit_bias, min_tokens, bad_words, allowed_token_ids).
 
 
-async def send_request(async_client, model: str, config: RequestConfig,
+async def send_request(async_client,
+                       model: str,
+                       config: RequestConfig,
                        return_full_response: bool = False):
     """Send a single async legacy completion request (old API)."""
     extra_body: dict[str, Any] = {}
@@ -48,7 +50,8 @@ async def send_request(async_client, model: str, config: RequestConfig,
     if config.return_tokens_as_token_ids:
         extra_body["return_tokens_as_token_ids"] = True
     if config.bad_words is not None:
-        raise ValueError("bad_words is not supported in legacy completions API")
+        raise ValueError(
+            "bad_words is not supported in legacy completions API")
 
     response = await async_client.completions.create(
         model=model,
@@ -67,7 +70,9 @@ async def send_request(async_client, model: str, config: RequestConfig,
     return response.choices[0].text
 
 
-async def send_chat_request(async_client, model: str, config: RequestConfig,
+async def send_chat_request(async_client,
+                            model: str,
+                            config: RequestConfig,
                             return_full_response: bool = False):
     """Send a single async chat completion request (new API).
     """
@@ -89,7 +94,10 @@ async def send_chat_request(async_client, model: str, config: RequestConfig,
 
     response = await async_client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": config.prompt}],
+        messages=[{
+            "role": "user",
+            "content": config.prompt
+        }],
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         top_p=config.top_p,
@@ -105,7 +113,8 @@ async def send_chat_request(async_client, model: str, config: RequestConfig,
     return response.choices[0].message.content
 
 
-async def send_batch_concurrent(async_client, model: str,
+async def send_batch_concurrent(async_client,
+                                model: str,
                                 configs: list[RequestConfig],
                                 use_chat: bool = False,
                                 return_full_response: bool = False):
@@ -118,13 +127,17 @@ async def send_batch_concurrent(async_client, model: str,
         return_full_response: If True, return full response objects instead of just text.
     """
     send_fn = send_chat_request if use_chat else send_request
-    tasks = [send_fn(async_client, model, cfg,
-                     return_full_response=return_full_response)
-             for cfg in configs]
+    tasks = [
+        send_fn(async_client,
+                model,
+                cfg,
+                return_full_response=return_full_response) for cfg in configs
+    ]
     return await asyncio.gather(*tasks)
 
 
-def run_concurrent_batch(tt_server, tt_model_name,
+def run_concurrent_batch(tt_server,
+                         tt_model_name,
                          configs: list[RequestConfig],
                          use_chat: bool = False,
                          return_full_response: bool = False):
@@ -140,9 +153,12 @@ def run_concurrent_batch(tt_server, tt_model_name,
     async def _run():
         async_client = tt_server.get_async_client()
         try:
-            return await send_batch_concurrent(async_client, tt_model_name,
-                                               configs, use_chat=use_chat,
-                                               return_full_response=return_full_response)
+            return await send_batch_concurrent(
+                async_client,
+                tt_model_name,
+                configs,
+                use_chat=use_chat,
+                return_full_response=return_full_response)
         finally:
             await async_client.close()
 

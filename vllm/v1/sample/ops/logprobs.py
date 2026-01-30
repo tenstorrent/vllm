@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 
+
 # newer versions of upstream already pass current_platform.simple_compile_backend
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def batched_count_greater_than(x: torch.Tensor,
