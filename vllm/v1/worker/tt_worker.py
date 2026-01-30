@@ -20,6 +20,7 @@ from vllm.worker.tt_worker import (close_mesh_device, get_mesh_grid,
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import LogprobsLists
 
 logger = init_logger(__name__)
 
@@ -272,7 +273,7 @@ class TTWorker(WorkerBase):
     def apply_dp_execution_result(
             self,
             sampled_token_ids: torch.Tensor,
-            logprobs_lists: Optional[list] = None) -> ModelRunnerOutput:
+            logprobs_lists: Optional[LogprobsLists] = None) -> ModelRunnerOutput:
         """Called by each DP rank to apply sampled tokens to internal caches.
         
         Args:

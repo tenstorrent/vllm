@@ -803,6 +803,10 @@ class TTModelRunner:
                                          dim=1)
             return block_tables
 
+        allowed_token_ids_mask_list: list[Optional[torch.Tensor]] = []
+        bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
+        logitsprocs_list: list[Optional[LogitsProcessorManager]] = []
+
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W),
@@ -881,9 +885,6 @@ class TTModelRunner:
 
             # Extract host-only params from gathered inputs (per-rank lists)
             host_only_params_list = inputs.get("host_only_params")
-            allowed_token_ids_mask_list: list[Optional[torch.Tensor]] = []
-            bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
-            logitsprocs_list: list[Optional[LogitsProcessorManager]] = []
             max_num_logprobs: Optional[int] = None
             if host_only_params_list:
                 for rank_params in host_only_params_list:
@@ -942,10 +943,6 @@ class TTModelRunner:
             frequency_penalty_list: list[torch.Tensor] = []
             repetition_penalty_list: list[torch.Tensor] = []
             seed_list: list[torch.Tensor] = []
-            # Host-only params (per-rank lists)
-            allowed_token_ids_mask_list: list[Optional[torch.Tensor]] = []
-            bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
-            logitsprocs_list: list[Optional[LogitsProcessorManager]] = []
             max_num_logprobs: Optional[int] = None
             reset_batch = False
 
@@ -1154,7 +1151,7 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         # Only 1 DP rank here
-        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input(
+        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input( # noqa: E501
             model_input)
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
@@ -1184,15 +1181,18 @@ class TTModelRunner:
         if has_always_host_only_params:
             return False
 
-        # Logprobs on device are only supported on multi-device setups (num_devices > 1)
-        # Also, only the sampled token's logprob is returned on device, not the top-k alternatives.
+        # Logprobs on device are only supported on multi-device setups 
+        # (num_devices > 1)
+        # Also, only the sampled token's logprob is returned on device, 
+        # not the top-k alternatives.
         # On single device, logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
         if input_batch.num_logprobs and (num_devices == 1 or any(
                 x > 1 for x in input_batch.num_logprobs.values())):
             return False
 
-        # TTPlatform.non_greedy_decoding_on_device must be True for random sampling,
+        # TTPlatform.non_greedy_decoding_on_device must be True
+        # for random sampling, 
         # or all requests must be greedy without penalties.
         params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
             self.input_batch.all_greedy and self.input_batch.no_penalties)
@@ -1350,7 +1350,7 @@ class TTModelRunner:
 
         Args:
             tt_out: Model output (logits or tokens depending on sampling mode)
-            tt_log_probs: Optional logprobs from device sampling (batch_size tensor)
+            tt_log_probs: Optional logprobs from device sampling
 
         Returns:
             Tuple of (sampled_token_ids_per_dp, logprobs_per_dp).
@@ -1455,7 +1455,8 @@ class TTModelRunner:
                         prompt_token_ids = prompt_token_ids.masked_fill(
                             pad_mask, self.vocab_size)
 
-                # Get host-only sampling params from model_input (per-rank lists).
+                # Get host-only sampling params from model_input
+                # (per-rank lists).
                 # These are populated for both DP and non-DP cases.
                 rank_max_num_logprobs = model_input.max_num_logprobs
                 allowed_token_ids_mask = None
