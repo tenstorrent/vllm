@@ -27,6 +27,7 @@ class SamplingInputBatch:
         "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
         "seed": SEED_NONE_SENTINEL,  # Sentinel represents None (no seed)
+        "enable_log_probs": False,  # Default to no logprobs
     }
 
     def __init__(self, max_num_reqs: int):
@@ -41,6 +42,7 @@ class SamplingInputBatch:
         self.frequency_penalty = default_tensors["frequency_penalty"]
         self.repetition_penalty = default_tensors["repetition_penalty"]
         self.seed = default_tensors["seed"]
+        self.enable_log_probs = default_tensors["enable_log_probs"]
         # Asserting that all defaults have corresponding attributes.
         for name in self.DEFAULTS:
             assert hasattr(
@@ -270,6 +272,9 @@ class InputBatch:
         # Logprobs
         if sampling_params.logprobs is not None:
             self.num_logprobs[req_id] = sampling_params.logprobs
+            self.sampling.enable_log_probs[req_index] = True
+        else:
+            self.sampling.enable_log_probs[req_index] = False
 
         # Allowed token IDs
         if sampling_params.allowed_token_ids:

@@ -23,12 +23,16 @@ class TestV1Sampling:
     def test_logprobs(self, tt_server, tt_model_name, max_batch_size,
                       batch_fraction):
         """Test logprobs parameter returns actual logprobs data.
-        
+
         Parametrized by batch size to verify logprobs work correctly across
-        all DP ranks. In DP mode, logprobs are computed on rank 0 and must
-        be properly distributed to all ranks. Testing with full batch size
-        maximizes coverage across DP ranks.
-        
+        all DP ranks. On multi-device setups (num_devices > 1), logprobs can
+        be computed on device. On single-device setups, logprobs fall back to
+        host sampling.
+
+        Note: Device-sampled logprobs only include the sampled token's logprob,
+        not top-k alternatives or ranks. Host-sampled logprobs include full
+        top-k alternatives and ranks.
+
         batch_fraction: 1 = full batch, 0.5 = half batch, 0 = single request
         """
         num_logprobs = 5
@@ -37,9 +41,13 @@ class TestV1Sampling:
         else:
             num_requests = max(1, int(max_batch_size * batch_fraction))
         
+        # Use return_tokens_as_token_ids to ensure unique keys in top_logprobs
+        # dict. Without this, different token IDs that decode to the same
+        # string would collide, reducing the count below num_logprobs.
         configs = [
             RequestConfig(prompt=f"Count from {i}: ", max_tokens=10,
-                          logprobs=num_logprobs)
+                          logprobs=num_logprobs,
+                          return_tokens_as_token_ids=True)
             for i in range(num_requests)
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs,
@@ -65,6 +73,9 @@ class TestV1Sampling:
                 f"should have top_logprobs for tokens for request {i}"
             # Each position should have up to num_logprobs+1 alternatives
             for j, top_lp in enumerate(choice.logprobs.top_logprobs):
+                assert len(top_lp) >= num_logprobs, \
+                    f"request {i}, token {j}: should have at least " \
+                    f"{num_logprobs} alternatives per token"
                 assert len(top_lp) <= num_logprobs + 1, \
                     f"request {i}, token {j}: should have at most " \
                     f"{num_logprobs+1} alternatives per token"
@@ -173,3 +184,50 @@ class TestV1Sampling:
         assert response.usage.completion_tokens >= min_tokens, \
             f"should produce at least {min_tokens} tokens, " \
             f"got {response.usage.completion_tokens}"
+
+    @pytest.mark.parametrize("temperature", [0.0, 0.8, 1.5])
+    def test_logprobs_with_sampling(self, tt_server, tt_model_name,
+                                    max_batch_size, temperature):
+        """Test logprobs work with different sampling temperatures.
+
+        On multi-device setups, this tests that logprobs work with both:
+        - Greedy sampling (temperature=0.0) on device
+        - Random sampling (temperature > 0.0) on device
+
+        Device-sampled logprobs only include the sampled token's logprob,
+        not top-k alternatives, but should still be valid values.
+        """
+        num_requests = max(1, max_batch_size // 2)
+        configs = [
+            RequestConfig(
+                prompt=f"Random text {i}: ",
+                max_tokens=5,
+                logprobs=1,
+                temperature=temperature,
+            )
+            for i in range(num_requests)
+        ]
+        results = run_concurrent_batch(tt_server, tt_model_name, configs,
+                                       return_full_response=True)
+        assert len(results) == len(configs)
+
+        # Verify all responses have valid logprobs
+        for i, response in enumerate(results):
+            choice = response.choices[0]
+            assert choice.logprobs is not None, \
+                f"request {i}: logprobs should be returned"
+            assert choice.logprobs.token_logprobs is not None, \
+                f"request {i}: token_logprobs should exist"
+            assert len(choice.logprobs.token_logprobs) > 0, \
+                f"request {i}: should have logprobs for tokens"
+
+            # Verify logprob values are reasonable (not dummy values)
+            for j, lp in enumerate(choice.logprobs.token_logprobs):
+                assert lp is not None, \
+                    f"request {i}, token {j}: logprob is None"
+                # Log probabilities should be <= 0 (log of probability <= 1)
+                assert lp <= 0.0, \
+                    f"request {i}, token {j}: logprob {lp} should be <= 0"
+                # Sanity check: should not be extremely low (e.g., not -1000)
+                assert lp > -100.0, \
+                    f"request {i}, token {j}: logprob {lp} seems invalid"

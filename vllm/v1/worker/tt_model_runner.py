@@ -1171,23 +1171,29 @@ class TTModelRunner:
         if not want_device_sampling:
             return False
 
-        # Host-only sampling params (logprobs, min_p, bad_words, logit_bias,
-        # allowed_token_ids, min_tokens) require host sampling.
-        # Check if any requests in the batch use these params.
+        # Calculate number of devices per DP rank
+        num_devices = (self.device_config.num_devices //
+                       self.parallel_config.data_parallel_size)
+
+        # Always host-only sampling params: min_p, bad_words, logit_bias,
+        # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
-        has_host_only_params = (
-            input_batch.num_logprobs  # logprobs requested
-            or not input_batch.no_allowed_token_ids  # allowed_token_ids set
+        has_always_host_only_params = (
+            not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.bad_words_token_ids  # bad_words set
             or input_batch.logitsprocs.has_active_processors()  # min_p, logit_bias, min_tokens
         )
-        if has_host_only_params:
+        if has_always_host_only_params:
             return False
-        # Device sampling currently doesn't support logprobs.
-        # TTPlatform.non_greedy_decoding_on_device must be True
-        # Also if logprobs is not None and devices_per_dp_cache == 1,
-        # logprobs on device is not supported
-        # (https://github.com/tenstorrent/tt-metal/issues/34077).
+
+        # Logprobs on device are only supported on multi-device setups (num_devices > 1).
+        # On single device, logprobs require host sampling.
+        # https://github.com/tenstorrent/tt-metal/issues/34077
+        if input_batch.num_logprobs and num_devices == 1:
+            return False
+
+        # TTPlatform.non_greedy_decoding_on_device must be True for random sampling,
+        # or all requests must be greedy without penalties.
         params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
             self.input_batch.all_greedy and self.input_batch.no_penalties)
         return params_device_supported
@@ -1305,13 +1311,15 @@ class TTModelRunner:
                                                enable_trace=enable_trace,
                                                read_from_device=True)
 
-        # tt_out is a tuple of (logits, logprobs)
-        # v1 currently doesn't handle logprobs from TT models
+        # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
+        # sampling is enabled with logprobs. Extract both components.
+        tt_log_probs = None
         if isinstance(tt_out, tuple):
-            tt_out = tt_out[0]
+            tt_out, tt_log_probs = tt_out
 
         return self._get_output_tokens(
             tt_out=tt_out,
+            tt_log_probs=tt_log_probs,
             sampling_params=sampling_params,
             model_input=model_input,
             batch_size_per_dp=batch_size_per_dp,
@@ -1322,6 +1330,7 @@ class TTModelRunner:
     def _get_output_tokens(
         self,
         tt_out: torch.Tensor,
+        tt_log_probs: Optional[torch.Tensor],
         sampling_params: TTSamplingParams,
         model_input: TTModelInput,
         batch_size_per_dp: list[int],
@@ -1330,10 +1339,14 @@ class TTModelRunner:
     ) -> tuple[list[torch.Tensor], list[Optional[LogprobsTensors]]]:
         """Return sampled tokens per DP rank using concatenated model
         outputs, plus optional logprobs per DP rank.
-        
+
         If perform_device_sampling is True, tokens are already sampled on
         device. Otherwise, sample on host using host_sampler.
-        
+
+        Args:
+            tt_out: Model output (logits or tokens depending on sampling mode)
+            tt_log_probs: Optional logprobs from device sampling (batch_size tensor)
+
         Returns:
             Tuple of (sampled_token_ids_per_dp, logprobs_per_dp).
             Each element in logprobs_per_dp is None if logprobs were not
@@ -1489,7 +1502,30 @@ class TTModelRunner:
             else:  # sample on device
                 # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start:start + sz]
-                logprobs_per_dp.append(None)  # No logprobs with device sampling
+
+                # Extract logprobs if available from device sampling
+                if tt_log_probs is not None and model_input.max_num_logprobs:
+                    # TT device returns raw logprobs as [batch_size] tensor
+                    # containing log probability of the sampled token only.
+                    # Convert to LogprobsTensors format with minimal info.
+                    sampled_log_probs = tt_log_probs[start:start + sz]
+
+                    # Create LogprobsTensors with only sampled token info
+                    # Shape: [sz, 1] for token_ids and logprobs
+                    logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
+                    logprobs_values = sampled_log_probs.unsqueeze(-1).to(torch.float32)
+                    # Rank is unknown with device sampling, use -1 to indicate
+                    selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
+
+                    logprobs_tensors = LogprobsTensors(
+                        logprob_token_ids=logprob_token_ids,
+                        logprobs=logprobs_values,
+                        selected_token_ranks=selected_token_ranks,
+                    )
+                    logprobs_per_dp.append(logprobs_tensors)
+                else:
+                    logprobs_per_dp.append(None)
+
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:

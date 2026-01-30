@@ -23,6 +23,7 @@ class RequestConfig:
     logit_bias: Union[dict[int, float], None] = None
     allowed_token_ids: Union[list[int], None] = None
     min_tokens: int = 0
+    return_tokens_as_token_ids: bool = False
     # Note: Custom logits_processors are NOT supported in V1.
     # V1 only supports built-in processors via their respective params
     # (min_p, logit_bias, min_tokens, bad_words, allowed_token_ids).
@@ -44,6 +45,8 @@ async def send_request(async_client, model: str, config: RequestConfig,
         extra_body["logit_bias"] = config.logit_bias
     if config.allowed_token_ids is not None:
         extra_body["allowed_token_ids"] = config.allowed_token_ids
+    if config.return_tokens_as_token_ids:
+        extra_body["return_tokens_as_token_ids"] = True
     if config.bad_words is not None:
         raise ValueError("bad_words is not supported in legacy completions API")
 
