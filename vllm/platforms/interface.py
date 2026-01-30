@@ -510,6 +510,20 @@ class Platform:
         return False
 
     @classmethod
+    def requires_dp_lockstep(cls) -> bool:
+        """
+        Whether DP ranks must stay in lockstep for scheduler decisions.
+
+        This is used to gate DP-wide collectives that synchronize scheduling
+        intent (e.g., prefill vs decode) even when model inputs are not gathered
+        to a single driver rank.
+
+        By default, this follows gathered-batch DP behavior for backwards
+        compatibility.
+        """
+        return cls.requires_gathered_batch_dp()
+
+    @classmethod
     def validate_request(
         cls,
         prompt: PromptType,

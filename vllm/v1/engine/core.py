@@ -261,12 +261,14 @@ class EngineCore:
         was executed.
         """
 
-        # For gathered DP execution, agree on mode BEFORE any early returns,
-        # and only apply it if we will schedule locally.
+        # For DP lockstep (gathered or not), agree on mode BEFORE any early
+        # returns, and only apply it if we will schedule locally.
         forced_mode: Optional[int] = None
-        requires_gather = hasattr(self,
-                                  "requires_gather") and self.requires_gather
-        if requires_gather:
+        requires_input_gather = bool(getattr(self, "requires_gather", False))
+        requires_lockstep = bool(getattr(self, "requires_dp_lockstep",
+                                         False)) or requires_input_gather
+
+        if requires_lockstep:
             assert hasattr(self, "dp_max_consec_decodes")
             assert hasattr(self, "dp_decode_streak")
             assert hasattr(self, "dlog")
@@ -314,26 +316,35 @@ class EngineCore:
                             group=self.dp_group)
             forced_mode = int(intent_tensor.item())  # 1=prefill, 0=decode
             self.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
-            # Record forced_mode so it can be used by _execute_model_dp_gather.
+            # Record forced_mode so it can be used by _execute_model_dp_gather
+            # (and for debugging in non-gather lockstep mode).
             self._dp_gather_forced_mode = forced_mode
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            if requires_gather:
-                # Enter DP-gather every iteration to keep collectives ordered.
+            if requires_input_gather:
+                # Enter DP-gather every iteration to keep gather collectives
+                # ordered across ranks when some ranks have no work.
                 _ = self.execute_model(None)  # type: ignore[arg-type]
+            elif requires_lockstep:
+                # Other ranks will execute the model and run in-model
+                # collectives. We must also execute a dummy batch to avoid
+                # collective mismatch/deadlock.
+                is_decode = (forced_mode
+                             == 0) if forced_mode is not None else None
+                self.execute_dummy_batch_lockstep(is_decode=is_decode)
             return {}, False
 
         # Apply the forced mode only for ranks that will call schedule().
-        if requires_gather and forced_mode is not None:
+        if requires_lockstep and forced_mode is not None:
             set_mode = getattr(self.scheduler, "set_forced_mode", None)
             if callable(set_mode):
                 set_mode(forced_mode)
 
         scheduler_output = self.scheduler.schedule()
 
-        if requires_gather and forced_mode is not None:
+        if requires_lockstep and forced_mode is not None:
             # Reset forced mode after scheduling to leave no residual state.
             set_mode = getattr(self.scheduler, "set_forced_mode", None)
             if callable(set_mode):
@@ -435,6 +446,23 @@ class EngineCore:
 
     def execute_dummy_batch(self):
         self.model_executor.collective_rpc("execute_dummy_batch")
+
+    def execute_dummy_batch_lockstep(self,
+                                     is_decode: Optional[bool] = None) -> None:
+        """Execute a dummy batch while staying aligned with DP peers.
+
+        Some backends use in-model collectives that require every DP rank to
+        execute a model step, even when a given rank has no local requests.
+        When is_decode is provided, the backend may choose a decode- or
+        prefill-shaped dummy to keep collectives aligned.
+        """
+        if is_decode is None:
+            self.model_executor.collective_rpc("execute_dummy_batch")
+        else:
+            # TT-only: keep other workers' execute_dummy_batch signature
+            # unchanged.
+            self.model_executor.collective_rpc("execute_dummy_batch_lockstep",
+                                               args=(is_decode, ))
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
@@ -978,8 +1006,17 @@ class DPEngineCoreProc(EngineCoreProc):
         self.last_counts = (0, 0)
 
         from vllm.platforms import current_platform
-        self.requires_gather = current_platform.requires_gathered_batch_dp()
-        if self.requires_gather:
+        self.requires_dp_lockstep = current_platform.requires_dp_lockstep()
+        # Gathered-batch DP only makes sense when there are multiple local
+        # DP ranks (e.g., multiple ranks on the same host). In multi-host
+        # deployments where each host has a single local DP rank 0, we must
+        # not gather inputs and instead execute the model independently per
+        # rank while keeping scheduler decisions in lockstep.
+        self.requires_gather = (
+            current_platform.requires_gathered_batch_dp()
+            and vllm_config.parallel_config.data_parallel_size_local > 1)
+
+        if self.requires_dp_lockstep:
             # Track decode streak for DP gather fairness policy.
             self.dp_decode_streak: int = 0
             # Max consecutive decode iterations allowed before we must
@@ -1137,9 +1174,11 @@ class DPEngineCoreProc(EngineCoreProc):
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
 
-            # In gathered-DP mode, avoid early-continue to keep
-            # the global finish all-reduce aligned across ranks.
-            if not executed and not self.requires_gather:
+            # In DP-lockstep mode, avoid early-continue so we always
+            # participate in DP-wide collectives for scheduler alignment.
+            requires_lockstep = bool(
+                getattr(self, "requires_dp_lockstep", False))
+            if not executed and not requires_lockstep:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
                     continue

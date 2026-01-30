@@ -311,6 +311,12 @@ class TTPlatform(Platform):
         return True
 
     @classmethod
+    def requires_dp_lockstep(cls) -> bool:
+        # TT DP-attention requires all ranks to stay in lockstep for scheduler
+        # decisions (prefill vs decode), even when inputs are not gathered.
+        return True
+
+    @classmethod
     def validate_request(
         cls,
         prompt: PromptType,

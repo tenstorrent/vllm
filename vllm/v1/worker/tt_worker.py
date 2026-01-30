@@ -176,6 +176,49 @@ class TTWorker(WorkerBase):
         output = self.model_runner.execute_model(scheduler_output)
         return output
 
+    def execute_dummy_batch(self) -> None:
+        # Default dummy is decode-shaped (covers in-model collectives).
+        self.execute_dummy_batch_lockstep(is_decode=True)
+
+    def execute_dummy_batch_lockstep(self, is_decode: bool) -> None:
+        """Execute a minimal dummy step for DP lockstep (TT-only)."""
+        assert self.model_runner is not None
+
+        max_batch = int(self.model_runner.scheduler_config.max_num_seqs)
+        max_blocks = int(self.model_runner.max_num_blocks_per_req)
+
+        # Construct fixed-shape dummy tensors.
+        tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
+        start_pos = torch.zeros((max_batch, ), dtype=torch.int32)
+        page_table = torch.zeros((max_batch, max_blocks), dtype=torch.int32)
+
+        if is_decode:
+            kwargs: dict[str, Any] = {
+                "tokens": tokens,
+                "start_pos": start_pos,
+                "page_table": page_table,
+                "kv_cache": self.model_runner.kv_caches,
+                "enable_trace": False,
+                "read_from_device": True,
+                "sampling_params": None,
+            }
+            if getattr(self.model_runner, "request_specific_rope", False):
+                kwargs["rope_deltas_all_users"] = None
+            _ = self.model_runner.model.decode_forward(**kwargs)
+        else:
+            # Prefill dummy: prompt length 1 for all slots.
+            prompt_lens = [1] * max_batch
+            kwargs = {
+                "tokens": tokens,
+                "start_pos": start_pos,
+                "page_table": page_table,
+                "kv_cache": self.model_runner.kv_caches,
+                "prompt_lens": prompt_lens,
+            }
+            out = self.model_runner.model.prefill_forward(**kwargs)
+            # request_specific_rope may return (tt_out, rope_deltas)
+            _ = out
+
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return
