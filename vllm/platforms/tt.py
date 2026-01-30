@@ -213,7 +213,7 @@ class TTPlatform(Platform):
 
         # Compat sampling uses the full vLLM sampling pipeline,
         # with logit processors and sampler, instead of our custom sampling.
-        # It is enabled only on request if any of the requests in the batch require it,
+        # It is enabled only if any of the requests in the batch requires it,
         # or if always_compat_sampling is enabled.
 
         always_compat_sampling = False

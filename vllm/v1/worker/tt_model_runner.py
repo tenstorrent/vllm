@@ -597,11 +597,11 @@ class TTModelRunner:
 
         # Build host-only sampling params from input_batch
         allowed_token_ids_mask = None
-        if not input_batch.no_allowed_token_ids:
-            if input_batch.allowed_token_ids_mask is not None:
-                allowed_token_ids_mask = (
-                    input_batch.allowed_token_ids_mask[:input_batch.
-                                                       num_reqs].clone())
+        if not input_batch.no_allowed_token_ids and \
+            input_batch.allowed_token_ids_mask is not None:
+            allowed_token_ids_mask = (
+                input_batch.allowed_token_ids_mask[:input_batch.
+                                                    num_reqs].clone())
 
         return TTModelInput(
             input_tokens=input_tokens,
