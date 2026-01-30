@@ -138,10 +138,11 @@ class TestV1Sampling:
             # Check if any bad word appears as a whole word (case-insensitive)
             for bad_word in bad_words:
                 assert bad_word not in words, \
-                    f"bad_word '{bad_word}' found as whole word in response {i}: {text!r}"
+                    f"bad_word '{bad_word}' found as whole word" \
+                    f"in response {i}: {text!r}"
 
     def test_logit_bias(self, tt_server, tt_model_name, max_batch_size):
-        """Test logit_bias parameter (smoke test - verifies it doesn't error)."""
+        """Test logit_bias parameter (smoke test)."""
         configs = [
             RequestConfig(prompt="Logit bias: ",
                           max_tokens=10,

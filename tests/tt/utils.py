@@ -123,8 +123,8 @@ async def send_batch_concurrent(async_client,
     The vLLM server will batch these together internally.
 
     Args:
-        use_chat: If True, use chat completions API instead of legacy completions API.
-        return_full_response: If True, return full response objects instead of just text.
+        use_chat: use chat completions API instead of legacy completions API.
+        return_full_response: return full response objects vs just text.
     """
     send_fn = send_chat_request if use_chat else send_request
     tasks = [
@@ -146,8 +146,8 @@ def run_concurrent_batch(tt_server,
     Returns list of output texts (or full responses) in same order as configs.
 
     Args:
-        use_chat: If True, use chat completions API instead of legacy completions API.
-        return_full_response: If True, return full response objects instead of just text.
+        use_chat: use chat completions API instead of legacy completions API.
+        return_full_response: return full response objects vs just text.
     """
 
     async def _run():

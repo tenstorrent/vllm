@@ -1476,7 +1476,8 @@ class DPEngineCoreProc(EngineCoreProc):
         dist.scatter(my_ids, scatter_list, src=0, group=group)
         self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
 
-        # Scatter logprobs only if any rank needs them (determined in all_reduce).
+        # Scatter logprobs only if any rank needs them
+        # (determined in all_reduce).
         my_logprobs_val = None
         if any_needs_logprobs:
             my_logprobs: list = [None]
