@@ -7,12 +7,6 @@ from typing import Annotated, Final, Literal, Protocol, TypeVar
 
 import torch
 import torch.nn as nn
-from mistral_common.protocol.instruct.messages import (
-    ImageChunk,
-    TextChunk,
-    UserMessage,
-)
-from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from transformers import (
     BatchFeature,
     Mistral3Config,
@@ -44,7 +38,7 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import (
     MistralTokenizer,
@@ -262,41 +256,6 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
             )
         }
 
-    def get_dummy_processor_inputs(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
-    ) -> ProcessorInputs:
-        tokenizer = self.info.get_tokenizer()
-
-        dummy_text = self.get_dummy_text(mm_counts)
-        dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
-        dummy_images = dummy_mm_data.get("image", [])
-        tokenization_kwargs = {"truncation": False}
-
-        # Check if we're using MistralTokenizer (--tokenizer-mode mistral)
-        if isinstance(tokenizer, MistralTokenizer):
-            # Use Mistral's chat encoding which handles image tokens properly
-            request = ChatCompletionRequest(messages=[
-                UserMessage(content=[
-                    TextChunk(text=dummy_text),
-                    *(ImageChunk(image=image) for image in dummy_images),
-                ]),
-            ])
-            res = tokenizer.mistral.encode_chat_completion(request)
-            dummy_tokens = res.tokens
-
-            return ProcessorInputs(prompt=dummy_tokens,
-                                   mm_data=dummy_mm_data,
-                                   tokenization_kwargs=tokenization_kwargs)
-        else:
-            # Use HF tokenizer - fall back to default behavior
-            return super().get_dummy_processor_inputs(
-                seq_len, mm_counts, mm_options
-            )
-
-
 class Mistral3ProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         # Check which tokenizer is being used
@@ -384,7 +343,7 @@ class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo
         return [
             PromptReplacement(
                 modality="image",
-                target=[image_token_id],
+                target="",  # Never match (for profiling with empty text)
                 replacement=get_replacement,
             ),
         ]
