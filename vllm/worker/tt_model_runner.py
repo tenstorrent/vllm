@@ -163,6 +163,10 @@ def decode_warmup(model,
         "read_from_device": True,
         "sampling_params": None,  #to be filled
     }
+    # Only pass global_stride when the model explicitly advertises support.
+    model_capabilities = getattr(model, "model_capabilities", None)
+    if model_capabilities and model_capabilities.get("supports_global_stride", False):
+        local_kwargs["global_stride"] = int(max_batch_size)
 
     for s in sampling_params:
         local_kwargs["sampling_params"] = s
