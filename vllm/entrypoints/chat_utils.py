@@ -1283,6 +1283,14 @@ def apply_hf_chat_template(
         model_config=model_config,
     )
 
+    is_gpt_oss = (
+        model_config.architecture == "TTGptOssForCausalLM"
+        or (isinstance(model_config.model, str)
+            and "gpt-oss" in model_config.model.lower())
+    )
+    if is_gpt_oss:
+        kwargs.setdefault("reasoning_effort", "high")
+
     if hf_chat_template is None:
         raise ValueError(
             "As of transformers v4.44, default chat template is no longer "
