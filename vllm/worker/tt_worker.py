@@ -434,15 +434,20 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
             and is_wormhole):
         # Llama8B on N150
         max_tokens_all_users = 32768
+    elif ("Qwen3-8B" in model_config.model and devices_per_dp_cache == 1
+          and is_wormhole):
+        # Qwen3-8B on N150 (same constraint as Llama8B-N150)
+        max_tokens_all_users = 32768
     elif (("Mistral-7B" in model_config.model
            or "gemma-3-4b" in model_config.model) and devices_per_dp_cache == 1
           and is_wormhole):
         # Mistral7B, and gemma3-4b on N150
         max_tokens_all_users = 65536
-    elif (("DeepSeek-R1-Distill-Qwen-14B" in model_config.model
-           or "Qwen2.5-14B" in model_config.model)
-          and devices_per_dp_cache == 2 and is_wormhole):
-        # Qwen2.5-14B on N300
+    elif (
+        ("DeepSeek-R1-Distill-Qwen-14B" in model_config.model or "Qwen2.5-14B"
+         in model_config.model or "gemma-3-4b" in model_config.model)
+            and devices_per_dp_cache == 2 and is_wormhole):
+        # Qwen2.5-14B and gemma3-4b on N300
         max_tokens_all_users = 65536
     elif ("Llama-3.2-90B" in model_config.model and devices_per_dp_cache == 8
           and is_wormhole):
@@ -452,9 +457,6 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
           and is_wormhole):
         # Qwen2.5-VL-72B on WH T3K
         max_tokens_all_users = 65536
-    elif "gpt-oss" in model_config.model:
-        # gpt-oss on Galaxy and T3K
-        max_tokens_all_users = 1024
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
     else:

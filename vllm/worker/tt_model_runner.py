@@ -381,7 +381,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         if ("Llama" in self.model_config.model
                 and "70B" in self.model_config.model and
                 self.device_config.num_devices == 32) or is_dp or os.getenv(
-                    "TT_QWEN3_TEXT_VER", None) == "qwen3_32b_galaxy":
+                    "TT_QWEN3_TEXT_VER", None) == "qwen3_32b_galaxy" or (
+                        "gpt" in self.model_config.model
+                        and self.device_config.num_devices == 32
+                        and self.scheduler_config.max_num_seqs == 128):
             self.dp_kv_cache = True
         else:
             self.dp_kv_cache = False

@@ -1254,27 +1254,42 @@ class DPEngineCoreProc(EngineCoreProc):
         # Build local dp model input (or None).
         all_local_inputs = self.model_executor.collective_rpc(
             "build_dp_model_input", args=(scheduler_output, ))[0]
-        local_input, local_max_blocks, local_has_structured = all_local_inputs
+        (local_input, local_max_blocks, local_has_structured,
+         local_has_penalties, local_reset_batch,
+         local_can_sample_device) = all_local_inputs
         max_blocks_decode = None  # Only used for decode.
         any_structured_inputs = False  # Only used for decode.
 
         if is_decode:
-            # Gather max blocks and has_structured from all ranks.
+            # Gather max_blocks, has_structured, has_penalties, reset_batch,
+            # and cannot_sample_on_device from all ranks.
             input_info_t = torch.tensor(
-                [local_max_blocks, local_has_structured], dtype=torch.int32)
+                [
+                    local_max_blocks,
+                    local_has_structured,
+                    local_has_penalties,
+                    local_reset_batch,
+                    # Invert so we can use MAX reduction and still compute
+                    # "all ranks can sample on device".
+                    1 - local_can_sample_device,
+                ],
+                dtype=torch.int32)
             dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
             max_blocks_decode = int(input_info_t[0].item())
             any_structured_inputs = input_info_t[1].item() > 0
+            any_penalties_inputs = input_info_t[2].item() > 0
+            any_reset_batch = input_info_t[3].item() > 0
+            all_sample_device = input_info_t[4].item() == 0
 
             # Build tensorized gather input for decode.
-            tensorized_input = self.model_executor.collective_rpc(
+            decode_inputs = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
-                args=(local_input, max_blocks_decode,
-                      any_structured_inputs))[0]
+                args=(local_input, max_blocks_decode, any_structured_inputs,
+                      any_penalties_inputs))[0]
 
             # Decode: use gather with fixed-shape inputs.
-            int_local = tensorized_input["int_inputs"]  # 1D int32
-            float_local = tensorized_input["float_inputs"]  # 1D float32
+            int_local = decode_inputs["int_inputs"]  # 1D int32
+            float_local = decode_inputs["float_inputs"]  # 1D float32
 
             # Only rank 0 needs buffers for the gather operation.
             # Pre-allocate stacked tensors and create list views for gather.
@@ -1310,10 +1325,48 @@ class DPEngineCoreProc(EngineCoreProc):
                     dist.recv(stacked_int, src=0, group=group)
                     dist.recv(stacked_float, src=0, group=group)
 
+            # Gather prompt/output tokens only when they are needed (penalties)
+            # and (if sampling on host or the decode batch layout changed).
+            gathered_tokens_inputs = None
+            if any_penalties_inputs and (not all_sample_device
+                                         or any_reset_batch):
+                # Gather token dicts (containing tensors) to rank 0
+                if rank == 0:
+                    gathered_tokens_inputs = [None for _ in range(world)]
+                local_tokens_inputs = decode_inputs["sampling_tokens_inputs"]
+                dist.gather_object(local_tokens_inputs,
+                                   gathered_tokens_inputs,
+                                   dst=0,
+                                   group=group)
+
+                if len(self.dp_device_ranks) > 1:
+                    if rank == 0:
+                        # Rank 0 sends gathered tokens to other device ranks
+                        pickled_tokens = pickle.dumps(gathered_tokens_inputs)
+                        tokens_tensor = torch.frombuffer(pickled_tokens,
+                                                         dtype=torch.uint8)
+                        tokens_size = torch.tensor([tokens_tensor.numel()],
+                                                   dtype=torch.long)
+                        for dst in self.dp_device_ranks[1:]:
+                            dist.send(tokens_size, dst=dst, group=group)
+                            dist.send(tokens_tensor, dst=dst, group=group)
+                    elif local_rank == 0:  # other device ranks
+                        # Other device ranks receive from rank 0
+                        tokens_size = torch.zeros(1, dtype=torch.long)
+                        dist.recv(tokens_size, src=0, group=group)
+                        tokens_tensor = torch.empty(tokens_size.item(),
+                                                    dtype=torch.uint8)
+                        dist.recv(tokens_tensor, src=0, group=group)
+                        gathered_tokens_inputs = pickle.loads(
+                            tokens_tensor.numpy().tobytes())
+
             if local_rank == 0:
                 gathered_inputs = {
                     "int_inputs": stacked_int,
                     "float_inputs": stacked_float,
+                    "sampling_tokens_inputs": gathered_tokens_inputs,
+                    "reset_batch": any_reset_batch,
+                    "all_sample_device": all_sample_device,
                 }
 
         else:
