@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-import vllm.envs as envs
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
@@ -168,13 +167,10 @@ class TTPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            if envs.VLLM_USE_V1:
-                parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
-                vllm_config.scheduler_config.scheduler_cls = (
-                    "vllm.v1.core.sched.ascend_scheduler.AscendScheduler"
-                )
-            else:
-                parallel_config.worker_cls = "vllm.worker.tt_worker.TTWorker"
+            parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm.v1.core.sched.ascend_scheduler.AscendScheduler"
+            )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -223,12 +219,6 @@ class TTPlatform(Platform):
         # or if any of the requests in the batch require it.
         # For now, it is only supported with host-side sampling.
 
-        if envs.VLLM_USE_V1:  # type: ignore[attr-defined]
-            logger.warning(
-                "Disabling compatibility sampling as it's not yet support for "
-                "V1 TT backend."
-            )
-
         always_compat_sampling = False
         if (
             override_tt_config is not None
@@ -239,11 +229,9 @@ class TTPlatform(Platform):
                 "always_compat_sampling must be a boolean"
             )
             if always_compat_sampling:
-                if envs.VLLM_USE_V1:
-                    raise ValueError(
-                        "always_compat_sampling is not yet supported for V1 TT backend."
-                    )
-                logger.info("Compatibility sampling mode enabled for all requests")
+                raise ValueError(
+                    "always_compat_sampling is not yet supported for V1 TT backend."
+                )
         cls.always_compat_sampling = always_compat_sampling  # type: ignore[attr-defined]
 
         # must perform local import to get around circular import
@@ -264,12 +252,6 @@ class TTPlatform(Platform):
             "models.tt_transformers.tt.generator_vllm"
         ):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if vllm_config.cache_config.enable_prefix_caching and not envs.VLLM_USE_V1:
-            vllm_config.cache_config.enable_prefix_caching = False
-            logger.warning(
-                "Prefix caching is not supported for V0 TT backend, disabling it"
-            )
 
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
@@ -309,19 +291,6 @@ class TTPlatform(Platform):
         )
 
     @classmethod
-    def supports_v1(cls, model_config: ModelConfig) -> bool:
-        # Allow users to opt in to V1 for TT backend.
-        if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
-            if model_config.is_encoder_decoder:
-                raise ValueError(
-                    "VLLM_USE_V1=1 was set but encoder-decoder models aren't "
-                    "yet supported in V1 for TT"
-                )
-            logger.warning("Enabling V1 since VLLM_USE_V1=1")
-            return envs.VLLM_USE_V1
-        return False
-
-    @classmethod
     def is_pin_memory_available(cls) -> bool:
         # The regular v0 vLLM sampling code tries
         # to use pinned memory in case we're using GPUs.
@@ -352,21 +321,20 @@ class TTPlatform(Platform):
         if params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
 
-        if envs.VLLM_USE_V1:
-            if params.min_p != 0.0:
-                raise ValueError(f"Not yet supporting min_p on {dev} in V1")
-            if params.bad_words is not None and len(params.bad_words) > 0:
-                raise ValueError(f"Not yet supporting bad_words on {dev} in V1")
-            if params.logits_processors is not None:
-                raise ValueError(f"Not yet supporting logits_processors on {dev} in V1")
-            if params.logit_bias is not None:
-                raise ValueError(f"Not yet supporting logit_bias on {dev} in V1")
-            if params.allowed_token_ids is not None:
-                raise ValueError(f"Not yet supporting allowed_token_ids on {dev} in V1")
-            if params.min_tokens != 0:
-                raise ValueError(f"Not yet supporting min_tokens on {dev} in V1")
-            if params.logprobs is not None:
-                raise ValueError(f"Not yet supporting logprobs on {dev} in V1")
+        if params.min_p != 0.0:
+            raise ValueError(f"Not yet supporting min_p on {dev} in V1")
+        if params.bad_words is not None and len(params.bad_words) > 0:
+            raise ValueError(f"Not yet supporting bad_words on {dev} in V1")
+        if params.logits_processors is not None:
+            raise ValueError(f"Not yet supporting logits_processors on {dev} in V1")
+        if params.logit_bias is not None:
+            raise ValueError(f"Not yet supporting logit_bias on {dev} in V1")
+        if params.allowed_token_ids is not None:
+            raise ValueError(f"Not yet supporting allowed_token_ids on {dev} in V1")
+        if params.min_tokens != 0:
+            raise ValueError(f"Not yet supporting min_tokens on {dev} in V1")
+        if params.logprobs is not None:
+            raise ValueError(f"Not yet supporting logprobs on {dev} in V1")
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:

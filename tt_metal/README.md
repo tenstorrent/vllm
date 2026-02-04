@@ -77,7 +77,7 @@ To measure performance (Llama70B on QuietBox) for a single batch of 32 prompts (
 MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 ```
 
-> **⚠️ Enabling V1 Backend**: V1 can be enabled by setting `VLLM_USE_V1=1` and `--num_scheduler_steps 1`, though it may still have limitations compared to the default V0 backend. To disable multiprocessing in V1 (to step through code or make scheduling deterministic), set `VLLM_ENABLE_V1_MULTIPROCESSING=0` (note: not compatible with DP models). To run a model with DP attention, set the DP factor with `--data_parallel_size`, set the max batch size as the max batch per DP group, and set `--async_engine` (only for offline script) for proper load balancing.
+> **⚠️ Notes on V1 Backend**: To disable multiprocessing in V1 (to step through code or make scheduling deterministic), set `VLLM_ENABLE_V1_MULTIPROCESSING=0` (note: not compatible with DP models). To run a model with DP attention, set the DP factor with `--data_parallel_size`, set the max batch size as the max batch per DP group, and set `--async_engine` (only for offline script) for proper load balancing.
 
 **Note 1**: Custom TT options can be set using `--override_tt_config` with a json string, e.g. `--override_tt_config '{"sample_on_device_mode": "all"}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters are:
 - `sample_on_device_mode`: ["all", "decode_only"]
@@ -156,10 +156,7 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d
 ### Compatibility Sampling Mode, Guided Decoding, Structured Outputs
 
 Sampling parameters beyond `temperature`, `top_k`, `top_p` require the compatibility sampling mode.
-The compatibility sampling pathway is selected per batch when any request in the batch requires it. It can also be force-enabled for testing purposes with `--override_tt_config '{"always_compat_sampling": true}'`
-
-Some parameters, such as guided_decoding / strucured outputs require additionally setting `num_scheduler_steps=1`.
-Be aware that both of these settings will incur performance penalties.
+The compatibility sampling pathway is selected per batch when any request in the batch requires it.
 
 ### Llama-3.2 (11B and 90B) and Qwen-2.5-VL (32B and 72B) Vision Models
 
@@ -255,7 +252,7 @@ for example `--prompts_json tt_metal/prompts_overlapping.json`
 There is also a dedicated script for offline testing of prefix caching. Example:
 
 ```bash
-VLLM_USE_V1=1 HF_MODEL=meta-llama/Llama-3.1-8B-Instruct MESH_DEVICE=N300 python benchmarks/benchmark_prefix_caching.py --model meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-num-seqs 32 --num_scheduler_steps 1 --block-size 64 --num-prompts 1 --repeat-count <X> --input-length-range 128:1024
+HF_MODEL=meta-llama/Llama-3.1-8B-Instruct MESH_DEVICE=N300 python benchmarks/benchmark_prefix_caching.py --model meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-num-seqs 32 --block-size 64 --num-prompts 1 --repeat-count <X> --input-length-range 128:1024
 ```
 
 Here the `--repeat-count` parameter specifies how many times each prompt will be repeated.
@@ -274,7 +271,7 @@ pytest tests/tt -v --tt-server-url=http://localhost:8000 --tt-model-name=meta-ll
 To run offline inference or a server on a multi-host system, vLLM needs to be launched from the host that has MPI rank 0 (determined from the rankfile). Underneath the hood, the `tt-run` utility from tt-metal will be used to spawn MPI processes on each host. For example, for offline inference on 2 Wormhole Galaxy hosts with DP=2 (distributed across hosts):
 
 ```sh
-MESH_DEVICE=(8,8) VLLM_USE_V1=1 python -u examples/offline_inference_tt.py --model <MODEL_NAME> --num_scheduler_steps 1 --data_parallel_size 2 --async_engine --override_tt_config '{"rank_binding": "<PATH_TO_TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml", "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile --mca btl self,tcp --mca btl_tcp_if_include cnx1 --bind-to none --tag-output", "config_pkl_dir": "<PATH_TO_SHARED_TMP_DIR>", "fabric_config": "FABRIC_1D", "fabric_reliability_mode": "RELAXED_INIT", "env_passthrough":["VLLM_*", "MESH_DEVICE"]}'
+MESH_DEVICE=(8,8) python -u examples/offline_inference_tt.py --model <MODEL_NAME> --data_parallel_size 2 --async_engine --override_tt_config '{"rank_binding": "<PATH_TO_TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml", "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile --mca btl self,tcp --mca btl_tcp_if_include cnx1 --bind-to none --tag-output", "config_pkl_dir": "<PATH_TO_SHARED_TMP_DIR>", "fabric_config": "FABRIC_1D", "fabric_reliability_mode": "RELAXED_INIT", "env_passthrough":["VLLM_*", "MESH_DEVICE"]}'
 ```
 
 > **Notes:**

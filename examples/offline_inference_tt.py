@@ -15,15 +15,14 @@ from pkg_resources import resource_filename
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import vllm.envs as envs
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
 from vllm.inputs.data import TokensPrompt
 from vllm.utils import merge_async_iterators
+from vllm.v1.engine.async_llm import AsyncLLM
 
 
 def get_sample_multi_modal_llama_inputs():
@@ -241,7 +240,6 @@ def run_inference(
     perf_prompt_len=None,
     greedy_sampling=False,  # Use greedy decoding instead of top-k/p
     async_engine=False,
-    num_scheduler_steps=10,
     disable_async_output_proc=False,
     multi_modal=False,
     multi_image=False,
@@ -266,9 +264,6 @@ def run_inference(
             f"currently only supports {supported_models} models"
         )
 
-    if data_parallel_size > 1:
-        assert envs.VLLM_USE_V1, "Data parallel size > 1 is only supported with V1"
-
     # Validate non_uniform_sampling is not used with incompatible options
     if non_uniform_sampling:
         assert not greedy_sampling, (
@@ -290,7 +285,6 @@ def run_inference(
         "disable_log_stats": False,
         "max_num_batched_tokens": max_num_batched_tokens,
         "log_global_stats": measure_perf,
-        "num_scheduler_steps": num_scheduler_steps,
         "disable_async_output_proc": disable_async_output_proc,
         "data_parallel_size": data_parallel_size,
         "enable_prefix_caching": enable_prefix_caching,
@@ -552,7 +546,7 @@ def generate_tokens(
 
 
 async def generate_tokens_async(
-    llm: MQLLMEngineClient,
+    llm: AsyncLLM,
     prompts,
     sampling_params,
     dp_ranks=None,
@@ -569,7 +563,6 @@ async def generate_tokens_async(
         sampling_params = [sampling_params] * len(prompts)
 
     if dp_ranks:
-        assert envs.VLLM_USE_V1, "DP ranks are only supported with V1"
         assert len(dp_ranks) == len(prompts), (
             "DP ranks must be the same length as prompts"
         )
@@ -646,9 +639,6 @@ if __name__ == "__main__":
         help="Disable async output processing",
     )
     parser.add_argument(
-        "--num_scheduler_steps", type=int, default=10, help="Number of scheduler steps"
-    )
-    parser.add_argument(
         "--multi_modal",
         action="store_true",
         help="Run multi-modal inference (vision + text)",
@@ -721,7 +711,6 @@ if __name__ == "__main__":
         max_seqs_in_batch=args.max_seqs_in_batch,
         num_repeat_prompts=args.num_repeat_prompts,
         async_engine=args.async_engine,
-        num_scheduler_steps=args.num_scheduler_steps,
         disable_async_output_proc=args.disable_async_output_proc,
         multi_modal=args.multi_modal,
         multi_image=args.multi_image,
