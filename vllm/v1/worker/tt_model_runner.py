@@ -152,6 +152,20 @@ class TTModelRunner:
         if self.parallel_config.data_parallel_rank_local == 0:
             self.host_sampler = Sampler()
 
+        # Cache global_stride support checks (prefill/decode).
+        self._supports_global_stride_prefill: Optional[bool] = None
+        self._supports_global_stride_decode: Optional[bool] = None
+
+    def _supports_global_stride(self, is_decode: bool) -> bool:
+        cache_attr = "_supports_global_stride_decode" if is_decode else "_supports_global_stride_prefill"
+        cached = getattr(self, cache_attr)
+        if cached is not None:
+            return cached
+
+        model_capabilities: Optional[dict] = getattr(self.model, "model_capabilities", None)
+        supported = bool(model_capabilities and model_capabilities.get("supports_global_stride", False))
+        setattr(self, cache_attr, supported)
+        return supported
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(vllm_config=self.vllm_config,
@@ -1136,7 +1150,12 @@ class TTModelRunner:
                     empty_summary,
                 )
 
-        if self.scheduler_config is not None and hasattr(self.scheduler_config, "max_num_seqs"):
+        # Only pass global_stride to TT models that accept it; many decode
+        # implementations have fixed signatures and will raise TypeError for
+        # unexpected kwargs.
+        if (self.scheduler_config is not None
+                and hasattr(self.scheduler_config, "max_num_seqs")
+                and self._supports_global_stride(is_decode)):
             kwargs["global_stride"] = int(self.scheduler_config.max_num_seqs)
         kwargs["start_pos"] = model_input.input_positions
         if debug_investigation and is_decode and not getattr(self, "_debug_inv_exec_decode", False):
