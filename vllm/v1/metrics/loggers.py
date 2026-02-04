@@ -115,8 +115,8 @@ class AvgTracker:
 
 
 class GlobalStatLogger(StatLoggerBase):
-    """GlobalStatLogger is used in LLMEngine to track stats across the entire 
-    generation (until manually reset) """
+    """GlobalStatLogger is used in LLMEngine to track stats across the entire
+    generation (until manually reset)"""
 
     def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
         self.engine_index = engine_index
@@ -124,10 +124,12 @@ class GlobalStatLogger(StatLoggerBase):
         self.time_to_first_token = AvgTracker()
         self.time_per_output_token = AvgTracker()
 
-    def record(self,
-               scheduler_stats: Optional[SchedulerStats],
-               iteration_stats: Optional[IterationStats],
-               engine_idx: int = 0):
+    def record(
+        self,
+        scheduler_stats: Optional[SchedulerStats],
+        iteration_stats: Optional[IterationStats],
+        engine_idx: int = 0,
+    ):
         """Called by LLMEngine. Updates stats at end of each step"""
 
         def avg_list(list):
@@ -150,8 +152,7 @@ class GlobalStatLogger(StatLoggerBase):
             logger.info("Average time to first token (batch): %f s", ttft.avg)
         if tpot.count != 0:
             decode_throughput = 1 / tpot.avg if tpot.avg != 0 else 0
-            logger.info("Average decode throughput: %f t/s/u",
-                        decode_throughput)
+            logger.info("Average decode throughput: %f t/s/u", decode_throughput)
 
     def reset(self) -> None:
         self.time_to_first_token = AvgTracker()
@@ -161,8 +162,10 @@ class GlobalStatLogger(StatLoggerBase):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.info(
                 "Engine %03d: vllm cache_config_info with initialization "
-                "after num_gpu_blocks is: %d", self.engine_index,
-                self.vllm_config.cache_config.num_gpu_blocks)
+                "after num_gpu_blocks is: %d",
+                self.engine_index,
+                self.vllm_config.cache_config.num_gpu_blocks,
+            )
 
 
 class LoggingStatLogger(StatLoggerBase):
