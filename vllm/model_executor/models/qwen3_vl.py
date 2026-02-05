@@ -23,26 +23,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen3VL model compatible with HuggingFace weights."""
-from collections.abc import Iterable, Mapping, Sequence
-from functools import partial
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers import BatchFeature
 from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.models.qwen3_vl import (Qwen3VLProcessor,
                                           Qwen3VLVideoProcessor)
-from transformers.models.qwen3_vl.configuration_qwen3_vl import (
-    Qwen3VLConfig, Qwen3VLVisionConfig)
-from transformers.video_utils import VideoMetadata
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 
 from vllm.model_executor.models.qwen2_vl import Qwen2VLProcessingInfo
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.parse import ImageSize
+
 
 class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
 
