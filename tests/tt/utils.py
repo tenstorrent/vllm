@@ -24,9 +24,6 @@ class RequestConfig:
     allowed_token_ids: Union[list[int], None] = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
-    # Note: Custom logits_processors are NOT supported in V1.
-    # V1 only supports built-in processors via their respective params
-    # (min_p, logit_bias, min_tokens, bad_words, allowed_token_ids).
 
 
 async def send_request(async_client,

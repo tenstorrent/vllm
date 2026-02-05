@@ -13,16 +13,8 @@ class TestLogprobs:
                       batch_fraction, num_logprobs):
         """Test logprobs parameter returns actual logprobs data.
 
-        Parametrized by batch size to verify logprobs work correctly across
-        all DP ranks. On multi-device setups (num_devices > 1), logprobs can
-        be computed on device. On single-device setups, logprobs fall back to
-        host sampling.
-
-        Note: Device-sampled logprobs only include the sampled token's logprob,
-        not top-k alternatives or ranks. Host-sampled logprobs include full
-        top-k alternatives and ranks.
-
-        batch_fraction: 1 = full batch, 0.5 = half batch, 0 = single request
+        batch_fraction: 1.5 = one and a half batches, 1 = full batch, 
+            0.5 = half batch, 0 = single request
         num_logprobs: number of top logprobs alternatives to return
         """
         if batch_fraction == 0:

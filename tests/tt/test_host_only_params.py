@@ -6,7 +6,8 @@ Tests for sampling parameters which require host ("compat") sampling.
 Note: Custom user-provided logits_processors are NOT supported in V1.
 V1 only supports built-in logits processors (min_p, logit_bias, min_tokens)
 which are configured via their respective sampling parameters.
-This has been added to V1 since the version we have checked out.
+This has been added to V1 since the version we have checked out
+around https://github.com/vllm-project/vllm/pull/19912.
 """
 
 import string
