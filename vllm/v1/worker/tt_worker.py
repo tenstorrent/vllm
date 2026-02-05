@@ -273,7 +273,7 @@ class TTWorker(WorkerBase):
     def apply_dp_execution_result(
             self,
             sampled_token_ids: torch.Tensor,
-            logprobs_lists: Optional[LogprobsLists] = None) -> ModelRunnerOutput:
+            logprobs_lists: Optional["LogprobsLists"] = None) -> ModelRunnerOutput:
         """Called by each DP rank to apply sampled tokens to internal caches.
         
         Args:
