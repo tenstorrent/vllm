@@ -15,14 +15,14 @@ from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.multimodal.inputs import MultiModalKwargs
 from vllm.platforms.tt import TTPlatform
 from vllm.sequence import IntermediateTensors
-from vllm.utils import LayerBlockType, cdiv
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LogitsProcessorManager
+from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.tt_input_batch import (
@@ -101,7 +101,6 @@ class TTModelRunner:
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
-        self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
 
@@ -202,6 +201,7 @@ class TTModelRunner:
             max_num_batched_tokens=max_num_batched_tokens,
             vocab_size=self.vocab_size,
             block_sizes=[kv_cache_spec.block_size],
+            kernel_block_sizes=[kv_cache_spec.block_size],
         )
 
         # The block tables in the persistent input batch have
@@ -234,7 +234,7 @@ class TTModelRunner:
         )
         dtype = kv_cache_spec.dtype
         num_layers = model_config.get_num_layers_by_block_type(
-            self.parallel_config, LayerBlockType.attention
+            self.parallel_config, "attention"
         )
 
         # Allocate KV cache tensors.
@@ -1381,7 +1381,7 @@ class TTModelRunner:
                     output_token_ids=output_token_ids,
                     allowed_token_ids_mask=None,
                     bad_words_token_ids={},
-                    logitsprocs=LogitsProcessorManager(),
+                    logitsprocs=LogitsProcessors(),
                 )
 
                 sampler_output = self.host_sampler(

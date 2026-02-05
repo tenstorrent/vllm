@@ -21,7 +21,7 @@ from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
 from vllm.inputs.data import TokensPrompt
-from vllm.utils import merge_async_iterators
+from vllm.utils.async_utils import merge_async_iterators
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
@@ -240,7 +240,6 @@ def run_inference(
     perf_prompt_len=None,
     greedy_sampling=False,  # Use greedy decoding instead of top-k/p
     async_engine=False,
-    disable_async_output_proc=False,
     multi_modal=False,
     multi_image=False,
     mm_processor_kwargs=None,
@@ -276,6 +275,11 @@ def run_inference(
             "non_uniform_sampling cannot be used with measure_perf option"
         )
 
+    assert not measure_perf, (
+        "The measure_perf option is deprecated and should no longer be used. "
+        "Measure perf instead with the vllm bench serve tool."
+    )
+
     # LLM args
     engine_kw_args = {
         "model": model,
@@ -284,8 +288,8 @@ def run_inference(
         "max_model_len": max_model_len,
         "disable_log_stats": False,
         "max_num_batched_tokens": max_num_batched_tokens,
-        "log_global_stats": measure_perf,
-        "disable_async_output_proc": disable_async_output_proc,
+        # TODO: Remove measure_perf option as log_global_stats was removed.
+        # "log_global_stats": measure_perf,
         "data_parallel_size": data_parallel_size,
         "enable_prefix_caching": enable_prefix_caching,
     }
@@ -634,11 +638,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--async_engine", action="store_true", help="Use async engine")
     parser.add_argument(
-        "--disable_async_output_proc",
-        action="store_true",
-        help="Disable async output processing",
-    )
-    parser.add_argument(
         "--multi_modal",
         action="store_true",
         help="Run multi-modal inference (vision + text)",
@@ -711,7 +710,6 @@ if __name__ == "__main__":
         max_seqs_in_batch=args.max_seqs_in_batch,
         num_repeat_prompts=args.num_repeat_prompts,
         async_engine=args.async_engine,
-        disable_async_output_proc=args.disable_async_output_proc,
         multi_modal=args.multi_modal,
         multi_image=args.multi_image,
         mm_processor_kwargs=args.mm_processor_kwargs,

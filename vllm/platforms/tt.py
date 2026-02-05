@@ -6,18 +6,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
-from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
 
 from .interface import Platform, PlatformEnum
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig, VllmConfig
-else:
-    ModelConfig = None
-    VllmConfig = None
+    from vllm.config import VllmConfig
+    from vllm.inputs import ProcessorInputs, PromptType
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
 
@@ -142,7 +139,7 @@ class TTPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
-    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         assert not vllm_config.scheduler_config.chunked_prefill_enabled, (
             "Chunked prefill is not yet supported for TT backend"
         )
@@ -305,16 +302,13 @@ class TTPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: PromptType,
-        params: SamplingParams | PoolingParams,
-        processed_inputs: ProcessorInputs,
+        prompt: "PromptType",
+        params: "SamplingParams | PoolingParams",
+        processed_inputs: "ProcessorInputs",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
 
         dev = cls.device_name
-
-        if isinstance(params, PoolingParams):
-            raise NotImplementedError(f"Not yet supporting pooling for {dev}")
 
         if params.best_of is not None:
             raise ValueError(f"Not yet supporting best_of on {dev}")
