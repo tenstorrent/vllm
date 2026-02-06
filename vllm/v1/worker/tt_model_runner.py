@@ -138,6 +138,7 @@ class TTModelRunner:
             self.sample_on_device_mode,
             self.enable_model_warmup,
         )
+        assert False, "TODO: haha crash"
 
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
