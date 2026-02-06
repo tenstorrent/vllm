@@ -12,6 +12,7 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -92,6 +93,9 @@ class TTWorker(WorkerBase):
         # Only local DP rank 0 (device rank) loads the model
         if self.parallel_config.data_parallel_rank_local == 0:
             self.model_runner.load_model()
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return self.model_runner.get_supported_tasks()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """

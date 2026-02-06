@@ -12,9 +12,10 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
-from vllm.multimodal.inputs import MultiModalKwargs
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargs
 from vllm.platforms.tt import TTPlatform
 from vllm.sequence import IntermediateTensors
+from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
@@ -135,8 +136,8 @@ class TTModelRunner:
             self.enable_model_warmup,
         )
 
-        # req_id -> (input_id -> encoder_output)
-        self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
+        # mm_hash -> encoder_output
+        self.encoder_cache: dict[str, torch.Tensor] = {}
 
         # Cached request states. Request states are tracked in the runner so
         # they don't need to be re-sent every scheduling step. For requests
@@ -165,6 +166,25 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+
+    def get_supported_generation_tasks(self) -> list[GenerationTask]:
+        # TT backend currently supports text generation only.
+        # (No transcription support yet.)
+        return ["generate"]
+
+    def get_supported_pooling_tasks(self) -> list[PoolingTask]:
+        # TT backend does not support pooling/embedding tasks yet.
+        return []
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        tasks = list[SupportedTask]()
+
+        if self.model_config.runner_type == "generate":
+            tasks.extend(self.get_supported_generation_tasks())
+        if self.model_config.runner_type == "pooling":
+            tasks.extend(self.get_supported_pooling_tasks())
+
+        return tuple(tasks)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -252,7 +272,6 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            self.encoder_cache.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -268,12 +287,8 @@ class TTModelRunner:
                 persistent_batch_layout_changed = True
 
         # Free the cached encoder outputs.
-        for req_id, input_id in scheduler_output.free_encoder_input_ids:
-            encoder_outputs = self.encoder_cache.get(req_id)
-            if encoder_outputs is not None:
-                encoder_outputs.pop(input_id, None)
-                if not encoder_outputs:
-                    self.encoder_cache.pop(req_id, None)
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            self.encoder_cache.pop(mm_hash, None)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -299,14 +314,17 @@ class TTModelRunner:
             assert new_req_data.sampling_params is not None, (
                 "Pooling is not supported for TT yet"
             )
+            if new_req_data.prompt_token_ids is None:
+                raise NotImplementedError(
+                    "TT backend does not support prompt_embeds yet"
+                )
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
 
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_inputs=new_req_data.mm_inputs,
-                mm_positions=new_req_data.mm_positions,
+                mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=None,
                 generator=None,
@@ -314,6 +332,7 @@ class TTModelRunner:
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prompt_embeds=new_req_data.prompt_embeds,
             )
 
             req_ids_to_add.append(req_id)
@@ -324,15 +343,17 @@ class TTModelRunner:
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_data.resumed_from_preemption[i]
+            resumed_from_preemption = req_id in req_data.resumed_req_ids
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
             if not resumed_from_preemption:
-                # Append the new blocks to the existing block IDs.
-                for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                    block_ids.extend(new_ids)
+                if new_block_ids is not None:
+                    # Append the new blocks to the existing block IDs.
+                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+                        block_ids.extend(new_ids)
             else:
+                assert new_block_ids is not None
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
@@ -347,7 +368,8 @@ class TTModelRunner:
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            self.input_batch.block_table.append_row(new_block_ids, req_index)
+            if new_block_ids is not None:
+                self.input_batch.block_table.append_row(new_block_ids, req_index)
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -368,14 +390,10 @@ class TTModelRunner:
         if persistent_batch_layout_changed:
             self._decode_layout_changed_since_last_decode = True
 
-    def _validate_mm_input(self, mm_input: MultiModalKwargs) -> None:
-        """Validate multi-modal input supports only single images."""
-        if list(mm_input.modalities) != ["image"]:
+    def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
+        """Validate the multimodal feature is an image."""
+        if mm_feature.modality != "image":
             raise NotImplementedError("Only images are supported for now")
-        assert mm_input.get_item_count("image") == 1, (
-            "Request can contain multiple inputs, \
-            but each input can contain only one image!"
-        )
 
     def _gather_multi_modal_inputs(self, scheduler_output) -> dict[str, Any]:
         """
@@ -409,17 +427,24 @@ class TTModelRunner:
             req_id = new_req_data.req_id
             req_state = self.requests[req_id]
 
-            if not req_state.mm_inputs:
+            if not req_state.mm_features:
                 multi_modal_kwargs["pixel_values"].append(None)
                 multi_modal_kwargs["image_grid_thw"].append(None)
                 continue
 
-            pv_array = []
-            image_grid_thw_array = []
-            for mm_input in req_state.mm_inputs:
-                self._validate_mm_input(mm_input)
-                pv_array.append(mm_input["pixel_values"])
-                image_grid_thw_array.append(mm_input.get("image_grid_thw", None))
+            pv_array: list[torch.Tensor | None] = []
+            image_grid_thw_array: list[torch.Tensor | None] = []
+            for mm_feature in req_state.mm_features:
+                self._validate_mm_feature(mm_feature)
+                item = mm_feature.data
+                if item is None:
+                    pv_array.append(None)
+                    image_grid_thw_array.append(None)
+                    continue
+                pv_array.append(item["pixel_values"].data)
+                image_grid_thw_array.append(
+                    item["image_grid_thw"].data if "image_grid_thw" in item else None
+                )
 
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
