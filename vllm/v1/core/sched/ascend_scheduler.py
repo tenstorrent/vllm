@@ -148,6 +148,18 @@ class AscendScheduler(Scheduler):
                     skip_cur_request(request)
                     continue
 
+            # Skip request if the structured output request is still waiting
+            # for FSM compilation.
+            if request.status == RequestStatus.WAITING_FOR_FSM:
+                structured_output_req = request.structured_output_request
+                if structured_output_req and structured_output_req.grammar:
+                    # unblock request if FSM is now ready
+                    request.status = RequestStatus.WAITING
+                else:
+                    # skip request if FSM is still not ready
+                    skip_cur_request(request)
+                    continue
+
             # Check that adding the request still respects the max_loras
             # constraint.
             if (
@@ -523,6 +535,12 @@ class AscendScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,  # type: ignore
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
+        grammar_output = self.get_grammar_bitmask(scheduler_output)
+        if grammar_output is not None:
+            scheduler_output.structured_output_request_ids = (
+                grammar_output.structured_output_request_ids
+            )
+            scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object

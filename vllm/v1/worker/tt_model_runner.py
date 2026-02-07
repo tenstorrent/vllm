@@ -1465,6 +1465,8 @@ class TTModelRunner:
         assert num_out_tokens == 1, "Currently only supporting 1 output token"
 
         sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if sampled_token_ids_np.dtype != np.int32:
+            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
         # Vectorized update of persistent batch token storage.
         start_idxs = self.input_batch.num_tokens[:num_reqs]
@@ -1485,11 +1487,10 @@ class TTModelRunner:
         # the underlying `CachedRequestState.output_token_ids` list (stored in
         # `self.requests[req_id]`). Appending here updates request state too,
         # while avoiding a per-request dict lookup.
-        sampled_token_ids_list_1d = sampled_token_ids_np.tolist()
         for req_idx in range(num_reqs):
             output_token_ids = self.input_batch.req_output_token_ids[req_idx]
             assert output_token_ids is not None
-            output_token_ids.append(sampled_token_ids_list_1d[req_idx])
+            output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
         # Empty prompt log probs
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
@@ -1501,8 +1502,9 @@ class TTModelRunner:
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[[t] for t in sampled_token_ids_list_1d],
-            spec_token_ids=None,
+            sampled_token_ids=[
+                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
+            ],
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
