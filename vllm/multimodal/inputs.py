@@ -609,7 +609,40 @@ _I = TypeVar(
 
 
 class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
+    """
+    A dictionary of processed multi-modal inputs by modality.
 
+    For example, given a processor that processes
+    images into `pixel_values` and `image_grid_thw`,
+    and audios into `input_audio_features`,
+    a prompt with 2 images and 1 audio will be processed
+    into a `MultiModalKwargsItems` with the following structure:
+
+    ```python
+    MultiModalKwargsItems(
+        {
+            "image": [
+                # For the first image
+                MultiModalKwargsItem({"pixel_values": ..., "image_grid_thw": ...}),
+                # For the second imgae
+                MultiModalKwargsItem({"pixel_values": ..., "image_grid_thw": ...}),
+            ],
+            "audio": [
+                # For the first audio
+                MultiModalKwargsItem({"input_audio_features": ...}),
+            ],
+        }
+    )
+    ```
+
+    Unlike HF processing which returns all items
+    in a single dictionary with batched keyword arguments,
+    we split up the items because some of them may already be cached.
+    Also, items from multiple requests may be batched together to improve throughput,
+    using the logic defined by the
+    [`BaseMultiModalField`][vllm.multimodal.inputs.BaseMultiModalField]
+    for each keyword argument.
+    """
 
     @staticmethod
     def from_hf_inputs(
