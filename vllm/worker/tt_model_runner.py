@@ -60,7 +60,8 @@ PENALTY_PARAM_DEFAULTS = {
 def prefill_warmup(model,
                    kv_cache,
                    trace_prefill_mode,
-                   max_batch_size):
+                   max_batch_size,
+                   data_parallel_size=1):
     """
     NOTE: Also called from vLLM v1
     """
@@ -70,7 +71,7 @@ def prefill_warmup(model,
         enable_trace=trace_prefill_mode,
         sample_on_device_mode=TTPlatform.sample_on_device_mode,
         non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
-        max_batch_size=max_batch_size,
+        max_batch_size=max_batch_size * data_parallel_size,
     )
 
 
