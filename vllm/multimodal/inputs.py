@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
+from types import NoneType
 from typing import (TYPE_CHECKING, Any, Literal, Optional, TypedDict, TypeVar,
                     Union, cast, final)
 
@@ -601,11 +602,7 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
         return next(iter(modalities))
 
 
-_I = TypeVar(
-    "_I",
-    MultiModalKwargsItem,
-    MultiModalKwargsItem | None,
-)
+_I = TypeVar("_I", MultiModalKwargsItem, MultiModalKwargsItem | NoneType)
 
 
 class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
@@ -699,36 +696,6 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
                         f"Found empty mm_items[{modality}][{i}]")
 
         return self  # type: ignore[return-value]
-
-    def get_data(
-        self,
-        *,
-        device: torch.types.Device = None,
-        pin_memory: bool = False,
-    ) -> BatchedTensorInputs:
-        """Construct a dictionary of keyword arguments to pass to the model."""
-        elems_by_key = defaultdict[str, list[MultiModalFieldElem]](list)
-        for modality, items in self.items():
-            for i, item in enumerate(items):
-                if item is None:
-                    raise RuntimeError(
-                        f"Cannot build data from empty mm_items[{modality}][{i}]"
-                    )
-
-                for key, elem in item.items():
-                    elems_by_key[key].append(elem)
-
-        data = {
-            key:
-            elems[0].field.reduce_data(
-                elems,
-                device=device,
-                pin_memory=pin_memory,
-            )
-            for key, elems in elems_by_key.items()
-        }
-
-        return data
 
 
 # NOTE: UserDict is for V0 compatibility.
