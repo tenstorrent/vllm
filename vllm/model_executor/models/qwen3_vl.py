@@ -352,8 +352,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
 
         def get_image_replacement_qwen3vl(item_idx: int):
             print(out_mm_kwargs)
-            out_item = out_mm_kwargs["pixel_values"][item_idx]
-            grid_thw = out_item["image_grid_thw"].data
+            grid_thw = out_mm_kwargs["image_grid_thw"][item_idx]
             assert isinstance(grid_thw, torch.Tensor)
 
             num_tokens = int(grid_thw.prod()) // merge_length
