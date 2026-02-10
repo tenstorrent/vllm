@@ -358,6 +358,9 @@ class TTPlatform(Platform):
         if sampling_params.logprobs is not None and num_devices == 1:
             return True
 
+        if sampling_params.top_k is not None and sampling_params.top_k > 32:
+            return True
+
         # all of the following sampling params require compat sampling
         return (sampling_params.min_p != 0.0
                 or (sampling_params.bad_words is not None
