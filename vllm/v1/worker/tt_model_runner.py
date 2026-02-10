@@ -105,7 +105,6 @@ class TTModelRunner:
         self.request_specific_rope = bool(
             self.model_config.uses_mrope) or bool(
                 uses_mrope(self.model_config.hf_config.text_config))
-        print(f"request_specific_rope: {self.request_specific_rope}")
         if self.request_specific_rope:
             self.previous_req_ids: set[str] = set()
 

@@ -623,9 +623,11 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
         {
             "image": [
                 # For the first image
-                MultiModalKwargsItem({"pixel_values": ..., "image_grid_thw": ...}),
+                MultiModalKwargsItem({"pixel_values": ...,
+                                    "image_grid_thw": ...}),
                 # For the second imgae
-                MultiModalKwargsItem({"pixel_values": ..., "image_grid_thw": ...}),
+                MultiModalKwargsItem({"pixel_values": ...,
+                                    "image_grid_thw": ...}),
             ],
             "audio": [
                 # For the first audio
@@ -638,7 +640,8 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
     Unlike HF processing which returns all items
     in a single dictionary with batched keyword arguments,
     we split up the items because some of them may already be cached.
-    Also, items from multiple requests may be batched together to improve throughput,
+    Also, items from multiple requests may be 
+    batched together to improve throughput,
     using the logic defined by the
     [`BaseMultiModalField`][vllm.multimodal.inputs.BaseMultiModalField]
     for each keyword argument.
