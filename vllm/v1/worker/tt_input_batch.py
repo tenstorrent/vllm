@@ -178,18 +178,13 @@ class InputBatch:
                 and len(self.frequency_penalties_reqs) == 0
                 and len(self.repetition_penalties_reqs) == 0)
 
-    def _get_next_add_index(self) -> int:
-        # For TT, removed indices are managed by the model_runner, not here.
-        # Always append to end when req_index is not specified.
-        return self.num_reqs
-
     def add_request(
         self,
         request: "CachedRequestState",
         req_index: Optional[int] = None,
     ) -> None:
         if req_index is None:
-            req_index = self._get_next_add_index()
+            req_index = self.num_reqs
         assert req_index < self.max_num_reqs, (
             f"req_index={req_index} >= max_num_reqs={self.max_num_reqs}")
 
@@ -334,7 +329,7 @@ class InputBatch:
             self.random_reqs.clear()
             self.presence_penalties_reqs.clear()
             self.frequency_penalties_reqs.clear()
-            self.repetition_penalties_reqs.clear()
+            self.repetition_penalties_reqs.clear() #TODO I think these are taken care of by remove_request
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
@@ -393,14 +388,10 @@ class InputBatch:
             if last_req_index in self.generators:
                 self.generators[empty_index] = self.generators.pop(
                     last_req_index)
-            else:
-                self.generators.pop(empty_index, None)
 
             if last_req_index in self.bad_words_token_ids:
                 self.bad_words_token_ids[
                     empty_index] = self.bad_words_token_ids.pop(last_req_index)
-            else:
-                self.bad_words_token_ids.pop(empty_index, None)
 
             # Move allowed_token_ids_mask row
             if self.allowed_token_ids_mask is not None:
@@ -414,9 +405,6 @@ class InputBatch:
         del self._req_ids[self.num_reqs:]
         del self.req_output_token_ids[self.num_reqs:]
 
-        # Clear removed indices since they've been compacted or are being
-        # managed by the caller (model_runner manages removed_req_indices)
-        self.batch_update_builder.removed.clear()
 
     @property
     def max_num_logprobs(self) -> Optional[int]:

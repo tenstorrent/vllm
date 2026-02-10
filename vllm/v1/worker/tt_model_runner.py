@@ -22,6 +22,7 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
 from vllm.v1.sample.logits_processor import LogitsProcessorManager
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.sampling_params import SamplingType
 from vllm.v1.worker.tt_input_batch import (SEED_NONE_SENTINEL,
                                            CachedRequestState, InputBatch)
 from vllm.worker.tt_model_runner import decode_warmup, prefill_warmup
@@ -89,6 +90,10 @@ class TTModelInput:
 
     # max_num_logprobs: max logprobs value across all requests
     max_num_logprobs: Optional[int] = None
+
+    # list of dicts mapping req_index -> generator for each DP rank
+    # only set for host sampling
+    generators_list: list[dict[int, torch.Generator]]
 
 
 class TTModelRunner:
@@ -300,6 +305,12 @@ class TTModelRunner:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
 
+            if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(sampling_params.seed)
+            else:
+                generator = None
+
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -307,7 +318,7 @@ class TTModelRunner:
                 mm_positions=new_req_data.mm_positions,
                 sampling_params=sampling_params,
                 pooling_params=None,
-                generator=None,
+                generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
@@ -603,6 +614,10 @@ class TTModelRunner:
                 input_batch.allowed_token_ids_mask[:input_batch.
                                                    num_reqs].clone())
 
+        generators = None
+        if not perform_device_sampling:
+            generators = input_batch.generators
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -621,6 +636,7 @@ class TTModelRunner:
             bad_words_token_ids_list=[input_batch.bad_words_token_ids.copy()],
             max_num_logprobs=input_batch.max_num_logprobs,
             logitsprocs_list=[input_batch.logitsprocs],
+            generators_list=[generators]
         )
 
     def build_model_input(
@@ -760,6 +776,8 @@ class TTModelRunner:
                 model_input.max_num_logprobs,
                 "logitsprocs":
                 model_input.logitsprocs_list[0],
+                "generators":
+                model_input.generators_list[0],
             }
 
         result = {
@@ -808,6 +826,7 @@ class TTModelRunner:
         bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
         logitsprocs_list: list[Optional[LogitsProcessorManager]] = []
         max_num_logprobs: Optional[int] = None
+        generators_list: list[Optional[dict[int, torch.Generator]]] = []
 
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -902,15 +921,18 @@ class TTModelRunner:
                             else:
                                 max_num_logprobs = max(max_num_logprobs,
                                                        rank_logprobs)
+                        generators_list.append(rank_params.get("generators", {}))
                     else:
                         allowed_token_ids_mask_list.append(None)
                         bad_words_token_ids_list.append({})
                         logitsprocs_list.append(None)
+                        generators_list.append({})
             else:
                 # No host-only params - create empty lists
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
+                generators_list = [{}] * world
 
             off_f = 0
             temperature = stacked_float[:, off_f:off_f + B].reshape(total_B)
@@ -1011,10 +1033,12 @@ class TTModelRunner:
                         else:
                             max_num_logprobs = max(max_num_logprobs,
                                                    mi.max_num_logprobs)
+                    generators_list.append(mi.generators_list[0])
                 else:
                     allowed_token_ids_mask_list.append(None)
                     bad_words_token_ids_list.append({})
                     logitsprocs_list.append(None)
+                    generators_list.append({})
 
             input_tokens = torch.cat(input_tokens_list, dim=0)
             input_positions = np.concatenate(input_positions_list, axis=0)
@@ -1126,6 +1150,7 @@ class TTModelRunner:
             bad_words_token_ids_list=bad_words_token_ids_list,
             max_num_logprobs=max_num_logprobs,
             logitsprocs_list=logitsprocs_list,
+            generators_list=generators_list,
         )
         return merged
 
@@ -1399,14 +1424,7 @@ class TTModelRunner:
                 all_greedy = (temperature == 0.0).all().item()
                 all_random = (temperature != 0.0).all().item()
 
-                # Create generators from seeds for this DP rank
-                # Generator keys are batch indices (0-based within current
-                # slice).
-                generators: dict[int, torch.Generator] = {}
-                for i, seed_val in enumerate(seed):
-                    if seed_val.item() != SEED_NONE_SENTINEL:
-                        generators[i] = torch.Generator(
-                            device="cpu").manual_seed(seed_val.item())
+                generators = model_input.generators_list[dp_rank]
 
                 # Determine if penalties are needed
                 no_penalties = ((presence_penalty == 0.0).all().item()
