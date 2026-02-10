@@ -7,7 +7,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
-from types import NoneType
 from typing import (TYPE_CHECKING, Any, Literal, Optional, TypedDict, TypeVar,
                     Union, cast, final)
 
@@ -602,7 +601,7 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
         return next(iter(modalities))
 
 
-_I = TypeVar("_I", MultiModalKwargsItem, MultiModalKwargsItem | NoneType)
+_I = TypeVar("_I", MultiModalKwargsItem, MultiModalKwargsItem | None)
 
 
 class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
