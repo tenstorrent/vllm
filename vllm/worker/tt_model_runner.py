@@ -5,7 +5,6 @@ import dataclasses
 import os
 from dataclasses import dataclass
 from functools import cached_property
-from itertools import product
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
 import torch
