@@ -684,7 +684,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[MultiModalKwargsItem]]):
 
         return super().__getitem__(modality)  # type: ignore[return-value]
 
-    def require_data(self) -> "MultiModalKwargsItems[MultiModalKwargsItem]":
+    def require_data(self) -> "MultiModalKwargsItems":
         for modality, items in self.items():
             for i, item in enumerate(items):
                 if item is None:
