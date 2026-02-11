@@ -601,10 +601,7 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
         return next(iter(modalities))
 
 
-_I = TypeVar("_I", MultiModalKwargsItem, MultiModalKwargsItem | None)
-
-
-class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
+class MultiModalKwargsItems(UserDict[str, Sequence[MultiModalKwargsItem]]):
     """
     A dictionary of processed multi-modal inputs by modality.
 
@@ -680,7 +677,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
 
         return MultiModalKwargsItems(items_by_modality)
 
-    def __getitem__(self, modality: str) -> Sequence[_I]:
+    def __getitem__(self, modality: str) -> Sequence[MultiModalKwargsItem]:
         if modality not in self:
             raise KeyError(f"Modality {modality!r} not found. "
                            f"Available modalities: {set(self.keys())}")
