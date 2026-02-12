@@ -50,6 +50,34 @@ class SamplingInputBatch:
                 name), (f"Missing attribute '{name}' in SamplingInputBatch")
         self.sampling_param_names = list(self.DEFAULTS.keys())
 
+        # req_index -> generator
+        # NOTE: The indices of the requests that do not have their own
+        # generator should not be included in the dictionary.
+        self.generators: dict[int, torch.Generator] = {}
+
+        # Logprobs tracking
+        self.num_logprobs: dict[str, int] = {}
+
+        # Internal representation of per-step batch state changes, used for
+        # reordering persistent batch and generating logitsprocs batch state
+        # updates. Should reset each step.
+        self.batch_update_builder = BatchUpdateBuilder()
+
+        # Define logits processors.
+        self.logitsprocs = init_builtin_logitsprocs(pin_memory_available=False,
+                                                    max_num_reqs=max_num_reqs +
+                                                    1, # not sure why but match gpu_input_batch
+                                                    device=torch.device("cpu"))
+
+        # Allowed token IDs tracking
+        self.has_allowed_token_ids: set[str] = set()
+        # NOTE: In the mask tensor, if the corresponding token is allowed,
+        # the value is False. Since we use masked_fill_ to set -inf.
+        self.allowed_token_ids_mask: Optional[torch.Tensor] = None
+
+        # req_index -> bad_words_token_ids
+        self.bad_words_token_ids: dict[int, list[list[int]]] = {}
+
     def pad_with_defaults(self, num_reqs: int) -> None:
         """Pad sampling parameters with default values for indices >=
         num_reqs."""
@@ -128,34 +156,6 @@ class InputBatch:
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs)
 
-        # req_index -> generator
-        # NOTE: The indices of the requests that do not have their own
-        # generator should not be included in the dictionary.
-        self.generators: dict[int, torch.Generator] = {}
-
-        # Logprobs tracking
-        self.num_logprobs: dict[str, int] = {}
-
-        # Internal representation of per-step batch state changes, used for
-        # reordering persistent batch and generating logitsprocs batch state
-        # updates. Should reset each step.
-        self.batch_update_builder = BatchUpdateBuilder()
-
-        # Define logits processors.
-        self.logitsprocs = init_builtin_logitsprocs(pin_memory_available=False,
-                                                    max_num_reqs=max_num_reqs +
-                                                    1,
-                                                    device=torch.device("cpu"))
-
-        # Allowed token IDs tracking
-        self.has_allowed_token_ids: set[str] = set()
-        # NOTE: In the mask tensor, if the corresponding token is allowed,
-        # the value is False. Since we use masked_fill_ to set -inf.
-        self.allowed_token_ids_mask: Optional[torch.Tensor] = None
-
-        # req_index -> bad_words_token_ids
-        self.bad_words_token_ids: dict[int, list[list[int]]] = {}
-
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -218,7 +218,7 @@ class InputBatch:
         assert sampling_params is not None, "pooling requests not supported yet"
 
         # Register with batch update builder for logits processors
-        self.batch_update_builder.added.append(
+        self.sampling.batch_update_builder.added.append(
             (req_index, sampling_params, request.output_token_ids))
 
         self.sampling.temperature[req_index] = sampling_params.temperature
@@ -262,33 +262,34 @@ class InputBatch:
 
         # Generator for random sampling
         if request.generator is not None:
-            self.generators[req_index] = request.generator
+            self.sampling.generators[req_index] = request.generator
 
         # Logprobs
         if sampling_params.logprobs is not None:
-            self.num_logprobs[req_id] = sampling_params.logprobs
+            self.sampling.num_logprobs[req_id] = sampling_params.logprobs
             self.sampling.enable_log_probs[req_index] = True
         else:
             self.sampling.enable_log_probs[req_index] = False
 
         # Allowed token IDs
         if sampling_params.allowed_token_ids:
-            self.has_allowed_token_ids.add(req_id)
-            if self.allowed_token_ids_mask is None:
+            self.sampling.has_allowed_token_ids.add(req_id)
+            if self.sampling.allowed_token_ids_mask is None:
                 # Lazy allocation for this tensor, which can be large.
                 # True means we fill with -inf (disallowed).
-                self.allowed_token_ids_mask = torch.zeros(self.max_num_reqs,
-                                                          self.vocab_size,
-                                                          dtype=torch.bool,
-                                                          device="cpu")
-            self.allowed_token_ids_mask[req_index] = True
+                self.sampling.allowed_token_ids_mask = torch.zeros(
+                    self.max_num_reqs,
+                    self.vocab_size,
+                    dtype=torch.bool,
+                    device="cpu")
+            self.sampling.allowed_token_ids_mask[req_index] = True
             # False means we don't fill with -inf (allowed).
-            self.allowed_token_ids_mask[req_index][
+            self.sampling.allowed_token_ids_mask[req_index][
                 sampling_params.allowed_token_ids] = False
 
         # Bad words
         if sampling_params.bad_words_token_ids:
-            self.bad_words_token_ids[
+            self.sampling.bad_words_token_ids[
                 req_index] = sampling_params.bad_words_token_ids
 
     def remove_request(self, req_id: str) -> Optional[int]:
@@ -297,7 +298,7 @@ class InputBatch:
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
             return None
-        self.batch_update_builder.removed_append(req_index)
+        self.sampling.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
 
@@ -308,10 +309,10 @@ class InputBatch:
         self.repetition_penalties_reqs.discard(req_id)
 
         # Clean up host-only sampling param tracking
-        self.generators.pop(req_index, None)
-        self.num_logprobs.pop(req_id, None)
-        self.has_allowed_token_ids.discard(req_id)
-        self.bad_words_token_ids.pop(req_index, None)
+        self.sampling.generators.pop(req_index, None)
+        self.sampling.num_logprobs.pop(req_id, None)
+        self.sampling.has_allowed_token_ids.discard(req_id)
+        self.sampling.bad_words_token_ids.pop(req_index, None)
 
         return req_index
 
@@ -346,7 +347,7 @@ class InputBatch:
                 break
 
             # Track the move for logits processors
-            self.batch_update_builder.moved.append(
+            self.sampling.batch_update_builder.moved.append(
                 (last_req_index, empty_index,
                  MoveDirectionality.UNIDIRECTIONAL))
 
@@ -385,18 +386,21 @@ class InputBatch:
             sampling.seed[empty_index] = sampling.seed[last_req_index]
 
             # Move host-only sampling params
-            if last_req_index in self.generators:
-                self.generators[empty_index] = self.generators.pop(
-                    last_req_index)
+            if last_req_index in self.sampling.generators:
+                self.sampling.generators[
+                    empty_index] = self.sampling.generators.pop(
+                        last_req_index)
 
-            if last_req_index in self.bad_words_token_ids:
-                self.bad_words_token_ids[
-                    empty_index] = self.bad_words_token_ids.pop(last_req_index)
+            if last_req_index in self.sampling.bad_words_token_ids:
+                self.sampling.bad_words_token_ids[
+                    empty_index] = self.sampling.bad_words_token_ids.pop(
+                        last_req_index)
 
             # Move allowed_token_ids_mask row
-            if self.allowed_token_ids_mask is not None:
-                self.allowed_token_ids_mask[
-                    empty_index] = self.allowed_token_ids_mask[last_req_index]
+            if self.sampling.allowed_token_ids_mask is not None:
+                self.sampling.allowed_token_ids_mask[
+                    empty_index] = self.sampling.allowed_token_ids_mask[
+                        last_req_index]
 
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
@@ -409,18 +413,18 @@ class InputBatch:
     @property
     def max_num_logprobs(self) -> Optional[int]:
         """Returns the maximum logprobs value across all requests, or None."""
-        return max(self.num_logprobs.values()) if self.num_logprobs else None
+        return max(self.sampling.num_logprobs.values()) if self.sampling.num_logprobs else None
 
     @property
     def no_allowed_token_ids(self) -> bool:
         """True if no requests have allowed_token_ids set."""
-        return len(self.has_allowed_token_ids) == 0
+        return len(self.sampling.has_allowed_token_ids) == 0
 
     def refresh_logitsprocs(self) -> None:
         """Update logits processors with batch state changes."""
-        batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
+        batch_update = self.sampling.batch_update_builder.get_and_reset(self.num_reqs)
         if batch_update:
-            for processor in self.logitsprocs.all:
+            for processor in self.sampling.logitsprocs.all:
                 processor.update_state(batch_update)
 
     def make_prompt_token_ids_tensor(self) -> torch.Tensor:
@@ -479,6 +483,6 @@ class InputBatch:
         # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied, so the original object is not modified.
         # Otherwise, the generator at local_rank 0 would get out of sync with the others.
-        for generator in self.generators.values():
+        for generator in self.sampling.generators.values():
             # Sample once from the generator to advance its state.
             torch.rand(1, generator=generator)

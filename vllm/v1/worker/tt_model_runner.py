@@ -609,14 +609,14 @@ class TTModelRunner:
         # Build host-only sampling params from input_batch
         allowed_token_ids_mask = None
         if not input_batch.no_allowed_token_ids and \
-            input_batch.allowed_token_ids_mask is not None:
+            input_batch.sampling.allowed_token_ids_mask is not None:
             allowed_token_ids_mask = (
-                input_batch.allowed_token_ids_mask[:input_batch.
-                                                   num_reqs].clone())
+                input_batch.sampling.allowed_token_ids_mask[:input_batch.
+                                                            num_reqs].clone())
 
         generators = None
         if not perform_device_sampling:
-            generators = input_batch.generators
+            generators = input_batch.sampling.generators
             # Technically this advances the generator before it is copied,
             # but it's ok because this happens consistently.
             # We're assuming that _prepare_model_inputs is called
@@ -643,9 +643,9 @@ class TTModelRunner:
             reset_batch=reset_batch,
             # Host-only params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
-            bad_words_token_ids_list=[input_batch.bad_words_token_ids.copy()],
+            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids.copy()],
             max_num_logprobs=input_batch.max_num_logprobs,
-            logitsprocs_list=[input_batch.logitsprocs],
+            logitsprocs_list=[input_batch.sampling.logitsprocs],
             generators_list=[generators]
         )
 
@@ -1206,8 +1206,8 @@ class TTModelRunner:
         input_batch = self.input_batch
         has_always_host_only_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
-            or input_batch.bad_words_token_ids  # bad_words set
-            or input_batch.logitsprocs.has_active_processors(
+            or input_batch.sampling.bad_words_token_ids  # bad_words set
+            or input_batch.sampling.logitsprocs.has_active_processors(
             )  # min_p, logit_bias, min_tokens
         )
         if has_always_host_only_params:
@@ -1219,8 +1219,8 @@ class TTModelRunner:
         # not the top-k alternatives.
         # On single device, logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
-        if input_batch.num_logprobs and (num_devices == 1 or any(
-                x > 1 for x in input_batch.num_logprobs.values())):
+        if input_batch.sampling.num_logprobs and (num_devices == 1 or any(
+                x > 1 for x in input_batch.sampling.num_logprobs.values())):
             return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True
