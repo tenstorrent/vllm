@@ -56,13 +56,14 @@ PENALTY_PARAM_DEFAULTS = {
     "repetition_penalty": PADDING_REPETITION_PENALTY,
 }
 
+
 def prefill_warmup(model,
                    kv_cache,
                    trace_prefill_mode,
                    max_batch_size,
                    data_parallel_size=1):
     """
-    NOTE: Also called from vLLM v1
+    NOTE: Also called from vLLM v1.
     """
 
     model.warmup_model_prefill(
@@ -93,6 +94,7 @@ def decode_warmup(model,
         sample_on_device_mode=sample_on_device_mode,
         non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
     )
+
 
 @dataclass(frozen=True)
 class TTSamplingParams:
