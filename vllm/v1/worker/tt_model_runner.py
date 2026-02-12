@@ -617,6 +617,16 @@ class TTModelRunner:
         generators = None
         if not perform_device_sampling:
             generators = input_batch.generators
+            # Technically this advances the generator before it is copied,
+            # but it's ok because this happens consistently.
+            # We're assuming that _prepare_model_inputs is called
+            # exactly once per step.
+            input_batch.advance_generators()
+            # NOTE: Our sampling paths are different between host and device.
+            # Whether a request is sampled on device or host
+            # depends also on other requests in the batch.
+            # This means sampling is not perfectly deterministic
+            # whenever device sampling is enabled.
 
         return TTModelInput(
             input_tokens=input_tokens,
