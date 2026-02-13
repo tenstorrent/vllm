@@ -57,11 +57,7 @@ PENALTY_PARAM_DEFAULTS = {
 }
 
 
-def prefill_warmup(model,
-                   kv_cache,
-                   trace_prefill_mode,
-                   max_batch_size,
-                   data_parallel_size=1):
+def prefill_warmup(model, kv_cache, trace_prefill_mode):
     """
     NOTE: Also called from vLLM v1.
     """
@@ -69,10 +65,8 @@ def prefill_warmup(model,
     model.warmup_model_prefill(
         kv_cache=kv_cache,
         enable_trace=trace_prefill_mode,
-        sample_on_device_mode=TTPlatform.sample_on_device_mode,
-        non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
-        max_batch_size=max_batch_size * data_parallel_size,
-    )
+        can_sample_on_device=TTPlatform.sample_on_device_mode == "all",
+        non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device)
 
 
 def decode_warmup(model,
@@ -91,7 +85,7 @@ def decode_warmup(model,
         enable_trace=trace_decode_mode,
         max_batch_size=max_batch_size * data_parallel_size,
         num_gpu_blocks=num_gpu_blocks,
-        sample_on_device_mode=sample_on_device_mode,
+        can_sample_on_device=sample_on_device_mode in ["all", "decode_only"],
         non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
     )
 
@@ -1392,8 +1386,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
     def warmup_model(self, kv_cache) -> None:
         trace_prefill_mode = self.trace_mode in ["all"]
-        prefill_warmup(self.model, kv_cache, trace_prefill_mode,
-                       self.scheduler_config.max_num_seqs)
+        prefill_warmup(self.model, kv_cache, trace_prefill_mode)
 
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
         decode_warmup(self.model, kv_cache, trace_decode_mode,
