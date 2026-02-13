@@ -1362,7 +1362,8 @@ class TTModelRunner:
         # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
         # sampling is enabled with logprobs. Extract both components.
         tt_log_probs = None
-        if isinstance(tt_out, tuple):
+        if perform_device_sampling and model_input.max_num_logprobs > 0:
+            assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
 
         return self._get_output_tokens(
@@ -1540,7 +1541,9 @@ class TTModelRunner:
                 next_token_ids = tt_out[start:start + sz]
 
                 # Extract logprobs if available from device sampling
-                if tt_log_probs is not None and model_input.max_num_logprobs:
+                if model_input.max_num_logprobs:
+                    # Sanity check for if we correctly detect when logprobs are supported.
+                    assert tt_log_probs is not None, "model should return logprobs when requested"
                     # TT device returns raw logprobs as [batch_size] tensor
                     # containing log probability of the sampled token only.
                     # Convert to LogprobsTensors format with minimal info.
