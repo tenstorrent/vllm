@@ -1361,6 +1361,9 @@ class TTModelRunner:
         if perform_device_sampling and model_input.max_num_logprobs > 0:
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
+        elif isinstance(tt_out, tuple):
+            # Model may return (logits, dummy_logprobs) even when not requested
+            tt_out, _ = tt_out
 
         return self._get_output_tokens(
             tt_out=tt_out,
