@@ -165,7 +165,7 @@ class TestFrequencyPenalty:
                 RequestConfig(
                     prompt=prompt,
                     max_tokens=15,
-                    temperature=0.5,
+                    temperature=1.5,
                     frequency_penalty=0.0 if i % 2 == 0 else 2.0,
                     seed=42,
                 ))
