@@ -323,11 +323,6 @@ class InputBatch:
             # The batched states are empty.
             self._req_ids.clear()
             self.req_output_token_ids.clear()
-            self.random_reqs.clear()
-            self.presence_penalties_reqs.clear()
-            self.frequency_penalties_reqs.clear()
-            self.repetition_penalties_reqs.clear(
-            )  #TODO I think these are taken care of by remove_request
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
