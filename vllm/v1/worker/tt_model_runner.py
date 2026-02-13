@@ -531,7 +531,8 @@ class TTModelRunner:
                 sample_params.pad_with_defaults(num_reqs)
 
         if is_prompt:
-            # Convert num_logprobs (int tensor) to enable_log_probs (bool tensor)
+            # Convert num_logprobs (int tensor)
+            # to enable_log_probs (bool tensor)
             enable_log_probs = (sample_params.num_logprobs[:num_reqs] > 0)
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature[:num_reqs],
@@ -544,7 +545,8 @@ class TTModelRunner:
                 enable_log_probs=enable_log_probs,
             )
         else:
-            # Convert num_logprobs (int tensor) to enable_log_probs (bool tensor)
+            # Convert num_logprobs (int tensor)
+            # to enable_log_probs (bool tensor)
             enable_log_probs = (sample_params.num_logprobs > 0)
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature,
@@ -928,7 +930,8 @@ class TTModelRunner:
             else:
                 grammar_bitmask_list = [None] * world
 
-            # Extract host-only sampling params from gathered inputs (per-rank lists)
+            # Extract host-only sampling params
+            # from gathered inputs (per-rank lists)
             host_only_sample_params_list = inputs.get(
                 "host_only_sample_params")
             if host_only_sample_params_list:
@@ -1449,7 +1452,6 @@ class TTModelRunner:
                     start:start + sz]
                 repetition_penalty = sampling_params.repetition_penalty[
                     start:start + sz]
-                seed = sampling_params.seed[start:start + sz]
 
                 # Determine if all greedy (temperature == 0.0) or all random
                 all_greedy = (temperature == 0.0).all().item()
@@ -1546,8 +1548,10 @@ class TTModelRunner:
 
                 # Extract logprobs if available from device sampling
                 if model_input.max_num_logprobs:
-                    # Sanity check for if we correctly detect when logprobs are supported.
-                    assert tt_log_probs is not None, "model should return logprobs when requested"
+                    # Sanity check for if we correctly detect
+                    # when logprobs are supported.
+                    assert tt_log_probs is not None,\
+                        "model should return logprobs when requested"
                     # TT device returns raw logprobs as [batch_size] tensor
                     # containing log probability of the sampled token only.
                     # Convert to LogprobsTensors format with minimal info.

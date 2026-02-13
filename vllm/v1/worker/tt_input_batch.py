@@ -476,9 +476,11 @@ class InputBatch:
         return output_token_ids_tensor
 
     def advance_generators(self) -> None:
-        # This relies on the fact, that for a torch all_gather_object,
-        # the local object is also copied, so the original object is not modified.
-        # Otherwise, the generator at local_rank 0 would get out of sync with the others.
+        # This relies on the fact, that for a torch all_gather_object, 
+        # the local object is also copied,
+        # so the original object is not modified.
+        # Otherwise, the generator at local_rank 0
+        # would get out of sync with the others.
         for generator in self.sampling.generators.values():
             # Sample once from the generator to advance its state.
             torch.rand(1, generator=generator)
