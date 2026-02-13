@@ -383,6 +383,9 @@ class TTModelRunner:
         if persistent_batch_layout_changed:
             self._decode_layout_changed_since_last_decode = True
 
+        # Refresh logits processors with batch state changes
+        self.input_batch.refresh_logitsprocs()
+
     def _validate_mm_input(self, mm_input: MultiModalKwargs) -> None:
         """Validate multi-modal input supports only single images."""
         if list(mm_input.modalities) != ["image"]:
@@ -669,9 +672,6 @@ class TTModelRunner:
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
-
-        # Refresh logits processors with batch state changes
-        self.input_batch.refresh_logitsprocs()
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output)
