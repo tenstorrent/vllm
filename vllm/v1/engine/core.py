@@ -1365,13 +1365,13 @@ class DPEngineCoreProc(EngineCoreProc):
 
             # Gather host-only sampling params (logprobs, allowed_token_ids,
             # bad_words, logit_bias, min_p, min_tokens) when sampling on host.
-            gathered_host_only_params = None
+            gathered_host_only_sample_params = None
             if not all_sample_device:
                 if rank == 0:
-                    gathered_host_only_params = [None for _ in range(world)]
-                local_host_only_params = decode_inputs.get("host_only_params")
-                dist.gather_object(local_host_only_params,
-                                   gathered_host_only_params,
+                    gathered_host_only_sample_params = [None for _ in range(world)]
+                local_host_only_sample_params = decode_inputs.get("host_only_sample_params")
+                dist.gather_object(local_host_only_sample_params,
+                                   gathered_host_only_sample_params,
                                    dst=0,
                                    group=group)
 
@@ -1379,7 +1379,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     if rank == 0:
                         # Rank 0 sends gathered host_only params to device ranks
                         pickled_host_only = pickle.dumps(
-                            gathered_host_only_params)
+                            gathered_host_only_sample_params)
                         host_only_tensor = torch.frombuffer(pickled_host_only,
                                                             dtype=torch.uint8)
                         host_only_size = torch.tensor(
@@ -1394,7 +1394,7 @@ class DPEngineCoreProc(EngineCoreProc):
                         host_only_tensor = torch.empty(host_only_size.item(),
                                                        dtype=torch.uint8)
                         dist.recv(host_only_tensor, src=0, group=group)
-                        gathered_host_only_params = pickle.loads(
+                        gathered_host_only_sample_params = pickle.loads(
                             host_only_tensor.numpy().tobytes())
 
             if local_rank == 0:
@@ -1402,7 +1402,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     "int_inputs": stacked_int,
                     "float_inputs": stacked_float,
                     "sampling_tokens_inputs": gathered_tokens_inputs,
-                    "host_only_params": gathered_host_only_params,
+                    "host_only_sample_params": gathered_host_only_sample_params,
                     "reset_batch": any_reset_batch,
                     "all_sample_device": all_sample_device,
                 }

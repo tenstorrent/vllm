@@ -645,7 +645,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
-            # Host-only params - wrapped in lists for DP compatibility
+            # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids.copy()],
             max_num_logprobs=input_batch.max_num_logprobs,
@@ -782,10 +782,10 @@ class TTModelRunner:
                 "output_tokens": model_input.output_tokens,
             }
 
-        # Host-only params for host sampling
-        host_only_params = None
+        # Host-only sampling params for host sampling
+        host_only_sample_params = None
         if model_input is not None:
-            host_only_params = {
+            host_only_sample_params = {
                 "allowed_token_ids_mask":
                 model_input.allowed_token_ids_mask_list[0],
                 "bad_words_token_ids":
@@ -802,7 +802,7 @@ class TTModelRunner:
             "int_inputs": int_inputs,
             "float_inputs": float_inputs,
             "sampling_tokens_inputs": sampling_tokens_inputs,
-            "host_only_params": host_only_params,
+            "host_only_sample_params": host_only_sample_params,
         }
 
         return result
@@ -926,10 +926,10 @@ class TTModelRunner:
             else:
                 grammar_bitmask_list = [None] * world
 
-            # Extract host-only params from gathered inputs (per-rank lists)
-            host_only_params_list = inputs.get("host_only_params")
-            if host_only_params_list:
-                for rank_params in host_only_params_list:
+            # Extract host-only sampling params from gathered inputs (per-rank lists)
+            host_only_sample_params_list = inputs.get("host_only_sample_params")
+            if host_only_sample_params_list:
+                for rank_params in host_only_sample_params_list:
                     if rank_params is not None:
                         allowed_token_ids_mask_list.append(
                             rank_params.get("allowed_token_ids_mask"))
@@ -950,7 +950,7 @@ class TTModelRunner:
                         logitsprocs_list.append(None)
                         generators_list.append({})
             else:
-                # No host-only params - create empty lists
+                # No host-only sampling params - create empty lists
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
@@ -1044,7 +1044,7 @@ class TTModelRunner:
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
-                # Collect host-only params per rank
+                # Collect host-only sampling params per rank
                 if mi is not None:
                     allowed_token_ids_mask_list.append(
                         mi.allowed_token_ids_mask_list[0])
@@ -1171,7 +1171,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
-            # Host-only params (per-rank lists)
+            # Host-only sampling params (per-rank lists)
             allowed_token_ids_mask_list=allowed_token_ids_mask_list,
             bad_words_token_ids_list=bad_words_token_ids_list,
             max_num_logprobs=max_num_logprobs,
@@ -1220,13 +1220,13 @@ class TTModelRunner:
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
-        has_always_host_only_params = (
+        has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set
             or input_batch.sampling.logitsprocs.has_active_processors(
             )  # min_p, logit_bias, min_tokens
         )
-        if has_always_host_only_params:
+        if has_always_host_only_sampling_params:
             return False
 
         # Logprobs on device are only supported on multi-device setups
