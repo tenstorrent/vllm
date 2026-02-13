@@ -1368,8 +1368,11 @@ class DPEngineCoreProc(EngineCoreProc):
             gathered_host_only_sample_params = None
             if not all_sample_device:
                 if rank == 0:
-                    gathered_host_only_sample_params = [None for _ in range(world)]
-                local_host_only_sample_params = decode_inputs.get("host_only_sample_params")
+                    gathered_host_only_sample_params = [
+                        None for _ in range(world)
+                    ]
+                local_host_only_sample_params = decode_inputs.get(
+                    "host_only_sample_params")
                 dist.gather_object(local_host_only_sample_params,
                                    gathered_host_only_sample_params,
                                    dst=0,
@@ -1402,7 +1405,8 @@ class DPEngineCoreProc(EngineCoreProc):
                     "int_inputs": stacked_int,
                     "float_inputs": stacked_float,
                     "sampling_tokens_inputs": gathered_tokens_inputs,
-                    "host_only_sample_params": gathered_host_only_sample_params,
+                    "host_only_sample_params":
+                    gathered_host_only_sample_params,
                     "reset_batch": any_reset_batch,
                     "all_sample_device": all_sample_device,
                 }

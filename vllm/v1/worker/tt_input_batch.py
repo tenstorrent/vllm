@@ -61,10 +61,11 @@ class SamplingInputBatch:
         self.batch_update_builder = BatchUpdateBuilder()
 
         # Define logits processors.
-        self.logitsprocs = init_builtin_logitsprocs(pin_memory_available=False,
-                                                    max_num_reqs=max_num_reqs +
-                                                    1, # not sure why but match gpu_input_batch
-                                                    device=torch.device("cpu"))
+        self.logitsprocs = init_builtin_logitsprocs(
+            pin_memory_available=False,
+            max_num_reqs=max_num_reqs +
+            1,  # not sure why but match gpu_input_batch
+            device=torch.device("cpu"))
 
         # Allowed token IDs tracking
         self.has_allowed_token_ids: set[str] = set()
@@ -325,7 +326,8 @@ class InputBatch:
             self.random_reqs.clear()
             self.presence_penalties_reqs.clear()
             self.frequency_penalties_reqs.clear()
-            self.repetition_penalties_reqs.clear() #TODO I think these are taken care of by remove_request
+            self.repetition_penalties_reqs.clear(
+            )  #TODO I think these are taken care of by remove_request
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
@@ -379,13 +381,13 @@ class InputBatch:
             sampling.repetition_penalty[empty_index] = (
                 sampling.repetition_penalty[last_req_index])
             sampling.seed[empty_index] = sampling.seed[last_req_index]
-            sampling.num_logprobs[empty_index] = sampling.num_logprobs[last_req_index]
+            sampling.num_logprobs[empty_index] = sampling.num_logprobs[
+                last_req_index]
 
             # Move host-only sampling params
             if last_req_index in self.sampling.generators:
                 self.sampling.generators[
-                    empty_index] = self.sampling.generators.pop(
-                        last_req_index)
+                    empty_index] = self.sampling.generators.pop(last_req_index)
 
             if last_req_index in self.sampling.bad_words_token_ids:
                 self.sampling.bad_words_token_ids[
@@ -405,7 +407,6 @@ class InputBatch:
         del self._req_ids[self.num_reqs:]
         del self.req_output_token_ids[self.num_reqs:]
 
-
     @property
     def max_num_logprobs(self) -> Optional[int]:
         """Returns the maximum logprobs value across all requests, or None."""
@@ -421,7 +422,8 @@ class InputBatch:
 
     def refresh_logitsprocs(self) -> None:
         """Update logits processors with batch state changes."""
-        batch_update = self.sampling.batch_update_builder.get_and_reset(self.num_reqs)
+        batch_update = self.sampling.batch_update_builder.get_and_reset(
+            self.num_reqs)
         if batch_update:
             for processor in self.sampling.logitsprocs.all:
                 processor.update_state(batch_update)

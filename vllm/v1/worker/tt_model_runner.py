@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.multimodal.inputs import MultiModalKwargs
 from vllm.platforms.tt import TTPlatform
+from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
 from vllm.utils import LayerBlockType, cdiv
@@ -22,7 +23,6 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
 from vllm.v1.sample.logits_processor import LogitsProcessorManager
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
-from vllm.sampling_params import SamplingType
 from vllm.v1.worker.tt_input_batch import (SEED_NONE_SENTINEL,
                                            CachedRequestState, InputBatch)
 from vllm.worker.tt_model_runner import decode_warmup, prefill_warmup
@@ -650,11 +650,12 @@ class TTModelRunner:
             reset_batch=reset_batch,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
-            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
+            bad_words_token_ids_list=[
+                input_batch.sampling.bad_words_token_ids
+            ],
             max_num_logprobs=input_batch.max_num_logprobs,
             logitsprocs_list=[input_batch.sampling.logitsprocs],
-            generators_list=[generators]
-        )
+            generators_list=[generators])
 
     def build_model_input(
         self,
@@ -748,7 +749,8 @@ class TTModelRunner:
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # B
                 seed.contiguous().view(-1),  # B
-                enable_log_probs.contiguous().view(-1).to(torch.int32),  # B (bool->int32)
+                enable_log_probs.contiguous().view(-1).to(
+                    torch.int32),  # B (bool->int32)
             ],
             dim=0).contiguous()
 
@@ -927,7 +929,8 @@ class TTModelRunner:
                 grammar_bitmask_list = [None] * world
 
             # Extract host-only sampling params from gathered inputs (per-rank lists)
-            host_only_sample_params_list = inputs.get("host_only_sample_params")
+            host_only_sample_params_list = inputs.get(
+                "host_only_sample_params")
             if host_only_sample_params_list:
                 for rank_params in host_only_sample_params_list:
                     if rank_params is not None:
@@ -943,7 +946,8 @@ class TTModelRunner:
                             else:
                                 max_num_logprobs = max(max_num_logprobs,
                                                        rank_logprobs)
-                        generators_list.append(rank_params.get("generators", {}))
+                        generators_list.append(
+                            rank_params.get("generators", {}))
                     else:
                         allowed_token_ids_mask_list.append(None)
                         bad_words_token_ids_list.append({})
