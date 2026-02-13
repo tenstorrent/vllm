@@ -73,7 +73,7 @@ def decode_warmup(model,
                   kv_cache,
                   trace_decode_mode,
                   max_batch_size,
-                  num_gpu_blocks,
+                  num_blocks,
                   sample_on_device_mode,
                   data_parallel_size=1):
     """
@@ -84,7 +84,7 @@ def decode_warmup(model,
         kv_cache=kv_cache,
         enable_trace=trace_decode_mode,
         max_batch_size=max_batch_size * data_parallel_size,
-        num_gpu_blocks=num_gpu_blocks,
+        num_blocks=num_blocks,
         can_sample_on_device=sample_on_device_mode in ["all", "decode_only"],
         non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
     )
