@@ -268,7 +268,7 @@ class TTWorker(WorkerBase):
                     ],
                                           dim=0)
             sampled_token_ids_per_dp[dp_rank] = token_ids
-        return torch.stack(sampled_token_ids_per_dp), logprobs_lists_per_dp
+        return torch.stack(sampled_token_ids_per_dp), logprobs_lists_per_dp # [world, B, 1], [world]
 
     def apply_dp_execution_result(
             self,
