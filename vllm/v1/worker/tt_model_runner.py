@@ -647,7 +647,7 @@ class TTModelRunner:
             reset_batch=reset_batch,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
-            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids.copy()],
+            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
             max_num_logprobs=input_batch.max_num_logprobs,
             logitsprocs_list=[input_batch.sampling.logitsprocs],
             generators_list=[generators]
