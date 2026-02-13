@@ -528,6 +528,8 @@ class TTModelRunner:
                 sample_params.pad_with_defaults(num_reqs)
 
         if is_prompt:
+            # Convert num_logprobs (int tensor) to enable_log_probs (bool tensor)
+            enable_log_probs = (sample_params.num_logprobs[:num_reqs] > 0)
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature[:num_reqs],
                 top_k=sample_params.top_k[:num_reqs],
@@ -536,9 +538,11 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty[:num_reqs],
                 repetition_penalty=sample_params.repetition_penalty[:num_reqs],
                 seed=sample_params.seed[:num_reqs],
-                enable_log_probs=None,
+                enable_log_probs=enable_log_probs,
             )
         else:
+            # Convert num_logprobs (int tensor) to enable_log_probs (bool tensor)
+            enable_log_probs = (sample_params.num_logprobs > 0)
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature,
                 top_k=sample_params.top_k,
@@ -547,7 +551,7 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty,
                 repetition_penalty=sample_params.repetition_penalty,
                 seed=sample_params.seed,
-                enable_log_probs=None,
+                enable_log_probs=enable_log_probs,
             )
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt)
@@ -706,6 +710,8 @@ class TTModelRunner:
             frequency_penalty = sampling_default_tensors["frequency_penalty"]
             repetition_penalty = sampling_default_tensors["repetition_penalty"]
             seed = sampling_default_tensors["seed"]
+            # enable_log_probs: convert num_logprobs > 0
+            enable_log_probs = (sampling_default_tensors["num_logprobs"] > 0)
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -730,6 +736,7 @@ class TTModelRunner:
             frequency_penalty = sampling_params.frequency_penalty
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
+            enable_log_probs = sampling_params.enable_log_probs
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
@@ -741,6 +748,7 @@ class TTModelRunner:
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # B
                 seed.contiguous().view(-1),  # B
+                enable_log_probs.contiguous().view(-1).to(torch.int32),  # B (bool->int32)
             ],
             dim=0).contiguous()
 
@@ -895,6 +903,10 @@ class TTModelRunner:
             off += B
             seed = stacked_int[:, off:off + B].reshape(total_B)
             off += B
+            enable_log_probs_int = stacked_int[:, off:off + B].reshape(total_B)
+            off += B
+            # Convert back to bool tensor
+            enable_log_probs = (enable_log_probs_int > 0)
 
             # Optional structured inputs: keep as list[Optional[tensor]]
             # per DP rank to match prefill behavior.
@@ -976,6 +988,7 @@ class TTModelRunner:
             frequency_penalty_list: list[torch.Tensor] = []
             repetition_penalty_list: list[torch.Tensor] = []
             seed_list: list[torch.Tensor] = []
+            enable_log_probs_list: list[torch.Tensor] = []
             reset_batch = False
 
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
@@ -1022,6 +1035,7 @@ class TTModelRunner:
                     frequency_penalty_list.append(sp.frequency_penalty)
                     repetition_penalty_list.append(sp.repetition_penalty)
                     seed_list.append(sp.seed)
+                    enable_log_probs_list.append(sp.enable_log_probs)
 
                 # We know it's not a list here before concatenation
                 unpadded_batch_size: int = cast(
@@ -1063,6 +1077,7 @@ class TTModelRunner:
             frequency_penalty = torch.cat(frequency_penalty_list, dim=0)
             repetition_penalty = torch.cat(repetition_penalty_list, dim=0)
             seed = torch.cat(seed_list, dim=0)
+            enable_log_probs = torch.cat(enable_log_probs_list, dim=0)
 
         tt_sampling_params = TTSamplingParams(
             temperature=temperature,
@@ -1072,6 +1087,7 @@ class TTModelRunner:
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             seed=seed,
+            enable_log_probs=enable_log_probs,
         )
 
         if self.model_config.is_multimodal_model and not is_decode:

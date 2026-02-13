@@ -27,7 +27,7 @@ class SamplingInputBatch:
         "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
         "seed": SEED_NONE_SENTINEL,  # Sentinel represents None (no seed)
-        "enable_log_probs": False,  # Default to no logprobs
+        "num_logprobs": 0,  # Default to no logprobs
     }
 
     def __init__(self, max_num_reqs: int):
@@ -42,7 +42,7 @@ class SamplingInputBatch:
         self.frequency_penalty = default_tensors["frequency_penalty"]
         self.repetition_penalty = default_tensors["repetition_penalty"]
         self.seed = default_tensors["seed"]
-        self.enable_log_probs = default_tensors["enable_log_probs"]
+        self.num_logprobs = default_tensors["num_logprobs"]
         # Asserting that all defaults have corresponding attributes.
         for name in self.DEFAULTS:
             assert hasattr(
@@ -54,9 +54,6 @@ class SamplingInputBatch:
         # NOTE: The indices of the requests that do not have their own
         # generator should not be included in the dictionary.
         self.generators: dict[int, torch.Generator] = {}
-
-        # Logprobs tracking
-        self.num_logprobs: dict[str, int] = {}
 
         # Internal representation of per-step batch state changes, used for
         # reordering persistent batch and generating logitsprocs batch state
@@ -266,10 +263,9 @@ class InputBatch:
 
         # Logprobs
         if sampling_params.logprobs is not None:
-            self.sampling.num_logprobs[req_id] = sampling_params.logprobs
-            self.sampling.enable_log_probs[req_index] = True
+            self.sampling.num_logprobs[req_index] = sampling_params.logprobs
         else:
-            self.sampling.enable_log_probs[req_index] = False
+            self.sampling.num_logprobs[req_index] = 0
 
         # Allowed token IDs
         if sampling_params.allowed_token_ids:
@@ -310,7 +306,6 @@ class InputBatch:
 
         # Clean up host-only sampling param tracking
         self.sampling.generators.pop(req_index, None)
-        self.sampling.num_logprobs.pop(req_id, None)
         self.sampling.has_allowed_token_ids.discard(req_id)
         self.sampling.bad_words_token_ids.pop(req_index, None)
 
@@ -384,6 +379,7 @@ class InputBatch:
             sampling.repetition_penalty[empty_index] = (
                 sampling.repetition_penalty[last_req_index])
             sampling.seed[empty_index] = sampling.seed[last_req_index]
+            sampling.num_logprobs[empty_index] = sampling.num_logprobs[last_req_index]
 
             # Move host-only sampling params
             if last_req_index in self.sampling.generators:
@@ -413,7 +409,10 @@ class InputBatch:
     @property
     def max_num_logprobs(self) -> Optional[int]:
         """Returns the maximum logprobs value across all requests, or None."""
-        return max(self.sampling.num_logprobs.values()) if self.sampling.num_logprobs else None
+        if self.num_reqs == 0:
+            return None
+        max_val = int(self.sampling.num_logprobs[:self.num_reqs].max().item())
+        return max_val if max_val > 0 else None
 
     @property
     def no_allowed_token_ids(self) -> bool:
