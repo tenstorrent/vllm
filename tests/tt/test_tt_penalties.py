@@ -175,8 +175,8 @@ class TestFrequencyPenalty:
 
         assert no_penalty_a_count > with_penalty_a_count, (
             f"Frequency penalty should reduce 'a' repetitions: "
-            f"no_penalty={no_penalty_a_count}, with_penalty={with_penalty_a_count}"
-        )
+            f"no_penalty={no_penalty_a_count},"
+            f"with_penalty={with_penalty_a_count}")
         assert_deterministic(no_penalty,
                              "No penalty requests should be identical.")
         assert_deterministic(with_penalty,
