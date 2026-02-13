@@ -403,12 +403,12 @@ class InputBatch:
         del self.req_output_token_ids[self.num_reqs:]
 
     @property
-    def max_num_logprobs(self) -> Optional[int]:
+    def max_num_logprobs(self) -> int:
         """Returns the maximum logprobs value across all requests, or None."""
         if self.num_reqs == 0:
-            return None
+            return 0
         max_val = int(self.sampling.num_logprobs[:self.num_reqs].max().item())
-        return max_val if max_val > 0 else None
+        return max_val
 
     @property
     def no_allowed_token_ids(self) -> bool:
@@ -476,7 +476,7 @@ class InputBatch:
         return output_token_ids_tensor
 
     def advance_generators(self) -> None:
-        # This relies on the fact, that for a torch all_gather_object, 
+        # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied,
         # so the original object is not modified.
         # Otherwise, the generator at local_rank 0

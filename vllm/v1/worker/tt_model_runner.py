@@ -79,7 +79,12 @@ class TTModelInput:
     bad_words_token_ids_list: list[dict[int, list[list[int]]]]
     # allowed_token_ids_mask: list of (num_reqs, vocab_size) bool tensors
     allowed_token_ids_mask_list: list[Optional[torch.Tensor]]
+    # list of dicts mapping req_index -> generator for each DP rank
+    # only set for host sampling
+    generators_list: list[dict[int, torch.Generator]]
 
+    # max_num_logprobs: max logprobs value across all requests
+    max_num_logprobs: int
     # Optional: tokens for sampling with penalties during decode
     prompt_tokens: Optional[torch.Tensor] = None
     output_tokens: Optional[torch.Tensor] = None
@@ -87,13 +92,6 @@ class TTModelInput:
     # Decode-only: indicates the padded decode-batch layout changed since the
     # previous step (used by on-device sampling).
     reset_batch: bool = False
-
-    # max_num_logprobs: max logprobs value across all requests
-    max_num_logprobs: Optional[int] = None
-
-    # list of dicts mapping req_index -> generator for each DP rank
-    # only set for host sampling
-    generators_list: list[dict[int, torch.Generator]]
 
 
 class TTModelRunner:
@@ -623,7 +621,7 @@ class TTModelRunner:
                 input_batch.sampling.allowed_token_ids_mask[:input_batch.
                                                             num_reqs].clone())
 
-        generators = None
+        generators = dict()
         if not perform_device_sampling:
             generators = input_batch.sampling.generators
             # Technically this advances the generator before it is copied,
@@ -847,8 +845,8 @@ class TTModelRunner:
         allowed_token_ids_mask_list: list[Optional[torch.Tensor]] = []
         bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
         logitsprocs_list: list[Optional[LogitsProcessorManager]] = []
-        max_num_logprobs: Optional[int] = None
-        generators_list: list[Optional[dict[int, torch.Generator]]] = []
+        max_num_logprobs: int = 0
+        generators_list: list[dict[int, torch.Generator]] = []
 
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -943,12 +941,7 @@ class TTModelRunner:
                             rank_params.get("bad_words_token_ids", {}))
                         logitsprocs_list.append(rank_params.get("logitsprocs"))
                         rank_logprobs = rank_params.get("max_num_logprobs")
-                        if rank_logprobs is not None:
-                            if max_num_logprobs is None:
-                                max_num_logprobs = rank_logprobs
-                            else:
-                                max_num_logprobs = max(max_num_logprobs,
-                                                       rank_logprobs)
+                        max_num_logprobs = max(max_num_logprobs, rank_logprobs)
                         generators_list.append(
                             rank_params.get("generators", {}))
                     else:
@@ -1058,12 +1051,8 @@ class TTModelRunner:
                     bad_words_token_ids_list.append(
                         mi.bad_words_token_ids_list[0])
                     logitsprocs_list.append(mi.logitsprocs_list[0])
-                    if mi.max_num_logprobs is not None:
-                        if max_num_logprobs is None:
-                            max_num_logprobs = mi.max_num_logprobs
-                        else:
-                            max_num_logprobs = max(max_num_logprobs,
-                                                   mi.max_num_logprobs)
+                    max_num_logprobs = max(max_num_logprobs,
+                                           mi.max_num_logprobs)
                     generators_list.append(mi.generators_list[0])
                 else:
                     allowed_token_ids_mask_list.append(None)
