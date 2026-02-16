@@ -86,7 +86,7 @@ class TestPresencePenalty:
             RequestConfig(
                 prompt=prompt,
                 max_tokens=40,
-                temperature=0,
+                temperature=1.0,
                 presence_penalty=penalty,
             ) for penalty in penalties
         ]
@@ -107,7 +107,8 @@ class TestPresencePenalty:
                 RequestConfig(
                     prompt=prompt,
                     max_tokens=40,
-                    temperature=0,
+                    temperature=1.0,
+                    seed=42,
                     presence_penalty=0.0 if i % 2 == 0 else 2.0,
                 ))
 
