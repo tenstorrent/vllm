@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,8 +17,46 @@ if TYPE_CHECKING:
     from vllm.inputs import ProcessorInputs, PromptType
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+else:
+    FlexibleArgumentParser = object
 
 logger = init_logger(__name__)
+
+
+def _should_pre_register_tt_test_models_from_cli() -> bool:
+    """Return True iff `--override-tt-config` enables test models.
+
+    `TTPlatform.pre_register_and_update()` runs before `VllmConfig` (and thus
+    `ModelConfig.override_tt_config`) is constructed, but ModelConfig may
+    inspect architectures early.
+    """
+    argv = list(sys.argv[1:])
+
+    def _parse_override_tt_config(raw: str) -> dict | None:
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    # Users may pass either `--override-tt-config` or `--override_tt_config`.
+    # Arg name normalization happens later during argparse processing, but this
+    # function runs before parsing, so we normalize locally and compare against
+    # the canonical `--override-tt-config`.
+    canonical_flag = "--override-tt-config"
+    for i, arg in enumerate(argv):
+        if "=" in arg:
+            flag, value = arg.split("=", 1)
+            if flag.replace("_", "-") == canonical_flag:
+                cfg = _parse_override_tt_config(value)
+                return bool(cfg and cfg.get("register_test_models") is True)
+        else:
+            if arg.replace("_", "-") == canonical_flag and i + 1 < len(argv):
+                cfg = _parse_override_tt_config(argv[i + 1])
+                return bool(cfg and cfg.get("register_test_models") is True)
+
+    return False
 
 
 def register_tt_models(register_test_models=False) -> None:
@@ -104,7 +144,7 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
-    # Optionally register test models if an environment variable is set
+    # Optionally register test models if explicitly enabled
     if register_test_models:
         register_tt_test_models()
 
@@ -130,6 +170,14 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.TT
     device_name: str = "tt"
     device_type: str = "tt"
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: FlexibleArgumentParser | None = None
+    ) -> None:
+        super().pre_register_and_update(parser)
+        if _should_pre_register_tt_test_models_from_cli():
+            register_tt_test_models()
 
     @classmethod
     def import_kernels(cls) -> None:
