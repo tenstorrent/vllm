@@ -989,11 +989,14 @@ class TTModelRunner:
             repetition_penalty_list: list[torch.Tensor] = []
             seed_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
-            reset_batch = False
-
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
                 raise ValueError("All inputs are None; nothing to concatenate")
+
+            # Propagate reset_batch from per-rank inputs: if any rank's
+            # decode batch layout changed, the model must reset penalty
+            # state (prompt_mask, output_mask, output_counts).
+            reset_batch = any(mi.reset_batch for mi in active_inputs)
 
             # Check if all ranks can sample on device.
             perform_device_sampling = all(mi.perform_device_sampling
