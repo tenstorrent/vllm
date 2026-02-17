@@ -26,6 +26,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import LogprobsLists
 
 logger = init_logger(__name__)
 
@@ -205,21 +206,23 @@ class TTWorker(WorkerBase):
 
     def build_dp_model_input(
         self, scheduler_output: Optional["SchedulerOutput"]
-    ) -> tuple[TTModelInput | None, int, int, int, int, int]:
+    ) -> tuple[TTModelInput | None, int, int, int, int, int, int]:
         """Called by each DP rank to build model input from scheduler output.
         Returns: (model_input, max_blocks, has_structured_input, has_penalties,
-        reset_batch, can_sample_device)
+        reset_batch, can_sample_device, needs_logprobs)
         """
         model_input = None
         has_penalties = 0
         reset_batch = 0
         can_sample_device = 1
+        needs_logprobs = 0
         if scheduler_output is not None:
             model_input = self.model_runner.build_model_input(scheduler_output)
             if model_input is not None:
                 has_penalties = int(not self.model_runner.input_batch.no_penalties)
                 reset_batch = int(model_input.reset_batch)
                 can_sample_device = int(model_input.perform_device_sampling)
+                needs_logprobs = int(model_input.max_num_logprobs is not None)
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = (
             int(model_input.grammar_bitmask[0] is not None) if model_input else 0
@@ -231,6 +234,7 @@ class TTWorker(WorkerBase):
             has_penalties,
             reset_batch,
             can_sample_device,
+            needs_logprobs,
         )
 
     def build_dp_decode_gather_input(
@@ -253,10 +257,11 @@ class TTWorker(WorkerBase):
         is_decode: bool,
         max_blocks_decode_batch: int | None,
         any_structured_inputs: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list]:
         """Called by TT device ranks (local DP rank 0) to concatenate DP-sized
-        inputs and execute. Returns a stacked tensor
-        [world, max_num_seqs, 1] of sampled ids.
+        inputs and execute. Returns a tuple of:
+        - stacked tensor [world, max_num_seqs, 1] of sampled ids
+        - list of logprobs per DP rank (as picklable lists, or None)
         Each DP slice is right-padded with zeros to max_num_seqs; empty entries
         are zeros. Same behavior for both prefill and decode."""
 
@@ -267,9 +272,14 @@ class TTWorker(WorkerBase):
         merged = self.model_runner.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
         )
-        sampled_token_ids_per_dp: list[torch.Tensor] = (
+        sampled_token_ids_per_dp, logprobs_per_dp = (
             self.model_runner.execute_with_model_input(merged)
         )
+
+        # Convert LogprobsTensors to picklable lists for scatter
+        logprobs_lists_per_dp = [
+            lp.tolists() if lp is not None else None for lp in logprobs_per_dp
+        ]
 
         # Pad each DP result to uniform shape for tensor all_gather.
         world = self.parallel_config.data_parallel_size
@@ -295,16 +305,28 @@ class TTWorker(WorkerBase):
                         dim=0,
                     )
             sampled_token_ids_per_dp[dp_rank] = token_ids
-        return torch.stack(sampled_token_ids_per_dp)  # [world, B, 1]
+        return torch.stack(
+            sampled_token_ids_per_dp
+        ), logprobs_lists_per_dp  # [world, B, 1], [world]
 
     def apply_dp_execution_result(
-        self, sampled_token_ids: torch.Tensor
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs_lists: Optional["LogprobsLists"] = None,
     ) -> ModelRunnerOutput:
-        """Called by each DP rank to apply sampled tokens to internal caches."""
+        """Called by each DP rank to apply sampled tokens to internal caches.
+
+        Args:
+            sampled_token_ids: Sampled token IDs for this DP rank.
+            logprobs_lists: Logprobs as lists (already converted from tensors)
+                for this DP rank, or None if not requested.
+        """
         # Trim to active local batch size to drop padding rows.
         num_reqs = self.model_runner.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
-        return self.model_runner.generate_runner_output(sampled_token_ids)
+        return self.model_runner.generate_runner_output(
+            sampled_token_ids, logprobs_lists
+        )
 
     # ---- Destructor (used to close devices) ----
 

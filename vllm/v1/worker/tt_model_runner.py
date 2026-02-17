@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass, fields
 from itertools import product
@@ -14,16 +16,18 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargs
 from vllm.platforms.tt import TTPlatform
+from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.tt_input_batch import (
@@ -74,9 +78,23 @@ class TTModelInput:
     perform_device_sampling: bool
 
     # always lists: single-element for non-DP, multi-element for DP
-    # If not using structured outputs, [None]
+    # If not used, [None]
     grammar_bitmask: list[torch.Tensor | None]
 
+    # Host-only sampling params - lists for DP (one per rank), single-element
+    # for non-DP. These are used for host sampling when device sampling is not
+    # supported.
+    logitsprocs_list: list[LogitsProcessors | None]
+    # bad_words_token_ids: list of dicts mapping req_index -> token_ids
+    bad_words_token_ids_list: list[dict[int, list[list[int]]]]
+    # allowed_token_ids_mask: list of (num_reqs, vocab_size) bool tensors
+    allowed_token_ids_mask_list: list[torch.Tensor | None]
+    # list of dicts mapping req_index -> generator for each DP rank
+    # only set for host sampling
+    generators_list: list[dict[int, torch.Generator]]
+
+    # max_num_logprobs: max logprobs value across all requests
+    max_num_logprobs: int
     # Optional: tokens for sampling with penalties during decode
     prompt_tokens: torch.Tensor | None = None
     output_tokens: torch.Tensor | None = None
@@ -161,6 +179,17 @@ class TTModelRunner:
         if self.parallel_config.data_parallel_rank_local == 0:
             self.host_sampler = Sampler()
 
+        # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
+        # custom logits processors). Used by the host sampler when device
+        # sampling isn't supported for a given batch.
+        self._host_logitsprocs: LogitsProcessors = build_logitsprocs(
+            vllm_config=vllm_config,
+            device=torch.device("cpu"),
+            is_pin_memory=False,
+            is_pooling_model=False,
+            custom_logitsprocs=(self.model_config.logits_processors or ()),
+        )
+
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
@@ -222,6 +251,7 @@ class TTModelRunner:
             vocab_size=self.vocab_size,
             block_sizes=[kv_cache_spec.block_size],
             kernel_block_sizes=[kv_cache_spec.block_size],
+            logitsprocs=self._host_logitsprocs,
         )
 
         # The block tables in the persistent input batch have
@@ -260,7 +290,7 @@ class TTModelRunner:
         # Allocate KV cache tensors.
         self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape, dtype, num_layers)
 
-    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+    def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
         scheduler output.
         The updated states are used in `_prepare_model_inputs` to create the
@@ -321,13 +351,19 @@ class TTModelRunner:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
 
+            if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(sampling_params.seed)
+            else:
+                generator = None
+
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=None,
-                generator=None,
+                generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
@@ -390,6 +426,9 @@ class TTModelRunner:
         if persistent_batch_layout_changed:
             self._decode_layout_changed_since_last_decode = True
 
+        # Refresh logits processors with batch state changes
+        self.input_batch.refresh_logitsprocs()
+
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
         if mm_feature.modality != "image":
@@ -451,9 +490,7 @@ class TTModelRunner:
 
         return multi_modal_kwargs
 
-    def _prepare_model_inputs(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> TTModelInput:
+    def _prepare_model_inputs(self, scheduler_output: SchedulerOutput) -> TTModelInput:
         # In DP, called on each rank
         # In non-DP, this is the only input preparation function
 
@@ -543,6 +580,9 @@ class TTModelRunner:
                 sample_params.pad_with_defaults(num_reqs)
 
         if is_prompt:
+            # Convert num_logprobs (int tensor)
+            # to enable_log_probs (bool tensor)
+            enable_log_probs = sample_params.num_logprobs[:num_reqs] > 0
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature[:num_reqs],
                 top_k=sample_params.top_k[:num_reqs],
@@ -551,9 +591,12 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty[:num_reqs],
                 repetition_penalty=sample_params.repetition_penalty[:num_reqs],
                 seed=sample_params.seed[:num_reqs],
-                enable_log_probs=None,
+                enable_log_probs=enable_log_probs,
             )
         else:
+            # Convert num_logprobs (int tensor)
+            # to enable_log_probs (bool tensor)
+            enable_log_probs = sample_params.num_logprobs > 0
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature,
                 top_k=sample_params.top_k,
@@ -562,7 +605,7 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty,
                 repetition_penalty=sample_params.repetition_penalty,
                 seed=sample_params.seed,
-                enable_log_probs=None,
+                enable_log_probs=enable_log_probs,
             )
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt
@@ -628,6 +671,30 @@ class TTModelRunner:
                     ]
                 )
 
+        # Build host-only sampling params from input_batch
+        allowed_token_ids_mask = None
+        if (
+            not input_batch.no_allowed_token_ids
+            and input_batch.sampling.allowed_token_ids_mask is not None
+        ):
+            allowed_token_ids_mask = input_batch.sampling.allowed_token_ids_mask[
+                : input_batch.num_reqs
+            ].clone()
+
+        generators = dict()
+        if not perform_device_sampling:
+            generators = input_batch.sampling.generators
+            # Technically this advances the generator before it is copied,
+            # but it's ok because this happens consistently.
+            # We're assuming that _prepare_model_inputs is called
+            # exactly once per step.
+            input_batch.advance_generators()
+            # NOTE: Our sampling paths are different between host and device.
+            # Whether a request is sampled on device or host
+            # depends also on other requests in the batch.
+            # This means sampling is not perfectly deterministic
+            # whenever device sampling is enabled.
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -641,11 +708,17 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            # Host-only sampling params - wrapped in lists for DP compatibility
+            allowed_token_ids_mask_list=[allowed_token_ids_mask],
+            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
+            max_num_logprobs=input_batch.max_num_logprobs,
+            logitsprocs_list=[input_batch.sampling.logitsprocs],
+            generators_list=[generators],
         )
 
     def build_model_input(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: SchedulerOutput,
     ) -> TTModelInput | None:
         """
         Update internal state with the scheduler output and build
@@ -702,6 +775,8 @@ class TTModelRunner:
             frequency_penalty = sampling_default_tensors["frequency_penalty"]
             repetition_penalty = sampling_default_tensors["repetition_penalty"]
             seed = sampling_default_tensors["seed"]
+            # enable_log_probs: convert num_logprobs > 0
+            enable_log_probs = sampling_default_tensors["num_logprobs"] > 0
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -729,6 +804,7 @@ class TTModelRunner:
             frequency_penalty = sampling_params.frequency_penalty
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
+            enable_log_probs = sampling_params.enable_log_probs
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
@@ -740,6 +816,9 @@ class TTModelRunner:
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # B
                 seed.contiguous().view(-1),  # B
+                enable_log_probs.contiguous()
+                .view(-1)
+                .to(torch.int32),  # B (bool->int32)
             ],
             dim=0,
         ).contiguous()
@@ -776,10 +855,22 @@ class TTModelRunner:
                 "output_tokens": model_input.output_tokens,
             }
 
+        # Host-only sampling params for host sampling
+        host_only_sample_params = None
+        if model_input is not None:
+            host_only_sample_params = {
+                "allowed_token_ids_mask": model_input.allowed_token_ids_mask_list[0],
+                "bad_words_token_ids": model_input.bad_words_token_ids_list[0],
+                "max_num_logprobs": model_input.max_num_logprobs,
+                "logitsprocs": model_input.logitsprocs_list[0],
+                "generators": model_input.generators_list[0],
+            }
+
         result = {
             "int_inputs": int_inputs,
             "float_inputs": float_inputs,
             "sampling_tokens_inputs": sampling_tokens_inputs,
+            "host_only_sample_params": host_only_sample_params,
         }
 
         return result
@@ -790,7 +881,7 @@ class TTModelRunner:
         is_decode: bool,
         max_blocks_decode_batch: int | None,
         any_structured_inputs: bool,
-    ) -> "TTModelInput":
+    ) -> TTModelInput:
         """
         Concatenate a DP-sized set of inputs into a single TTModelInput.
         inputs can be either:
@@ -823,6 +914,12 @@ class TTModelRunner:
                     dim=1,
                 )
             return block_tables
+
+        allowed_token_ids_mask_list: list[torch.Tensor | None] = []
+        bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
+        logitsprocs_list: list[LogitsProcessors | None] = []
+        max_num_logprobs: int = 0
+        generators_list: list[dict[int, torch.Generator]] = []
 
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -882,6 +979,10 @@ class TTModelRunner:
             off += B
             seed = stacked_int[:, off : off + B].reshape(total_B)
             off += B
+            enable_log_probs_int = stacked_int[:, off : off + B].reshape(total_B)
+            off += B
+            # Convert back to bool tensor
+            enable_log_probs = enable_log_probs_int > 0
 
             # Optional structured inputs: keep as list[Optional[tensor]]
             # per DP rank to match prefill behavior.
@@ -900,6 +1001,34 @@ class TTModelRunner:
                         grammar_bitmask_list.append(None)
             else:
                 grammar_bitmask_list = [None] * world
+
+            # Extract host-only sampling params
+            # from gathered inputs (per-rank lists)
+            host_only_sample_params_list = inputs.get("host_only_sample_params")
+            if host_only_sample_params_list:
+                for rank_params in host_only_sample_params_list:
+                    if rank_params is not None:
+                        allowed_token_ids_mask_list.append(
+                            rank_params.get("allowed_token_ids_mask")
+                        )
+                        bad_words_token_ids_list.append(
+                            rank_params.get("bad_words_token_ids", {})
+                        )
+                        logitsprocs_list.append(rank_params.get("logitsprocs"))
+                        rank_logprobs = rank_params.get("max_num_logprobs")
+                        max_num_logprobs = max(max_num_logprobs, rank_logprobs)
+                        generators_list.append(rank_params.get("generators", {}))
+                    else:
+                        allowed_token_ids_mask_list.append(None)
+                        bad_words_token_ids_list.append({})
+                        logitsprocs_list.append(None)
+                        generators_list.append({})
+            else:
+                # No host-only sampling params - create empty lists
+                allowed_token_ids_mask_list = [None] * world
+                bad_words_token_ids_list = [{}] * world
+                logitsprocs_list = [None] * world
+                generators_list = [{}] * world
 
             off_f = 0
             temperature = stacked_float[:, off_f : off_f + B].reshape(total_B)
@@ -931,6 +1060,7 @@ class TTModelRunner:
             frequency_penalty_list: list[torch.Tensor] = []
             repetition_penalty_list: list[torch.Tensor] = []
             seed_list: list[torch.Tensor] = []
+            enable_log_probs_list: list[torch.Tensor] = []
             reset_batch = False
 
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
@@ -979,6 +1109,7 @@ class TTModelRunner:
                     frequency_penalty_list.append(sp.frequency_penalty)
                     repetition_penalty_list.append(sp.repetition_penalty)
                     seed_list.append(sp.seed)
+                    enable_log_probs_list.append(sp.enable_log_probs)
 
                 # We know it's not a list here before concatenation
                 unpadded_batch_size: int = (
@@ -986,6 +1117,21 @@ class TTModelRunner:
                 )
                 batch_size_per_dp.append(unpadded_batch_size)
                 grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None)
+
+                # Collect host-only sampling params per rank
+                if mi is not None:
+                    allowed_token_ids_mask_list.append(
+                        mi.allowed_token_ids_mask_list[0]
+                    )
+                    bad_words_token_ids_list.append(mi.bad_words_token_ids_list[0])
+                    logitsprocs_list.append(mi.logitsprocs_list[0])
+                    max_num_logprobs = max(max_num_logprobs, mi.max_num_logprobs)
+                    generators_list.append(mi.generators_list[0])
+                else:
+                    allowed_token_ids_mask_list.append(None)
+                    bad_words_token_ids_list.append({})
+                    logitsprocs_list.append(None)
+                    generators_list.append({})
 
             input_tokens = torch.cat(input_tokens_list, dim=0)
             input_positions = np.concatenate(input_positions_list, axis=0)
@@ -1000,6 +1146,7 @@ class TTModelRunner:
             frequency_penalty = torch.cat(frequency_penalty_list, dim=0)
             repetition_penalty = torch.cat(repetition_penalty_list, dim=0)
             seed = torch.cat(seed_list, dim=0)
+            enable_log_probs = torch.cat(enable_log_probs_list, dim=0)
 
         tt_sampling_params = TTSamplingParams(
             temperature=temperature,
@@ -1009,6 +1156,7 @@ class TTModelRunner:
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             seed=seed,
+            enable_log_probs=enable_log_probs,
         )
 
         if self.model_config.is_multimodal_model and not is_decode:
@@ -1096,13 +1244,19 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            # Host-only sampling params (per-rank lists)
+            allowed_token_ids_mask_list=allowed_token_ids_mask_list,
+            bad_words_token_ids_list=bad_words_token_ids_list,
+            max_num_logprobs=max_num_logprobs,
+            logitsprocs_list=logitsprocs_list,
+            generators_list=generators_list,
         )
         return merged
 
     @torch.no_grad()
     def execute_model(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput:
         """Execution path for non-DP case.
@@ -1118,8 +1272,13 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         # Only 1 DP rank here
-        sampled_token_ids = self.execute_with_model_input(model_input)[0]
-        output = self.generate_runner_output(sampled_token_ids)
+        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input(  # noqa: E501
+            model_input
+        )
+        sampled_token_ids = sampled_token_ids_per_dp[0]
+        logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
+        logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+        output = self.generate_runner_output(sampled_token_ids, logprobs)
         return output
 
     def check_perform_device_sampling(self, is_decode: bool) -> bool:
@@ -1129,14 +1288,37 @@ class TTModelRunner:
         if not want_device_sampling:
             return False
 
-        # Currently requests with logprobs fail on request
-        # validation, but once supported, the TODOs below will be relevant.
-        # TODO: Also if logprobs are not None,
+        # Calculate number of devices per DP rank
+        num_devices = (
+            self.device_config.num_devices // self.parallel_config.data_parallel_size
+        )
+
+        # Always host-only sampling params: min_p, bad_words, logit_bias,
+        # allowed_token_ids, min_tokens require host sampling.
+        input_batch = self.input_batch
+        has_always_host_only_sampling_params = (
+            not input_batch.no_allowed_token_ids  # allowed_token_ids set
+            or input_batch.sampling.bad_words_token_ids  # bad_words set
+            or input_batch.sampling.has_active_logitsprocs()  # min_p, logit_bias,
+            # min_tokens
+            or bool(self.model_config.logits_processors)  # custom logitsprocs
+        )
+        if has_always_host_only_sampling_params:
+            return False
+
+        # Logprobs on device are only supported on multi-device setups
+        # (num_devices > 1)
+        # Also, only the sampled token's logprob is returned on device,
+        # not the top-k alternatives.
+        # On single device, logprobs require host sampling.
+        # https://github.com/tenstorrent/tt-metal/issues/34077
+        max_lp = input_batch.max_num_logprobs
+        if max_lp > 1 or (max_lp > 0 and num_devices == 1):
+            return False
+
         # TTPlatform.non_greedy_decoding_on_device must be True
-        # (model limitations).
-        # TODO: Also if logprobs is not None and devices_per_dp_cache == 1,
-        # logprobs on device is not supported
-        # (https://github.com/tenstorrent/tt-metal/issues/34077).
+        # for random sampling,
+        # or all requests must be greedy without penalties.
         params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
             self.input_batch.all_greedy and self.input_batch.no_penalties
         )
@@ -1145,11 +1327,16 @@ class TTModelRunner:
     def execute_with_model_input(
         self,
         model_input: TTModelInput,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
         """
         Execute with a prebuilt input and return per-DP sampled ids without
         mutating internal state. In DP case, called by DP rank 0 to run merged
         batch. Note: currently does not support chunked prefill.
+
+        Returns:
+            Tuple of (sampled_token_ids_per_dp, logprobs_per_dp).
+            Each element in logprobs_per_dp is None if logprobs were not
+            requested for that DP rank.
         """
         is_decode = model_input.prompt_lens is None
 
@@ -1157,7 +1344,8 @@ class TTModelRunner:
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
         if not any(bs > 0 for bs in batch_size_per_dp):
-            return [torch.tensor([], dtype=torch.int32)] * len(batch_size_per_dp)
+            num_dp = len(batch_size_per_dp)
+            return ([torch.tensor([], dtype=torch.int32)] * num_dp, [None] * num_dp)
 
         kwargs = {
             "tokens": model_input.input_tokens,
@@ -1252,13 +1440,20 @@ class TTModelRunner:
                 enable_trace=enable_trace,
                 read_from_device=True,
             )
-            # tt_out is a tuple of (logits, logprobs)
-            # v1 currently doesn't handle logprobs from TT models
-            if isinstance(tt_out, tuple):
-                tt_out = tt_out[0]
+
+        # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
+        # sampling is enabled with logprobs. Extract both components.
+        tt_log_probs = None
+        if perform_device_sampling and model_input.max_num_logprobs > 0:
+            assert isinstance(tt_out, tuple) and len(tt_out) == 2
+            tt_out, tt_log_probs = tt_out
+        elif isinstance(tt_out, tuple):
+            # Model may return (logits, dummy_logprobs) even when not requested
+            tt_out, _ = tt_out
 
         return self._get_output_tokens(
             tt_out=tt_out,
+            tt_log_probs=tt_log_probs,
             sampling_params=sampling_params,
             model_input=model_input,
             batch_size_per_dp=batch_size_per_dp,
@@ -1269,24 +1464,36 @@ class TTModelRunner:
     def _get_output_tokens(
         self,
         tt_out: torch.Tensor,
+        tt_log_probs: torch.Tensor | None,
         sampling_params: TTSamplingParams,
         model_input: TTModelInput,
         batch_size_per_dp: list[int],
         perform_device_sampling: bool,
         is_decode: bool,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
         """Return sampled tokens per DP rank using concatenated model
-        outputs.
+        outputs, plus optional logprobs per DP rank.
 
         If perform_device_sampling is True, tokens are already sampled on
         device. Otherwise, sample on host using host_sampler.
+
+        Args:
+            tt_out: Model output (logits or tokens depending on sampling mode)
+            tt_log_probs: Optional logprobs from device sampling
+
+        Returns:
+            Tuple of (sampled_token_ids_per_dp, logprobs_per_dp).
+            Each element in logprobs_per_dp is None if logprobs were not
+            requested for that DP rank.
         """
         sampled_token_ids_per_dp: list[torch.Tensor] = []
+        logprobs_per_dp: list[LogprobsTensors | None] = []
 
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if sz <= 0:
                 sampled_token_ids_per_dp.append(torch.tensor([], dtype=torch.int32))
+                logprobs_per_dp.append(None)
                 if is_decode:
                     # Fixed stride segments per DP rank for decode
                     start += self.scheduler_config.max_num_seqs
@@ -1320,21 +1527,12 @@ class TTModelRunner:
                 repetition_penalty = sampling_params.repetition_penalty[
                     start : start + sz
                 ]
-                seed = sampling_params.seed[start : start + sz]
 
                 # Determine if all greedy (temperature == 0.0) or all random
                 all_greedy = (temperature == 0.0).all().item()
                 all_random = (temperature != 0.0).all().item()
 
-                # Create generators from seeds for this DP rank
-                # Generator keys are batch indices (0-based within current
-                # slice).
-                generators: dict[int, torch.Generator] = {}
-                for i, seed_val in enumerate(seed):
-                    if seed_val.item() != SEED_NONE_SENTINEL:
-                        generators[i] = torch.Generator(device="cpu").manual_seed(
-                            seed_val.item()
-                        )
+                generators = model_input.generators_list[dp_rank]
 
                 # Determine if penalties are needed
                 no_penalties = (
@@ -1383,8 +1581,24 @@ class TTModelRunner:
                             pad_mask, self.vocab_size
                         )
 
+                # Get host-only sampling params from model_input
+                # (per-rank lists).
+                # These are populated for both DP and non-DP cases.
+                rank_max_num_logprobs = model_input.max_num_logprobs
+                allowed_token_ids_mask = model_input.allowed_token_ids_mask_list[  # noqa: E501
+                    dp_rank
+                ]
+                if allowed_token_ids_mask is not None:
+                    # Slice to actual batch size for this rank
+                    allowed_token_ids_mask = allowed_token_ids_mask[:sz]
+
+                bad_words_token_ids = model_input.bad_words_token_ids_list[dp_rank]
+
+                logitsprocs = model_input.logitsprocs_list[dp_rank]
+                if logitsprocs is None:
+                    logitsprocs = LogitsProcessors()
+
                 # Create SamplingMetadata for this DP rank
-                # TODO: support logprobs
                 sampling_metadata = SamplingMetadata(
                     temperature=temperature if not all_greedy else None,
                     all_greedy=all_greedy,
@@ -1392,16 +1606,16 @@ class TTModelRunner:
                     top_p=top_p,
                     top_k=top_k,
                     generators=generators,
-                    max_num_logprobs=None,
+                    max_num_logprobs=rank_max_num_logprobs,
                     no_penalties=no_penalties,
                     prompt_token_ids=prompt_token_ids,
                     frequency_penalties=frequency_penalty,
                     presence_penalties=presence_penalty,
                     repetition_penalties=repetition_penalty,
                     output_token_ids=output_token_ids,
-                    allowed_token_ids_mask=None,
-                    bad_words_token_ids={},
-                    logitsprocs=LogitsProcessors(),
+                    allowed_token_ids_mask=allowed_token_ids_mask,
+                    bad_words_token_ids=bad_words_token_ids,
+                    logitsprocs=logitsprocs,
                 )
 
                 sampler_output = self.host_sampler(
@@ -1409,9 +1623,40 @@ class TTModelRunner:
                     sampling_metadata=sampling_metadata,
                 )
                 next_token_ids = sampler_output.sampled_token_ids
+                # Capture logprobs for this DP rank
+                logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
                 # Grammar bitmask is applied on device
                 next_token_ids = tt_out[start : start + sz]
+
+                # Extract logprobs if available from device sampling
+                if model_input.max_num_logprobs:
+                    # Sanity check for if we correctly detect
+                    # when logprobs are supported.
+                    assert tt_log_probs is not None, (
+                        "model should return logprobs when requested"
+                    )
+                    # TT device returns raw logprobs as [batch_size] tensor
+                    # containing log probability of the sampled token only.
+                    # Convert to LogprobsTensors format with minimal info.
+                    sampled_log_probs = tt_log_probs[start : start + sz]
+
+                    # Create LogprobsTensors with only sampled token info
+                    # Shape: [sz, 1] for token_ids and logprobs
+                    logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
+                    logprobs_values = sampled_log_probs.unsqueeze(-1).to(torch.float32)
+                    # Rank is unknown with device sampling, use -1 to indicate
+                    selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
+
+                    logprobs_tensors = LogprobsTensors(
+                        logprob_token_ids=logprob_token_ids,
+                        logprobs=logprobs_values,
+                        selected_token_ranks=selected_token_ranks,
+                    )
+                    logprobs_per_dp.append(logprobs_tensors)
+                else:
+                    logprobs_per_dp.append(None)
+
             sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:
@@ -1421,7 +1666,7 @@ class TTModelRunner:
                 # Prefill packed contiguously
                 start += sz
 
-        return sampled_token_ids_per_dp
+        return sampled_token_ids_per_dp, logprobs_per_dp
 
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor
@@ -1448,7 +1693,17 @@ class TTModelRunner:
         ]
         logits.masked_fill_(unpacked_bitmask, -float("inf"))
 
-    def generate_runner_output(self, sampled_token_ids: torch.Tensor):
+    def generate_runner_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None = None,
+    ):
+        """Generate ModelRunnerOutput from sampled tokens and optional logprobs.
+
+        Args:
+            sampled_token_ids: Sampled token IDs tensor.
+            logprobs: LogprobsLists (already converted from tensors).
+        """
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         num_reqs = self.input_batch.num_reqs
@@ -1492,15 +1747,14 @@ class TTModelRunner:
             self.input_batch.req_ids[:num_reqs], None
         )
 
-        # Note: currently does not support speculative decoding, log probs,
-        # or pooling.
+        # Note: currently does not support speculative decoding or pooling.
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=[
                 sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
             ],
-            logprobs=None,
+            logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )
