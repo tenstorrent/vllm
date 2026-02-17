@@ -58,6 +58,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
+        self._forced_mode: Optional[int] = None
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -161,6 +162,11 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+    def set_forced_mode(self, mode: Optional[int]) -> None:
+        # mode: None=no constraint, 0=decode only, 1=prefill allowed
+        assert mode in (None, 0, 1)
+        self._forced_mode = mode
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -329,7 +335,9 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
+        # When forced_mode=0 (decode), skip waiting requests so that
+        # DP ranks stay in sync on prefill vs decode steps.
+        if not preempted_reqs and self._forced_mode != 0:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
