@@ -234,6 +234,7 @@ def run_seq_len_tests(engine_kw_args, sampling_params):
 def run_inference(
     model,
     prompts_json,
+    use_hf_chat_template=False,
     max_tokens=128,
     max_seqs_in_batch=32,
     num_repeat_prompts=2,
@@ -254,6 +255,9 @@ def run_inference(
     block_size=64,
     enable_prefix_caching=False,
     non_uniform_sampling=False,
+    sampling_top_k=10,
+    sampling_top_p=0.9,
+    sampling_temperature=1.0,
 ):
     if multi_modal:
         supported_models = [
@@ -323,9 +327,9 @@ def run_inference(
             sampling_params = SamplingParams(
                 max_tokens=max_tokens,
                 ignore_eos=ignore_eos,
-                top_k=10,
-                top_p=0.9,
-                temperature=1.0,
+                top_k=sampling_top_k,
+                top_p=sampling_top_p,
+                temperature=sampling_temperature,
             )
 
     if test_increasing_seq_lens:
@@ -346,6 +350,19 @@ def run_inference(
             with open(prompts_json) as file:
                 prompts = json.load(file)
             assert isinstance(prompts, list), "Prompts must be a list of strings"
+            if use_hf_chat_template:
+                tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+                prompts = [
+                    tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    if isinstance(prompt, str)
+                    else prompt
+                    for prompt in prompts
+                ]
+                print("Applied HF chat template to prompts from prompts_json")
         else:
             print("Ignoring prompts json for multi-modal inference")
             if "Llama-3.2" in model:
@@ -613,6 +630,14 @@ if __name__ == "__main__":
         help="Path to JSON file containing prompts",
     )
     parser.add_argument(
+        "--use_hf_chat_template",
+        action="store_true",
+        help=(
+            "Apply the model tokenizer's HF chat template to each string prompt "
+            "loaded from --prompts_json."
+        ),
+    )
+    parser.add_argument(
         "--measure_perf", action="store_true", help="Measure performance"
     )
     parser.add_argument(
@@ -622,6 +647,24 @@ if __name__ == "__main__":
         help="Length of dummy prompts for performance measurement",
     )
     parser.add_argument("--max_tokens", type=int, default=128, help="Length of outputs")
+    parser.add_argument(
+        "--sampling_top_k",
+        type=int,
+        default=10,
+        help="top-k for normal sampling mode (ignored by --greedy_sampling)",
+    )
+    parser.add_argument(
+        "--sampling_top_p",
+        type=float,
+        default=0.9,
+        help="top-p for normal sampling mode (ignored by --greedy_sampling)",
+    )
+    parser.add_argument(
+        "--sampling_temperature",
+        type=float,
+        default=1.0,
+        help="temperature for normal sampling mode (ignored by --greedy_sampling)",
+    )
     parser.add_argument(
         "--greedy_sampling",
         action="store_true",
@@ -714,6 +757,7 @@ if __name__ == "__main__":
     run_inference(
         args.model,
         args.prompts_json,
+        use_hf_chat_template=args.use_hf_chat_template,
         measure_perf=args.measure_perf,
         perf_prompt_len=args.perf_prompt_len,
         max_tokens=args.max_tokens,
@@ -734,4 +778,7 @@ if __name__ == "__main__":
         block_size=args.block_size,
         enable_prefix_caching=args.enable_prefix_caching,
         non_uniform_sampling=args.non_uniform_sampling,
+        sampling_top_k=args.sampling_top_k,
+        sampling_top_p=args.sampling_top_p,
+        sampling_temperature=args.sampling_temperature,
     )
