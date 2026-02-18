@@ -131,11 +131,6 @@ class TTModelRunner:
         if self.request_specific_rope:
             self.previous_req_ids: set[str] = set()
 
-        # Because of multiprocessing, the config-dependent
-        # class attributes might not have been set in this process,
-        # so we need to call this again.
-        TTPlatform.check_and_update_config(vllm_config)
-
         # Currently, TT model runner doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
 
@@ -440,20 +435,28 @@ class TTModelRunner:
         Currently only supports image inputs in the "pixel_values" and
         "image_grid_thw" fields.
 
-        Returns dict, each value is a list of lists of tensors per-request:
-        [
-          # for requests w/o mm_inputs:
-          {"pixel_values": None,
-           "image_grid_thw": None},
-          # for requests w/ single mm_input:
-          {"pixel_values": [[pv_user_1],[pv_user_2]],
-          "image_grid_thw": [[ig_user_1],[ig_user_2]]},
-          # for requests w/ multiple mm_inputs:
-          {"pixel_values": [[pv_user_1_image_1, pv_user_1_image_2],
-                            [pv_user_2_image_1, pv_user_2_image_2]],
-           "image_grid_thw":[[ig_user_1_image_1, ig_user_1_image_2],
-                             [ig_user_2_image_1, ig_user_2_image_2]]},
-        ]
+        Returns a dict with keys "pixel_values" and "image_grid_thw".
+        Each value is a list aligned with `scheduler_output.scheduled_new_reqs`.
+
+        For request i:
+        - If it has no `mm_features`, the entry is None.
+        - Otherwise the entry is a list aligned with that request's
+          `mm_features` (currently only images), where each element is a
+          tensor (or None if that feature has no data).
+
+        Example (3 scheduled requests: text-only, 1 image, 2 images):
+        {
+          "pixel_values": [
+            None,
+            [pv_req1_img0],
+            [pv_req2_img0, pv_req2_img1],
+          ],
+          "image_grid_thw": [
+            None,
+            [ig_req1_img0],
+            [ig_req2_img0, ig_req2_img1],
+          ],
+        }
         """
 
         multi_modal_kwargs: MultiModalKwargs = {
@@ -629,12 +632,21 @@ class TTModelRunner:
                 (batch_length, grammar_bitmask_length), dtype=torch.int32
             )
             reordered_bitmask = torch.bitwise_not(reordered_bitmask)
-            structured_request_ids = scheduler_output.structured_output_request_ids  # noqa: E501
+            # `structured_output_request_ids` is produced by the scheduler as a
+            # list of request IDs (bitmask rows are in this order). TT does not
+            # support speculative decoding in this path, so we assume a single
+            # bitmask row per request.
+            structured_output_request_ids = (
+                scheduler_output.structured_output_request_ids or []
+            )
+            req_id_to_bitmask_row: dict[str, int] = {
+                req_id: i for i, req_id in enumerate(structured_output_request_ids)
+            }
             for req_id, persistent_batch_index in input_batch.req_id_to_index.items():
-                if req_id in structured_request_ids:
-                    scheduler_batch_index = structured_request_ids[req_id]
+                scheduler_bitmask_row = req_id_to_bitmask_row.get(req_id)
+                if scheduler_bitmask_row is not None:
                     reordered_bitmask[persistent_batch_index, :] = bitmask[
-                        scheduler_batch_index, :
+                        scheduler_bitmask_row, :
                     ]
             bitmask = reordered_bitmask
 

@@ -24,6 +24,16 @@ else:
 logger = init_logger(__name__)
 
 
+def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
+    """Register `model_arch` only if not already registered.
+
+    This keeps TT model registration idempotent across multiple call sites
+    (e.g. APIServer pre-register, TT worker import, and platform config hook).
+    """
+    if model_arch not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(model_arch, model_path)
+
+
 def _should_pre_register_tt_test_models_from_cli() -> bool:
     """Return True iff `--override-tt-config` enables test models.
 
@@ -60,7 +70,7 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
 
 
 def register_tt_models(register_test_models=False) -> None:
-    from vllm import ModelRegistry
+    from vllm.model_executor.models.registry import ModelRegistry
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
@@ -80,17 +90,18 @@ def register_tt_models(register_test_models=False) -> None:
         )
 
     # Llama3.1/3.2 - Text
-    ModelRegistry.register_model("TTLlamaForCausalLM", path_llama_text)
+    _register_model_if_missing(ModelRegistry, "TTLlamaForCausalLM", path_llama_text)
 
     # Llama3.2 - Vision
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTMllamaForConditionalGeneration",
         "models.tt_transformers.tt.generator_vllm:MllamaForConditionalGeneration",
     )
 
     # Qwen2.5 - Text
     path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
-    ModelRegistry.register_model("TTQwen2ForCausalLM", path_qwen_text)
+    _register_model_if_missing(ModelRegistry, "TTQwen2ForCausalLM", path_qwen_text)
 
     # Qwen3 - Text
     qwen3_text_version = os.getenv("TT_QWEN3_TEXT_VER", "tt_transformers")
@@ -106,40 +117,46 @@ def register_tt_models(register_test_models=False) -> None:
             "pick one of [tt_transformers, qwen3_32b_galaxy]"
         )
 
-    ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen3_text)
+    _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
     # Qwen2.5 - Vision
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTQwen2_5_VLForConditionalGeneration",
         "models.demos.qwen25_vl.tt.generator_vllm:Qwen2_5_VLForConditionalGeneration",
     )
 
     # Qwen3 - Vision
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTQwen3VLForConditionalGeneration",
         "models.demos.qwen3_vl.tt.generator_vllm:Qwen3VLForConditionalGeneration",
     )
 
     # Mistral
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTMistralForCausalLM",
         "models.tt_transformers.tt.generator_vllm:MistralForCausalLM",
     )
 
     # Gemma3
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTGemma3ForConditionalGeneration",
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
 
     # DeepseekV3
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTDeepseekV3ForCausalLM",
         "models.demos.deepseek_v3.tt.generator_vllm:DeepseekV3ForCausalLM",
     )
 
     # GPT-OSS
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTGptOssForCausalLM",
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
@@ -151,16 +168,18 @@ def register_tt_models(register_test_models=False) -> None:
 
 def register_tt_test_models():
     """Register non-production TT models which are only used for testing."""
-    from vllm import ModelRegistry
+    from vllm.model_executor.models.registry import ModelRegistry
 
     # Fake model for testing multi-process inference on T3000
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTDummyT3000MultiProcessModel",
         "models.vllm_test_utils.t3000_multiproc_test.test_model:DummyT3000MultiProcessModel",
     )
 
     # Fake model which does nothing, for measuring vLLM host overheads
-    ModelRegistry.register_model(
+    _register_model_if_missing(
+        ModelRegistry,
         "TTDummyNoOpModel",
         "models.vllm_test_utils.no_op_test.test_model:DummyNoOpModel",
     )
@@ -178,6 +197,10 @@ class TTPlatform(Platform):
     def pre_register_and_update(
         cls, parser: FlexibleArgumentParser | None = None
     ) -> None:
+        # Called during CLI/parser setup (APIServer). ModelConfig may
+        # validate/inspect architectures before VllmConfig is constructed in
+        # this process, so we must ensure TT test models are registered early
+        # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
@@ -209,7 +232,13 @@ class TTPlatform(Platform):
         ), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, "LoRA is not supported for TT backend"
 
-        # Import and register models from tt-metal
+        # Import and register models from tt-metal.
+        #
+        # NOTE: We also register TT models early in `vllm/v1/worker/tt_worker.py`
+        # (at module import time). That registration is required to handle
+        # engine/worker subprocess startup ordering where model architectures
+        # may be inspected (e.g. multimodal processor cache init) before this
+        # `check_and_update_config()` hook is reached in that process.
         override_tt_config = vllm_config.model_config.override_tt_config
         register_test_models = False
         if override_tt_config and "register_test_models" in override_tt_config:
@@ -234,7 +263,7 @@ class TTPlatform(Platform):
                 arch_names[i] = "TT" + arch_names[i]
 
         # Verify that the TT architecture is registered in the model registry
-        from vllm import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
         supported_archs = ModelRegistry.get_supported_archs()
         if not any(arch_name in supported_archs for arch_name in arch_names):

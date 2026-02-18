@@ -12,6 +12,11 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.platforms.tt import (
+    TTPlatform,
+    _should_pre_register_tt_test_models_from_cli,
+    register_tt_models,
+)
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (
@@ -29,6 +34,12 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import LogprobsLists
 
 logger = init_logger(__name__)
+
+# Ensure TT model architectures are registered in this process as early as
+# possible. `WorkerWrapperBase.init_worker` imports the worker class module
+# before initializing multimodal caches; without this, early architecture
+# inspection may fail for TT-prefixed architectures.
+register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
 
 
 class TTWorker(WorkerBase):
@@ -68,6 +79,11 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = override_tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        # Validate/apply TT config in this worker process (multiprocessing
+        # means platform class attrs + config mutations must be applied per
+        # subprocess) before runner init.
+        TTPlatform.check_and_update_config(self.vllm_config)
+
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         # Open mesh only on local DP rank 0 (device ranks).
         if local_dp_rank == 0:

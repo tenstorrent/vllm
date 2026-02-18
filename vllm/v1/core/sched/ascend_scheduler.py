@@ -378,13 +378,16 @@ class AscendScheduler(Scheduler):
                 encoder_inputs_to_schedule = None
                 new_encoder_budget = encoder_budget
                 if request.has_encoder_inputs:
-                    (encoder_inputs_to_schedule, num_new_tokens, new_encoder_budget) = (
-                        self._try_schedule_encoder_inputs(
-                            request,
-                            request.num_computed_tokens,
-                            num_new_tokens,
-                            encoder_budget,
-                        )
+                    (
+                        encoder_inputs_to_schedule,
+                        num_new_tokens,
+                        new_encoder_budget,
+                        _,
+                    ) = self._try_schedule_encoder_inputs(
+                        request,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        encoder_budget,
                     )
 
                 # Check that adding the request still respects the max_loras
