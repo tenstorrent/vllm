@@ -953,7 +953,7 @@ class TTModelRunner:
                         generators_list.append({})
             else:
                 # No host-only sampling params - create empty lists
-                # Happens if we didn't perform the gather at all - device sampling
+                # Happens if we didn't skipped gather (when device sampling)
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
@@ -1362,6 +1362,9 @@ class TTModelRunner:
         # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
         # sampling is enabled with logprobs. Extract both components.
         tt_log_probs = None
+
+        # Always tensors - turned into lists only right before passing to model
+        assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
         if perform_device_sampling and sampling_params.enable_log_probs.any():
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
@@ -1543,8 +1546,11 @@ class TTModelRunner:
                 next_token_ids = tt_out[start:start + sz]
 
                 # Extract logprobs if available from device sampling
-                rank_enable_lp = sampling_params.enable_log_probs[
-                    start:start + sz]
+                # Always tensors - turned into lists only when passing to model
+                assert isinstance(sampling_params.enable_log_probs,
+                                  torch.Tensor)
+                rank_enable_lp = sampling_params.enable_log_probs[start:start +
+                                                                  sz]
                 if rank_enable_lp.any():
                     # Sanity check for if we correctly detect
                     # when logprobs are supported.
