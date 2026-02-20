@@ -334,6 +334,16 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule()
 
         if requires_gather and forced_mode is not None:
+            self.dlog(
+                "after_schedule forced_mode=%s total_scheduled=%d "
+                "new_reqs=%d cached_reqs=%d resumed_preemption=%s",
+                forced_mode,
+                scheduler_output.total_num_scheduled_tokens,
+                len(scheduler_output.scheduled_new_reqs),
+                scheduler_output.scheduled_cached_reqs.num_reqs,
+                scheduler_output.scheduled_cached_reqs
+                .resumed_from_preemption,
+            )
             # Reset forced mode after scheduling to leave no residual state.
             set_mode = getattr(self.scheduler, "set_forced_mode", None)
             if callable(set_mode):

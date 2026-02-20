@@ -471,8 +471,25 @@ class TTModelRunner:
             block_tables = block_tables[:, :max_blocks_in_batch]
 
         # NOTE: We assume that all sequences in the group are all prompts or
-        # all decodes.
-        is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
+        # all decodes.  Resumed-from-preemption requests are prefill work even
+        # though they appear in scheduled_cached_reqs, not scheduled_new_reqs.
+        is_prompt = (
+            len(scheduler_output.scheduled_new_reqs) > 0
+            or any(scheduler_output.scheduled_cached_reqs
+                   .resumed_from_preemption)
+        )
+        cached = scheduler_output.scheduled_cached_reqs
+        if cached.num_reqs > 0:
+            logger.debug(
+                "_prepare_model_inputs: is_prompt=%s, new_reqs=%d, "
+                "cached_reqs=%d, resumed_from_preemption=%s, "
+                "total_scheduled_tokens=%d",
+                is_prompt,
+                len(scheduler_output.scheduled_new_reqs),
+                cached.num_reqs,
+                cached.resumed_from_preemption,
+                scheduler_output.total_num_scheduled_tokens,
+            )
         sample_params = input_batch.sampling
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
@@ -1022,7 +1039,14 @@ class TTModelRunner:
                         ],
                                          dim=1)
                     input_tokens_list.append(toks)
-                    prompt_lens_list.append(mi.prompt_lens)
+                    if mi.prompt_lens is not None:
+                        prompt_lens_list.append(mi.prompt_lens)
+                    else:
+                        logger.warning(
+                            "DP rank input has prompt_lens=None in prefill "
+                            "concat (is_decode=%s, batch_size=%d). "
+                            "Likely a is_prompt classification bug.",
+                            is_decode, mi.input_tokens.shape[0])
                     block_tables_list.append(pad_block_tables(mi.block_tables))
                     input_positions_list.append(mi.input_positions)
 
@@ -1060,9 +1084,24 @@ class TTModelRunner:
                     logitsprocs_list.append(None)
                     generators_list.append({})
 
+            logger.debug(
+                "concat_dp_model_inputs (prefill): "
+                "num_active_inputs=%d, batch_size_per_dp=%s, "
+                "prompt_lens_per_rank=[%s]",
+                len(active_inputs),
+                batch_size_per_dp,
+                ", ".join(
+                    str(pl.shape if hasattr(pl, 'shape') else pl)
+                    for pl in prompt_lens_list
+                ),
+            )
+
             input_tokens = torch.cat(input_tokens_list, dim=0)
             input_positions = np.concatenate(input_positions_list, axis=0)
-            prompt_lens = np.concatenate(prompt_lens_list, axis=0)
+            if prompt_lens_list:
+                prompt_lens = np.concatenate(prompt_lens_list, axis=0)
+            else:
+                prompt_lens = None
             block_tables = torch.cat(block_tables_list, dim=0)
 
             # Concatenate sampling parameter tensors across DP ranks
