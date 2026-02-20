@@ -480,7 +480,7 @@ class TTModelRunner:
         )
         cached = scheduler_output.scheduled_cached_reqs
         if cached.num_reqs > 0:
-            logger.debug(
+            logger.info(
                 "_prepare_model_inputs: is_prompt=%s, new_reqs=%d, "
                 "cached_reqs=%d, resumed_from_preemption=%s, "
                 "total_scheduled_tokens=%d",
@@ -1084,7 +1084,7 @@ class TTModelRunner:
                     logitsprocs_list.append(None)
                     generators_list.append({})
 
-            logger.debug(
+            logger.info(
                 "concat_dp_model_inputs (prefill): "
                 "num_active_inputs=%d, batch_size_per_dp=%s, "
                 "prompt_lens_per_rank=[%s]",
