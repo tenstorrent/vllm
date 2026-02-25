@@ -1535,7 +1535,7 @@ class TTModelRunner:
                     start += self.scheduler_config.max_num_seqs
                 continue
             if not perform_device_sampling:
-                logits = tt_out[start : start + sz, -1, :]
+                logits = tt_out[start : start + sz, -1, :self.vocab_size]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
 
