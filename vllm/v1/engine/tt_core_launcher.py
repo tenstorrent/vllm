@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import weakref
 
 import cloudpickle
@@ -16,7 +17,7 @@ import yaml
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
-from vllm.utils.system_utils import kill_process_tree
+from vllm.utils.system_utils import get_mp_context, kill_process_tree
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.abstract import UniProcExecutor
 
@@ -100,13 +101,14 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     logger.info("Validated launching from MPI rank 0 host %s", rank0_host)
 
 
-def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
+def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, int, int]:
     """
     Parse override_tt_config for a rank binding file (required for launching
-    TT MPI processes), and compute device and local DP ranks.
+    TT MPI processes), and compute MPI topology information.
     Returns tuple with:
       - rank_binding_file: str
-      - non_device_dp_ranks: set[int]
+      - mpi_world: int (number of MPI ranks / hosts)
+      - dp_size_per_mpi_rank: int (DP ranks per host segment)
     """
 
     parallel_config = vllm_config.parallel_config
@@ -116,7 +118,8 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
     dp_size = parallel_config.data_parallel_size
     override_tt_config = vllm_config.model_config.override_tt_config or {}
     rank_binding_file = override_tt_config.get("rank_binding")
-    non_device_dp_ranks: set[int] = set()
+    mpi_world = 0
+    dp_size_per_mpi_rank = 0
     if rank_binding_file:
         if not isinstance(rank_binding_file, str):
             raise RuntimeError(
@@ -138,10 +141,8 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         # Assume DP world is evenly split into mpi_world groups and set
         # device DP ranks as the first rank in each group.
         dp_size_per_mpi_rank = dp_size // mpi_world
-        device_dp_ranks = {i * dp_size_per_mpi_rank for i in range(mpi_world)}
-        non_device_dp_ranks = {i for i in range(dp_size) if i not in device_dp_ranks}
 
-    return rank_binding_file, non_device_dp_ranks
+    return rank_binding_file, mpi_world, dp_size_per_mpi_rank
 
 
 def tt_run_launch(
@@ -307,6 +308,103 @@ def _setup_mpi_proc_finalizer(
     weakref.finalize(cleanup_target, _finalize_mpi, weakref.ref(mpi_proc))
 
 
+def _spawn_local_non_device_dp_ranks(
+    *,
+    handshake_address: str,
+    vllm_config: VllmConfig,
+    log_stats: bool,
+    mpi_rank: int,
+    mpi_world: int,
+) -> list[object]:
+    """Spawn additional (non-device) DP ranks on this host.
+
+    tt-run launches exactly one MPI rank per host (the "device" rank). The rest
+    of the DP ranks for that host are spawned locally as plain subprocesses to
+    keep the MPI world size equal to the number of hosts.
+
+    We intentionally do **not** spawn any extra ranks on MPI rank 0, because the
+    vLLM launcher process (running on host 0) already spawns those ranks locally
+    so it can track their sentinels and surface failures early.
+    """
+    pc = vllm_config.parallel_config
+    dp_size = pc.data_parallel_size
+    if mpi_world <= 0:
+        raise RuntimeError(f"Invalid mpi_world={mpi_world}")
+    if dp_size % mpi_world != 0:
+        raise RuntimeError(
+            f"dp_size ({dp_size}) must be divisible by mpi_world ({mpi_world})"
+        )
+    segment = dp_size // mpi_world
+    if segment <= 1:
+        return []
+    if mpi_rank == 0:
+        return []
+
+    # This MPI rank corresponds to the first DP rank in its segment.
+    segment_start = mpi_rank * segment
+    dp_ranks_to_spawn = list(range(segment_start + 1, segment_start + segment))
+    if not dp_ranks_to_spawn:
+        return []
+
+    # local_dp_rank is per-host, so it is computed relative to segment_start.
+    # The device rank on this host uses local_dp_rank=0, so spawned ranks map to
+    # [1, segment-1].
+    local_rank_map = {r: (r - segment_start) for r in dp_ranks_to_spawn}
+    logger.info(
+        "TT-MPI balanced launch (mpi_rank=%d/%d): spawning non-device DP ranks %s "
+        "with local_dp_rank mapping %s (device dp_rank=%d local_dp_rank=0)",
+        mpi_rank,
+        mpi_world,
+        dp_ranks_to_spawn,
+        local_rank_map,
+        segment_start,
+    )
+
+    ctx = get_mp_context()
+    procs = []
+    common_kwargs = {
+        "vllm_config": vllm_config,
+        # "Remote" from the launcher/front-end process on host 0.
+        "local_client": False,
+        "handshake_address": handshake_address,
+        "executor_class": UniProcExecutor,
+        "log_stats": log_stats,
+    }
+
+    for dp_rank in dp_ranks_to_spawn:
+        # Preserve mixed-launch convention: device rank uses local_dp_rank=0,
+        # and spawned ranks use local_dp_rank in [1, segment-1] for this host.
+        local_dp_rank = dp_rank - segment_start
+        p = ctx.Process(
+            target=EngineCoreProc.run_engine_core,
+            name=f"EngineCore_DP{dp_rank}",
+            kwargs=common_kwargs
+            | {
+                "dp_rank": dp_rank,
+                "local_dp_rank": local_dp_rank,
+            },
+        )
+        p.start()
+        procs.append(p)
+
+    # If any spawned process exits, terminate this MPI rank. This helps the
+    # rank-0 launcher fail fast instead of waiting indefinitely for a missing
+    # handshake from a remote engine.
+    def _watch_children() -> None:
+        try:
+            import signal
+            from multiprocessing import connection
+
+            connection.wait([p.sentinel for p in procs])
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            # Best-effort: if something goes wrong here, let the main engine run.
+            logger.exception("Failed while watching spawned non-device ranks")
+
+    threading.Thread(target=_watch_children, daemon=True).start()
+    return procs
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TT engine core entrypoint")
     parser.add_argument("--handshake", required=True, help="Handshake address")
@@ -372,6 +470,16 @@ def main() -> None:
     # Ensure uniproc in engine process (worker inline).
     assert pc.distributed_executor_backend == "uni", (
         "TT MPI must be used with uniproc executor backend"
+    )
+
+    # Spawn the rest of the DP ranks for this host (if any) before entering the
+    # device engine busy-loop (which blocks).
+    _spawn_local_non_device_dp_ranks(
+        handshake_address=handshake_address,
+        vllm_config=vllm_config,
+        log_stats=log_stats,
+        mpi_rank=mpi_rank,
+        mpi_world=mpi_world,
     )
 
     # Run engine core busy loop.

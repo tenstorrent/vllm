@@ -797,13 +797,25 @@ def launch_core_engines(
     if current_platform.is_tt():
         from vllm.v1.engine.tt_core_launcher import parse_tt_mpi_params
 
-        rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+        rank_binding_file, tt_mpi_world, tt_dp_size_per_mpi_rank = parse_tt_mpi_params(
+            vllm_config
+        )
         use_tt_mpi = rank_binding_file is not None
         if use_tt_mpi:
-            # Device ranks (one per host) are launched via MPI and considered
-            # remote here; only non-device ranks are local on host 0.
+            assert tt_mpi_world > 0, "Invalid TT MPI world size"
+            assert tt_dp_size_per_mpi_rank > 0, "Invalid TT MPI segment size"
+            # Balanced mixed-launch:
+            # - One "device" DP rank per host is launched via tt-run (MPI).
+            # - Remaining ranks are spawned locally on each host by that host's
+            #   device process, except for host 0 where the launcher process
+            #   spawns them so it can track their sentinels.
+            #
+            # From the launcher's perspective, only the host-0 non-device ranks
+            # are "local". All other ranks (including host-0 device rank) are
+            # treated as "remote" and are expected to connect via handshake.
+            rank0_non_device_dp_ranks = set(range(1, tt_dp_size_per_mpi_rank))
             vllm_config.parallel_config.data_parallel_size_local = len(
-                non_device_dp_ranks
+                rank0_non_device_dp_ranks
             )
 
     parallel_config = vllm_config.parallel_config
@@ -872,12 +884,12 @@ def launch_core_engines(
         return
 
     if use_tt_mpi:
-        # Override local DP size to exclude device DP ranks.
-        # Device ranks are considered remote since they're launched via MPI,
-        # and are expected to connect over the handshake socket as they have no
-        # local process sentinel.
+        # TT mixed-launch: only host-0 non-device ranks are started locally by
+        # the launcher (this process). All other ranks (including all device
+        # ranks, plus non-device ranks on other hosts) are considered "remote"
+        # and are expected to connect via handshake.
         engines_to_handshake = [
-            CoreEngine(index=i, local=(i in non_device_dp_ranks))
+            CoreEngine(index=i, local=(i in rank0_non_device_dp_ranks))
             for i in range(vllm_config.parallel_config.data_parallel_size)
         ]
     elif offline_mode:
@@ -927,17 +939,22 @@ def launch_core_engines(
 
         local_engine_dp_ranks = None
         if use_tt_mpi:
-            # Mixed-launch: start all non-device DP ranks locally on host 0 and
-            # launch device ranks (including on other hosts) via tt-run (MPI).
-            # Device ranks have local_dp_rank=0 and
-            # dp_rank = mpi_rank * (dp_size // mpi_world).
-            # Non-device ranks have local_dp_rank=1..len(non_device_dp_ranks).
+            # Balanced TT mixed-launch:
+            # - Launch exactly one process per host via tt-run (MPI). Those are
+            #   the "device" ranks, which use local_dp_rank=0 and
+            #   dp_rank = mpi_rank * (dp_size // mpi_world).
+            # - Spawn non-device ranks (the remainder of each host's DP segment)
+            #   locally on each host. The rank-0 launcher spawns its local
+            #   non-device ranks, and each non-zero MPI rank spawns the rest on
+            #   its host before entering its device engine loop.
             logger.info(
-                "TT-MPI mixed launch: dp_size=%d local_count=%d "
-                "non_device_ranks=%s handshake=%s",
+                "TT-MPI balanced mixed launch: dp_size=%d mpi_world=%d "
+                "segment=%d local_count=%d rank0_non_device_ranks=%s handshake=%s",
                 parallel_config.data_parallel_size,
+                tt_mpi_world,
+                tt_dp_size_per_mpi_rank,
                 parallel_config.data_parallel_size_local,
-                non_device_dp_ranks,
+                sorted(rank0_non_device_dp_ranks),
                 handshake_address,
             )
             assert dp_rank == 0, "TT MPI must be launched from rank 0"
@@ -954,10 +971,10 @@ def launch_core_engines(
                 log_stats=log_stats,
                 cleanup_target=addresses,
             )
-            if non_device_dp_ranks:
+            if rank0_non_device_dp_ranks:
                 # Use CoreEngineProcManager with explicit dp_ranks list.
                 # local_dp_rank starts at 1 (0 is reserved for device rank).
-                local_engine_dp_ranks = sorted(non_device_dp_ranks)
+                local_engine_dp_ranks = sorted(rank0_non_device_dp_ranks)
                 local_start_index = 1
 
         # Start local engines.
