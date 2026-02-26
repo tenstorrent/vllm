@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import atexit
 import fnmatch
 import os
 import shlex
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import weakref
+from multiprocessing.process import BaseProcess
 
 import cloudpickle
 import yaml
@@ -20,8 +22,65 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.system_utils import get_mp_context, kill_process_tree
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.abstract import UniProcExecutor
+from vllm.v1.utils import shutdown
 
 logger = init_logger(__name__)
+
+
+def _shutdown_mpi_proc(proc: subprocess.Popen) -> None:
+    """Best-effort shutdown for the tt-run (MPI) subprocess."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=5.0)
+        return
+    except subprocess.TimeoutExpired:
+        logger.warning("tt-run subprocess did not exit within timeout, SIGKILLing")
+    if proc.pid is not None:
+        kill_process_tree(proc.pid)
+
+
+def _install_cleanup_handlers(
+    *,
+    name: str,
+    cleanup_fn,
+    handled_signal_exit_code_base: int = 128,
+) -> None:
+    """Install atexit + SIGINT/SIGTERM handlers that run cleanup_fn once."""
+    import signal
+
+    cleaned_up = threading.Event()
+
+    def _cleanup_once() -> None:
+        if cleaned_up.is_set():
+            return
+        cleaned_up.set()
+        try:
+            cleanup_fn()
+        except Exception:
+            logger.exception("Cleanup failed (%s)", name)
+
+    def _make_handler(sig: int, prev_handler):
+        def _handler(signum, frame):
+            _cleanup_once()
+            if callable(prev_handler):
+                return prev_handler(signum, frame)
+            raise SystemExit(handled_signal_exit_code_base + signum)
+
+        return _handler
+
+    atexit.register(_cleanup_once)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        prev = signal.getsignal(sig)
+        try:
+            signal.signal(sig, _make_handler(sig, prev))
+        except Exception:
+            logger.debug("Could not install signal handler for %s (%s)", sig, name)
 
 
 def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
@@ -276,6 +335,13 @@ def tt_run_launch(
     # Set up finalizer for MPI subprocess cleanup
     _setup_mpi_proc_finalizer(mpi_proc, cleanup_target)
 
+    # Also install explicit cleanup on normal termination signals. The weakref
+    # finalizer is not guaranteed to run on SIGTERM/SIGINT.
+    _install_cleanup_handlers(
+        name="tt-run",
+        cleanup_fn=lambda: _shutdown_mpi_proc(mpi_proc),
+    )
+
 
 def _setup_mpi_proc_finalizer(
     mpi_proc: subprocess.Popen, cleanup_target: object
@@ -292,18 +358,7 @@ def _setup_mpi_proc_finalizer(
         proc = proc_ref()
         if proc is None:
             return
-        # Check if process is already dead
-        if proc.poll() is not None:
-            return
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "tt-run subprocess did not exit within timeout, sending SIGKILL"
-            )
-            if proc.pid is not None:
-                kill_process_tree(proc.pid)
+        _shutdown_mpi_proc(proc)
 
     weakref.finalize(cleanup_target, _finalize_mpi, weakref.ref(mpi_proc))
 
@@ -315,7 +370,7 @@ def _spawn_local_non_device_dp_ranks(
     log_stats: bool,
     mpi_rank: int,
     mpi_world: int,
-) -> list[object]:
+) -> list[BaseProcess]:
     """Spawn additional (non-device) DP ranks on this host.
 
     tt-run launches exactly one MPI rank per host (the "device" rank). The rest
@@ -361,7 +416,7 @@ def _spawn_local_non_device_dp_ranks(
     )
 
     ctx = get_mp_context()
-    procs = []
+    procs: list[BaseProcess] = []
     common_kwargs = {
         "vllm_config": vllm_config,
         # "Remote" from the launcher/front-end process on host 0.
@@ -474,13 +529,18 @@ def main() -> None:
 
     # Spawn the rest of the DP ranks for this host (if any) before entering the
     # device engine busy-loop (which blocks).
-    _spawn_local_non_device_dp_ranks(
+    spawned_procs: list[BaseProcess] = _spawn_local_non_device_dp_ranks(
         handshake_address=handshake_address,
         vllm_config=vllm_config,
         log_stats=log_stats,
         mpi_rank=mpi_rank,
         mpi_world=mpi_world,
     )
+    if spawned_procs:
+        _install_cleanup_handlers(
+            name=f"tt-mpi-rank-{mpi_rank}-spawned-procs",
+            cleanup_fn=lambda: shutdown(spawned_procs),
+        )
 
     # Run engine core busy loop.
     # Local client is False since only non-device ranks are spawned in-process.
