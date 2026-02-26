@@ -611,7 +611,7 @@ def get_mesh_grid(local_dp_rank=0):
         "P150x4": (1, 4),
         "T3K": (1, 8),
         "P150x8": (1, 8),
-        "P300x2": (1, 4),
+        "P300x2": (2, 2),
         "TG": (8, 4)
     }
     mesh_device_env = os.environ.get("MESH_DEVICE")
