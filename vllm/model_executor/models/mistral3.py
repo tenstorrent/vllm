@@ -256,6 +256,7 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
             )
         }
 
+
 class Mistral3ProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         # Check which tokenizer is being used
@@ -264,9 +265,7 @@ class Mistral3ProcessingInfo(BaseLlavaProcessingInfo):
         if isinstance(tokenizer, MistralTokenizer):
             # Use PixtralProcessorAdapter for MistralTokenizer (--tokenizer-mode mistral)
             return PixtralProcessorAdapter(tokenizer)
-        else:
-            # Use HuggingFace PixtralProcessor for HF tokenizers
-            return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
+        return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
 
 
 class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo]):
@@ -315,10 +314,7 @@ class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         hf_config = self.info.get_hf_config()
-        tokenizer = self.info.get_tokenizer()
 
-        # Use processor properties directly to get token IDs
-        # (works for both HF PixtralProcessor and PixtralProcessorAdapter)
         image_break_id = processor.image_break_token_id
         image_token_id = hf_config.image_token_index
         image_end_id = processor.image_end_token_id

@@ -53,7 +53,7 @@ def get_sample_multi_modal_llama_inputs():
 def get_sample_multi_modal_inputs(model: str, multi_image: bool):
     """
     Build sample multi-modal inputs for vision-language models.
-    Currently supports Qwen2.5-VL, Qwen3-VL and Gemma-3.
+    Currently supports Qwen2.5-VL, Qwen3-VL, Gemma-3, and Mistral 3.1.
 
     Args:
         model (str): Hugging Face model identifier
@@ -114,6 +114,8 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
         # [INFO] Qwen-VL currently does not support a mixture of
         # text-image and text-only inputs
         content += single_image_prompts_content
+    elif "Mistral" in model:
+        content += text_prompts_content + single_image_prompts_content
     else:
         content += text_prompts_content + single_image_prompts_content
         if multi_image:
@@ -149,7 +151,7 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
             image_inputs, video_inputs = process_vision_info(prompt)
             assert video_inputs is None, "Video inputs not supported yet"
             image_inputs = image_inputs if image_inputs else None
-        elif "gemma-3" in model:
+        elif "gemma-3" in model or "Mistral" in model:
             image_inputs = [
                 ctnt["image"]
                 for entry in prompt
@@ -258,6 +260,7 @@ def run_inference(
             "Qwen2.5-VL",
             "Qwen3-VL",
             "gemma",
+            "Mistral",
         ]
         assert any(name in model for name in supported_models), (
             "The multi-modal inference test "
@@ -349,7 +352,7 @@ def run_inference(
             print("Ignoring prompts json for multi-modal inference")
             if "Llama-3.2" in model:
                 prompts = get_sample_multi_modal_llama_inputs()
-            elif any(name in model for name in ["Qwen2.5-VL", "Qwen3-VL", "gemma"]):
+            elif any(name in model for name in ["Qwen2.5-VL", "Qwen3-VL", "gemma", "Mistral"]):
                 prompts = get_sample_multi_modal_inputs(model, multi_image)
             else:
                 raise ValueError(
@@ -389,6 +392,8 @@ def run_inference(
                 IMAGE_TOKEN_ID = 151655  # Specific to multi-modal qwen
             elif "gemma" in model:
                 IMAGE_TOKEN_ID = 262144  # Specific to multi-modal gemma
+            elif "Mistral" in model:
+                IMAGE_TOKEN_ID = 10  # [IMG] token in Mistral tokenizer
             else:
                 raise ValueError(
                     f"Unsupported model for multi-modal inference test in perf "
