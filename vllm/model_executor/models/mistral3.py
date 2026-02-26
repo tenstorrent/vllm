@@ -259,11 +259,8 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 
 class Mistral3ProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
-        # Check which tokenizer is being used
         tokenizer = cached_tokenizer_from_config(self.ctx.model_config)
-        
         if isinstance(tokenizer, MistralTokenizer):
-            # Use PixtralProcessorAdapter for MistralTokenizer (--tokenizer-mode mistral)
             return PixtralProcessorAdapter(tokenizer)
         return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
 

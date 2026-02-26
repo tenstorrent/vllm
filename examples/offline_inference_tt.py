@@ -352,7 +352,9 @@ def run_inference(
             print("Ignoring prompts json for multi-modal inference")
             if "Llama-3.2" in model:
                 prompts = get_sample_multi_modal_llama_inputs()
-            elif any(name in model for name in ["Qwen2.5-VL", "Qwen3-VL", "gemma", "Mistral"]):
+            elif any(
+                name in model for name in ["Qwen2.5-VL", "Qwen3-VL", "gemma", "Mistral"]
+            ):
                 prompts = get_sample_multi_modal_inputs(model, multi_image)
             else:
                 raise ValueError(
