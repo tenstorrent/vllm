@@ -273,23 +273,42 @@ class TTWorker(WorkerBase):
         is_decode: bool,
         max_blocks_decode_batch: int | None,
         any_structured_inputs: bool,
+        host_device_dp_rank: int,
     ) -> tuple[torch.Tensor, list]:
         """Called by TT device ranks (local DP rank 0) to concatenate DP-sized
         inputs and execute. Returns a tuple of:
-        - stacked tensor [world, max_num_seqs, 1] of sampled ids
-        - list of logprobs per DP rank (as picklable lists, or None)
+        - stacked tensor [segment, max_num_seqs, 1] of sampled ids
+        - list of logprobs per DP rank in this segment (as picklable lists, or None)
         Each DP slice is right-padded with zeros to max_num_seqs; empty entries
-        are zeros. Same behavior for both prefill and decode."""
+        are zeros. Same behavior for both prefill and decode.
+
+        "segment" = this host's DP subgroup (contiguous global DP ranks) gathered
+        and executed by this host's device DP rank. Its first global DP rank is
+        host_device_dp_rank (the device DP rank for this host).
+        """
 
         assert self.parallel_config.data_parallel_rank_local == 0, (
             "concat_and_execute_dp must run on local DP rank 0 (device rank)"
         )
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
+
+        if is_decode:
+            assert isinstance(inputs, dict)
+            seg_world = int(inputs["int_inputs"].shape[0])
+        else:
+            assert isinstance(inputs, list)
+            seg_world = len(inputs)
         merged = self.model_runner.concat_dp_model_inputs(
-            inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
+            inputs,
+            is_decode,
+            max_blocks_decode_batch,
+            any_structured_inputs,
         )
         sampled_token_ids_per_dp, logprobs_per_dp = (
-            self.model_runner.execute_with_model_input(merged)
+            self.model_runner.execute_with_model_input(
+                merged,
+                host_segment_size=seg_world,
+            )
         )
 
         # Convert LogprobsTensors to picklable lists for scatter
@@ -298,10 +317,9 @@ class TTWorker(WorkerBase):
         ]
 
         # Pad each DP result to uniform shape for tensor all_gather.
-        world = self.parallel_config.data_parallel_size
-        assert len(sampled_token_ids_per_dp) == world
+        assert len(sampled_token_ids_per_dp) == seg_world
         B = int(self.model_runner.scheduler_config.max_num_seqs)
-        for dp_rank in range(world):
+        for dp_rank in range(seg_world):
             token_ids = sampled_token_ids_per_dp[dp_rank].to(torch.int32)
             if token_ids.numel() == 0:
                 token_ids = torch.zeros((B, 1), dtype=torch.int32)
@@ -323,7 +341,7 @@ class TTWorker(WorkerBase):
             sampled_token_ids_per_dp[dp_rank] = token_ids
         return torch.stack(
             sampled_token_ids_per_dp
-        ), logprobs_lists_per_dp  # [world, B, 1], [world]
+        ), logprobs_lists_per_dp  # [segment, B, 1], [segment]
 
     def apply_dp_execution_result(
         self,

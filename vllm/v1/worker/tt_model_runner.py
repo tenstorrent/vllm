@@ -973,8 +973,94 @@ class TTModelRunner:
             assert (
                 isinstance(stacked_float, torch.Tensor) and stacked_float.dim() == 2
             ), "decode expects stacked float_inputs of shape [world, -1]"
-            world = int(stacked_int.shape[0])
+            seg_world = int(stacked_int.shape[0])
+            world = int(self.parallel_config.data_parallel_size)
             total_B = world * B
+            host_device_dp_rank = int(self.parallel_config.data_parallel_rank)
+
+            # If we gathered only the local host segment, expand to a "global"
+            # view (world=B*dp_size) with default/empty rows for other hosts.
+            if world != seg_world:
+                assert 0 <= host_device_dp_rank < world
+                assert host_device_dp_rank + seg_world <= world, (
+                    f"Invalid host_device_dp_rank={host_device_dp_rank} for "
+                    f"seg_world={seg_world} "
+                    f"world={world}"
+                )
+
+                # Build default flattened rows matching build_dp_decode_gather_input(None,...)
+                sampling_default_tensors = (
+                    self.input_batch.sampling.create_default_tensors()
+                )
+                default_tokens = torch.zeros((B, 1), dtype=torch.int32)
+                default_positions = torch.full((B,), -1, dtype=torch.int32)
+                default_block_tables = torch.zeros((B, W), dtype=torch.int32)
+                default_bs = torch.tensor([0], dtype=torch.int32)
+                default_top_k = sampling_default_tensors["top_k"].to(torch.int32)
+                default_seed = sampling_default_tensors["seed"].to(torch.int32)
+                default_enable_lp = (
+                    (sampling_default_tensors["num_logprobs"] > 0)
+                    .to(torch.int32)
+                    .view(-1)
+                )
+                default_int = torch.cat(
+                    [
+                        default_tokens.contiguous().view(-1),
+                        default_positions.contiguous().view(-1),
+                        default_block_tables.contiguous().view(-1),
+                        default_bs.contiguous().view(-1),
+                        default_top_k.contiguous().view(-1),
+                        default_seed.contiguous().view(-1),
+                        default_enable_lp.contiguous().view(-1),
+                    ],
+                    dim=0,
+                ).contiguous()
+                if any_structured_inputs:
+                    default_int = torch.cat(
+                        [
+                            default_int,
+                            torch.tensor([0], dtype=torch.int32),
+                            torch.zeros((B * self.bitmask_size,), dtype=torch.int32),
+                        ],
+                        dim=0,
+                    ).contiguous()
+
+                default_float = torch.cat(
+                    [
+                        sampling_default_tensors["temperature"]
+                        .to(torch.float32)
+                        .contiguous()
+                        .view(-1),
+                        sampling_default_tensors["top_p"]
+                        .to(torch.float32)
+                        .contiguous()
+                        .view(-1),
+                        sampling_default_tensors["presence_penalty"]
+                        .to(torch.float32)
+                        .contiguous()
+                        .view(-1),
+                        sampling_default_tensors["frequency_penalty"]
+                        .to(torch.float32)
+                        .contiguous()
+                        .view(-1),
+                        sampling_default_tensors["repetition_penalty"]
+                        .to(torch.float32)
+                        .contiguous()
+                        .view(-1),
+                    ],
+                    dim=0,
+                ).contiguous()
+
+                stacked_int_full = default_int.unsqueeze(0).repeat(world, 1)
+                stacked_float_full = default_float.unsqueeze(0).repeat(world, 1)
+                stacked_int_full[
+                    host_device_dp_rank : host_device_dp_rank + seg_world
+                ] = stacked_int
+                stacked_float_full[
+                    host_device_dp_rank : host_device_dp_rank + seg_world
+                ] = stacked_float
+                stacked_int = stacked_int_full
+                stacked_float = stacked_float_full
 
             # Slice views out of the stacked gather buffers (no per-rank
             # Python lists, no torch.cat). Layout is constant for fixed B.
@@ -1035,6 +1121,11 @@ class TTModelRunner:
             # from gathered inputs (per-rank lists)
             host_only_sample_params_list = inputs.get("host_only_sample_params")
             if host_only_sample_params_list:
+                if world != seg_world:
+                    expanded = [None for _ in range(world)]
+                    for i, v in enumerate(host_only_sample_params_list):
+                        expanded[host_device_dp_rank + i] = v
+                    host_only_sample_params_list = expanded
                 for rank_params in host_only_sample_params_list:
                     if rank_params is not None:
                         allowed_token_ids_mask_list.append(
@@ -1218,6 +1309,11 @@ class TTModelRunner:
             inputs.get("sampling_tokens_inputs") if is_decode else None
         )
         if sampling_tokens_inputs:
+            if is_decode and world != seg_world:
+                expanded_tokens = [None for _ in range(world)]
+                for i, v in enumerate(sampling_tokens_inputs):
+                    expanded_tokens[host_device_dp_rank + i] = v
+                sampling_tokens_inputs = expanded_tokens
             # Find max shapes across all ranks
             max_prompt_len = 0
             max_output_len = 0
@@ -1360,6 +1456,7 @@ class TTModelRunner:
     def execute_with_model_input(
         self,
         model_input: TTModelInput,
+        host_segment_size: int | None = None,
     ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
         """
         Execute with a prebuilt input and return per-DP sampled ids without
@@ -1372,6 +1469,7 @@ class TTModelRunner:
             requested for that DP rank.
         """
         is_decode = model_input.prompt_lens is None
+        host_device_dp_rank = int(self.parallel_config.data_parallel_rank)
 
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
@@ -1394,10 +1492,17 @@ class TTModelRunner:
                 # TODO: the model should only require DP ranks, but passing
                 # "global" user ids instead for backwards compatibility.
                 stride = int(self.scheduler_config.max_num_seqs)
+                # In TT multi-host mode, we gather/execute only a host-local DP
+                # segment, so batch_size_per_dp is only for that segment (not the
+                # full DP world). We still must emit "global" user ids of the form
+                # global_dp_rank * stride + i. The global dp rank for the local
+                # segment index j is (host_device_dp_rank + j).
+                seg_world = len(batch_size_per_dp)
                 empty_slots = []
-                for dp_rank, sz in enumerate(batch_size_per_dp):
+                for j, sz in enumerate(batch_size_per_dp):
+                    global_dp_rank = host_device_dp_rank + j
                     for i in range(int(sz)):
-                        empty_slots.append(dp_rank * stride + i)
+                        empty_slots.append(global_dp_rank * stride + i)
                 kwargs["empty_slots"] = empty_slots
 
         kwargs["start_pos"] = model_input.input_positions
@@ -1487,7 +1592,7 @@ class TTModelRunner:
             # Model may return (logits, dummy_logprobs) even when not requested
             tt_out, _ = tt_out
 
-        return self._get_output_tokens(
+        sampled_token_ids_per_dp, logprobs_per_dp = self._get_output_tokens(
             tt_out=tt_out,
             tt_log_probs=tt_log_probs,
             sampling_params=sampling_params,
@@ -1496,6 +1601,21 @@ class TTModelRunner:
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
         )
+
+        # If decode used a global DP view (full dp_world_size) but this host only
+        # gathered/executed a local segment, return only the host-local portion.
+        if host_segment_size is not None and is_decode:
+            seg_start = host_device_dp_rank
+            seg_end = host_device_dp_rank + host_segment_size
+            if seg_end > len(sampled_token_ids_per_dp):
+                raise ValueError(
+                    f"Invalid host segment slice [{seg_start},{seg_end}) for "
+                    f"dp_world_size={len(sampled_token_ids_per_dp)}"
+                )
+            sampled_token_ids_per_dp = sampled_token_ids_per_dp[seg_start:seg_end]
+            logprobs_per_dp = logprobs_per_dp[seg_start:seg_end]
+
+        return sampled_token_ids_per_dp, logprobs_per_dp
 
     def _get_output_tokens(
         self,
