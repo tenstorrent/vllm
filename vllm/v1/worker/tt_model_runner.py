@@ -1727,9 +1727,17 @@ class TTModelRunner:
             )
             & 1
         ) == 0
-        unpacked_bitmask = unpacked_bitmask.reshape(grammar_bitmask.shape[0], -1)[
-            :, : logits.shape[-1]
-        ]
+        unpacked_bitmask = unpacked_bitmask.reshape(grammar_bitmask.shape[0], -1)
+        vocab_logits = logits.shape[-1]
+        vocab_bitmask = unpacked_bitmask.shape[-1]
+        if vocab_bitmask < vocab_logits:
+            # Logits may be wider than vocab (e.g. padded for on-device sampling).
+            # Pad bitmask with True (mask out) so padding positions are set to -inf.
+            unpacked_bitmask = torch.nn.functional.pad(
+                unpacked_bitmask, (0, vocab_logits - vocab_bitmask), value=True
+            )
+        elif vocab_bitmask > vocab_logits:
+            unpacked_bitmask = unpacked_bitmask[:, :vocab_logits]
         logits.masked_fill_(unpacked_bitmask, -float("inf"))
 
     def generate_runner_output(
