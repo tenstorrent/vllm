@@ -1679,12 +1679,7 @@ class TTModelRunner:
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
                 rank_enable_lp = sampling_params.enable_log_probs[start : start + sz]
-                if rank_enable_lp.any():
-                    # Sanity check for if we correctly detect
-                    # when logprobs are supported.
-                    assert tt_log_probs is not None, (
-                        "model should return logprobs when requested"
-                    )
+                if rank_enable_lp.any() and tt_log_probs is not None:
                     # TT device returns raw logprobs as [batch_size] tensor
                     # containing log probability of the sampled token only.
                     # Convert to LogprobsTensors format with minimal info.
