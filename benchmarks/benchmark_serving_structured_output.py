@@ -439,6 +439,7 @@ async def benchmark(
     max_concurrency: int | None,
     structured_output_ratio: float,
     goodput_config_dict: dict[str, float] | None = None,
+    reasoning_effort: str | None = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -450,6 +451,8 @@ async def benchmark(
         # Add the schema to the extra_body
         extra_body["structured_outputs"] = {}
         extra_body["structured_outputs"][request.structure_type] = request.schema
+        if reasoning_effort is not None:
+            extra_body["reasoning_effort"] = reasoning_effort
         return extra_body
 
     print("Starting initial single prompt test run...")
@@ -818,6 +821,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             structured_output_ratio=args.structured_output_ratio,
             goodput_config_dict=goodput_config_dict,
+            reasoning_effort=args.reasoning_effort,
         )
     )
 
@@ -1029,6 +1033,13 @@ def create_argument_parser():
         type=float,
         default=1.0,
         help="Ratio of Structured Outputs requests",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=None,
+        choices=["low", "medium", "high"],
+        help="Reasoning effort level for reasoning models (e.g., GPT-OSS)",
     )
 
     return parser
