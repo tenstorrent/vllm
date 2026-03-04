@@ -712,10 +712,9 @@ class TTModelRunner:
             bitmask = torch.from_numpy(bitmask)
             # unpadded for prefill, padded for decode
             batch_length = input_tokens.shape[0]
-            grammar_bitmask_length = bitmask.shape[1]
             # Ones in the compressed bitmask represent tokens that are allowed.
             reordered_bitmask = torch.zeros(
-                (batch_length, grammar_bitmask_length), dtype=torch.int32
+                (batch_length, self.bitmask_size), dtype=torch.int32
             )
             reordered_bitmask = torch.bitwise_not(reordered_bitmask)
             # `structured_output_request_ids` is produced by the scheduler as a
@@ -1427,10 +1426,6 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # Structured outputs are not supported on device yet
-        # https://github.com/tenstorrent/vllm/issues/277
-        if has_structured_outputs:
-            return False
 
         # Logprobs on device require multi-device setups (num_devices in {8,32}).
         # On single device, all logprobs require host sampling.
@@ -1536,6 +1531,12 @@ class TTModelRunner:
                 # reset_batch is precomputed (for non-DP in
                 # _prepare_model_inputs; for DP after inputs are gathered).
                 kwargs["reset_batch"] = model_input.reset_batch
+
+            # If sampling on device, we pass the bitmask as well
+            # Concat it first
+            joint_bitmask = self.prepare_bitmask_for_device(
+                is_decode, batch_size_per_dp, model_input.grammar_bitmask)
+            kwargs["bitmask"] = joint_bitmask
 
         # Execute model
         if not is_decode:
@@ -1815,6 +1816,43 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp, logprobs_per_dp
+
+    def prepare_bitmask_for_device(
+            self, is_decode: bool, batch_size_per_dp: list[int],
+            grammar_bitmask_list: list[torch.Tensor | None]
+    ) -> torch.Tensor:
+        """Prepare the bitmask for device sampling
+           Return None if no structured output requests are present
+           or a len(joint_input_batch) x ceil(vocab_size/32) tensor
+           if structured output requests are present"""
+
+        if all(x is None for x in grammar_bitmask_list):
+            return None
+
+        # We want to match the shape of the joint input batch
+        if is_decode:
+            total_batch_size = self.scheduler_config.max_num_seqs * len(
+                batch_size_per_dp)
+        else:
+            total_batch_size = sum(batch_size_per_dp)
+
+
+        # We can't just concatenate because some bitmasks may be None
+        # Ones in the compressed bitmask represent tokens that are allowed.
+        joint_bitmask = torch.zeros((total_batch_size, self.bitmask_size),
+                                    dtype=torch.int32)
+        joint_bitmask = torch.bitwise_not(joint_bitmask)
+        start = 0
+        for dp_rank, sz in enumerate(batch_size_per_dp):
+            if grammar_bitmask_list[dp_rank] is not None:
+                joint_bitmask[start:start +
+                              sz, :] = grammar_bitmask_list[dp_rank][start:start+sz, :]
+            if is_decode:
+                start += self.scheduler_config.max_num_seqs
+            else:
+                start += sz
+
+        return joint_bitmask
 
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor
