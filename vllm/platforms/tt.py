@@ -140,11 +140,18 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:MistralForCausalLM",
     )
 
-    # Gemma3
+    # Gemma3 - Multimodal (gemma-3-4b-it, gemma-3-12b-it, gemma-3-27b-it)
     _register_model_if_missing(
         ModelRegistry,
         "TTGemma3ForConditionalGeneration",
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
+    )
+
+    # Gemma3 - Text-only (gemma-3-1b-it)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTGemma3ForCausalLM",
+        "models.tt_transformers.tt.generator_vllm:Gemma3ForCausalLM",
     )
 
     # DeepseekV3
