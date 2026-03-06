@@ -429,8 +429,21 @@ class EngineCore:
             assert hasattr(self, "_execute_model_dp_gather")
             model_output = self._execute_model_dp_gather(scheduler_output)
         else:
-            future = self.model_executor.execute_model(scheduler_output, non_block=True)
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            if current_platform.is_tt():
+                # TT consumes grammar constraints inside execute_model
+                # (worker-side), so materialize them on scheduler_output before
+                # submission.
+                if grammar_output is not None:
+                    scheduler_output.structured_output_request_ids = (
+                        grammar_output.structured_output_request_ids
+                    )
+                    scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
+                else:
+                    scheduler_output.structured_output_request_ids = None
+                    scheduler_output.grammar_bitmask = None
+
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
             with self.log_error_detail(scheduler_output):
                 model_output = future.result()
                 if model_output is None:
@@ -478,22 +491,52 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        exec_future: Future[ModelRunnerOutput] | None = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            exec_future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
+                exec_future = cast(
+                    Future[ModelRunnerOutput],
+                    self.model_executor.execute_model(scheduler_output, non_block=True),
+                )
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     if current_platform.is_tt():
+                        # TT consumes grammar constraints inside execute_model
+                        # (worker-side), so materialize grammar fields on
+                        # scheduler_output before execute_model submission.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        if grammar_output is not None:
+                            scheduler_output.structured_output_request_ids = (
+                                grammar_output.structured_output_request_ids
+                            )
+                            scheduler_output.grammar_bitmask = (
+                                grammar_output.grammar_bitmask
+                            )
+                        else:
+                            scheduler_output.structured_output_request_ids = None
+                            scheduler_output.grammar_bitmask = None
+                        exec_future = cast(
+                            Future[ModelRunnerOutput],
+                            self.model_executor.execute_model(
+                                scheduler_output, non_block=True
+                            ),
+                        )
                         future = cast(Future[ModelRunnerOutput], exec_future)
                     else:
+                        exec_future = cast(
+                            Future[ModelRunnerOutput],
+                            self.model_executor.execute_model(
+                                scheduler_output, non_block=True
+                            ),
+                        )
                         exec_future.add_done_callback(
                             self._log_err_callback(scheduler_output)
                         )
@@ -504,13 +547,24 @@ class EngineCore:
                             grammar_output, non_block=True
                         )
                 else:
-                    if not current_platform.is_tt():
+                    # Structured-output grammar needs previous-step tokens.
+                    # For TT, grammar is consumed in execute_model path, so we
+                    # must defer execute_model submission itself.
+                    if current_platform.is_tt():
+                        deferred_scheduler_output = scheduler_output
+                    else:
+                        exec_future = cast(
+                            Future[ModelRunnerOutput],
+                            self.model_executor.execute_model(
+                                scheduler_output, non_block=True
+                            ),
+                        )
                         exec_future.add_done_callback(
                             self._log_err_callback(scheduler_output)
                         )
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                        # We need to defer sampling until we have processed the
+                        # model output from the prior step.
+                        deferred_scheduler_output = scheduler_output
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
@@ -546,6 +600,28 @@ class EngineCore:
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
             if current_platform.is_tt():
+                # For TT async path, grammar must be computed after prior output
+                # has updated request states, and before execute_model consumes
+                # scheduler_output in build_model_input.
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    deferred_scheduler_output
+                )
+                if grammar_output is not None:
+                    deferred_scheduler_output.structured_output_request_ids = (
+                        grammar_output.structured_output_request_ids
+                    )
+                    deferred_scheduler_output.grammar_bitmask = (
+                        grammar_output.grammar_bitmask
+                    )
+                else:
+                    deferred_scheduler_output.structured_output_request_ids = None
+                    deferred_scheduler_output.grammar_bitmask = None
+                exec_future = cast(
+                    Future[ModelRunnerOutput],
+                    self.model_executor.execute_model(
+                        deferred_scheduler_output, non_block=True
+                    ),
+                )
                 batch_queue.appendleft(
                     (
                         cast(Future[ModelRunnerOutput], exec_future),
