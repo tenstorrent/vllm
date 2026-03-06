@@ -354,10 +354,7 @@ class TTPlatform(Platform):
             if model_capabilities
             else False
         )
-        if (
-            vllm_config.scheduler_config.async_scheduling
-            and not supports_async_decode
-        ):
+        if vllm_config.scheduler_config.async_scheduling and not supports_async_decode:
             logger.warning(
                 "Async scheduling was requested, but TT model %s (%s) does not "
                 "declare support (`model_capabilities['supports_async_decode']`). "
@@ -369,13 +366,8 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.async_scheduling = False
             # If TT selected the async scheduler by default, switch back to
             # the standard TT scheduler. Keep user-provided custom scheduler.
-            if (
-                vllm_config.scheduler_config.scheduler_cls
-                == TT_ASYNC_SCHEDULER_CLS
-            ):
-                vllm_config.scheduler_config.scheduler_cls = (
-                    TT_STANDARD_SCHEDULER_CLS
-                )
+            if vllm_config.scheduler_config.scheduler_cls == TT_ASYNC_SCHEDULER_CLS:
+                vllm_config.scheduler_config.scheduler_cls = TT_STANDARD_SCHEDULER_CLS
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

@@ -24,10 +24,10 @@ from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
-from vllm.platforms import current_platform
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import engine_receiver_cache_from_config
+from vllm.platforms import current_platform
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils.gc_utils import (
@@ -492,9 +492,7 @@ class EngineCore:
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     if current_platform.is_tt():
-                        future = cast(
-                            Future[ModelRunnerOutput], exec_future
-                        )
+                        future = cast(Future[ModelRunnerOutput], exec_future)
                     else:
                         exec_future.add_done_callback(
                             self._log_err_callback(scheduler_output)

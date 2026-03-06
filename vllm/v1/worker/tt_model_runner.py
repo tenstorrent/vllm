@@ -120,7 +120,7 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
 
     def __init__(
         self,
-        runner: "TTModelRunner",
+        runner: TTModelRunner,
         tt_out: Any | None,
         model_input: TTModelInput,
         batch_size_per_dp: list[int],
@@ -159,9 +159,7 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         )
 
         tt_log_probs = None
-        assert isinstance(
-            self._sampling_params.enable_log_probs, torch.Tensor
-        )
+        assert isinstance(self._sampling_params.enable_log_probs, torch.Tensor)
         if (
             self._perform_device_sampling
             and self._sampling_params.enable_log_probs.any()
@@ -2047,9 +2045,7 @@ class TTModelRunner:
         num_reqs = len(req_ids)
         sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
         if sampled_token_ids_np.dtype != np.int32:
-            sampled_token_ids_np = sampled_token_ids_np.astype(
-                np.int32, copy=False
-            )
+            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
         # Write the sampled token into persistent batch token storage so
         # that _prepare_model_inputs reads it as the next decode input.
@@ -2064,8 +2060,8 @@ class TTModelRunner:
             output_token_ids = self.requests[req_id].output_token_ids
             output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = (
-            dict.fromkeys(req_ids, None)
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
+            req_ids, None
         )
 
         return ModelRunnerOutput(
