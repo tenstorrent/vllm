@@ -23,6 +23,9 @@ else:
 
 logger = init_logger(__name__)
 
+TT_ASYNC_SCHEDULER_CLS = "vllm.v1.core.sched.tt_scheduler.TTScheduler"
+TT_STANDARD_SCHEDULER_CLS = "vllm.v1.core.sched.ascend_scheduler.AscendScheduler"
+
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
     """Register `model_arch` only if not already registered.
@@ -278,9 +281,7 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
-            vllm_config.scheduler_config.scheduler_cls = (
-                "vllm.v1.core.sched.ascend_scheduler.AscendScheduler"
-            )
+            vllm_config.scheduler_config.scheduler_cls = TT_ASYNC_SCHEDULER_CLS
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -371,6 +372,35 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # Model-gated async scheduling.
+        supports_async_decode = (
+            model_capabilities.get("supports_async_decode", False)
+            if model_capabilities
+            else False
+        )
+        if (
+            vllm_config.scheduler_config.async_scheduling
+            and not supports_async_decode
+        ):
+            logger.warning(
+                "Async scheduling was requested, but TT model %s (%s) does not "
+                "declare support (`model_capabilities['supports_async_decode']`). "
+                "Disabling async scheduling and falling back to standard TT "
+                "scheduler.",
+                model_class.__name__,
+                model_class.__module__,
+            )
+            vllm_config.scheduler_config.async_scheduling = False
+            # If TT selected the async scheduler by default, switch back to
+            # the standard TT scheduler. Keep user-provided custom scheduler.
+            if (
+                vllm_config.scheduler_config.scheduler_cls
+                == TT_ASYNC_SCHEDULER_CLS
+            ):
+                vllm_config.scheduler_config.scheduler_cls = (
+                    TT_STANDARD_SCHEDULER_CLS
+                )
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

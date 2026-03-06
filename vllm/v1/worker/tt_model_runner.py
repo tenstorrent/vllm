@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,6 +23,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -164,6 +166,93 @@ class TTModelInput:
     reset_batch: bool = False
 
 
+class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
+    """Wraps a non-blocking TT decode submission.
+
+    Returned by ``_execute_model_async_decode`` so that the executor can
+    defer the blocking device-sync / readback to a worker thread while the
+    main thread continues scheduling the next batch.
+
+    ``req_ids`` and ``req_id_to_index`` are captured at submit time because
+    ``input_batch`` may be overwritten by the next step before
+    ``get_output()`` runs.
+    """
+
+    def __init__(
+        self,
+        runner: "TTModelRunner",
+        tt_out: Any | None,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+        sampling_params: TTSamplingParams,
+        perform_device_sampling: bool,
+        completion_event: threading.Event,
+        req_ids: list[str],
+        req_id_to_index: dict[str, int],
+    ):
+        self._runner = runner
+        self._tt_out = tt_out
+        self._model_input = model_input
+        self._batch_size_per_dp = batch_size_per_dp
+        self._sampling_params = sampling_params
+        self._perform_device_sampling = perform_device_sampling
+        self._completion_event = completion_event
+        self._req_ids = req_ids
+        self._req_id_to_index = req_id_to_index
+
+    def get_output(self) -> ModelRunnerOutput:
+        try:
+            return self._get_output_impl()
+        finally:
+            self._completion_event.set()
+
+    def _get_output_impl(self) -> ModelRunnerOutput:
+        runner = self._runner
+        tt_out_raw = self._tt_out
+
+        if tt_out_raw is None:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        tt_out = runner.model.sync_and_read_decode_output(
+            tt_out_raw,
+            is_tokens=self._perform_device_sampling,
+        )
+
+        tt_log_probs = None
+        assert isinstance(
+            self._sampling_params.enable_log_probs, torch.Tensor
+        )
+        if (
+            self._perform_device_sampling
+            and self._sampling_params.enable_log_probs.any()
+        ):
+            assert isinstance(tt_out, tuple) and len(tt_out) == 2
+            tt_out, tt_log_probs = tt_out
+        elif isinstance(tt_out, tuple):
+            tt_out, _ = tt_out
+
+        sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
+            tt_out=tt_out,
+            tt_log_probs=tt_log_probs,
+            sampling_params=self._sampling_params,
+            model_input=self._model_input,
+            batch_size_per_dp=self._batch_size_per_dp,
+            perform_device_sampling=self._perform_device_sampling,
+            is_decode=True,
+        )
+
+        sampled_token_ids = sampled_token_ids_per_dp[0]
+        logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
+        logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+
+        return runner.generate_runner_output_from_async(
+            req_ids=self._req_ids,
+            req_id_to_index=self._req_id_to_index,
+            sampled_token_ids=sampled_token_ids,
+            logprobs=logprobs,
+        )
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -237,6 +326,16 @@ class TTModelRunner:
         # change during prefill steps (e.g. new requests added), so we keep a
         # sticky flag and clear it only after a decode input consumes it.
         self._decode_layout_changed_since_last_decode: bool = True
+
+        # Async scheduling: overlap CPU scheduling with device execution.
+        # Only supported for DP=1 (DP>1 uses a different execution path).
+        self.async_scheduling = (
+            self.scheduler_config.async_scheduling
+            and self.parallel_config.data_parallel_size == 1
+        )
+        # Guards single in-flight async decode. Set when an async decode is
+        # submitted; cleared when get_output() completes on the async thread.
+        self._pending_async_event: threading.Event | None = None
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -1377,20 +1476,35 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         """Execution path for non-DP case.
-        Execute the model with the given scheduler output."""
+        Execute the model with the given scheduler output.
+
+        When ``async_scheduling`` is enabled and the step is a decode,
+        returns ``AsyncTTModelRunnerOutput`` (the trace is submitted but
+        the device has not been synced yet).  The executor puts
+        ``get_output()`` on its async thread and returns a Future.
+        """
         # In the DP case, this function is skipped!
         # tt_worker.py directly calls execute_with_model_input
         # With DP, the actual model pass happens on a batch
         # produced by concatenating the inputs from all DP ranks.
+
+        # Wait for any in-flight async decode from the previous step.
+        if self._pending_async_event is not None:
+            self._pending_async_event.wait()
+            self._pending_async_event = None
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        # Only 1 DP rank here
+        is_decode = model_input.prompt_lens is None
+        if self.async_scheduling and is_decode:
+            return self._execute_model_async_decode(model_input)
+
+        # Synchronous path (prefill, or decode without async scheduling)
         sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input(  # noqa: E501
             model_input
         )
@@ -1399,6 +1513,111 @@ class TTModelRunner:
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
         output = self.generate_runner_output(sampled_token_ids, logprobs)
         return output
+
+    def _execute_model_async_decode(
+        self,
+        model_input: TTModelInput,
+    ) -> AsyncTTModelRunnerOutput:
+        """Submit a decode trace without blocking for device completion.
+
+        Mirrors the decode path of ``execute_with_model_input`` but passes
+        ``read_from_device=False`` so that ``decode_forward`` returns device
+        tensors immediately.  The actual sync + readback + sampling happens
+        later inside ``AsyncTTModelRunnerOutput.get_output()``.
+        """
+        event = threading.Event()
+
+        batch_size_per_dp = model_input.unpadded_batch_size
+        if not isinstance(batch_size_per_dp, list):
+            batch_size_per_dp = [batch_size_per_dp]
+
+        if not any(bs > 0 for bs in batch_size_per_dp):
+            event.set()
+            self._pending_async_event = event
+            num_reqs = self.input_batch.num_reqs
+            return AsyncTTModelRunnerOutput(
+                runner=self,
+                tt_out=None,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                sampling_params=model_input.tt_sampling_params,
+                perform_device_sampling=model_input.perform_device_sampling,
+                completion_event=event,
+                req_ids=list(self.input_batch.req_ids[:num_reqs]),
+                req_id_to_index=dict(self.input_batch.req_id_to_index),
+            )
+
+        kwargs: dict[str, Any] = {
+            "tokens": model_input.input_tokens,
+            "page_table": model_input.block_tables,
+            "kv_cache": self.kv_caches,
+            "start_pos": model_input.input_positions,
+        }
+
+        sampling_params = model_input.tt_sampling_params
+        perform_device_sampling = model_input.perform_device_sampling
+        if perform_device_sampling:
+            sampling_param_dict = {
+                field.name: (
+                    getattr(sampling_params, field.name).tolist()
+                    if getattr(sampling_params, field.name) is not None
+                    else None
+                )
+                for field in fields(sampling_params)
+            }
+            sampling_param_dict["seed"] = [
+                None if s == SEED_NONE_SENTINEL else s
+                for s in sampling_param_dict["seed"]
+            ]
+            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+
+            if model_input.prompt_tokens is not None:
+                assert model_input.output_tokens is not None
+                kwargs["prompt_tokens"] = model_input.prompt_tokens
+                kwargs["output_tokens"] = model_input.output_tokens
+
+            kwargs["reset_batch"] = model_input.reset_batch
+
+        enc_dec_kwargs: dict[str, Any] = {}
+        if self.request_specific_rope:
+            if any(
+                req_id not in self.previous_req_ids
+                for req_id in self.input_batch.req_ids
+            ):
+                enc_dec_kwargs = {
+                    "rope_deltas_all_users": [
+                        self.requests[req_id].mrope_position_delta
+                        for req_id in self.input_batch.req_ids
+                    ]
+                }
+            else:
+                enc_dec_kwargs = {"rope_deltas_all_users": None}
+            self.previous_req_ids = set(self.input_batch.req_ids)
+
+        enable_trace = self.trace_mode in ["all", "decode_only"]
+        tt_out = self.model.decode_forward(
+            **kwargs,
+            **enc_dec_kwargs,
+            enable_trace=enable_trace,
+            read_from_device=False,
+        )
+
+        # Capture req_ids/req_id_to_index now - input_batch will be
+        # overwritten by the next step's build_model_input before
+        # get_output() runs on the async thread.
+        self._pending_async_event = event
+        num_reqs = self.input_batch.num_reqs
+        return AsyncTTModelRunnerOutput(
+            runner=self,
+            tt_out=tt_out,
+            model_input=model_input,
+            batch_size_per_dp=batch_size_per_dp,
+            sampling_params=sampling_params,
+            perform_device_sampling=perform_device_sampling,
+            completion_event=event,
+            req_ids=list(self.input_batch.req_ids[:num_reqs]),
+            req_id_to_index=dict(self.input_batch.req_id_to_index),
+        )
 
     def check_perform_device_sampling(
         self, is_decode: bool, has_structured_outputs: bool
@@ -1899,6 +2118,60 @@ class TTModelRunner:
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids=[
+                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
+            ],
+            logprobs=logprobs,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            pooler_output=[],
+        )
+
+    def generate_runner_output_from_async(
+        self,
+        req_ids: list[str],
+        req_id_to_index: dict[str, int],
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None = None,
+    ) -> ModelRunnerOutput:
+        """Build ``ModelRunnerOutput`` for an async decode step.
+
+        Runs on the async output thread after device sync + sampling.
+        Updates ``self.input_batch`` (token_ids_cpu and num_tokens) so
+        that the next step's ``_prepare_model_inputs`` reads the correct
+        decode input token.  Thread-safe: ``_pending_async_event.wait()``
+        on the main thread guarantees this method completes before
+        ``build_model_input`` accesses ``input_batch``.
+
+        Uses *captured* ``req_ids`` / ``req_id_to_index`` for the
+        ``ModelRunnerOutput`` since those reflect the batch at submit time.
+        """
+        num_reqs = len(req_ids)
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if sampled_token_ids_np.dtype != np.int32:
+            sampled_token_ids_np = sampled_token_ids_np.astype(
+                np.int32, copy=False
+            )
+
+        # Write the sampled token into persistent batch token storage so
+        # that _prepare_model_inputs reads it as the next decode input.
+        start_idxs = self.input_batch.num_tokens[:num_reqs]
+        end_idxs = start_idxs + 1
+        rows = np.arange(num_reqs)
+        self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
+        self.input_batch.num_tokens[:num_reqs] = end_idxs
+
+        for req_idx in range(num_reqs):
+            req_id = req_ids[req_idx]
+            output_token_ids = self.requests[req_id].output_token_ids
+            output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = (
+            dict.fromkeys(req_ids, None)
+        )
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
             sampled_token_ids=[
                 sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
             ],

@@ -24,6 +24,7 @@ from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
+from vllm.platforms import current_platform
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import engine_receiver_cache_from_config
@@ -121,6 +122,11 @@ class EngineCore:
 
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        logger.info(
+            "Scheduler class: %s, async_scheduling=%s",
+            Scheduler.__name__,
+            vllm_config.scheduler_config.async_scheduling,
+        )
 
         if len(kv_cache_config.kv_cache_groups) == 0:
             # Encoder models without KV cache don't support
@@ -484,18 +490,26 @@ class EngineCore:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
-                exec_future.add_done_callback(self._log_err_callback(scheduler_output))
-
                 if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                    if current_platform.is_tt():
+                        future = cast(
+                            Future[ModelRunnerOutput], exec_future
+                        )
+                    else:
+                        exec_future.add_done_callback(
+                            self._log_err_callback(scheduler_output)
+                        )
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
                 else:
+                    if not current_platform.is_tt():
+                        exec_future.add_done_callback(
+                            self._log_err_callback(scheduler_output)
+                        )
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
@@ -533,11 +547,21 @@ class EngineCore:
         if deferred_scheduler_output:
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
-            )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output))
+            if current_platform.is_tt():
+                batch_queue.appendleft(
+                    (
+                        cast(Future[ModelRunnerOutput], exec_future),
+                        deferred_scheduler_output,
+                    )
+                )
+            else:
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    deferred_scheduler_output
+                )
+                future = self.model_executor.sample_tokens(
+                    grammar_output, non_block=True
+                )
+                batch_queue.appendleft((future, deferred_scheduler_output))
 
         return engine_core_outputs, model_executed
 
