@@ -259,9 +259,23 @@ class TTPlatform(Platform):
         register_tt_models(register_test_models)
 
         parallel_config = vllm_config.parallel_config
+        if (
+            vllm_config.scheduler_config.async_scheduling
+            and parallel_config.data_parallel_size > 1
+        ):
+            logger.warning(
+                "Async scheduling on TT is only supported with data_parallel_size=1. "
+                "Got data_parallel_size=%d, disabling async scheduling.",
+                parallel_config.data_parallel_size,
+            )
+            vllm_config.scheduler_config.async_scheduling = False
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
-            vllm_config.scheduler_config.scheduler_cls = TT_ASYNC_SCHEDULER_CLS
+            vllm_config.scheduler_config.scheduler_cls = (
+                TT_ASYNC_SCHEDULER_CLS
+                if vllm_config.scheduler_config.async_scheduling
+                else TT_STANDARD_SCHEDULER_CLS
+            )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -368,6 +382,14 @@ class TTPlatform(Platform):
             # the standard TT scheduler. Keep user-provided custom scheduler.
             if vllm_config.scheduler_config.scheduler_cls == TT_ASYNC_SCHEDULER_CLS:
                 vllm_config.scheduler_config.scheduler_cls = TT_STANDARD_SCHEDULER_CLS
+
+        # Guardrail: when async scheduling is disabled, do not leave the TT
+        # async scheduler selected.
+        if (
+            not vllm_config.scheduler_config.async_scheduling
+            and vllm_config.scheduler_config.scheduler_cls == TT_ASYNC_SCHEDULER_CLS
+        ):
+            vllm_config.scheduler_config.scheduler_cls = TT_STANDARD_SCHEDULER_CLS
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

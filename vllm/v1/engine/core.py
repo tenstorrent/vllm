@@ -427,6 +427,18 @@ class EngineCore:
         if hasattr(self, "requires_gather") and self.requires_gather:
             # Different execution path for gathered batch DP.
             assert hasattr(self, "_execute_model_dp_gather")
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            # DP gather path for TT still consumes structured constraints from
+            # scheduler_output in worker-side model input building.
+            if current_platform.is_tt():
+                if grammar_output is not None:
+                    scheduler_output.structured_output_request_ids = (
+                        grammar_output.structured_output_request_ids
+                    )
+                    scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
+                else:
+                    scheduler_output.structured_output_request_ids = None
+                    scheduler_output.grammar_bitmask = None
             model_output = self._execute_model_dp_gather(scheduler_output)
         else:
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
