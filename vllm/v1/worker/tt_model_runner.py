@@ -2072,6 +2072,11 @@ class TTModelRunner:
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         num_reqs = self.input_batch.num_reqs
+        # Snapshot request mapping for this step. The batch queue may allow a
+        # later step to run and mutate input_batch before EngineCore consumes
+        # this ModelRunnerOutput.
+        req_ids = list(self.input_batch.req_ids[:num_reqs])
+        req_id_to_index = dict(self.input_batch.req_id_to_index)
         assert sampled_token_ids.shape[0] == num_reqs, (
             f"Number of request outputs {sampled_token_ids.shape[0]} != "
             f"number of requests in input batch {num_reqs}"
@@ -2109,13 +2114,13 @@ class TTModelRunner:
 
         # Empty prompt log probs
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
-            self.input_batch.req_ids[:num_reqs], None
+            req_ids, None
         )
 
         # Note: currently does not support speculative decoding or pooling.
         return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
             sampled_token_ids=[
                 sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
             ],
