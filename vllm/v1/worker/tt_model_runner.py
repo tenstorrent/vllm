@@ -138,6 +138,7 @@ class TTModelInput:
 
     # always lists: single-element for non-DP, multi-element for DP
     # If not used, [None]
+    # each bitmask is (batch_size, bitmask_size)
     grammar_bitmask: list[torch.Tensor | None]
 
     # Host-only sampling params - lists for DP (one per rank), single-element
@@ -1846,7 +1847,7 @@ class TTModelRunner:
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if grammar_bitmask_list[dp_rank] is not None:
                 joint_bitmask[start:start +
-                              sz, :] = grammar_bitmask_list[dp_rank][start:start+sz, :]
+                              sz, :] = grammar_bitmask_list[dp_rank][:sz, :]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
