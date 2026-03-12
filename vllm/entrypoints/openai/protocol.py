@@ -945,6 +945,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             if top_logprobs < 0 and top_logprobs != -1:
                 raise ValueError("`top_logprobs` must be a positive value or -1.")
 
+            # Validate top_logprobs range: must be between 0 and 20 (OpenAI API limit).
+            # Return HTTP 400 immediately rather than silently clipping or crashing.
+            if top_logprobs > 20:
+                raise ValueError(
+                    f"`top_logprobs` must be between 0 and 20 (inclusive), "
+                    f"got {top_logprobs}."
+                )
+
             if (top_logprobs == -1 or top_logprobs > 0) and not data.get("logprobs"):
                 raise ValueError(
                     "when using `top_logprobs`, `logprobs` must be set to true."
