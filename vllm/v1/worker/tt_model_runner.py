@@ -1846,8 +1846,17 @@ class TTModelRunner:
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if grammar_bitmask_list[dp_rank] is not None:
-                joint_bitmask[start:start +
-                              sz, :] = grammar_bitmask_list[dp_rank][:sz, :]
+                if is_decode:
+                    # Decode bitmasks are already in padded slot layout
+                    # (max_num_seqs rows per DP rank). Copy the full slot block
+                    # so row-to-slot alignment is preserved.
+                    stride = self.scheduler_config.max_num_seqs
+                    joint_bitmask[start:start + stride, :] = grammar_bitmask_list[
+                        dp_rank
+                    ][:stride, :]
+                else:
+                    joint_bitmask[start:start +
+                                  sz, :] = grammar_bitmask_list[dp_rank][:sz, :]
             if is_decode:
                 start += self.scheduler_config.max_num_seqs
             else:
