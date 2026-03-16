@@ -5,7 +5,7 @@ from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
@@ -20,10 +20,13 @@ class TTScheduler(AsyncScheduler):
       or all-decode.
     - No chunked prefill: each prefill must be scheduled in full.
 
-    Inherits from AsyncScheduler to get num_output_placeholders support,
-    which allows decode requests to be re-scheduled before
-    update_from_output processes the previous step's results.  This is
-    essential for overlapping CPU scheduling with device execution.
+    Inherits from AsyncScheduler to get num_output_placeholders support.
+    TT uses this scheduler in both sync and async execution modes:
+    - with async_scheduling=False, it behaves as the single TT scheduler
+      without execution overlap
+    - with async_scheduling=True, placeholders allow decode requests to be
+      re-scheduled before update_from_output processes the previous step's
+      results, enabling host/device overlap
 
     Supports ``set_forced_mode`` for DP-gather coordination:
     - ``0`` forces decode-only (even if waiting queue is non-empty).
@@ -56,13 +59,16 @@ class TTScheduler(AsyncScheduler):
         #   mode == 0 -> decode-only
         if mode == 1:
             # If waiting is empty, this intentionally returns an empty batch.
-            return self._schedule_prefill_only()
+            result = self._schedule_prefill_only()
+            return self._finalize_scheduler_output(result)
         if mode == 0:
             if has_waiting:
                 # Hide waiting so base scheduler cannot admit prefill.
-                return self._schedule_decode_only()
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result)
             # No waiting requests: base scheduler naturally runs decode-only.
-            return super().schedule()
+            result = super().schedule()
+            return self._finalize_scheduler_output(result)
 
         # Default mode (mode is None):
         # Prefer prefill whenever waiting is non-empty to admit new requests.
@@ -86,11 +92,34 @@ class TTScheduler(AsyncScheduler):
                 and bool(self.waiting)
                 and not has_prefill_running
             ):
-                return self._schedule_decode_only()
-            return prefill_result
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result)
+            return self._finalize_scheduler_output(prefill_result)
 
         # No waiting requests in default mode: run decode-only naturally.
-        return super().schedule()
+        result = super().schedule()
+        return self._finalize_scheduler_output(result)
+
+    def _finalize_scheduler_output(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        if not scheduler_output.pending_structured_output_tokens:
+            self.get_grammar_bitmask(scheduler_output)
+        return scheduler_output
+
+    def get_grammar_bitmask(
+        self, scheduler_output: SchedulerOutput
+    ) -> GrammarOutput | None:
+        grammar_output = super().get_grammar_bitmask(scheduler_output)
+        if grammar_output is not None:
+            scheduler_output.structured_output_request_ids = (
+                grammar_output.structured_output_request_ids
+            )
+            scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
+        else:
+            scheduler_output.structured_output_request_ids = None
+            scheduler_output.grammar_bitmask = None
+        return grammar_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule only waiting (prefill) requests.

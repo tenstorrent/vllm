@@ -101,6 +101,27 @@ class UniProcExecutor(Executor):
             single_value=True,
         )
 
+    def concat_and_execute_dp(
+        self,
+        inputs: Any,
+        is_decode: bool,
+        max_blocks_decode_batch: int | None,
+        any_structured_inputs: bool,
+        non_block: bool = False,
+    ) -> tuple[torch.Tensor, list[Any]] | Future[tuple[torch.Tensor, list[Any]]]:
+        return self.collective_rpc(
+            "concat_and_execute_dp",
+            args=(
+                inputs,
+                is_decode,
+                max_blocks_decode_batch,
+                any_structured_inputs,
+            ),
+            kwargs={"non_block": non_block},
+            non_block=non_block,
+            single_value=True,
+        )
+
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:

@@ -10,8 +10,10 @@ from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from inspect import isclass, signature
 from logging import DEBUG
+from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import msgspec
@@ -77,6 +79,17 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+@dataclass
+class DPGatherHandle:
+    future: Future[tuple[torch.Tensor, list]]
+    scheduler_output: SchedulerOutput | None
+    local_has_requests: bool
+    is_decode: bool
+    any_needs_logprobs: bool
+    req_ids: list[str]
+    req_id_to_index: dict[str, int]
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -101,6 +114,7 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self._init_debug_viztracer()
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -424,38 +438,19 @@ class EngineCore:
             else:
                 self.dp_decode_streak = 0
 
-        if hasattr(self, "requires_gather") and self.requires_gather:
+        is_tt = current_platform.is_tt()
+        grammar_output = None
+
+        if requires_gather:
             # Different execution path for gathered batch DP.
+            if not is_tt:
+                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             assert hasattr(self, "_execute_model_dp_gather")
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-            # DP gather path for TT still consumes structured constraints from
-            # scheduler_output in worker-side model input building.
-            if current_platform.is_tt():
-                if grammar_output is not None:
-                    scheduler_output.structured_output_request_ids = (
-                        grammar_output.structured_output_request_ids
-                    )
-                    scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
-                else:
-                    scheduler_output.structured_output_request_ids = None
-                    scheduler_output.grammar_bitmask = None
             model_output = self._execute_model_dp_gather(scheduler_output)
         else:
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-            if current_platform.is_tt():
-                # TT consumes grammar constraints inside execute_model
-                # (worker-side), so materialize them on scheduler_output before
-                # submission.
-                if grammar_output is not None:
-                    scheduler_output.structured_output_request_ids = (
-                        grammar_output.structured_output_request_ids
-                    )
-                    scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
-                else:
-                    scheduler_output.structured_output_request_ids = None
-                    scheduler_output.grammar_bitmask = None
-
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
+            if not is_tt:
+                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 model_output = future.result()
                 if model_output is None:
@@ -519,22 +514,6 @@ class EngineCore:
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     if current_platform.is_tt():
-                        # TT consumes grammar constraints inside execute_model
-                        # (worker-side), so materialize grammar fields on
-                        # scheduler_output before execute_model submission.
-                        grammar_output = self.scheduler.get_grammar_bitmask(
-                            scheduler_output
-                        )
-                        if grammar_output is not None:
-                            scheduler_output.structured_output_request_ids = (
-                                grammar_output.structured_output_request_ids
-                            )
-                            scheduler_output.grammar_bitmask = (
-                                grammar_output.grammar_bitmask
-                            )
-                        else:
-                            scheduler_output.structured_output_request_ids = None
-                            scheduler_output.grammar_bitmask = None
                         exec_future = cast(
                             Future[ModelRunnerOutput],
                             self.model_executor.execute_model(
@@ -615,19 +594,7 @@ class EngineCore:
                 # For TT async path, grammar must be computed after prior output
                 # has updated request states, and before execute_model consumes
                 # scheduler_output in build_model_input.
-                grammar_output = self.scheduler.get_grammar_bitmask(
-                    deferred_scheduler_output
-                )
-                if grammar_output is not None:
-                    deferred_scheduler_output.structured_output_request_ids = (
-                        grammar_output.structured_output_request_ids
-                    )
-                    deferred_scheduler_output.grammar_bitmask = (
-                        grammar_output.grammar_bitmask
-                    )
-                else:
-                    deferred_scheduler_output.structured_output_request_ids = None
-                    deferred_scheduler_output.grammar_bitmask = None
+                self.scheduler.get_grammar_bitmask(deferred_scheduler_output)
                 exec_future = cast(
                     Future[ModelRunnerOutput],
                     self.model_executor.execute_model(
@@ -651,7 +618,206 @@ class EngineCore:
 
         return engine_core_outputs, model_executed
 
+    def _init_debug_viztracer(self) -> None:
+        self._debug_viztracer = None
+        self._debug_viztracer_started = False
+        self._debug_viztracer_capture_active = False
+        # VizTracer env vars:
+        # - `VLLM_VIZTRACE_MODE`: enables tracing and selects when capture starts.
+        #   Supported values are `first_request` and `first_dp_decode_submit`.
+        #   Unset or empty disables VizTracer.
+        # - `VLLM_VIZTRACE_STEPS`: number of engine steps to capture after
+        #   tracing becomes active. Default `200`, minimum `1`.
+        # - `VLLM_VIZTRACE_ENTRIES`: VizTracer buffer size (`tracer_entries`).
+        #   Default `2000000`, minimum `1000`.
+        # - `VLLM_VIZTRACE_MIN_DURATION_US`: minimum event duration passed to
+        #   VizTracer as `min_duration`. Default `0`.
+        # - `VLLM_VIZTRACE_USE_INCLUDE_FILTER`: when set to `1`, restricts the
+        #   trace to the curated `include_files` list built below. Default `0`.
+        # - `VLLM_VIZTRACE_ALL_RANKS`: when set to `1` with
+        #   `VLLM_VIZTRACE_MODE=first_dp_decode_submit`, start armed tracers on
+        #   all local DP ranks instead of only local rank 0. Default `0`.
+        # - `VLLM_VIZTRACE_OUTPUT_DIR`: directory where the trace JSON is
+        #   written. Default is the current working directory.
+        # Example: set all VizTracer env vars.
+        #   export VLLM_VIZTRACE_MODE=first_dp_decode_submit
+        #   export VLLM_VIZTRACE_STEPS=8000
+        #   export VLLM_VIZTRACE_ENTRIES=4000000
+        #   export VLLM_VIZTRACE_MIN_DURATION_US=0
+        #   export VLLM_VIZTRACE_USE_INCLUDE_FILTER=1
+        #   export VLLM_VIZTRACE_ALL_RANKS=1
+        #   export VLLM_VIZTRACE_OUTPUT_DIR=/tmp/vllm-viztraces
+        # Example: unset all VizTracer env vars.
+        #   unset VLLM_VIZTRACE_MODE
+        #   unset VLLM_VIZTRACE_STEPS
+        #   unset VLLM_VIZTRACE_ENTRIES
+        #   unset VLLM_VIZTRACE_MIN_DURATION_US
+        #   unset VLLM_VIZTRACE_USE_INCLUDE_FILTER
+        #   unset VLLM_VIZTRACE_ALL_RANKS
+        #   unset VLLM_VIZTRACE_OUTPUT_DIR
+        self._debug_viztracer_mode = os.environ.get("VLLM_VIZTRACE_MODE", "")
+        self._debug_viztracer_enabled = bool(self._debug_viztracer_mode)
+        self._debug_viztracer_steps_remaining = max(
+            int(os.environ.get("VLLM_VIZTRACE_STEPS", "200")),
+            1,
+        )
+        self._debug_viztracer_entries = max(
+            int(os.environ.get("VLLM_VIZTRACE_ENTRIES", "2000000")),
+            1000,
+        )
+        self._debug_viztracer_min_duration_us = max(
+            float(os.environ.get("VLLM_VIZTRACE_MIN_DURATION_US", "0")),
+            0.0,
+        )
+        self._debug_viztracer_use_include_filter = (
+            os.environ.get("VLLM_VIZTRACE_USE_INCLUDE_FILTER") == "1"
+        )
+        self._debug_viztracer_all_ranks = (
+            os.environ.get("VLLM_VIZTRACE_ALL_RANKS") == "1"
+        )
+        self._debug_viztracer_output_dir = os.environ.get(
+            "VLLM_VIZTRACE_OUTPUT_DIR",
+            os.getcwd(),
+        )
+
+        repo_root = Path(__file__).resolve().parents[3]
+        include_files = [
+            repo_root / "vllm/v1/engine/core.py",
+            repo_root / "vllm/v1/executor/uniproc_executor.py",
+            repo_root / "vllm/v1/worker/tt_worker.py",
+            repo_root / "vllm/v1/worker/tt_model_runner.py",
+            repo_root.parent / "tt-metal/models/demos/llama3_70b_galaxy/tt/generator.py",
+            repo_root.parent / "tt-metal/models/tt_transformers/tt/generator.py",
+        ]
+        self._debug_viztracer_include_files = [
+            str(path) for path in include_files if path.exists()
+        ]
+
+        if self._debug_viztracer_mode == "first_dp_decode_submit":
+            self._start_debug_viztracer(armed_only=True)
+
+    def _start_debug_viztracer(self, armed_only: bool) -> None:
+        if not self._debug_viztracer_enabled or self._debug_viztracer_started:
+            return
+
+        try:
+            from viztracer import VizTracer
+        except ImportError:
+            logger.warning(
+                "VizTracer debugging was requested but viztracer is not installed."
+            )
+            self._debug_viztracer_enabled = False
+            return
+
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        if (
+            self._debug_viztracer_mode == "first_dp_decode_submit"
+            and not self._debug_viztracer_all_ranks
+            and local_dp_rank != 0
+        ):
+            return
+
+        filename_stem = (
+            "viztrace-first-dp-decode-submit"
+            if self._debug_viztracer_mode == "first_dp_decode_submit"
+            else "viztrace-first-request"
+        )
+        output_path = os.path.join(
+            self._debug_viztracer_output_dir,
+            f"{filename_stem}-pid{os.getpid()}-dp{dp_rank}-ldp{local_dp_rank}.json",
+        )
+        tracer_kwargs: dict[str, Any] = {
+            "output_file": output_path,
+            "tracer_entries": self._debug_viztracer_entries,
+            "pid_suffix": False,
+            "min_duration": self._debug_viztracer_min_duration_us,
+        }
+        if self._debug_viztracer_use_include_filter:
+            tracer_kwargs["include_files"] = self._debug_viztracer_include_files
+        tracer_kwargs["process_name"] = (
+            f"EngineCore_DP{dp_rank}_LDP{local_dp_rank}"
+        )
+        tracer = VizTracer(**tracer_kwargs)
+        tracer.start()
+        self._debug_viztracer = tracer
+        self._debug_viztracer_started = True
+        self._debug_viztracer_capture_active = not armed_only
+        logger.info(
+            "Started VizTracer: mode=%s output=%s steps=%d entries=%d include_filter=%s armed_only=%s",
+            self._debug_viztracer_mode,
+            output_path,
+            self._debug_viztracer_steps_remaining,
+            self._debug_viztracer_entries,
+            self._debug_viztracer_use_include_filter,
+            armed_only,
+        )
+
+    def _maybe_start_debug_viztracer(
+        self, request_type: EngineCoreRequestType
+    ) -> None:
+        if (
+            self._debug_viztracer_mode != "first_request"
+            or request_type != EngineCoreRequestType.ADD
+        ):
+            return
+        self._start_debug_viztracer(armed_only=False)
+
+    def _maybe_trigger_debug_viztracer_on_dp_decode_submit(
+        self, is_decode: bool, local_dp_rank: int
+    ) -> None:
+        if (
+            self._debug_viztracer_mode != "first_dp_decode_submit"
+            or not self._debug_viztracer_started
+            or self._debug_viztracer_capture_active
+            or not is_decode
+            or local_dp_rank != 0
+        ):
+            return
+        assert self._debug_viztracer is not None
+        self._debug_viztracer_capture_active = True
+        self._debug_viztracer.log_instant(
+            "VLLM_VIZTRACE_TRIGGER:first_dp_decode_submit",
+            args={
+                "pid": os.getpid(),
+                "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
+                "local_dp_rank": local_dp_rank,
+            },
+            scope="p",
+        )
+        logger.info(
+            "Activated VizTracer capture on first DP decode submit: pid=%d dp_rank=%s local_dp_rank=%s",
+            os.getpid(),
+            self.vllm_config.parallel_config.data_parallel_rank,
+            local_dp_rank,
+        )
+
+    def _maybe_advance_debug_viztracer(self) -> None:
+        if (
+            not self._debug_viztracer_started
+            or not self._debug_viztracer_capture_active
+        ):
+            return
+        self._debug_viztracer_steps_remaining -= 1
+        if self._debug_viztracer_steps_remaining <= 0:
+            self._stop_debug_viztracer("captured configured number of engine steps")
+
+    def _stop_debug_viztracer(self, reason: str) -> None:
+        if not self._debug_viztracer_started or self._debug_viztracer is None:
+            return
+
+        tracer = self._debug_viztracer
+        self._debug_viztracer = None
+        self._debug_viztracer_started = False
+        try:
+            tracer.stop()
+            tracer.save()
+            logger.info("Saved VizTracer trace: %s", reason)
+        except Exception:
+            logger.exception("Failed to stop/save VizTracer trace")
+
     def shutdown(self):
+        self._stop_debug_viztracer("engine shutdown")
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1066,6 +1232,7 @@ class EngineCoreProc(EngineCore):
             not self.engines_running
             and not self.scheduler.has_requests()
             and not self.batch_queue
+            and not getattr(self, "_dp_in_flight", None)
         ):
             if hasattr(self, "requires_gather") and self.requires_gather:
                 # Non-blocking input polling so idle ranks can progress
@@ -1124,6 +1291,7 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        self._maybe_advance_debug_viztracer()
 
         return model_executed
 
@@ -1131,6 +1299,7 @@ class EngineCoreProc(EngineCore):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
+        self._maybe_start_debug_viztracer(request_type)
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
@@ -1379,6 +1548,10 @@ class DPEngineCoreProc(EngineCoreProc):
             client_handshake_address,
             dp_rank,
         )
+        if self.requires_gather:
+            self._dp_in_flight: DPGatherHandle | None = None
+            if self.batch_queue is not None:
+                self.step_fn = self.step_dp_with_batch_queue
 
     def _init_dp_group(self, parallel_config: ParallelConfig) -> None:
         """Initialize DP group in self.dp_group. For DP gather execution, also
@@ -1613,7 +1786,141 @@ class DPEngineCoreProc(EngineCoreProc):
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
 
-    def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
+    def _completed_dp_gather_future(self) -> Future[tuple[torch.Tensor, list]]:
+        parallel_config = self.vllm_config.parallel_config
+        world = parallel_config.data_parallel_size
+        batch_size = self.vllm_config.scheduler_config.max_num_seqs
+        future: Future[tuple[torch.Tensor, list]] = Future()
+        future.set_result(
+            (torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world)
+        )
+        return future
+
+    def _dp_any_rank_has_scheduler_requests(self) -> bool:
+        local_has_requests = 1 if self.scheduler.has_requests() else 0
+        has_requests_t = torch.tensor([local_has_requests], dtype=torch.int32)
+        try:
+            dist.all_reduce(has_requests_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+        except RuntimeError as e:
+            # During shutdown, peers may close connections mid-collective.
+            # Exit gracefully to allow coordinated shutdown.
+            if "Connection closed by peer" in str(e):
+                logger.debug(
+                    "Collective failed during shutdown, exiting gracefully"
+                )
+                raise SystemExit() from e
+            raise
+        return int(has_requests_t.item()) > 0
+
+    def _dp_negotiate_forced_mode(self) -> int:
+        # Max-consecutive-decoding guard: if there are waiting prefills
+        # and we decoded for dp_max_consec_decodes steps consecutively,
+        # force one prefill step. Otherwise, prefer decode while running.
+        # Can't automatically set intent to be prefill if there are any
+        # waiting requests since we could get stuck in a loop where intent
+        # is prefill but it doesn't get scheduled.
+        has_running = bool(getattr(self.scheduler, "running", []))
+        has_waiting = bool(getattr(self.scheduler, "waiting", False))
+        must_prefill = has_waiting and self.dp_decode_streak >= self.dp_max_consec_decodes
+        local_prefill_intent = (
+            1 if (has_waiting and (must_prefill or not has_running)) else 0
+        )
+        intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
+        self.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
+        dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=self.dp_group)
+        forced_mode = int(intent_tensor.item())  # 1=prefill, 0=decode
+        self.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
+        # Record forced_mode so it can be used by DP gather submission.
+        self._dp_gather_forced_mode = forced_mode
+        return forced_mode
+
+    def _dp_apply_forced_mode(self, forced_mode: int | None) -> None:
+        set_mode = getattr(self.scheduler, "set_forced_mode", None)
+        if callable(set_mode):
+            set_mode(forced_mode)
+
+    def _dp_update_decode_streak(
+        self, scheduler_output: SchedulerOutput | None, forced_mode: int | None
+    ) -> None:
+        if scheduler_output is None or forced_mode is None:
+            return
+        # This is intentionally stale by at most one step in async DP mode:
+        # forced-mode negotiation for step N+1 runs before update_from_output(N).
+        if scheduler_output.total_num_scheduled_tokens > 0 and forced_mode == 0:
+            self.dp_decode_streak += 1
+        else:
+            self.dp_decode_streak = 0
+
+    def step_dp_with_batch_queue(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        assert self.batch_queue is not None
+
+        global_has_requests = self._dp_any_rank_has_scheduler_requests()
+        in_flight = self._dp_in_flight
+        if not global_has_requests and in_flight is None:
+            return {}, False
+
+        forced_mode: int | None = None
+        scheduler_output: SchedulerOutput | None = None
+        model_executed = False
+        if global_has_requests:
+            forced_mode = self._dp_negotiate_forced_mode()
+            if self.scheduler.has_requests():
+                self._dp_apply_forced_mode(forced_mode)
+                scheduler_output = self.scheduler.schedule()
+                self._dp_apply_forced_mode(None)
+                self._dp_update_decode_streak(scheduler_output, forced_mode)
+                if not self.is_ec_producer:
+                    model_executed = (
+                        scheduler_output.total_num_scheduled_tokens > 0
+                    )
+
+        prev_model_output: ModelRunnerOutput | None = None
+        prev_scheduler_output: SchedulerOutput | None = None
+        engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
+        if in_flight is not None:
+            prev_model_output = self.dp_gather_finalize(in_flight)
+            prev_scheduler_output = in_flight.scheduler_output
+            self._dp_in_flight = None
+
+        if scheduler_output is not None and scheduler_output.pending_structured_output_tokens:
+            if prev_model_output is not None and prev_scheduler_output is not None:
+                engine_core_outputs = self.scheduler.update_from_output(
+                    prev_scheduler_output, prev_model_output
+                )
+                prev_model_output = None
+                prev_scheduler_output = None
+            self.scheduler.get_grammar_bitmask(scheduler_output)
+
+        if global_has_requests:
+            self._dp_in_flight = self.dp_gather_submit(scheduler_output)
+
+        if prev_model_output is not None and prev_scheduler_output is not None:
+            engine_core_outputs = self.scheduler.update_from_output(
+                prev_scheduler_output, prev_model_output
+            )
+            return engine_core_outputs, model_executed
+
+        if not global_has_requests:
+            return engine_core_outputs, False
+
+        return engine_core_outputs, model_executed
+
+    def dp_gather_submit(self, scheduler_output: SchedulerOutput | None) -> DPGatherHandle:
+        """Prepare and submit one gathered-DP execution step.
+
+        Collects per-rank DP inputs, negotiates the merged execution shape, and
+        returns a `DPGatherHandle` consumed by `dp_gather_finalize()` on the
+        next step.
+
+        This path is mixed-mode rather than purely sync or async:
+        - it is always synchronous for the host-side gather/orchestration work
+        - for prefill, the worker executes synchronously even though we pass
+          `non_block=True` through the executor boundary
+        - for decode, the worker uses the async decode submit path and returns
+          a future-like handle that is completed later in `dp_gather_finalize()`
+        """
         parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
@@ -1630,6 +1937,10 @@ class DPEngineCoreProc(EngineCoreProc):
         # 0=decode, 1=prefill.
         assert hasattr(self, "_dp_gather_forced_mode"), "forced_mode not set"
         is_decode = self._dp_gather_forced_mode == 0
+        self._maybe_trigger_debug_viztracer_on_dp_decode_submit(
+            is_decode=is_decode,
+            local_dp_rank=local_rank,
+        )
 
         # Build local dp model input (or None).
         all_local_inputs = self.model_executor.collective_rpc(
@@ -1643,11 +1954,14 @@ class DPEngineCoreProc(EngineCoreProc):
             local_reset_batch,
             local_can_sample_device,
             local_needs_logprobs,
+            req_ids,
+            req_id_to_index,
         ) = all_local_inputs
         max_blocks_decode = None  # Only used for decode.
         any_structured_inputs = False  # Only used for decode.
         any_needs_logprobs = False
 
+        gathered_inputs: Any = None
         if is_decode:
             # Gather max_blocks, has_structured, has_penalties, reset_batch,
             # cannot_sample_on_device, and needs_logprobs from all ranks.
@@ -1850,32 +2164,45 @@ class DPEngineCoreProc(EngineCoreProc):
                     gathered_inputs = pickle.loads(object_tensor.numpy().tobytes())
         self.dlog("after_inputs_gather")
 
-        # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
-        logprobs_per_dp: list = [None] * world
-        if local_rank == 0 and (
-            is_decode
-            or (
-                isinstance(gathered_inputs, list)
-                and any(x is not None for x in gathered_inputs)
-            )
-        ):
-            result: tuple[torch.Tensor, list] = self.model_executor.collective_rpc(
-                "concat_and_execute_dp",
-                args=(
+        should_submit = is_decode or (
+            isinstance(gathered_inputs, list)
+            and any(x is not None for x in gathered_inputs)
+        )
+        if should_submit:
+            future = cast(
+                Future[tuple[torch.Tensor, list]],
+                self.model_executor.concat_and_execute_dp(
                     gathered_inputs,
                     is_decode,
                     max_blocks_decode,
                     any_structured_inputs,
+                    non_block=True,
                 ),
-            )[0]
-            # Result is (send_tensor, logprobs_lists_per_dp)
-            assert isinstance(result, tuple) and len(result) == 2
-            send_tensor, logprobs_per_dp = result
-            assert isinstance(send_tensor, torch.Tensor)
+            )
         else:
-            B = self.vllm_config.scheduler_config.max_num_seqs
-            # Currently only supporting 1 output token per request.
-            send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
+            future = self._completed_dp_gather_future()
+
+        return DPGatherHandle(
+            future=future,
+            scheduler_output=scheduler_output,
+            local_has_requests=local_has_requests,
+            is_decode=is_decode,
+            any_needs_logprobs=any_needs_logprobs,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+        )
+
+    def dp_gather_finalize(self, handle: DPGatherHandle) -> ModelRunnerOutput:
+        parallel_config = self.vllm_config.parallel_config
+        group = self.dp_group
+        rank = self.dp_rank
+        world = parallel_config.data_parallel_size
+        logprobs_per_dp: list = [None] * world
+
+        result = handle.future.result()  # Waiting for step output to be ready
+        assert isinstance(result, tuple) and len(result) == 2
+        send_tensor, logprobs_per_dp = result
+        assert isinstance(send_tensor, torch.Tensor)
 
         # Global rank 0 scatters results to all ranks
         my_ids = torch.empty_like(send_tensor[0])  # Shape (B, 1)
@@ -1889,7 +2216,7 @@ class DPEngineCoreProc(EngineCoreProc):
         # Scatter logprobs only if any rank needs them
         # (determined in all_reduce).
         my_logprobs_val = None
-        if any_needs_logprobs:
+        if handle.any_needs_logprobs:
             my_logprobs: list = [None]
             logprobs_scatter_list = logprobs_per_dp if rank == 0 else None
             dist.scatter_object_list(
@@ -1898,13 +2225,23 @@ class DPEngineCoreProc(EngineCoreProc):
             my_logprobs_val = my_logprobs[0]
 
         # If rank had scheduled tokens, apply results locally and return output
-        if local_has_requests:
+        if handle.local_has_requests:
             output: ModelRunnerOutput = self.model_executor.collective_rpc(
-                "apply_dp_execution_result", args=(my_ids, my_logprobs_val)
+                "apply_dp_execution_result",
+                args=(
+                    my_ids,
+                    my_logprobs_val,
+                    handle.req_ids,
+                    handle.req_id_to_index,
+                ),
             )[0]
             return output
         else:
             return EMPTY_MODEL_RUNNER_OUTPUT
+
+    def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
+        handle = self.dp_gather_submit(scheduler_output)
+        return self.dp_gather_finalize(handle)
 
 
 class DPEngineCoreActor(DPEngineCoreProc):
