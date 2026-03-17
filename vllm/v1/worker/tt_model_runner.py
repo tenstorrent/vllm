@@ -242,9 +242,7 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
             is_decode=True,
         )
 
-        return runner.pack_dp_results(
-            sampled_token_ids_per_dp, logprobs_per_dp
-        )
+        return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
 
 
 class TTModelRunner:
@@ -2318,7 +2316,9 @@ class TTModelRunner:
                 output_token_ids = self.input_batch.req_output_token_ids[req_idx]
                 assert output_token_ids is not None
             else:
-                output_token_ids = self.requests[output_req_ids[req_idx]].output_token_ids
+                output_token_ids = self.requests[
+                    output_req_ids[req_idx]
+                ].output_token_ids
             output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
         # Empty prompt log probs

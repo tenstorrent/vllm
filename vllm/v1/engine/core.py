@@ -373,9 +373,7 @@ class EngineCore:
                 # During shutdown, peers may close connections mid-collective.
                 # Exit gracefully to allow coordinated shutdown.
                 if "Connection closed by peer" in str(e):
-                    logger.debug(
-                        "Collective failed during shutdown, exiting gracefully"
-                    )
+                    logger.debug("Collective failed during shutdown, exiting gracefully")
                     raise SystemExit() from e
                 raise
             if int(has_requests_t.item()) == 0:
@@ -390,11 +388,7 @@ class EngineCore:
             # is prefill but it doesn't get scheduled.
             has_running = bool(getattr(self.scheduler, "running", []))
             has_waiting = bool(getattr(self.scheduler, "waiting", False))
-            must_prefill = (
-                has_waiting
-                and self.dp_decode_streak  # type: ignore[has-type]
-                >= self.dp_max_consec_decodes
-            )
+            must_prefill = has_waiting and self.dp_decode_streak >= self.dp_max_consec_decodes
             local_prefill_intent = (
                 1 if (has_waiting and (must_prefill or not has_running)) else 0
             )
@@ -1683,7 +1677,10 @@ class DPEngineCoreProc(EngineCoreProc):
             prev_scheduler_output = in_flight.scheduler_output
             self._dp_in_flight = None
 
-        if scheduler_output is not None and scheduler_output.pending_structured_output_tokens:
+        if (
+            scheduler_output is not None
+            and scheduler_output.pending_structured_output_tokens
+        ):
             if prev_model_output is not None and prev_scheduler_output is not None:
                 engine_core_outputs = self.scheduler.update_from_output(
                     prev_scheduler_output, prev_model_output
@@ -1706,7 +1703,9 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return engine_core_outputs, model_executed
 
-    def dp_gather_submit(self, scheduler_output: SchedulerOutput | None) -> DPGatherHandle:
+    def dp_gather_submit(
+        self, scheduler_output: SchedulerOutput | None
+    ) -> DPGatherHandle:
         """Prepare and submit one gathered-DP execution step.
 
         Collects per-rank DP inputs, negotiates the merged execution shape, and
