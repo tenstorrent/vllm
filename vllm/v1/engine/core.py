@@ -678,10 +678,12 @@ class EngineCore:
         self._debug_viztracer = None
         self._debug_viztracer_started = False
         self._debug_viztracer_capture_active = False
+        self._debug_viztracer_clear_on_activate = False
+        self._debug_viztracer_finished = False
         # VizTracer env vars:
         # - `VLLM_VIZTRACE_MODE`: enables tracing and selects when capture starts.
-        #   Supported values are `first_request` and `first_dp_decode_submit`.
-        #   Unset or empty disables VizTracer.
+        #   Supported values are `engine_init`, `first_request`, and
+        #   `first_dp_decode_submit`. Unset or empty disables VizTracer.
         # - `VLLM_VIZTRACE_STEPS`: number of engine steps to capture after
         #   tracing becomes active. Default `200`, minimum `1`.
         # - `VLLM_VIZTRACE_ENTRIES`: VizTracer buffer size (`tracer_entries`).
@@ -696,7 +698,7 @@ class EngineCore:
         # - `VLLM_VIZTRACE_OUTPUT_DIR`: directory where the trace JSON is
         #   written. Default is the current working directory.
         # Example: set all VizTracer env vars.
-        #   export VLLM_VIZTRACE_MODE=first_dp_decode_submit
+        #   export VLLM_VIZTRACE_MODE=engine_init
         #   export VLLM_VIZTRACE_STEPS=8000
         #   export VLLM_VIZTRACE_ENTRIES=4000000
         #   export VLLM_VIZTRACE_MIN_DURATION_US=0
@@ -713,10 +715,11 @@ class EngineCore:
         #   unset VLLM_VIZTRACE_OUTPUT_DIR
         self._debug_viztracer_mode = os.environ.get("VLLM_VIZTRACE_MODE", "")
         self._debug_viztracer_enabled = bool(self._debug_viztracer_mode)
-        self._debug_viztracer_steps_remaining = max(
+        self._debug_viztracer_step_budget = max(
             int(os.environ.get("VLLM_VIZTRACE_STEPS", "200")),
             1,
         )
+        self._debug_viztracer_steps_remaining = self._debug_viztracer_step_budget
         self._debug_viztracer_entries = max(
             int(os.environ.get("VLLM_VIZTRACE_ENTRIES", "2000000")),
             1000,
@@ -749,11 +752,25 @@ class EngineCore:
             str(path) for path in include_files if path.exists()
         ]
 
-        if self._debug_viztracer_mode == "first_dp_decode_submit":
-            self._start_debug_viztracer(armed_only=True)
+        if self._debug_viztracer_mode == "engine_init":
+            self._start_debug_viztracer(armed_only=False)
+        elif self._debug_viztracer_mode in {
+            "first_request",
+            "first_dp_decode_submit",
+        }:
+            # Start tracing before the executor constructs worker threads, then
+            # clear bootstrap data when the requested trigger fires so the saved
+            # report focuses on the interesting window.
+            self._start_debug_viztracer(armed_only=True, clear_on_activate=True)
 
-    def _start_debug_viztracer(self, armed_only: bool) -> None:
-        if not self._debug_viztracer_enabled or self._debug_viztracer_started:
+    def _start_debug_viztracer(
+        self, armed_only: bool, clear_on_activate: bool = False
+    ) -> None:
+        if (
+            not self._debug_viztracer_enabled
+            or self._debug_viztracer_started
+            or self._debug_viztracer_finished
+        ):
             return
 
         try:
@@ -777,7 +794,11 @@ class EngineCore:
         filename_stem = (
             "viztrace-first-dp-decode-submit"
             if self._debug_viztracer_mode == "first_dp_decode_submit"
-            else "viztrace-first-request"
+            else (
+                "viztrace-engine-init"
+                if self._debug_viztracer_mode == "engine_init"
+                else "viztrace-first-request"
+            )
         )
         output_path = os.path.join(
             self._debug_viztracer_output_dir,
@@ -799,6 +820,8 @@ class EngineCore:
         self._debug_viztracer = tracer
         self._debug_viztracer_started = True
         self._debug_viztracer_capture_active = not armed_only
+        self._debug_viztracer_clear_on_activate = clear_on_activate
+        self._debug_viztracer_steps_remaining = self._debug_viztracer_step_budget
         logger.info(
             "Started VizTracer: mode=%s output=%s steps=%d entries=%d include_filter=%s armed_only=%s",
             self._debug_viztracer_mode,
@@ -809,21 +832,51 @@ class EngineCore:
             armed_only,
         )
 
+    def _activate_debug_viztracer(self, trigger: str) -> None:
+        if (
+            not self._debug_viztracer_started
+            or self._debug_viztracer is None
+            or self._debug_viztracer_capture_active
+        ):
+            return
+
+        if self._debug_viztracer_clear_on_activate:
+            self._debug_viztracer.clear()
+            logger.info(
+                "Cleared VizTracer bootstrap data on activation: mode=%s trigger=%s",
+                self._debug_viztracer_mode,
+                trigger,
+            )
+
+        self._debug_viztracer_capture_active = True
+        self._debug_viztracer_steps_remaining = self._debug_viztracer_step_budget
+        logger.info(
+            "Activated VizTracer capture: mode=%s trigger=%s steps=%d",
+            self._debug_viztracer_mode,
+            trigger,
+            self._debug_viztracer_steps_remaining,
+        )
+
     def _maybe_start_debug_viztracer(
         self, request_type: EngineCoreRequestType
     ) -> None:
         if (
             self._debug_viztracer_mode != "first_request"
+            or self._debug_viztracer_finished
             or request_type != EngineCoreRequestType.ADD
         ):
             return
-        self._start_debug_viztracer(armed_only=False)
+        if not self._debug_viztracer_started:
+            self._start_debug_viztracer(armed_only=False)
+            return
+        self._activate_debug_viztracer("first_request")
 
     def _maybe_trigger_debug_viztracer_on_dp_decode_submit(
         self, is_decode: bool, local_dp_rank: int
     ) -> None:
         if (
             self._debug_viztracer_mode != "first_dp_decode_submit"
+            or self._debug_viztracer_finished
             or not self._debug_viztracer_started
             or self._debug_viztracer_capture_active
             or not is_decode
@@ -831,7 +884,7 @@ class EngineCore:
         ):
             return
         assert self._debug_viztracer is not None
-        self._debug_viztracer_capture_active = True
+        self._activate_debug_viztracer("first_dp_decode_submit")
         self._debug_viztracer.log_instant(
             "VLLM_VIZTRACE_TRIGGER:first_dp_decode_submit",
             args={
@@ -865,6 +918,9 @@ class EngineCore:
         tracer = self._debug_viztracer
         self._debug_viztracer = None
         self._debug_viztracer_started = False
+        self._debug_viztracer_capture_active = False
+        self._debug_viztracer_clear_on_activate = False
+        self._debug_viztracer_finished = True
         try:
             tracer.stop()
             tracer.save()
