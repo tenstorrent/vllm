@@ -497,21 +497,12 @@ class EngineCore:
         assert batch_queue is not None
 
         is_tt = current_platform.is_tt()
-        oldest_future_done = bool(batch_queue and batch_queue[-1][0].done())
 
-        # TT async decode completion runs host-side postprocessing on the worker
-        # async thread before the EngineCore consumes the result. Once the
-        # oldest future is done, the TT runner state has already advanced, so
-        # issuing another schedule here would build a new SchedulerOutput
-        # against stale scheduler bookkeeping and can mismatch the in-flight
-        # request set. Drain the completed output first.
-        should_schedule = not (is_tt and oldest_future_done)
         if is_tt:
             self._tt_debug(
-                "enter queue_len=%d oldest_done=%s "
+                "enter queue_len=%d "
                 "has_requests=%s running=%d waiting=%d",
                 len(batch_queue),
-                oldest_future_done,
                 self.scheduler.has_requests(),
                 len(getattr(self.scheduler, "running", [])),
                 len(getattr(self.scheduler, "waiting", [])),

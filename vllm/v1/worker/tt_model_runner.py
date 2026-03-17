@@ -1726,10 +1726,28 @@ class TTModelRunner:
             for read_event in submission.read_events:
                 ttnn.event_synchronize(read_event)
 
-        tt_out = self.model.process_decode_output_host(
-            submission.tt_out,
-            is_tokens=submission.perform_device_sampling,
-        )
+        # Real TT generator models expose `process_decode_output_host()` to
+        # convert readback tensors into torch outputs. Keep compatibility with
+        # lightweight/no-op test models that already return host tensors and do
+        # not implement the newer hook.
+        if hasattr(self.model, "process_decode_output_host"):
+            tt_out = self.model.process_decode_output_host(
+                submission.tt_out,
+                is_tokens=submission.perform_device_sampling,
+            )
+        else:
+            raw_tt_out = submission.tt_out
+            is_host_tensor = isinstance(raw_tt_out, torch.Tensor)
+            is_host_tensor_tuple = isinstance(raw_tt_out, tuple) and all(
+                tensor is None or isinstance(tensor, torch.Tensor)
+                for tensor in raw_tt_out
+            )
+            if not (is_host_tensor or is_host_tensor_tuple):
+                raise AttributeError(
+                    "TT model must implement process_decode_output_host() "
+                    "unless decode output is already a torch tensor"
+                )
+            tt_out = raw_tt_out
 
         tt_log_probs = None
         assert isinstance(submission.sampling_params.enable_log_probs, torch.Tensor)
