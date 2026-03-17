@@ -1458,7 +1458,13 @@ class TTModelRunner:
         # With DP, the actual model pass happens on a batch
         # produced by concatenating the inputs from all DP ranks.
 
-        # Wait for any in-flight async decode from the previous step.
+        # Wait for any in-flight async decode from the previous step to finish
+        # writing its results (token_ids_cpu, num_tokens, output_token_ids) into
+        # input_batch and self.requests before _update_states (called inside
+        # build_model_input below) mutates those same structures.  This is the
+        # sole synchronisation point that prevents a data-race between the
+        # WorkerAsyncOutput thread and the main engine thread.  Do NOT move this
+        # wait after build_model_input.
         if self._pending_async_event is not None:
             self._pending_async_event.wait()
             self._pending_async_event = None
@@ -2277,6 +2283,20 @@ class TTModelRunner:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
         # Vectorized update of persistent batch token storage.
+        #
+        # When called from the sync path (use_captured_req_ids=False) the
+        # positional ordering in input_batch matches the ordering used during
+        # build_model_input, so arange(num_reqs) is a valid row index.
+        #
+        # When called from the async path (use_captured_req_ids=True) this
+        # function runs on the WorkerAsyncOutput thread, but the wait on
+        # _pending_async_event in execute_model (see above) guarantees that
+        # _update_states for step N+1 cannot run until this function has
+        # returned and the completion event is set.  Therefore the positional
+        # indices here are still consistent with what was observed when
+        # build_model_input ran for this step.  This invariant must be
+        # preserved: never remove or move the _pending_async_event.wait()
+        # call without re-evaluating the safety of these positional writes.
         start_idxs = self.input_batch.num_tokens[:num_reqs]
         end_idxs = start_idxs + 1
         max_end = int(end_idxs.max()) if num_reqs > 0 else 0

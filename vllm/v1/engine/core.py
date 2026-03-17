@@ -591,6 +591,10 @@ class EngineCore:
                 # For TT async path, grammar must be computed after prior output
                 # has updated request states, and before execute_model consumes
                 # scheduler_output in build_model_input.
+                # NOTE: get_grammar_bitmask writes the bitmask directly into
+                # deferred_scheduler_output.grammar_bitmask in-place; there is
+                # no return value to capture here (contrast with the non-TT path
+                # below, which passes the bitmask explicitly to sample_tokens).
                 self.scheduler.get_grammar_bitmask(deferred_scheduler_output)
                 exec_future = cast(
                     Future[ModelRunnerOutput],
