@@ -1698,10 +1698,22 @@ class TTModelRunner:
         )
         read_events = None
         if async_read:
-            tt_out, read_events = cast(
-                tuple[Any, list[Any]],
-                self.model.read_decode_output(tt_out, async_read=True),
-            )
+            if hasattr(self.model, "read_decode_output"):
+                tt_out, read_events = cast(
+                    tuple[Any, list[Any]],
+                    self.model.read_decode_output(tt_out, async_read=True),
+                )
+            else:
+                is_host_tensor = isinstance(tt_out, torch.Tensor)
+                is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
+                    tensor is None or isinstance(tensor, torch.Tensor)
+                    for tensor in tt_out
+                )
+                if not (is_host_tensor or is_host_tensor_tuple):
+                    raise AttributeError(
+                        "TT model must implement read_decode_output() "
+                        "unless decode_forward() already returns host tensors"
+                    )
         return TTDecodeSubmission(
             tt_out=tt_out,
             read_events=read_events,
