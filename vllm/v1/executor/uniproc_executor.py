@@ -59,19 +59,6 @@ class UniProcExecutor(Executor):
     def max_concurrent_batches(self) -> int:
         return 2 if self.scheduler_config.async_scheduling else 1
 
-    @staticmethod
-    def _run_instrumented_async_output(task: Callable[[], Any]) -> Any:
-        """Enable VizTracer on the async output thread before running work."""
-        try:
-            from viztracer import get_tracer
-        except ImportError:
-            return task()
-
-        tracer = get_tracer()
-        if tracer is not None:
-            tracer.enable_thread_tracing()
-        return task()
-
     def collective_rpc(  # type: ignore[override]
         self,
         method: str | Callable,
@@ -95,9 +82,7 @@ class UniProcExecutor(Executor):
                     get_output = result.get_output
                     if not single_value:
                         get_output = lambda go=result.get_output: [go()]
-                    return async_thread.submit(
-                        self._run_instrumented_async_output, get_output
-                    )
+                    return async_thread.submit(get_output)
                 result = result.get_output()
             future = Future[Any]()
             future.set_result(result if single_value else [result])

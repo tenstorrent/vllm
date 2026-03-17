@@ -13,7 +13,6 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from inspect import isclass, signature
 from logging import DEBUG
-from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import msgspec
@@ -114,8 +113,6 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
-        self._tt_step_debug = os.environ.get("VLLM_TT_STEP_DEBUG") == "1"
-        self._init_debug_viztracer()
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -230,10 +227,6 @@ class EngineCore:
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
-
-    def _tt_debug(self, msg: str, *args: object) -> None:
-        if self._tt_step_debug:
-            logger.info("[TT_STEP_DEBUG][core] " + msg, *args)
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -496,18 +489,6 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        is_tt = current_platform.is_tt()
-
-        if is_tt:
-            self._tt_debug(
-                "enter queue_len=%d "
-                "has_requests=%s running=%d waiting=%d",
-                len(batch_queue),
-                self.scheduler.has_requests(),
-                len(getattr(self.scheduler, "running", [])),
-                len(getattr(self.scheduler, "waiting", [])),
-            )
-
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -520,17 +501,6 @@ class EngineCore:
             scheduler_output = self.scheduler.schedule()
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
-            if is_tt:
-                self._tt_debug(
-                    "scheduled total_tokens=%d reqs=%s new=%s cached=%s "
-                    "pending_struct=%s",
-                    scheduler_output.total_num_scheduled_tokens,
-                    list(scheduler_output.num_scheduled_tokens.keys()),
-                    [r.req_id for r in scheduler_output.scheduled_new_reqs],
-                    list(scheduler_output.scheduled_cached_reqs.req_ids),
-                    scheduler_output.pending_structured_output_tokens,
-                )
-
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 exec_future = cast(
@@ -587,13 +557,6 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output))
-                if is_tt:
-                    self._tt_debug(
-                        "queued queue_len=%d newest_reqs=%s oldest_done=%s",
-                        len(batch_queue),
-                        list(scheduler_output.num_scheduled_tokens.keys()),
-                        bool(batch_queue[-1][0].done()),
-                    )
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -611,25 +574,12 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
-        if is_tt:
-            self._tt_debug(
-                "drain queue_len_after_pop=%d reqs=%s future_done=%s",
-                len(batch_queue),
-                list(scheduler_output.num_scheduled_tokens.keys()),
-                future.done(),
-            )
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        if is_tt:
-            self._tt_debug(
-                "updated reqs=%s output_reqs=%s",
-                list(scheduler_output.num_scheduled_tokens.keys()),
-                list(model_output.req_ids),
-            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -665,262 +615,7 @@ class EngineCore:
 
         return engine_core_outputs, model_executed
 
-    def _init_debug_viztracer(self) -> None:
-        self._debug_viztracer = None
-        self._debug_viztracer_started = False
-        self._debug_viztracer_capture_active = False
-        self._debug_viztracer_clear_on_activate = False
-        self._debug_viztracer_finished = False
-        # VizTracer env vars:
-        # - `VLLM_VIZTRACE_MODE`: enables tracing and selects when capture starts.
-        #   Supported values are `engine_init`, `first_request`, and
-        #   `first_dp_decode_submit`. Unset or empty disables VizTracer.
-        # - `VLLM_VIZTRACE_STEPS`: number of engine steps to capture after
-        #   tracing becomes active. Default `200`, minimum `1`.
-        # - `VLLM_VIZTRACE_ENTRIES`: VizTracer buffer size (`tracer_entries`).
-        #   Default `2000000`, minimum `1000`.
-        # - `VLLM_VIZTRACE_MIN_DURATION_US`: minimum event duration passed to
-        #   VizTracer as `min_duration`. Default `0`.
-        # - `VLLM_VIZTRACE_USE_INCLUDE_FILTER`: when set to `1`, restricts the
-        #   trace to the curated `include_files` list built below. Default `0`.
-        # - `VLLM_VIZTRACE_ALL_RANKS`: when set to `1` with
-        #   `VLLM_VIZTRACE_MODE=first_dp_decode_submit`, start armed tracers on
-        #   all local DP ranks instead of only local rank 0. Default `0`.
-        # - `VLLM_VIZTRACE_OUTPUT_DIR`: directory where the trace JSON is
-        #   written. Default is the current working directory.
-        # Example: set all VizTracer env vars.
-        #   export VLLM_VIZTRACE_MODE=engine_init
-        #   export VLLM_VIZTRACE_STEPS=8000
-        #   export VLLM_VIZTRACE_ENTRIES=4000000
-        #   export VLLM_VIZTRACE_MIN_DURATION_US=0
-        #   export VLLM_VIZTRACE_USE_INCLUDE_FILTER=1
-        #   export VLLM_VIZTRACE_ALL_RANKS=1
-        #   export VLLM_VIZTRACE_OUTPUT_DIR=/tmp/vllm-viztraces
-        # Example: unset all VizTracer env vars.
-        #   unset VLLM_VIZTRACE_MODE
-        #   unset VLLM_VIZTRACE_STEPS
-        #   unset VLLM_VIZTRACE_ENTRIES
-        #   unset VLLM_VIZTRACE_MIN_DURATION_US
-        #   unset VLLM_VIZTRACE_USE_INCLUDE_FILTER
-        #   unset VLLM_VIZTRACE_ALL_RANKS
-        #   unset VLLM_VIZTRACE_OUTPUT_DIR
-        self._debug_viztracer_mode = os.environ.get("VLLM_VIZTRACE_MODE", "")
-        self._debug_viztracer_enabled = bool(self._debug_viztracer_mode)
-        self._debug_viztracer_step_budget = max(
-            int(os.environ.get("VLLM_VIZTRACE_STEPS", "200")),
-            1,
-        )
-        self._debug_viztracer_steps_remaining = self._debug_viztracer_step_budget
-        self._debug_viztracer_entries = max(
-            int(os.environ.get("VLLM_VIZTRACE_ENTRIES", "2000000")),
-            1000,
-        )
-        self._debug_viztracer_min_duration_us = max(
-            float(os.environ.get("VLLM_VIZTRACE_MIN_DURATION_US", "0")),
-            0.0,
-        )
-        self._debug_viztracer_use_include_filter = (
-            os.environ.get("VLLM_VIZTRACE_USE_INCLUDE_FILTER") == "1"
-        )
-        self._debug_viztracer_all_ranks = (
-            os.environ.get("VLLM_VIZTRACE_ALL_RANKS") == "1"
-        )
-        self._debug_viztracer_output_dir = os.environ.get(
-            "VLLM_VIZTRACE_OUTPUT_DIR",
-            os.getcwd(),
-        )
-
-        repo_root = Path(__file__).resolve().parents[3]
-        include_files = [
-            repo_root / "vllm/v1/engine/core.py",
-            repo_root / "vllm/v1/executor/uniproc_executor.py",
-            repo_root / "vllm/v1/worker/tt_worker.py",
-            repo_root / "vllm/v1/worker/tt_model_runner.py",
-            repo_root.parent / "tt-metal/models/demos/llama3_70b_galaxy/tt/generator.py",
-            repo_root.parent / "tt-metal/models/tt_transformers/tt/generator.py",
-        ]
-        self._debug_viztracer_include_files = [
-            str(path) for path in include_files if path.exists()
-        ]
-
-        if self._debug_viztracer_mode == "engine_init":
-            self._start_debug_viztracer(armed_only=False)
-        elif self._debug_viztracer_mode in {
-            "first_request",
-            "first_dp_decode_submit",
-        }:
-            # Start tracing before the executor constructs worker threads, then
-            # clear bootstrap data when the requested trigger fires so the saved
-            # report focuses on the interesting window.
-            self._start_debug_viztracer(armed_only=True, clear_on_activate=True)
-
-    def _start_debug_viztracer(
-        self, armed_only: bool, clear_on_activate: bool = False
-    ) -> None:
-        if (
-            not self._debug_viztracer_enabled
-            or self._debug_viztracer_started
-            or self._debug_viztracer_finished
-        ):
-            return
-
-        try:
-            from viztracer import VizTracer
-        except ImportError:
-            logger.warning(
-                "VizTracer debugging was requested but viztracer is not installed."
-            )
-            self._debug_viztracer_enabled = False
-            return
-
-        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
-        if (
-            self._debug_viztracer_mode == "first_dp_decode_submit"
-            and not self._debug_viztracer_all_ranks
-            and local_dp_rank != 0
-        ):
-            return
-
-        filename_stem = (
-            "viztrace-first-dp-decode-submit"
-            if self._debug_viztracer_mode == "first_dp_decode_submit"
-            else (
-                "viztrace-engine-init"
-                if self._debug_viztracer_mode == "engine_init"
-                else "viztrace-first-request"
-            )
-        )
-        output_path = os.path.join(
-            self._debug_viztracer_output_dir,
-            f"{filename_stem}-pid{os.getpid()}-dp{dp_rank}-ldp{local_dp_rank}.json",
-        )
-        tracer_kwargs: dict[str, Any] = {
-            "output_file": output_path,
-            "tracer_entries": self._debug_viztracer_entries,
-            "pid_suffix": False,
-            "min_duration": self._debug_viztracer_min_duration_us,
-        }
-        if self._debug_viztracer_use_include_filter:
-            tracer_kwargs["include_files"] = self._debug_viztracer_include_files
-        tracer_kwargs["process_name"] = (
-            f"EngineCore_DP{dp_rank}_LDP{local_dp_rank}"
-        )
-        tracer = VizTracer(**tracer_kwargs)
-        tracer.start()
-        self._debug_viztracer = tracer
-        self._debug_viztracer_started = True
-        self._debug_viztracer_capture_active = not armed_only
-        self._debug_viztracer_clear_on_activate = clear_on_activate
-        self._debug_viztracer_steps_remaining = self._debug_viztracer_step_budget
-        logger.info(
-            "Started VizTracer: mode=%s output=%s steps=%d entries=%d include_filter=%s armed_only=%s",
-            self._debug_viztracer_mode,
-            output_path,
-            self._debug_viztracer_steps_remaining,
-            self._debug_viztracer_entries,
-            self._debug_viztracer_use_include_filter,
-            armed_only,
-        )
-
-    def _activate_debug_viztracer(self, trigger: str) -> None:
-        if (
-            not self._debug_viztracer_started
-            or self._debug_viztracer is None
-            or self._debug_viztracer_capture_active
-        ):
-            return
-
-        if self._debug_viztracer_clear_on_activate:
-            self._debug_viztracer.clear()
-            logger.info(
-                "Cleared VizTracer bootstrap data on activation: mode=%s trigger=%s",
-                self._debug_viztracer_mode,
-                trigger,
-            )
-
-        self._debug_viztracer_capture_active = True
-        self._debug_viztracer_steps_remaining = self._debug_viztracer_step_budget
-        logger.info(
-            "Activated VizTracer capture: mode=%s trigger=%s steps=%d",
-            self._debug_viztracer_mode,
-            trigger,
-            self._debug_viztracer_steps_remaining,
-        )
-
-    def _maybe_start_debug_viztracer(
-        self, request_type: EngineCoreRequestType
-    ) -> None:
-        if (
-            self._debug_viztracer_mode != "first_request"
-            or self._debug_viztracer_finished
-            or request_type != EngineCoreRequestType.ADD
-        ):
-            return
-        if not self._debug_viztracer_started:
-            self._start_debug_viztracer(armed_only=False)
-            return
-        self._activate_debug_viztracer("first_request")
-
-    def _maybe_trigger_debug_viztracer_on_dp_decode_submit(
-        self, is_decode: bool, local_dp_rank: int
-    ) -> None:
-        if (
-            self._debug_viztracer_mode != "first_dp_decode_submit"
-            or self._debug_viztracer_finished
-            or not self._debug_viztracer_started
-            or self._debug_viztracer_capture_active
-            or not is_decode
-            or local_dp_rank != 0
-        ):
-            return
-        assert self._debug_viztracer is not None
-        self._activate_debug_viztracer("first_dp_decode_submit")
-        self._debug_viztracer.log_instant(
-            "VLLM_VIZTRACE_TRIGGER:first_dp_decode_submit",
-            args={
-                "pid": os.getpid(),
-                "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
-                "local_dp_rank": local_dp_rank,
-            },
-            scope="p",
-        )
-        logger.info(
-            "Activated VizTracer capture on first DP decode submit: pid=%d dp_rank=%s local_dp_rank=%s",
-            os.getpid(),
-            self.vllm_config.parallel_config.data_parallel_rank,
-            local_dp_rank,
-        )
-
-    def _maybe_advance_debug_viztracer(self) -> None:
-        if (
-            not self._debug_viztracer_started
-            or not self._debug_viztracer_capture_active
-        ):
-            return
-        self._debug_viztracer_steps_remaining -= 1
-        if self._debug_viztracer_steps_remaining <= 0:
-            self._stop_debug_viztracer("captured configured number of engine steps")
-
-    def _stop_debug_viztracer(self, reason: str) -> None:
-        if not self._debug_viztracer_started or self._debug_viztracer is None:
-            return
-
-        tracer = self._debug_viztracer
-        self._debug_viztracer = None
-        self._debug_viztracer_started = False
-        self._debug_viztracer_capture_active = False
-        self._debug_viztracer_clear_on_activate = False
-        self._debug_viztracer_finished = True
-        try:
-            tracer.stop()
-            tracer.save()
-            logger.info("Saved VizTracer trace: %s", reason)
-        except Exception:
-            logger.exception("Failed to stop/save VizTracer trace")
-
     def shutdown(self):
-        self._stop_debug_viztracer("engine shutdown")
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1394,7 +1089,6 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
-        self._maybe_advance_debug_viztracer()
 
         return model_executed
 
@@ -1402,8 +1096,6 @@ class EngineCoreProc(EngineCore):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
-        self._maybe_start_debug_viztracer(request_type)
-
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             self.add_request(req, request_wave)
@@ -2040,10 +1732,6 @@ class DPEngineCoreProc(EngineCoreProc):
         # 0=decode, 1=prefill.
         assert hasattr(self, "_dp_gather_forced_mode"), "forced_mode not set"
         is_decode = self._dp_gather_forced_mode == 0
-        self._maybe_trigger_debug_viztracer_on_dp_decode_submit(
-            is_decode=is_decode,
-            local_dp_rank=local_rank,
-        )
 
         # Build local dp model input (or None).
         all_local_inputs = self.model_executor.collective_rpc(
