@@ -232,11 +232,6 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
 
     def _get_output_impl(self) -> ModelRunnerOutput:
         runner = self._runner
-        runner._tt_debug(
-            "async_get_output start captured_reqs=%s current_batch=%s",
-            self._req_ids,
-            list(runner.input_batch.req_ids[: runner.input_batch.num_reqs]),
-        )
         finalized = runner.finalize_decode(self._submission)
         if finalized is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -260,12 +255,6 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
             logprobs=logprobs,
             req_ids=self._req_ids,
             req_id_to_index=self._req_id_to_index,
-        )
-        runner._tt_debug(
-            "async_get_output done captured_reqs=%s output_reqs=%s current_batch=%s",
-            self._req_ids,
-            list(output.req_ids),
-            list(runner.input_batch.req_ids[: runner.input_batch.num_reqs]),
         )
         return output
 
@@ -398,7 +387,6 @@ class TTModelRunner:
             self.scheduler_config.async_scheduling
             and self.parallel_config.data_parallel_size == 1
         )
-        self._tt_step_debug = os.environ.get("VLLM_TT_STEP_DEBUG") == "1"
         # Guards single in-flight async decode. Set when an async decode is
         # submitted; cleared when get_output() completes on the async thread.
         self._pending_async_event: threading.Event | None = None
@@ -418,10 +406,6 @@ class TTModelRunner:
             is_pooling_model=False,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
-
-    def _tt_debug(self, msg: str, *args: object) -> None:
-        if self._tt_step_debug:
-            logger.info("[TT_STEP_DEBUG][runner] " + msg, *args)
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
@@ -531,13 +515,6 @@ class TTModelRunner:
         Based on _update_states for GPU/TPU backends.
         """
         persistent_batch_layout_changed = False
-        if self._tt_step_debug:
-            self._tt_debug(
-                "_update_states start scheduled=%s current_batch=%s finished=%s",
-                list(scheduler_output.num_scheduled_tokens.keys()),
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                list(scheduler_output.finished_req_ids),
-            )
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -568,11 +545,6 @@ class TTModelRunner:
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         unscheduled_req_ids = cached_req_ids - scheduled_req_ids
-        if self._tt_step_debug and unscheduled_req_ids:
-            self._tt_debug(
-                "_update_states unscheduled=%s",
-                list(unscheduled_req_ids),
-            )
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -673,12 +645,6 @@ class TTModelRunner:
 
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
-        if self._tt_step_debug:
-            self._tt_debug(
-                "_update_states done batch=%s decode_layout_changed=%s",
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                self._decode_layout_changed_since_last_decode,
-            )
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
@@ -1020,20 +986,10 @@ class TTModelRunner:
         # Update cached state
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
-            if self._tt_step_debug:
-                self._tt_debug("build_model_input empty scheduled batch")
             return None
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output)
-        if self._tt_step_debug:
-            self._tt_debug(
-                "build_model_input mode=%s reqs=%s prompt_lens=%s reset_batch=%s",
-                "prefill" if model_input.prompt_lens is not None else "decode",
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                model_input.prompt_lens,
-                model_input.reset_batch,
-            )
         return model_input
 
     def build_dp_decode_gather_input(
@@ -1588,20 +1544,8 @@ class TTModelRunner:
 
         # Wait for any in-flight async decode from the previous step.
         if self._pending_async_event is not None:
-            if self._tt_step_debug:
-                self._tt_debug(
-                    "execute_model waiting for previous async completion "
-                    "batch_before=%s",
-                    list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                )
             self._pending_async_event.wait()
             self._pending_async_event = None
-            if self._tt_step_debug:
-                self._tt_debug(
-                    "execute_model previous async completion observed "
-                    "batch_after=%s",
-                    list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                )
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
@@ -1609,13 +1553,6 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if self._tt_step_debug:
-            self._tt_debug(
-                "execute_model prepared mode=%s scheduled=%s batch=%s",
-                "decode" if is_decode else "prefill",
-                list(scheduler_output.num_scheduled_tokens.keys()),
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-            )
         if self.async_scheduling and is_decode:
             return self.submit_async_non_dp_decode(model_input)
 
@@ -1643,13 +1580,6 @@ class TTModelRunner:
         submission = self.submit_decode(
             model_input, read_from_device=False, async_read=True
         )
-        if self._tt_step_debug:
-            self._tt_debug(
-                "submit_async_non_dp_decode reqs=%s batch=%s reset_batch=%s",
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                model_input.reset_batch,
-            )
 
         if submission.tt_out is None:
             # No decode work was submitted to the device for this step
@@ -2034,20 +1964,8 @@ class TTModelRunner:
 
         # Execute model
         if not is_decode:
-            if self._tt_step_debug:
-                self._tt_debug(
-                    "execute_sync_with_model_input prefill reqs=%s prompt_lens=%s",
-                    list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                    model_input.prompt_lens,
-                )
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
         else:
-            if self._tt_step_debug:
-                self._tt_debug(
-                    "execute_sync_with_model_input decode reqs=%s reset_batch=%s",
-                    list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-                    model_input.reset_batch,
-                )
             submission = self.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
@@ -2433,14 +2351,6 @@ class TTModelRunner:
         # doesn't need to send them back.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
-        if self._tt_step_debug:
-            self._tt_debug(
-                "apply_and_build_runner_output use_captured=%s req_ids=%s "
-                "current_batch=%s",
-                use_captured_req_ids,
-                req_ids if req_ids is not None else list(self.input_batch.req_ids[:num_reqs]),
-                list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
-            )
         # Queueing can delay consumption of ModelRunnerOutput until after the
         # persistent batch has been repacked for a newer step, so always
         # snapshot request identity instead of aliasing mutable input_batch
