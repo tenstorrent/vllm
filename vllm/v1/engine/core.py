@@ -114,6 +114,7 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self._tt_step_debug = os.environ.get("VLLM_TT_STEP_DEBUG") == "1"
         self._init_debug_viztracer()
 
         # Setup Model.
@@ -229,6 +230,10 @@ class EngineCore:
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
+
+    def _tt_debug(self, msg: str, *args: object) -> None:
+        if self._tt_step_debug:
+            logger.info("[TT_STEP_DEBUG][core] " + msg, *args)
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -491,6 +496,27 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        is_tt = current_platform.is_tt()
+        oldest_future_done = bool(batch_queue and batch_queue[-1][0].done())
+
+        # TT async decode completion runs host-side postprocessing on the worker
+        # async thread before the EngineCore consumes the result. Once the
+        # oldest future is done, the TT runner state has already advanced, so
+        # issuing another schedule here would build a new SchedulerOutput
+        # against stale scheduler bookkeeping and can mismatch the in-flight
+        # request set. Drain the completed output first.
+        should_schedule = not (is_tt and oldest_future_done)
+        if is_tt:
+            self._tt_debug(
+                "enter queue_len=%d oldest_done=%s "
+                "has_requests=%s running=%d waiting=%d",
+                len(batch_queue),
+                oldest_future_done,
+                self.scheduler.has_requests(),
+                len(getattr(self.scheduler, "running", [])),
+                len(getattr(self.scheduler, "waiting", [])),
+            )
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -503,6 +529,16 @@ class EngineCore:
             scheduler_output = self.scheduler.schedule()
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if is_tt:
+                self._tt_debug(
+                    "scheduled total_tokens=%d reqs=%s new=%s cached=%s "
+                    "pending_struct=%s",
+                    scheduler_output.total_num_scheduled_tokens,
+                    list(scheduler_output.num_scheduled_tokens.keys()),
+                    [r.req_id for r in scheduler_output.scheduled_new_reqs],
+                    list(scheduler_output.scheduled_cached_reqs.req_ids),
+                    scheduler_output.pending_structured_output_tokens,
+                )
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
@@ -560,6 +596,13 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output))
+                if is_tt:
+                    self._tt_debug(
+                        "queued queue_len=%d newest_reqs=%s oldest_done=%s",
+                        len(batch_queue),
+                        list(scheduler_output.num_scheduled_tokens.keys()),
+                        bool(batch_queue[-1][0].done()),
+                    )
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -577,12 +620,25 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
+        if is_tt:
+            self._tt_debug(
+                "drain queue_len_after_pop=%d reqs=%s future_done=%s",
+                len(batch_queue),
+                list(scheduler_output.num_scheduled_tokens.keys()),
+                future.done(),
+            )
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if is_tt:
+            self._tt_debug(
+                "updated reqs=%s output_reqs=%s",
+                list(scheduler_output.num_scheduled_tokens.keys()),
+                list(model_output.req_ids),
+            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
