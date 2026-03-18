@@ -46,6 +46,56 @@ logger = init_logger(__name__)
 MAX_K = 32
 
 
+def _build_logprobs_from_topk(
+    top_k_logprobs: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    max_num_logprobs: int,
+) -> LogprobsTensors:
+    """Build LogprobsTensors from device top-K logprobs.
+
+    Device returns top-32 logprobs already sorted descending.
+    This function packs them into the LogprobsTensors format expected
+    by the downstream vLLM pipeline.
+
+    Args:
+        top_k_logprobs: [sz, 32] sorted descending logprobs from device.
+        top_k_indices: [sz, 32] corresponding token IDs, same order.
+        sampled_token_ids: [sz] sampled token IDs.
+        max_num_logprobs: max top_logprobs requested across batch.
+
+    Returns:
+        LogprobsTensors with shape [sz, N+1] where N = min(max_num_logprobs, 32).
+        Column 0 = sampled token, columns 1..N = top-N from sorted list.
+    """
+    sz = top_k_logprobs.shape[0]
+    N = min(max_num_logprobs, MAX_K)
+
+    # Find sampled token rank in the already-sorted top-32
+    sampled_expanded = sampled_token_ids.unsqueeze(-1)
+    match_mask = (top_k_indices == sampled_expanded)
+    ranks = match_mask.float().argmax(dim=-1)
+
+    # Extract sampled token logprob
+    sampled_logprob = top_k_logprobs.gather(
+        1, ranks.unsqueeze(-1).long()
+    )
+
+    # Build output: col 0 = sampled, cols 1..N = top-N from sorted
+    logprob_token_ids = torch.zeros(sz, N + 1, dtype=torch.int32)
+    logprobs_values = torch.zeros(sz, N + 1, dtype=torch.float32)
+
+    logprob_token_ids[:, 0] = sampled_token_ids
+    logprobs_values[:, 0] = sampled_logprob.squeeze(-1)
+    logprob_token_ids[:, 1:N + 1] = top_k_indices[:, :N].to(torch.int32)
+    logprobs_values[:, 1:N + 1] = top_k_logprobs[:, :N].to(torch.float32)
+
+    selected_token_ranks = ranks.to(torch.int32)
+
+    return LogprobsTensors(logprob_token_ids, logprobs_values,
+                           selected_token_ranks)
+
+
 @dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
@@ -1680,23 +1730,35 @@ class TTModelRunner:
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
                 rank_enable_lp = sampling_params.enable_log_probs[start : start + sz]
                 if rank_enable_lp.any() and tt_log_probs is not None:
-                    # TT device returns raw logprobs as [batch_size] tensor
-                    # containing log probability of the sampled token only.
-                    # Convert to LogprobsTensors format with minimal info.
-                    sampled_log_probs = tt_log_probs[start : start + sz]
-
-                    # Create LogprobsTensors with only sampled token info
-                    # Shape: [sz, 1] for token_ids and logprobs
-                    logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
-                    logprobs_values = sampled_log_probs.unsqueeze(-1).to(torch.float32)
-                    # Rank is unknown with device sampling, use -1 to indicate
-                    selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
-
-                    logprobs_tensors = LogprobsTensors(
-                        logprob_token_ids=logprob_token_ids,
-                        logprobs=logprobs_values,
-                        selected_token_ranks=selected_token_ranks,
-                    )
+                    if isinstance(tt_log_probs, tuple):
+                        # New path: top-K logprobs from device
+                        # (gpt-oss-120b). Device returns already-sorted
+                        # (top_k_logprobs[B,32], top_k_indices[B,32]).
+                        top_k_logprobs, top_k_indices = tt_log_probs
+                        logprobs_tensors = _build_logprobs_from_topk(
+                            top_k_logprobs=top_k_logprobs[start:start + sz],
+                            top_k_indices=top_k_indices[start:start + sz],
+                            sampled_token_ids=next_token_ids,
+                            max_num_logprobs=rank_max_num_logprobs,
+                        )
+                    else:
+                        # Old path: single sampled-token logprob
+                        # (all other models). Device returns [B] tensor.
+                        sampled_log_probs = tt_log_probs[start : start + sz]
+                        logprob_token_ids = (
+                            next_token_ids.unsqueeze(-1).to(torch.int32)
+                        )
+                        logprobs_values = (
+                            sampled_log_probs.unsqueeze(-1).to(torch.float32)
+                        )
+                        selected_token_ranks = torch.full(
+                            (sz,), -1, dtype=torch.int32
+                        )
+                        logprobs_tensors = LogprobsTensors(
+                            logprob_token_ids=logprob_token_ids,
+                            logprobs=logprobs_values,
+                            selected_token_ranks=selected_token_ranks,
+                        )
                     logprobs_per_dp.append(logprobs_tensors)
                 else:
                     logprobs_per_dp.append(None)
