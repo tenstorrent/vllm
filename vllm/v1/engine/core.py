@@ -500,6 +500,7 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        future: Future[ModelRunnerOutput] | None = None
         exec_future: Future[ModelRunnerOutput] | None = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
@@ -511,7 +512,7 @@ class EngineCore:
                     Future[ModelRunnerOutput],
                     self.model_executor.execute_model(scheduler_output, non_block=True),
                 )
-                future = cast(Future[ModelRunnerOutput], exec_future)
+                future = exec_future
             else:
                 future, deferred_scheduler_output = (
                     self.model_executor.submit_scheduled_batch(
