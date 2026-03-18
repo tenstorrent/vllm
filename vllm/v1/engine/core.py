@@ -503,53 +503,18 @@ class EngineCore:
                 )
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    if current_platform.is_tt():
-                        exec_future = cast(
-                            Future[ModelRunnerOutput],
-                            self.model_executor.execute_model(
-                                scheduler_output, non_block=True
-                            ),
-                        )
-                        future = cast(Future[ModelRunnerOutput], exec_future)
-                    else:
-                        exec_future = cast(
-                            Future[ModelRunnerOutput],
-                            self.model_executor.execute_model(
-                                scheduler_output, non_block=True
-                            ),
-                        )
-                        exec_future.add_done_callback(
-                            self._log_err_callback(scheduler_output)
-                        )
-                        grammar_output = self.scheduler.get_grammar_bitmask(
-                            scheduler_output
-                        )
-                        future = self.model_executor.sample_tokens(
-                            grammar_output, non_block=True
-                        )
-                else:
-                    # Structured-output grammar needs previous-step tokens.
-                    # For TT, grammar is consumed in execute_model path, so we
-                    # must defer execute_model submission itself.
-                    if current_platform.is_tt():
-                        deferred_scheduler_output = scheduler_output
-                    else:
-                        exec_future = cast(
-                            Future[ModelRunnerOutput],
-                            self.model_executor.execute_model(
-                                scheduler_output, non_block=True
-                            ),
-                        )
-                        exec_future.add_done_callback(
-                            self._log_err_callback(scheduler_output)
-                        )
-                        # We need to defer sampling until we have processed the
-                        # model output from the prior step.
-                        deferred_scheduler_output = scheduler_output
+                future, deferred_scheduler_output = (
+                    self.model_executor.submit_scheduled_batch(
+                        scheduler_output,
+                        self.scheduler.get_grammar_bitmask,
+                        non_block=True,
+                        failure_callback=self._log_err_callback(scheduler_output),
+                    )
+                )
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
+                assert future is not None
                 batch_queue.appendleft((future, scheduler_output))
                 if (
                     model_executed
@@ -579,37 +544,15 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
-            # We now have the tokens needed to compute the bitmask for the
-            # deferred request. Get the bitmask and call sample tokens.
-            if current_platform.is_tt():
-                # For TT async path, grammar must be computed after prior output
-                # has updated request states, and before execute_model consumes
-                # scheduler_output in build_model_input.
-                # NOTE: get_grammar_bitmask writes the bitmask directly into
-                # deferred_scheduler_output.grammar_bitmask in-place; there is
-                # no return value to capture here (contrast with the non-TT path
-                # below, which passes the bitmask explicitly to sample_tokens).
-                self.scheduler.get_grammar_bitmask(deferred_scheduler_output)
-                exec_future = cast(
-                    Future[ModelRunnerOutput],
-                    self.model_executor.execute_model(
-                        deferred_scheduler_output, non_block=True
-                    ),
-                )
-                batch_queue.appendleft(
-                    (
-                        cast(Future[ModelRunnerOutput], exec_future),
-                        deferred_scheduler_output,
-                    )
-                )
-            else:
-                grammar_output = self.scheduler.get_grammar_bitmask(
-                    deferred_scheduler_output
-                )
-                future = self.model_executor.sample_tokens(
-                    grammar_output, non_block=True
-                )
-                batch_queue.appendleft((future, deferred_scheduler_output))
+            future = cast(
+                Future[ModelRunnerOutput],
+                self.model_executor.submit_deferred_scheduled_batch(
+                    deferred_scheduler_output,
+                    self.scheduler.get_grammar_bitmask,
+                    non_block=True,
+                ),
+            )
+            batch_queue.appendleft((future, deferred_scheduler_output))
 
         return engine_core_outputs, model_executed
 
