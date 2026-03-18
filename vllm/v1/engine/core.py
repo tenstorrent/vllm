@@ -373,7 +373,9 @@ class EngineCore:
                 # During shutdown, peers may close connections mid-collective.
                 # Exit gracefully to allow coordinated shutdown.
                 if "Connection closed by peer" in str(e):
-                    logger.debug("Collective failed during shutdown, exiting gracefully")
+                    logger.debug(
+                        "Collective failed during shutdown, exiting gracefully"
+                    )
                     raise SystemExit() from e
                 raise
             if int(has_requests_t.item()) == 0:
@@ -388,7 +390,9 @@ class EngineCore:
             # is prefill but it doesn't get scheduled.
             has_running = bool(getattr(self.scheduler, "running", []))
             has_waiting = bool(getattr(self.scheduler, "waiting", False))
-            must_prefill = has_waiting and self.dp_decode_streak >= self.dp_max_consec_decodes
+            dp_decode_streak = cast(int, self.dp_decode_streak)
+            dp_max_consec_decodes = cast(int, self.dp_max_consec_decodes)
+            must_prefill = has_waiting and dp_decode_streak >= dp_max_consec_decodes
             local_prefill_intent = (
                 1 if (has_waiting and (must_prefill or not has_running)) else 0
             )
@@ -426,7 +430,7 @@ class EngineCore:
             # Update decode streak: increment only when decode scheduled tokens;
             # reset to 0 when prefill runs OR when nothing was scheduled.
             if scheduler_output.total_num_scheduled_tokens > 0 and forced_mode == 0:
-                self.dp_decode_streak += 1  # type: ignore[has-type]
+                self.dp_decode_streak = dp_decode_streak + 1
             else:
                 self.dp_decode_streak = 0
 
@@ -1541,9 +1545,7 @@ class DPEngineCoreProc(EngineCoreProc):
             # During shutdown, peers may close connections mid-collective.
             # Exit gracefully to allow coordinated shutdown.
             if "Connection closed by peer" in str(e):
-                logger.debug(
-                    "Collective failed during shutdown, exiting gracefully"
-                )
+                logger.debug("Collective failed during shutdown, exiting gracefully")
                 raise SystemExit() from e
             raise
         return int(has_requests_t.item()) > 0
@@ -1557,7 +1559,9 @@ class DPEngineCoreProc(EngineCoreProc):
         # is prefill but it doesn't get scheduled.
         has_running = bool(getattr(self.scheduler, "running", []))
         has_waiting = bool(getattr(self.scheduler, "waiting", False))
-        must_prefill = has_waiting and self.dp_decode_streak >= self.dp_max_consec_decodes
+        must_prefill = (
+            has_waiting and self.dp_decode_streak >= self.dp_max_consec_decodes
+        )
         local_prefill_intent = (
             1 if (has_waiting and (must_prefill or not has_running)) else 0
         )
@@ -1608,9 +1612,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 self._dp_apply_forced_mode(None)
                 self._dp_update_decode_streak(scheduler_output, forced_mode)
                 if not self.is_ec_producer:
-                    model_executed = (
-                        scheduler_output.total_num_scheduled_tokens > 0
-                    )
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
         prev_model_output: ModelRunnerOutput | None = None
         prev_scheduler_output: SchedulerOutput | None = None
@@ -1669,7 +1671,7 @@ class DPEngineCoreProc(EngineCoreProc):
         world = parallel_config.data_parallel_size
 
         local_has_requests = scheduler_output is not None
-        if local_has_requests:
+        if scheduler_output is not None:
             self.dlog(
                 "enter_gather tokens=%d", scheduler_output.total_num_scheduled_tokens
             )
