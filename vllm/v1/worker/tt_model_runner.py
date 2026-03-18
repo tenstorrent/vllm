@@ -178,6 +178,7 @@ class TTDecodeSubmission:
 
     tt_out: Any | None
     read_events: list[Any] | None
+    defer_blocking_read: bool
     batch_size_per_dp: list[int]
     sampling_params: TTSamplingParams
     perform_device_sampling: bool
@@ -350,13 +351,21 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        self.async_read_mode = os.getenv("VLLM_TT_ASYNC_READ_MODE", "event").strip().lower()
+        if self.async_read_mode not in {"event", "blocking_worker"}:
+            raise ValueError(
+                "VLLM_TT_ASYNC_READ_MODE must be 'event' or 'blocking_worker', "
+                f"got {self.async_read_mode!r}"
+            )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
-            "sample_on_device_mode=%s, enable_model_warmup=%s",
+            "sample_on_device_mode=%s, enable_model_warmup=%s, "
+            "async_read_mode=%s",
             self.trace_mode,
             self.sample_on_device_mode,
             self.enable_model_warmup,
+            self.async_read_mode,
         )
 
         # mm_hash -> encoder_output
@@ -1577,8 +1586,10 @@ class TTModelRunner:
         """Submit non-DP decode work for async completion.
 
         Returns an `AsyncTTModelRunnerOutput` after issuing TT decode work and
-        async read submission. The wrapper carries the captured request
-        identity needed to build the final non-DP output on the async thread.
+        either async read submission (`event` mode) or deferred blocking
+        readback on the worker thread (`blocking_worker` mode). The wrapper
+        carries the captured request identity needed to build the final non-DP
+        output on the async thread.
         """
         event = threading.Event()
         submission = self.submit_decode(
@@ -1622,8 +1633,10 @@ class TTModelRunner:
         """Submit merged DP decode work for async completion.
 
         Returns an `AsyncTTDPGatherOutput` after issuing merged DP decode work
-        and async read submission. The wrapper later produces the packed
-        per-DP payload consumed by gathered-DP finalization.
+        and either async read submission (`event` mode) or deferred blocking
+        readback on the worker thread (`blocking_worker` mode). The wrapper
+        later produces the packed per-DP payload consumed by gathered-DP
+        finalization.
         """
         submission = self.submit_decode(
             model_input, read_from_device=False, async_read=True
@@ -1644,9 +1657,11 @@ class TTModelRunner:
     ) -> TTDecodeSubmission:
         """Submit decode work and return a normalized submission record.
 
-        Launches TT decode with either immediate readback or async read submit
-        and returns a normalized record consumed by sync and async completion
-        paths.
+        Launches TT decode and returns a normalized record consumed by sync and
+        async completion paths. In async mode, the readback strategy depends on
+        `VLLM_TT_ASYNC_READ_MODE`: `event` submits non-blocking reads on the
+        caller thread and later waits on events; `blocking_worker` defers the
+        blocking readback to `finalize_decode()` on the async worker thread.
         """
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
@@ -1658,6 +1673,7 @@ class TTModelRunner:
             return TTDecodeSubmission(
                 tt_out=None,
                 read_events=None,
+                defer_blocking_read=False,
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
                 perform_device_sampling=perform_device_sampling,
@@ -1715,7 +1731,8 @@ class TTModelRunner:
             read_from_device=read_from_device,
         )
         read_events = None
-        if async_read:
+        defer_blocking_read = False
+        if async_read and self.async_read_mode == "event":
             if hasattr(self.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
@@ -1732,9 +1749,15 @@ class TTModelRunner:
                         "TT model must implement read_decode_output() "
                         "unless decode_forward() already returns host tensors"
                     )
+        elif async_read:
+            # Match the older async path from viktorpus/async-sched: hand off the
+            # raw TT decode result and let finalize_decode() perform a blocking
+            # read on the async worker thread.
+            defer_blocking_read = True
         return TTDecodeSubmission(
             tt_out=tt_out,
             read_events=read_events,
+            defer_blocking_read=defer_blocking_read,
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
@@ -1752,9 +1775,30 @@ class TTModelRunner:
         if submission.tt_out is None:
             return None
 
-        if submission.read_events is not None:
+        if submission.defer_blocking_read:
+            if hasattr(self.model, "read_decode_output"):
+                tt_out = self.model.read_decode_output(
+                    submission.tt_out, async_read=False
+                )
+            else:
+                raw_tt_out = submission.tt_out
+                is_host_tensor = isinstance(raw_tt_out, torch.Tensor)
+                is_host_tensor_tuple = isinstance(raw_tt_out, tuple) and all(
+                    tensor is None or isinstance(tensor, torch.Tensor)
+                    for tensor in raw_tt_out
+                )
+                if not (is_host_tensor or is_host_tensor_tuple):
+                    raise AttributeError(
+                        "TT model must implement read_decode_output() "
+                        "unless decode_forward() already returns host tensors"
+                    )
+                tt_out = raw_tt_out
+        elif submission.read_events is not None:
             for read_event in submission.read_events:
                 ttnn.event_synchronize(read_event)
+            tt_out = submission.tt_out
+        else:
+            tt_out = submission.tt_out
 
         # Real TT generator models expose `process_decode_output_host()` to
         # convert readback tensors into torch outputs. Keep compatibility with
@@ -1762,22 +1806,20 @@ class TTModelRunner:
         # not implement the newer hook.
         if hasattr(self.model, "process_decode_output_host"):
             tt_out = self.model.process_decode_output_host(
-                submission.tt_out,
+                tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
         else:
-            raw_tt_out = submission.tt_out
-            is_host_tensor = isinstance(raw_tt_out, torch.Tensor)
-            is_host_tensor_tuple = isinstance(raw_tt_out, tuple) and all(
+            is_host_tensor = isinstance(tt_out, torch.Tensor)
+            is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
                 tensor is None or isinstance(tensor, torch.Tensor)
-                for tensor in raw_tt_out
+                for tensor in tt_out
             )
             if not (is_host_tensor or is_host_tensor_tuple):
                 raise AttributeError(
                     "TT model must implement process_decode_output_host() "
                     "unless decode output is already a torch tensor"
                 )
-            tt_out = raw_tt_out
 
         tt_log_probs = None
         assert isinstance(submission.sampling_params.enable_log_probs, torch.Tensor)

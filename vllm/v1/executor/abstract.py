@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -224,6 +224,83 @@ class Executor(ABC):
             "sample_tokens", args=(grammar_output,), non_block=non_block
         )
         return output[0]
+
+    def samples_tokens_in_execute_model(self) -> bool:
+        """Return True when execute_model() already applies sampling/output work.
+
+        Most executors follow the default vLLM flow: execute_model() produces
+        model state/logits, then sample_tokens() consumes the grammar bitmask
+        and returns the final ModelRunnerOutput. TT keeps that sampling/output
+        path inside execute_model(), so the engine must defer execute_model()
+        itself until structured-output grammar is available.
+        """
+        return self.device_config.device_type == "tt"
+
+    def submit_scheduled_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        get_grammar_bitmask: Callable[[SchedulerOutput], GrammarOutput | None],
+        *,
+        non_block: bool,
+        failure_callback: Callable[[Future[ModelRunnerOutput | None]], None] | None = None,
+    ) -> tuple[Future[ModelRunnerOutput | None] | None, SchedulerOutput | None]:
+        """Start work for one scheduled batch.
+
+        Returns a `(future, deferred_scheduler_output)` pair. Executors that
+        sample inside execute_model() return a future directly when grammar is
+        already available, or defer execute_model() itself until a later call.
+        Executors that keep sampling separate submit execute_model() first and,
+        when possible, immediately enqueue sample_tokens().
+        """
+        if self.samples_tokens_in_execute_model():
+            if scheduler_output.pending_structured_output_tokens:
+                return None, scheduler_output
+            future = cast(
+                Future[ModelRunnerOutput | None],
+                self.execute_model(scheduler_output, non_block=non_block),
+            )
+            return future, None
+
+        exec_future = cast(
+            Future[ModelRunnerOutput | None],
+            self.execute_model(scheduler_output, non_block=non_block),
+        )
+        if failure_callback is not None:
+            exec_future.add_done_callback(failure_callback)
+
+        if scheduler_output.pending_structured_output_tokens:
+            return None, scheduler_output
+
+        grammar_output = get_grammar_bitmask(scheduler_output)
+        future = cast(
+            Future[ModelRunnerOutput | None],
+            self.sample_tokens(grammar_output, non_block=non_block),
+        )
+        return future, None
+
+    def submit_deferred_scheduled_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        get_grammar_bitmask: Callable[[SchedulerOutput], GrammarOutput | None],
+        *,
+        non_block: bool,
+    ) -> Future[ModelRunnerOutput | None]:
+        """Submit a batch whose structured-output grammar became available later."""
+        if self.samples_tokens_in_execute_model():
+            # Executors such as TT consume scheduler_output.grammar_bitmask
+            # inside execute_model(), so computing the bitmask is a required
+            # side effect before submission.
+            get_grammar_bitmask(scheduler_output)
+            return cast(
+                Future[ModelRunnerOutput | None],
+                self.execute_model(scheduler_output, non_block=non_block),
+            )
+
+        grammar_output = get_grammar_bitmask(scheduler_output)
+        return cast(
+            Future[ModelRunnerOutput | None],
+            self.sample_tokens(grammar_output, non_block=non_block),
+        )
 
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")
