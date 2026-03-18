@@ -1729,7 +1729,12 @@ class TTModelRunner:
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
                 rank_enable_lp = sampling_params.enable_log_probs[start : start + sz]
-                if rank_enable_lp.any() and tt_log_probs is not None:
+                if rank_enable_lp.any():
+                    # Sanity check for if we correctly detect
+                    # when logprobs are supported.
+                    assert tt_log_probs is not None, (
+                        "model should return logprobs when requested"
+                    )
                     if isinstance(tt_log_probs, tuple):
                         # New path: top-K logprobs from device
                         # (gpt-oss-120b). Device returns already-sorted
