@@ -282,12 +282,11 @@ class TTModelRunner:
         self.enable_model_warmup = enable_model_warmup
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
-        self.async_read_mode = os.getenv("VLLM_TT_ASYNC_READ_MODE", "event").strip().lower()
+        self.async_read_mode = (
+            os.getenv("VLLM_TT_ASYNC_READ_MODE", "event").strip().lower()
+        )
         if self.async_read_mode not in {"event", "blocking_worker"}:
-            raise ValueError(
-                "VLLM_TT_ASYNC_READ_MODE must be 'event' or 'blocking_worker', "
-                f"got {self.async_read_mode!r}"
-            )
+            self.async_read_mode = "event"
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -1728,8 +1727,7 @@ class TTModelRunner:
         else:
             is_host_tensor = isinstance(tt_out, torch.Tensor)
             is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                tensor is None or isinstance(tensor, torch.Tensor)
-                for tensor in tt_out
+                tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
             )
             if not (is_host_tensor or is_host_tensor_tuple):
                 raise AttributeError(

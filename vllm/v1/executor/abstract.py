@@ -236,13 +236,20 @@ class Executor(ABC):
         """
         return self.device_config.device_type == "tt"
 
+    @staticmethod
+    def _as_future(value: _R) -> Future[_R]:
+        future: Future[_R] = Future()
+        future.set_result(value)
+        return future
+
     def submit_scheduled_batch(
         self,
         scheduler_output: SchedulerOutput,
         get_grammar_bitmask: Callable[[SchedulerOutput], GrammarOutput | None],
         *,
         non_block: bool,
-        failure_callback: Callable[[Future[ModelRunnerOutput | None]], None] | None = None,
+        failure_callback: Callable[[Future[ModelRunnerOutput | None]], None]
+        | None = None,
     ) -> tuple[Future[ModelRunnerOutput | None] | None, SchedulerOutput | None]:
         """Start work for one scheduled batch.
 
@@ -255,16 +262,26 @@ class Executor(ABC):
         if self.samples_tokens_in_execute_model():
             if scheduler_output.pending_structured_output_tokens:
                 return None, scheduler_output
-            future = cast(
-                Future[ModelRunnerOutput | None],
-                self.execute_model(scheduler_output, non_block=non_block),
-            )
+            if non_block:
+                future = cast(
+                    Future[ModelRunnerOutput | None],
+                    self.execute_model(scheduler_output, non_block=True),
+                )
+            else:
+                future = self._as_future(
+                    self.execute_model(scheduler_output, non_block=False)
+                )
             return future, None
 
-        exec_future = cast(
-            Future[ModelRunnerOutput | None],
-            self.execute_model(scheduler_output, non_block=non_block),
-        )
+        if non_block:
+            exec_future = cast(
+                Future[ModelRunnerOutput | None],
+                self.execute_model(scheduler_output, non_block=True),
+            )
+        else:
+            exec_future = self._as_future(
+                self.execute_model(scheduler_output, non_block=False)
+            )
         if failure_callback is not None:
             exec_future.add_done_callback(failure_callback)
 
@@ -272,10 +289,16 @@ class Executor(ABC):
             return None, scheduler_output
 
         grammar_output = get_grammar_bitmask(scheduler_output)
-        future = cast(
-            Future[ModelRunnerOutput | None],
-            self.sample_tokens(grammar_output, non_block=non_block),
-        )
+        if non_block:
+            future = cast(
+                Future[ModelRunnerOutput | None],
+                self.sample_tokens(grammar_output, non_block=True),
+            )
+        else:
+            future = cast(
+                Future[ModelRunnerOutput | None],
+                self._as_future(self.sample_tokens(grammar_output, non_block=False)),
+            )
         return future, None
 
     def submit_deferred_scheduled_batch(
@@ -291,15 +314,24 @@ class Executor(ABC):
             # inside execute_model(), so computing the bitmask is a required
             # side effect before submission.
             get_grammar_bitmask(scheduler_output)
-            return cast(
-                Future[ModelRunnerOutput | None],
-                self.execute_model(scheduler_output, non_block=non_block),
+            if non_block:
+                return cast(
+                    Future[ModelRunnerOutput | None],
+                    self.execute_model(scheduler_output, non_block=True),
+                )
+            return self._as_future(
+                self.execute_model(scheduler_output, non_block=False)
             )
 
         grammar_output = get_grammar_bitmask(scheduler_output)
+        if non_block:
+            return cast(
+                Future[ModelRunnerOutput | None],
+                self.sample_tokens(grammar_output, non_block=True),
+            )
         return cast(
             Future[ModelRunnerOutput | None],
-            self.sample_tokens(grammar_output, non_block=non_block),
+            self._as_future(self.sample_tokens(grammar_output, non_block=False)),
         )
 
     def execute_dummy_batch(self) -> None:

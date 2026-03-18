@@ -5,7 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cached_property
 from multiprocessing import Lock
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -24,26 +24,6 @@ logger = init_logger(__name__)
 
 
 class UniProcExecutor(Executor):
-    def _create_async_output_thread(self) -> ThreadPoolExecutor | None:
-        if self.max_concurrent_batches <= 1:
-            return None
-        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="WorkerAsyncOutput")
-
-    def _submit_async_output(
-        self,
-        output: AsyncModelRunnerOutput,
-        *,
-        single_value: bool,
-    ) -> Future[Any | list[Any]] | Any | list[Any]:
-        if (async_thread := self.async_output_thread) is None:
-            result = output.get_output()
-            return result if single_value else [result]
-
-        get_output = output.get_output
-        if not single_value:
-            get_output = lambda go=output.get_output: [go()]
-        return async_thread.submit(get_output)
-
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(vllm_config=self.vllm_config, rpc_rank=0)
@@ -57,7 +37,11 @@ class UniProcExecutor(Executor):
             shared_worker_lock=Lock(),
         )
 
-        self.async_output_thread = self._create_async_output_thread()
+        self.async_output_thread: ThreadPoolExecutor | None = None
+        if self.max_concurrent_batches > 1:
+            self.async_output_thread = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="WorkerAsyncOutput"
+            )
 
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
@@ -94,7 +78,12 @@ class UniProcExecutor(Executor):
         try:
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
-                return self._submit_async_output(result, single_value=single_value)
+                if (async_thread := self.async_output_thread) is not None:
+                    get_output = result.get_output
+                    if not single_value:
+                        get_output = lambda go=result.get_output: [go()]
+                    return async_thread.submit(get_output)
+                result = result.get_output()
             future = Future[Any]()
             future.set_result(result if single_value else [result])
         except Exception as e:
@@ -120,17 +109,20 @@ class UniProcExecutor(Executor):
         any_structured_inputs: bool,
         non_block: bool = False,
     ) -> tuple[torch.Tensor, list[Any]] | Future[tuple[torch.Tensor, list[Any]]]:
-        return self.collective_rpc(
-            "concat_and_execute_dp",
-            args=(
-                inputs,
-                is_decode,
-                max_blocks_decode_batch,
-                any_structured_inputs,
+        return cast(
+            tuple[torch.Tensor, list[Any]] | Future[tuple[torch.Tensor, list[Any]]],
+            self.collective_rpc(
+                "concat_and_execute_dp",
+                args=(
+                    inputs,
+                    is_decode,
+                    max_blocks_decode_batch,
+                    any_structured_inputs,
+                ),
+                kwargs={"non_block": non_block},
+                non_block=non_block,
+                single_value=True,
             ),
-            kwargs={"non_block": non_block},
-            non_block=non_block,
-            single_value=True,
         )
 
     def sample_tokens(  # type: ignore[override]
