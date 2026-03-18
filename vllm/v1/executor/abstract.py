@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -225,6 +225,18 @@ class Executor(ABC):
         )
         return output[0]
 
+    def concat_and_execute_dp(
+        self,
+        inputs: Any,
+        is_decode: bool,
+        max_blocks_decode_batch: int | None,
+        any_structured_inputs: bool,
+        non_block: bool = False,
+    ) -> tuple[Any, list[Any]] | Future[tuple[Any, list[Any]]]:
+        raise NotImplementedError(
+            "concat_and_execute_dp is only supported by gathered-DP executors"
+        )
+
     def samples_tokens_in_execute_model(self) -> bool:
         """Return True when execute_model() already applies sampling/output work.
 
@@ -250,7 +262,7 @@ class Executor(ABC):
         non_block: bool,
         failure_callback: Callable[[Future[ModelRunnerOutput | None]], None]
         | None = None,
-    ) -> tuple[Future[ModelRunnerOutput | None] | None, SchedulerOutput | None]:
+    ) -> tuple[Future[ModelRunnerOutput] | None, SchedulerOutput | None]:
         """Start work for one scheduled batch.
 
         Returns a `(future, deferred_scheduler_output)` pair. Executors that
@@ -264,12 +276,15 @@ class Executor(ABC):
                 return None, scheduler_output
             if non_block:
                 future = cast(
-                    Future[ModelRunnerOutput | None],
+                    Future[ModelRunnerOutput],
                     self.execute_model(scheduler_output, non_block=True),
                 )
             else:
-                future = self._as_future(
-                    self.execute_model(scheduler_output, non_block=False)
+                future = cast(
+                    Future[ModelRunnerOutput],
+                    self._as_future(
+                        self.execute_model(scheduler_output, non_block=False)
+                    ),
                 )
             return future, None
 
@@ -291,12 +306,12 @@ class Executor(ABC):
         grammar_output = get_grammar_bitmask(scheduler_output)
         if non_block:
             future = cast(
-                Future[ModelRunnerOutput | None],
+                Future[ModelRunnerOutput],
                 self.sample_tokens(grammar_output, non_block=True),
             )
         else:
             future = cast(
-                Future[ModelRunnerOutput | None],
+                Future[ModelRunnerOutput],
                 self._as_future(self.sample_tokens(grammar_output, non_block=False)),
             )
         return future, None
@@ -307,7 +322,7 @@ class Executor(ABC):
         get_grammar_bitmask: Callable[[SchedulerOutput], GrammarOutput | None],
         *,
         non_block: bool,
-    ) -> Future[ModelRunnerOutput | None]:
+    ) -> Future[ModelRunnerOutput]:
         """Submit a batch whose structured-output grammar became available later."""
         if self.samples_tokens_in_execute_model():
             # Executors such as TT consume scheduler_output.grammar_bitmask
@@ -316,21 +331,22 @@ class Executor(ABC):
             get_grammar_bitmask(scheduler_output)
             if non_block:
                 return cast(
-                    Future[ModelRunnerOutput | None],
+                    Future[ModelRunnerOutput],
                     self.execute_model(scheduler_output, non_block=True),
                 )
-            return self._as_future(
-                self.execute_model(scheduler_output, non_block=False)
+            return cast(
+                Future[ModelRunnerOutput],
+                self._as_future(self.execute_model(scheduler_output, non_block=False)),
             )
 
         grammar_output = get_grammar_bitmask(scheduler_output)
         if non_block:
             return cast(
-                Future[ModelRunnerOutput | None],
+                Future[ModelRunnerOutput],
                 self.sample_tokens(grammar_output, non_block=True),
             )
         return cast(
-            Future[ModelRunnerOutput | None],
+            Future[ModelRunnerOutput],
             self._as_future(self.sample_tokens(grammar_output, non_block=False)),
         )
 

@@ -92,6 +92,12 @@ class DPGatherHandle:
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
+    # Gathered-DP subclasses initialize these before guarded access sites use
+    # them. Declaring them here lets mypy type-check direct attribute access.
+    requires_gather: bool
+    dp_decode_streak: int
+    dp_max_consec_decodes: int
+
     def __init__(
         self,
         vllm_config: VllmConfig,
