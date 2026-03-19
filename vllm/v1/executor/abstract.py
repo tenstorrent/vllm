@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -224,18 +224,6 @@ class Executor(ABC):
             "sample_tokens", args=(grammar_output,), non_block=non_block
         )
         return output[0]
-
-    def concat_and_execute_dp(
-        self,
-        inputs: Any,
-        is_decode: bool,
-        max_blocks_decode_batch: int | None,
-        any_structured_inputs: bool,
-        non_block: bool = False,
-    ) -> tuple[Any, list[Any]] | Future[tuple[Any, list[Any]]]:
-        raise NotImplementedError(
-            "concat_and_execute_dp is only supported by gathered-DP executors"
-        )
 
     def samples_tokens_in_execute_model(self) -> bool:
         """Return True when execute_model() already applies sampling/output work.
