@@ -408,6 +408,7 @@ class EngineCore:
 
         is_tt = current_platform.is_tt()
         grammar_output = None
+        model_output: ModelRunnerOutput | None
 
         if requires_gather:
             # Gathered-DP routes through the TT helper, which coordinates the
@@ -432,7 +433,7 @@ class EngineCore:
                     # Most backends sample after execute_model(); TT keeps that
                     # work inside execute_model(), so this branch is skipped there.
                     model_output = self.model_executor.sample_tokens(grammar_output)
-                assert model_output is not None
+        assert model_output is not None
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
