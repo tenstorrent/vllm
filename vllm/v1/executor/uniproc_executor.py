@@ -5,7 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cached_property
 from multiprocessing import Lock
-from typing import Any, cast
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -99,30 +99,6 @@ class UniProcExecutor(Executor):
             args=(scheduler_output,),
             non_block=non_block,
             single_value=True,
-        )
-
-    def concat_and_execute_dp(
-        self,
-        inputs: Any,
-        is_decode: bool,
-        max_blocks_decode_batch: int | None,
-        any_structured_inputs: bool,
-        non_block: bool = False,
-    ) -> tuple[torch.Tensor, list[Any]] | Future[tuple[torch.Tensor, list[Any]]]:
-        return cast(
-            tuple[torch.Tensor, list[Any]] | Future[tuple[torch.Tensor, list[Any]]],
-            self.collective_rpc(
-                "concat_and_execute_dp",
-                args=(
-                    inputs,
-                    is_decode,
-                    max_blocks_decode_batch,
-                    any_structured_inputs,
-                ),
-                kwargs={"non_block": non_block},
-                non_block=non_block,
-                single_value=True,
-            ),
         )
 
     def sample_tokens(  # type: ignore[override]
