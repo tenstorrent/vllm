@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pickle
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -18,6 +18,22 @@ if TYPE_CHECKING:
     from vllm.v1.engine.core import DPEngineCoreProc, DPGatherHandle
 
 logger = init_logger(__name__)
+_T = TypeVar("_T")
+
+
+def _unwrap_single_worker_future(future: Future[list[_T]]) -> Future[_T]:
+    single_future: Future[_T] = Future()
+
+    def _set_single_result(done_future: Future[list[_T]]) -> None:
+        try:
+            results = done_future.result()
+            assert len(results) == 1
+            single_future.set_result(results[0])
+        except Exception as exc:
+            single_future.set_exception(exc)
+
+    future.add_done_callback(_set_single_result)
+    return single_future
 
 
 def _completed_dp_gather_future(
@@ -398,8 +414,8 @@ def dp_gather_submit(
         and any(x is not None for x in gathered_inputs)
     )
     if should_submit:
-        future = cast(
-            Future[tuple[torch.Tensor, list]],
+        collective_future = cast(
+            Future[list[tuple[torch.Tensor, list]]],
             core.model_executor.collective_rpc(
                 "concat_and_execute_dp",
                 args=(
@@ -410,9 +426,9 @@ def dp_gather_submit(
                 ),
                 kwargs={"non_block": True},
                 non_block=True,
-                single_value=True,
             ),
         )
+        future = _unwrap_single_worker_future(collective_future)
     else:
         future = _completed_dp_gather_future(core)
 
