@@ -839,9 +839,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
             )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
-        # like </call> for gpt-oss) with any request-specified ones
+        # like </call> for gpt-oss) with any request-specified ones unless
+        # the request explicitly asks to ignore EOS-like stops.
         stop_token_ids = self.stop_token_ids or None
-        default_stop_ids = default_sampling_params.get("stop_token_ids")
+        default_stop_ids = (
+            None if self.ignore_eos else default_sampling_params.get("stop_token_ids")
+        )
         if default_stop_ids:
             if stop_token_ids is None:
                 stop_token_ids = list(default_stop_ids)
@@ -1344,9 +1347,12 @@ class CompletionRequest(OpenAIBaseModel):
             )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
-        # like </call> for gpt-oss) with any request-specified ones
+        # like </call> for gpt-oss) with any request-specified ones unless
+        # the request explicitly asks to ignore EOS-like stops.
         stop_token_ids = self.stop_token_ids or None
-        default_stop_ids = default_sampling_params.get("stop_token_ids")
+        default_stop_ids = (
+            None if self.ignore_eos else default_sampling_params.get("stop_token_ids")
+        )
         if default_stop_ids:
             if stop_token_ids is None:
                 stop_token_ids = list(default_stop_ids)

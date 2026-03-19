@@ -1330,7 +1330,10 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output(token_ids)
+                reasoning, content, _ = parse_chat_output(
+                    token_ids,
+                    stop_on_assistant_action=not request.ignore_eos,
+                )
                 if not request.include_reasoning:
                     reasoning = None
 

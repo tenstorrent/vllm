@@ -506,20 +506,29 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
     return StreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
-def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
+def parse_output_into_messages(
+    token_ids: Iterable[int],
+    *,
+    stop_on_assistant_action: bool = True,
+) -> StreamableParser:
     parser = get_streamable_parser_for_assistant()
     stop_tokens = set(get_stop_tokens_for_assistant_actions())
     for token_id in token_ids:
         parser.process(token_id)
-        if token_id in stop_tokens:
+        if stop_on_assistant_action and token_id in stop_tokens:
             break
     return parser
 
 
 def parse_chat_output(
     token_ids: Sequence[int],
+    *,
+    stop_on_assistant_action: bool = True,
 ) -> tuple[str | None, str | None, bool]:
-    parser = parse_output_into_messages(token_ids)
+    parser = parse_output_into_messages(
+        token_ids,
+        stop_on_assistant_action=stop_on_assistant_action,
+    )
     output_msgs = parser.messages
     is_tool_call = False  # TODO: update this when tool call is supported
     if len(output_msgs) == 0:
