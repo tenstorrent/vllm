@@ -723,6 +723,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)
         ) from e
     except Exception as e:
+        logger.exception("Error in create_completion")
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
         ) from e
