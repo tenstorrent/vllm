@@ -5,9 +5,11 @@ import pytest
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
+# -1 means all vocab logprobs, or max supported
+# 0 means just the sampled token's logprob
 class TestLogprobs:
     @pytest.mark.parametrize("batch_fraction", [0, 0.5, 1, 1.5])
-    @pytest.mark.parametrize("num_logprobs", [1, 3, 5, 10])
+    @pytest.mark.parametrize("num_logprobs", [-1, 0, 1, 3, 5, 10])
     def test_logprobs(
         self, tt_server, tt_model_name, max_batch_size, batch_fraction, num_logprobs
     ):

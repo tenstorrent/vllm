@@ -23,6 +23,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 # (see SamplingParams.__post_init__), so we use -1 as the sentinel.
 SEED_NONE_SENTINEL = -1
 
+# Sentinel for logprobs=None (disabled). Can't use 0 because
+# SamplingParams.logprobs=0 means "return the sampled token's logprob".
+# Can't use -1 because SamplingParams.logprobs=-1 means "all vocab logprobs".
+# although -1 gets remapped before writing to SamplingInputBatch.num_logprobs
+LOGPROBS_NONE_SENTINEL = -2
+
 
 class SamplingInputBatch:
     # Default values for padding sampling parameters in decode mode.
@@ -34,7 +40,7 @@ class SamplingInputBatch:
         "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
         "seed": SEED_NONE_SENTINEL,  # Sentinel represents None (no seed)
-        "num_logprobs": 0,  # Default to no logprobs
+        "num_logprobs": LOGPROBS_NONE_SENTINEL,
     }
 
     def __init__(self, max_num_reqs: int, logitsprocs: LogitsProcessors | None = None):
@@ -286,11 +292,15 @@ class InputBatch:
         if request.generator is not None:
             self.sampling.generators[req_index] = request.generator
 
-        # Logprobs
+        # Logprobs (-1 means all vocab logprobs, remap to vocab_size)
         if sampling_params.logprobs is not None:
-            self.sampling.num_logprobs[req_index] = sampling_params.logprobs
+            self.sampling.num_logprobs[req_index] = (
+                self.vocab_size
+                if sampling_params.logprobs == -1
+                else sampling_params.logprobs
+            )
         else:
-            self.sampling.num_logprobs[req_index] = 0
+            self.sampling.num_logprobs[req_index] = LOGPROBS_NONE_SENTINEL
 
         # Allowed token IDs
         if sampling_params.allowed_token_ids:
@@ -430,11 +440,13 @@ class InputBatch:
         del self.req_output_token_ids[self.num_reqs :]
 
     @property
-    def max_num_logprobs(self) -> int:
-        """Returns the maximum logprobs value across all requests, or None."""
+    def max_num_logprobs(self) -> int | None:
+        """Returns the max logprobs across requests, or None if none need logprobs."""
         if self.num_reqs == 0:
-            return 0
+            return None
         max_val = int(self.sampling.num_logprobs[: self.num_reqs].max().item())
+        if max_val < 0:
+            return None
         return max_val
 
     @property
