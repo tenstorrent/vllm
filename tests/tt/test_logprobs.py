@@ -115,9 +115,7 @@ class TestLogprobs:
         assert choice.logprobs.content is not None, "Logprobs content missing"
         assert len(choice.logprobs.content) > 0, "Logprobs content empty"
         for i, token_lp in enumerate(choice.logprobs.content):
-            assert token_lp.top_logprobs is not None, (
-                f"token {i}: top_logprobs missing"
-            )
+            assert token_lp.top_logprobs is not None, f"token {i}: top_logprobs missing"
             assert len(token_lp.top_logprobs) > 10, (
                 f"token {i}: expected many top_logprobs for all-vocab, "
                 f"got {len(token_lp.top_logprobs)}"

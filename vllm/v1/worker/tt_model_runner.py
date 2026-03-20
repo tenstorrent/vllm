@@ -1357,7 +1357,7 @@ class TTModelRunner:
         # On single device, logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
         max_lp = input_batch.max_num_logprobs
-        if max_lp is not None and (max_lp > 0 or not num_devices in (8,32)):
+        if max_lp is not None and (max_lp > 0 or num_devices not in (8, 32)):
             return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True
