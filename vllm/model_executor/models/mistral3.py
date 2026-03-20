@@ -231,9 +231,12 @@ _I = TypeVar("_I", bound=BaseLlavaProcessingInfo)
 
 class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        # Return empty string for PixtralProcessorAdapter compatibility
-        # The processor expects empty text for profiling/dummy inputs
-        return ""
+        num_images = mm_counts.get("image", 0)
+        hf_config = self.info.get_hf_config()
+        image_token_id = hf_config.image_token_index
+        tokenizer = self.info.get_tokenizer()
+        image_token = tokenizer.decode([image_token_id])
+        return image_token * num_images
 
     def get_dummy_mm_data(
         self,
@@ -336,7 +339,7 @@ class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo
         return [
             PromptReplacement(
                 modality="image",
-                target="",  # Never match (for profiling with empty text)
+                target=[image_token_id],
                 replacement=get_replacement,
             ),
         ]
