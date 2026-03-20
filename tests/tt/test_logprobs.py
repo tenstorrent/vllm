@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import openai
 import pytest
 
 from tests.tt.utils import RequestConfig, run_concurrent_batch
@@ -85,6 +86,8 @@ class TestLogprobs:
 
         The legacy completions API rejects logprobs=-1, so this must go
         through the chat API where top_logprobs=-1 is allowed.
+        Servers with a low max_logprobs cap will reject this request;
+        the test is skipped in that case.
         """
         configs = [
             RequestConfig(
@@ -93,13 +96,18 @@ class TestLogprobs:
                 logprobs=-1,
             )
         ]
-        results = run_concurrent_batch(
-            tt_server,
-            tt_model_name,
-            configs,
-            use_chat=True,
-            return_full_response=True,
-        )
+        try:
+            results = run_concurrent_batch(
+                tt_server,
+                tt_model_name,
+                configs,
+                use_chat=True,
+                return_full_response=True,
+            )
+        except openai.BadRequestError as e:
+            if "max allowed" in str(e).lower() and "logprobs" in str(e).lower():
+                pytest.skip(f"Server does not support all-vocab logprobs: {e}")
+            raise
         assert len(results) == 1
 
         choice = results[0].choices[0]
