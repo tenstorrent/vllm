@@ -721,7 +721,10 @@ class OpenAIServingChat(OpenAIServing):
                         harmony_parser = harmony_parsers[i]
                         prev_recipient = harmony_parser.current_recipient
                         delta_text = ""
+                        harmony_stop_tokens = set(get_stop_tokens_for_assistant_actions())
                         for token_id in output.token_ids:
+                            if token_id in harmony_stop_tokens:
+                                break
                             harmony_parser.process(token_id)
                             delta_text += harmony_parser.last_content_delta or ""
                         cur_channel = harmony_parser.current_channel
