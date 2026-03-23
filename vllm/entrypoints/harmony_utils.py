@@ -512,7 +512,13 @@ def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
     for token_id in token_ids:
         if token_id in stop_tokens:
             break
-        parser.process(token_id)
+        try:
+            parser.process(token_id)
+        except Exception:
+            # Model may generate unexpected special tokens (e.g. <|message|>,
+            # <|call|>) at positions where the harmony parser expects
+            # <|start|>. Stop parsing and return what we have so far.
+            break
     return parser
 
 
