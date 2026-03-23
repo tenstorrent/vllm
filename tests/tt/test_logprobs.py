@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import openai
 import pytest
 
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
+# 0 means just the sampled token's logprob
 class TestLogprobs:
     @pytest.mark.parametrize("batch_fraction", [0, 0.5, 1, 1.5])
-    @pytest.mark.parametrize("num_logprobs", [1, 3, 5, 10])
+    @pytest.mark.parametrize("num_logprobs", [0, 1, 3, 5, 10])
     def test_logprobs(
         self, tt_server, tt_model_name, max_batch_size, batch_fraction, num_logprobs
     ):
@@ -78,3 +80,43 @@ class TestLogprobs:
             )
             for j, lp in enumerate(choice.logprobs.token_logprobs):
                 assert lp is not None, f"request {i}, token {j}: logprob value is None"
+
+    def test_chat_logprobs_all_vocab(self, tt_server, tt_model_name):
+        """Test chat completions with top_logprobs=-1 (all vocab logprobs).
+
+        The legacy completions API rejects logprobs=-1, so this must go
+        through the chat API where top_logprobs=-1 is allowed.
+        Servers with a low max_logprobs cap will reject this request;
+        the test is skipped in that case.
+        """
+        configs = [
+            RequestConfig(
+                prompt="Say hello.",
+                max_tokens=5,
+                logprobs=-1,
+            )
+        ]
+        try:
+            results = run_concurrent_batch(
+                tt_server,
+                tt_model_name,
+                configs,
+                use_chat=True,
+                return_full_response=True,
+            )
+        except openai.BadRequestError as e:
+            if "max allowed" in str(e).lower() and "logprobs" in str(e).lower():
+                pytest.skip(f"Server does not support all-vocab logprobs: {e}")
+            raise
+        assert len(results) == 1
+
+        choice = results[0].choices[0]
+        assert choice.logprobs is not None, "Logprobs missing"
+        assert choice.logprobs.content is not None, "Logprobs content missing"
+        assert len(choice.logprobs.content) > 0, "Logprobs content empty"
+        for i, token_lp in enumerate(choice.logprobs.content):
+            assert token_lp.top_logprobs is not None, f"token {i}: top_logprobs missing"
+            assert len(token_lp.top_logprobs) > 10, (
+                f"token {i}: expected many top_logprobs for all-vocab, "
+                f"got {len(token_lp.top_logprobs)}"
+            )

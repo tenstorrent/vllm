@@ -92,8 +92,8 @@ class TTModelInput:
     # only gathered when host sampling
     generators_list: list[dict[int, torch.Generator]]
     # max_num_logprobs: per-DP-rank list of max logprobs values
-    # only gathered when host sampling
-    max_num_logprobs: list[int]
+    # None means no logprobs, 0 means sampled token only
+    max_num_logprobs: list[int | None]
 
     # Optional: tokens for sampling with penalties during decode
     prompt_tokens: torch.Tensor | None = None
@@ -602,7 +602,8 @@ class TTModelRunner:
         if is_prompt:
             # Convert num_logprobs (int tensor)
             # to enable_log_probs (bool tensor)
-            enable_log_probs = sample_params.num_logprobs[:num_reqs] > 0
+            # -2 means no logprobs, 0 means sampled token only
+            enable_log_probs = sample_params.num_logprobs[:num_reqs] >= 0
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature[:num_reqs],
                 top_k=sample_params.top_k[:num_reqs],
@@ -616,7 +617,8 @@ class TTModelRunner:
         else:
             # Convert num_logprobs (int tensor)
             # to enable_log_probs (bool tensor)
-            enable_log_probs = sample_params.num_logprobs > 0
+            # -2 means no logprobs, 0 means sampled token only
+            enable_log_probs = sample_params.num_logprobs >= 0
             tt_sampling_params = TTSamplingParams(
                 temperature=sample_params.temperature,
                 top_k=sample_params.top_k,
@@ -806,8 +808,8 @@ class TTModelRunner:
             frequency_penalty = sampling_default_tensors["frequency_penalty"]
             repetition_penalty = sampling_default_tensors["repetition_penalty"]
             seed = sampling_default_tensors["seed"]
-            # enable_log_probs: convert num_logprobs > 0
-            enable_log_probs = sampling_default_tensors["num_logprobs"] > 0
+            # enable_log_probs: convert num_logprobs >= 0
+            enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -949,7 +951,7 @@ class TTModelRunner:
         allowed_token_ids_mask_list: list[torch.Tensor | None] = []
         bad_words_token_ids_list: list[dict[int, list[list[int]]]] = []
         logitsprocs_list: list[LogitsProcessors | None] = []
-        max_num_logprobs: list[int] = []
+        max_num_logprobs: list[int | None] = []
         generators_list: list[dict[int, torch.Generator]] = []
 
         if is_decode:
@@ -1052,15 +1054,15 @@ class TTModelRunner:
                         allowed_token_ids_mask_list.append(None)
                         bad_words_token_ids_list.append({})
                         logitsprocs_list.append(None)
-                        max_num_logprobs.append(0)
+                        max_num_logprobs.append(None)
                         generators_list.append({})
             else:
                 # No host-only sampling params - create empty lists
-                # Happens if we didn't skipped gather (when device sampling)
+                # Happens if we skipped gather (when device sampling)
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
-                max_num_logprobs = [0] * world
+                max_num_logprobs = [None] * world
                 generators_list = [{}] * world
 
             off_f = 0
@@ -1165,7 +1167,7 @@ class TTModelRunner:
                     allowed_token_ids_mask_list.append(None)
                     bad_words_token_ids_list.append({})
                     logitsprocs_list.append(None)
-                    max_num_logprobs.append(0)
+                    max_num_logprobs.append(None)
                     generators_list.append({})
 
             input_tokens = torch.cat(input_tokens_list, dim=0)
@@ -1349,13 +1351,13 @@ class TTModelRunner:
             return False
 
         # Logprobs on device are only supported on multi-device setups
-        # (num_devices > 1)
+        # (num_devices in {8,32})
         # Also, only the sampled token's logprob is returned on device,
         # not the top-k alternatives.
         # On single device, logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
         max_lp = input_batch.max_num_logprobs
-        if max_lp > 1 or (max_lp > 0 and num_devices == 1):
+        if max_lp is not None and (max_lp > 0 or num_devices not in (8, 32)):
             return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True
