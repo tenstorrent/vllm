@@ -2370,7 +2370,7 @@ class TTModelRunner:
         Converts the local gathered-DP result into the same state update and
         `ModelRunnerOutput` used by non-DP execution.
         """
-        num_reqs = self.input_batch.num_reqs
+        num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
         return self.apply_and_build_runner_output(
             sampled_token_ids,
