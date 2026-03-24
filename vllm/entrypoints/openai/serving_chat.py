@@ -1342,11 +1342,6 @@ class OpenAIServingChat(OpenAIServing):
 
             if self.use_harmony:
                 reasoning, content, _ = parse_chat_output(token_ids)
-                # Fallback: if model produced reasoning but no final content
-                # (e.g. hit max_tokens or stopped at <|call|>), use reasoning
-                # as content so evals can still extract answers like \boxed{}.
-                if not content and reasoning:
-                    content = reasoning
                 if not request.include_reasoning:
                     reasoning = None
 
