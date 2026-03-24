@@ -509,7 +509,6 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
 def parse_output_into_messages(token_ids: Iterable[int]) -> tuple[StreamableParser, list]:
     parser = get_streamable_parser_for_assistant()
     stop_tokens = set(get_stop_tokens_for_assistant_actions())
-    stop_tokens.discard(200012)  # Don't stop on <|call|> - skip past it instead
     start_token_id = 200006  # <|start|>
     skipping = False
     saved_messages = []
