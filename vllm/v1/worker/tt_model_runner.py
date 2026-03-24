@@ -951,6 +951,10 @@ class TTModelRunner:
             # This means sampling is not perfectly deterministic
             # whenever device sampling is enabled.
 
+        max_num_logprobs = input_batch.max_num_logprobs
+        if max_num_logprobs is None:
+            max_num_logprobs = 0
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -967,7 +971,7 @@ class TTModelRunner:
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
-            max_num_logprobs=[input_batch.max_num_logprobs],
+            max_num_logprobs=[max_num_logprobs],
             logitsprocs_list=[input_batch.sampling.logitsprocs],
             generators_list=[generators],
         )
@@ -1038,7 +1042,8 @@ class TTModelRunner:
             return False
         if model_input.bad_words_token_ids_list[0]:
             return False
-        if model_input.max_num_logprobs[0] > 0:
+        max_num_logprobs = model_input.max_num_logprobs[0]
+        if max_num_logprobs is not None and max_num_logprobs > 0:
             return False
         return True
 
@@ -1072,7 +1077,8 @@ class TTModelRunner:
             return False
         if input_batch.sampling.bad_words_token_ids:
             return False
-        if input_batch.max_num_logprobs > 0:
+        max_num_logprobs = input_batch.max_num_logprobs
+        if max_num_logprobs is not None and max_num_logprobs > 0:
             return False
         if input_batch.sampling.has_active_logitsprocs():
             return False
@@ -2236,7 +2242,10 @@ class TTModelRunner:
                 has_penalties = int(not self.input_batch.no_penalties)
                 reset_batch = int(model_input.reset_batch)
                 can_sample_device = int(model_input.perform_device_sampling)
-                needs_logprobs = int(model_input.max_num_logprobs[0] > 0)
+                max_num_logprobs = model_input.max_num_logprobs[0]
+                needs_logprobs = int(
+                    max_num_logprobs is not None and max_num_logprobs > 0
+                )
                 num_reqs = self.input_batch.num_reqs
                 req_ids = list(self.input_batch.req_ids[:num_reqs])
                 req_id_to_index = dict(self.input_batch.req_id_to_index)
