@@ -40,12 +40,13 @@ class OpenAIToolParser(ToolParser):
                 "OpenAIToolParser requires token IDs and does not support text-based extraction."  # noqa: E501
             )
 
-        parser = parse_output_into_messages(token_ids)
+        parser, saved_messages = parse_output_into_messages(token_ids)
         tool_calls = []
         final_content = None
+        all_messages = list(saved_messages) + list(parser.messages)
 
-        if len(parser.messages) > 0:
-            for msg in parser.messages:
+        if len(all_messages) > 0:
+            for msg in all_messages:
                 if len(msg.content) < 1:
                     continue
                 msg_text = msg.content[0].text

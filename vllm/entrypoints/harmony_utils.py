@@ -506,27 +506,40 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
     return StreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
-def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
+def parse_output_into_messages(token_ids: Iterable[int]) -> tuple[StreamableParser, list]:
     parser = get_streamable_parser_for_assistant()
     stop_tokens = set(get_stop_tokens_for_assistant_actions())
+    stop_tokens.discard(200012)  # Don't stop on <|call|> - skip past it instead
+    start_token_id = 200006  # <|start|>
+    skipping = False
+    saved_messages = []
     for token_id in token_ids:
         if token_id in stop_tokens:
             break
+        if skipping:
+            # Skip tokens until we see <|start|> to resume parsing
+            # after an unexpected token (e.g. <|call|> tool attempt)
+            if token_id == start_token_id:
+                skipping = False
+                parser = get_streamable_parser_for_assistant()
+                parser.process(token_id)
+            continue
         try:
             parser.process(token_id)
         except Exception:
-            # Model may generate unexpected special tokens (e.g. <|message|>,
-            # <|call|>) at positions where the harmony parser expects
-            # <|start|>. Stop parsing and return what we have so far.
-            break
-    return parser
+            # Model generated an unexpected token (e.g. <|call|> after
+            # <|end|>). Save parsed messages, then skip until next
+            # <|start|> to find the final answer.
+            saved_messages.extend(parser.messages)
+            skipping = True
+    return parser, saved_messages
 
 
 def parse_chat_output(
     token_ids: Sequence[int],
 ) -> tuple[str | None, str | None, bool]:
-    parser = parse_output_into_messages(token_ids)
-    output_msgs = parser.messages
+    parser, saved_messages = parse_output_into_messages(token_ids)
+    output_msgs = list(saved_messages) + list(parser.messages)
     is_tool_call = False  # TODO: update this when tool call is supported
     if len(output_msgs) == 0:
         # The generation has stopped during reasoning.
