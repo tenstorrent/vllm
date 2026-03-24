@@ -245,6 +245,18 @@ class TTWorker(WorkerBase):
         """
         return self.model_runner.prepare_dp_model_input(scheduler_output)
 
+    def can_attempt_steady_dp_decode_from_scheduler(
+        self, scheduler_output: Optional["SchedulerOutput"]
+    ) -> bool:
+        """Return whether this rank can submit decode one step ahead.
+
+        This checks only local runner invariants. The engine combines all ranks'
+        answers into a single global decision before using the DP steady path.
+        """
+        return self.model_runner.can_attempt_steady_dp_decode_from_scheduler(
+            scheduler_output
+        )
+
     def build_dp_decode_gather_input(
         self,
         model_input: TTModelInput | None,

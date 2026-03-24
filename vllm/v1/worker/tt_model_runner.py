@@ -1021,18 +1021,29 @@ class TTModelRunner:
             submit_time_ns=time.perf_counter_ns(),
         )
 
-    def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
-        if not self.enable_steady_decode or not self.async_scheduling:
+    def _steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
+        if not self.enable_steady_decode:
             return False
-        if self.parallel_config.data_parallel_size != 1:
+        if dp_gather:
+            if not self.scheduler_config.async_scheduling:
+                return False
+        else:
+            if not self.async_scheduling:
+                return False
+            if self.parallel_config.data_parallel_size != 1:
+                return False
+        if self.async_read_mode != "event":
+            return False
+        if self.trace_mode == "none":
+            return False
+        return True
+
+    def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
+        if not self._steady_decode_base_enabled(dp_gather=False):
             return False
         if model_input.prompt_lens is not None:
             return False
         if not model_input.perform_device_sampling:
-            return False
-        if self.async_read_mode != "event":
-            return False
-        if self.trace_mode == "none":
             return False
         if model_input.reset_batch:
             return False
@@ -1055,14 +1066,14 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
     ) -> bool:
-        if not self.enable_steady_decode or not self.async_scheduling:
+        if not self._steady_decode_base_enabled(dp_gather=False):
             return False
-        if self.parallel_config.data_parallel_size != 1:
-            return False
-        if self.async_read_mode != "event":
-            return False
-        if self.trace_mode == "none":
-            return False
+        return self._steady_decode_scheduler_invariants_met(scheduler_output)
+
+    def _steady_decode_scheduler_invariants_met(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> bool:
         cached_reqs = scheduler_output.scheduled_cached_reqs
         is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
             cached_reqs.resumed_req_ids
@@ -1091,6 +1102,16 @@ class TTModelRunner:
             is_decode=True,
             has_structured_outputs=False,
         )
+
+    def can_attempt_steady_dp_decode_from_scheduler(
+        self,
+        scheduler_output: SchedulerOutput | None,
+    ) -> bool:
+        if not self._steady_decode_base_enabled(dp_gather=True):
+            return False
+        if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
+            return True
+        return self._steady_decode_scheduler_invariants_met(scheduler_output)
 
     def _trace_steady_decode(self, message: str, *args: Any) -> None:
         if self.enable_steady_decode_trace:

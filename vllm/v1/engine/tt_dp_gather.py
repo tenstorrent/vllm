@@ -114,13 +114,14 @@ def step_dp_with_batch_queue(
     assert core.batch_queue is not None
 
     global_has_requests = _dp_any_rank_has_scheduler_requests(core)
-    in_flight = core._dp_in_flight
-    if not global_has_requests and in_flight is None:
+    prev_handle = core._dp_in_flight
+    if not global_has_requests and prev_handle is None:
         return {}, False
 
     forced_mode: int | None = None
     scheduler_output: SchedulerOutput | None = None
     model_executed = False
+    current_overlap_ok = False
     if global_has_requests:
         forced_mode = _dp_negotiate_forced_mode(core)
         if core.scheduler.has_requests():
@@ -130,35 +131,47 @@ def step_dp_with_batch_queue(
             _dp_update_decode_streak(core, scheduler_output, forced_mode)
             if not core.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if forced_mode == 0:
+                current_overlap_ok = _dp_can_attempt_steady_decode_from_scheduler(
+                    core, scheduler_output
+                )
 
-    prev_model_output: ModelRunnerOutput | None = None
-    prev_scheduler_output: SchedulerOutput | None = None
+    def _finalize_previous(
+        handle: DPGatherHandle,
+    ) -> dict[int, EngineCoreOutputs]:
+        model_output = dp_gather_finalize(core, handle)
+        if handle.scheduler_output is None:
+            return {}
+        return core.scheduler.update_from_output(handle.scheduler_output, model_output)
+
+    finalize_before_submit = prev_handle is not None and (
+        not global_has_requests or not prev_handle.overlap_ok or not current_overlap_ok
+    )
+
     engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
-    if in_flight is not None:
-        prev_model_output = dp_gather_finalize(core, in_flight)
-        prev_scheduler_output = in_flight.scheduler_output
-        core._dp_in_flight = None
+    if finalize_before_submit:
+        assert prev_handle is not None
+        engine_core_outputs = _finalize_previous(prev_handle)
+        prev_handle = None
 
     if (
         scheduler_output is not None
         and scheduler_output.pending_structured_output_tokens
     ):
-        if prev_model_output is not None and prev_scheduler_output is not None:
-            engine_core_outputs = core.scheduler.update_from_output(
-                prev_scheduler_output, prev_model_output
-            )
-            prev_model_output = None
-            prev_scheduler_output = None
         core.scheduler.get_grammar_bitmask(scheduler_output)
 
+    next_handle: DPGatherHandle | None = None
     if global_has_requests:
-        core._dp_in_flight = dp_gather_submit(core, scheduler_output)
-
-    if prev_model_output is not None and prev_scheduler_output is not None:
-        engine_core_outputs = core.scheduler.update_from_output(
-            prev_scheduler_output, prev_model_output
+        next_handle = dp_gather_submit(
+            core,
+            scheduler_output,
+            overlap_ok=current_overlap_ok,
         )
-        return engine_core_outputs, model_executed
+
+    if not finalize_before_submit and prev_handle is not None:
+        engine_core_outputs = _finalize_previous(prev_handle)
+
+    core._dp_in_flight = next_handle
 
     if not global_has_requests:
         return engine_core_outputs, False
@@ -166,8 +179,28 @@ def step_dp_with_batch_queue(
     return engine_core_outputs, model_executed
 
 
+def _dp_can_attempt_steady_decode_from_scheduler(
+    core: DPEngineCoreProc,
+    scheduler_output: SchedulerOutput | None,
+) -> bool:
+    local_overlap_ok = int(
+        core.model_executor.collective_rpc(
+            "can_attempt_steady_dp_decode_from_scheduler",
+            args=(scheduler_output,),
+        )[0]
+    )
+    overlap_ok_t = torch.tensor([local_overlap_ok], dtype=torch.int32)
+    dist.all_reduce(overlap_ok_t, op=dist.ReduceOp.MIN, group=core.dp_group)
+    overlap_ok = bool(overlap_ok_t.item())
+    core.dlog("steady_decode_overlap_ok=%s", overlap_ok)
+    return overlap_ok
+
+
 def dp_gather_submit(
-    core: DPEngineCoreProc, scheduler_output: SchedulerOutput | None
+    core: DPEngineCoreProc,
+    scheduler_output: SchedulerOutput | None,
+    *,
+    overlap_ok: bool = False,
 ) -> DPGatherHandle:
     """Prepare and submit one gathered-DP execution step.
 
@@ -437,6 +470,7 @@ def dp_gather_submit(
         scheduler_output=scheduler_output,
         local_has_requests=local_has_requests,
         is_decode=is_decode,
+        overlap_ok=overlap_ok,
         any_needs_logprobs=any_needs_logprobs,
         req_ids=req_ids,
         req_id_to_index=req_id_to_index,
@@ -494,5 +528,5 @@ def dp_gather_finalize(
 def _execute_model_dp_gather(
     core: DPEngineCoreProc, scheduler_output: SchedulerOutput | None
 ) -> ModelRunnerOutput:
-    handle = dp_gather_submit(core, scheduler_output)
+    handle = dp_gather_submit(core, scheduler_output, overlap_ok=False)
     return dp_gather_finalize(core, handle)

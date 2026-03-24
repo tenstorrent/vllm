@@ -84,6 +84,7 @@ class DPGatherHandle:
     scheduler_output: SchedulerOutput | None
     local_has_requests: bool
     is_decode: bool
+    overlap_ok: bool
     any_needs_logprobs: bool
     req_ids: list[str]
     req_id_to_index: dict[str, int]
@@ -1590,9 +1591,16 @@ class DPEngineCoreProc(EngineCoreProc):
         return tt_dp_gather.step_dp_with_batch_queue(self)
 
     def dp_gather_submit(
-        self, scheduler_output: SchedulerOutput | None
+        self,
+        scheduler_output: SchedulerOutput | None,
+        *,
+        overlap_ok: bool = False,
     ) -> DPGatherHandle:
-        return tt_dp_gather.dp_gather_submit(self, scheduler_output)
+        return tt_dp_gather.dp_gather_submit(
+            self,
+            scheduler_output,
+            overlap_ok=overlap_ok,
+        )
 
     def dp_gather_finalize(self, handle: DPGatherHandle) -> ModelRunnerOutput:
         return tt_dp_gather.dp_gather_finalize(self, handle)
