@@ -139,12 +139,16 @@ class OpenAIServingChat(OpenAIServing):
             self.tool_call_id_type = "random"
 
         self.use_harmony = self.model_config.hf_config.model_type == "gpt_oss"
+        self.harmony_call_token_id = 200012  # <|call|>
         if self.use_harmony:
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
-            self.default_sampling_params["stop_token_ids"].extend(
-                get_stop_tokens_for_assistant_actions()
-            )
+            # Only add <|return|> (EOS) as default stop token.
+            # <|call|> is added per-request only when tools are present,
+            # so the model can generate past tool call attempts in evals.
+            for t in get_stop_tokens_for_assistant_actions():
+                if t != self.harmony_call_token_id:
+                    self.default_sampling_params["stop_token_ids"].append(t)
 
         # NOTE(woosuk): While OpenAI's chat completion API supports browsing
         # for some models, currently vLLM doesn't support it. Please use the
@@ -295,6 +299,12 @@ class OpenAIServingChat(OpenAIServing):
                         self.model_config.logits_processor_pattern,
                         self.default_sampling_params,
                     )
+                    # Add <|call|> stop token only when tools are present
+                    if (self.use_harmony and request.tools
+                            and self.harmony_call_token_id
+                            not in sampling_params.stop_token_ids):
+                        sampling_params.stop_token_ids.append(
+                            self.harmony_call_token_id)
                     validate_logits_processors_parameters(
                         self.logits_processors,
                         sampling_params,

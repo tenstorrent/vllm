@@ -86,7 +86,7 @@ class LogprobsProcessor:
         ):
             rank = rank_np.tolist()
             logprobs = logprobs_np.tolist()
-            token_ids = token_ids_np.tolist()
+            token_ids = token_ids_np.flatten().tolist()
             # Detokenize (non-incrementally).
             decoded_tokens = (
                 NONES
