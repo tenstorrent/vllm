@@ -131,10 +131,15 @@ def step_dp_with_batch_queue(
             _dp_update_decode_streak(core, scheduler_output, forced_mode)
             if not core.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
-            if forced_mode == 0:
-                current_overlap_ok = _dp_can_attempt_steady_decode_from_scheduler(
-                    core, scheduler_output
-                )
+        if forced_mode == 0:
+            # All DP ranks must enter this collective once decode mode is chosen,
+            # even if a particular rank has no local batch this step. Ranks with
+            # no local work pass scheduler_output=None, which the worker treats
+            # as steady-eligible, and the MIN reduction keeps the global decision
+            # conservative.
+            current_overlap_ok = _dp_can_attempt_steady_decode_from_scheduler(
+                core, scheduler_output
+            )
 
     def _finalize_previous(
         handle: DPGatherHandle,
