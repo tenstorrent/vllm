@@ -61,7 +61,7 @@ def _build_logprobs_from_topk(
     Args:
         top_k_logprobs: [sz, 32] sorted descending logprobs from device.
         top_k_indices: [sz, 32] corresponding token IDs, same order.
-        sampled_token_ids: [sz] sampled token IDs.
+        sampled_token_ids: [sz, 1] or [sz] sampled token IDs.
         max_num_logprobs: max top_logprobs requested across batch.
 
     Returns:
@@ -72,25 +72,30 @@ def _build_logprobs_from_topk(
     N = min(max_num_logprobs, MAX_K)
 
     # Find sampled token rank in the already-sorted top-32
-    sampled_expanded = sampled_token_ids.unsqueeze(-1)
-    match_mask = (top_k_indices == sampled_expanded)
+    # Cast both to int64 to avoid uint32/int32 promotion error
+    # sampled_token_ids is [sz, 1], top_k_indices is [sz, 32] — broadcasts directly
+    if sampled_token_ids.dim() == 1:
+        sampled_token_ids = sampled_token_ids.unsqueeze(-1)
+    sampled_expanded = sampled_token_ids.to(torch.int64)
+    match_mask = (top_k_indices.to(torch.int64) == sampled_expanded)
     ranks = match_mask.float().argmax(dim=-1)
 
+    if ranks.dim() < top_k_logprobs.dim():
+        ranks = ranks.unsqueeze(-1)
     # Extract sampled token logprob
     sampled_logprob = top_k_logprobs.gather(
-        1, ranks.unsqueeze(-1).long()
+        1, ranks.long()
     )
-
     # Build output: col 0 = sampled, cols 1..N = top-N from sorted
     logprob_token_ids = torch.zeros(sz, N + 1, dtype=torch.int32)
     logprobs_values = torch.zeros(sz, N + 1, dtype=torch.float32)
 
-    logprob_token_ids[:, 0] = sampled_token_ids
+    logprob_token_ids[:, 0] = sampled_token_ids.squeeze(-1)
     logprobs_values[:, 0] = sampled_logprob.squeeze(-1)
     logprob_token_ids[:, 1:N + 1] = top_k_indices[:, :N].to(torch.int32)
     logprobs_values[:, 1:N + 1] = top_k_logprobs[:, :N].to(torch.float32)
 
-    selected_token_ranks = ranks.to(torch.int32)
+    selected_token_ranks = ranks.squeeze(-1).to(torch.int32)
 
     return LogprobsTensors(logprob_token_ids, logprobs_values,
                            selected_token_ranks)
@@ -111,6 +116,7 @@ class TTSamplingParams:
     repetition_penalty: torch.Tensor | list[float] | float = 1.0
     seed: torch.Tensor | list[int | None] | int = 0
     enable_log_probs: torch.Tensor | list[bool] | None = None
+    num_logprobs: torch.Tensor | list[int] | int = None
 
 
 @dataclass(frozen=True)
@@ -1469,14 +1475,15 @@ class TTModelRunner:
         if perform_device_sampling:
             # On-device sampling currently needs sampling param attributes to
             # be lists instead of tensors.
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
+            sampling_param_dict = {}
+            for field in fields(sampling_params):
+                val = getattr(sampling_params, field.name)
+                if val is None:
+                    sampling_param_dict[field.name] = None
+                elif hasattr(val, "tolist"):
+                    sampling_param_dict[field.name] = val.tolist()
+                else:
+                    sampling_param_dict[field.name] = val
             # Convert seed sentinel value back to None
             # (vLLM treats -1 as equivalent to None for seeds)
             sampling_param_dict["seed"] = [
@@ -1724,7 +1731,7 @@ class TTModelRunner:
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
                 next_token_ids = tt_out[start : start + sz]
-
+                rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
