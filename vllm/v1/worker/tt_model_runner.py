@@ -1018,9 +1018,7 @@ class TTModelRunner:
                 return False
             if self.parallel_config.data_parallel_size != 1:
                 return False
-        if self.trace_mode == "none":
-            return False
-        return True
+        return self.trace_mode != "none"
 
     def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
         if not self._steady_decode_base_enabled(dp_gather=False):
@@ -1043,9 +1041,7 @@ class TTModelRunner:
         if model_input.bad_words_token_ids_list[0]:
             return False
         max_num_logprobs = model_input.max_num_logprobs[0]
-        if max_num_logprobs is not None and max_num_logprobs > 0:
-            return False
-        return True
+        return not (max_num_logprobs is not None and max_num_logprobs > 0)
 
     def _can_attempt_steady_decode_from_scheduler(
         self,
