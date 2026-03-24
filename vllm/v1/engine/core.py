@@ -471,10 +471,7 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        steady_decode_enabled = current_platform.is_tt() and os.getenv(
-            "VLLM_TT_STEADY_DECODE", "0"
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if steady_decode_enabled and len(batch_queue) == self.batch_queue_size:
+        if current_platform.is_tt() and len(batch_queue) == self.batch_queue_size:
             # TT steady decode wants the main thread to first consume the
             # oldest completed step (N-1), update scheduler-visible state from
             # that result, then schedule/build/submit the newest step (N+1)
