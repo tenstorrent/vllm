@@ -110,15 +110,15 @@ class TestBuildLogprobsFromTopk:
         assert torch.equal(result.logprob_token_ids[:, 0], sampled)
 
     def test_max_num_logprobs_exceeds_k(self):
-        """max_num_logprobs > 32 is clamped to 32."""
+        """max_num_logprobs > 20 is clamped to MAX_LOGPROBS (20)."""
         sz = 4
         logprobs, indices = self._make_sorted_topk(sz, k=32)
         sampled = indices[:, 0]
 
         result = _build_logprobs_from_topk(logprobs, indices, sampled, 100)
 
-        # N = min(100, 32) = 32
-        assert result.logprob_token_ids.shape == (sz, 33)
+        # N = min(100, 20) = 20
+        assert result.logprob_token_ids.shape == (sz, 21)
 
     def test_dtypes(self):
         """Output dtypes match LogprobsTensors contract."""
