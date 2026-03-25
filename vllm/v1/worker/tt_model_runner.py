@@ -44,8 +44,6 @@ logger = init_logger(__name__)
 
 # Maximum top_k value for on-device sampling
 MAX_K = 32
-# OpenAI API limit, matches vllm ModelConfig.max_logprobs
-MAX_LOGPROBS = 20
 
 
 def _build_logprobs_from_topk(
@@ -57,7 +55,7 @@ def _build_logprobs_from_topk(
     """Build LogprobsTensors from device top-K logprobs.
 
     Device always computes top-32 (MAX_K) logprobs sorted descending.
-    This function trims to min(max_num_logprobs, MAX_LOGPROBS=20) to
+    This function trims to max_num_logprobs which is in range (0-20) to
     match the OpenAI API limit, then packs into LogprobsTensors format
     expected by the downstream vLLM pipeline.
 
@@ -72,7 +70,7 @@ def _build_logprobs_from_topk(
         Column 0 = sampled token, columns 1..N = top-N from sorted list.
     """
     sz = top_k_logprobs.shape[0]
-    N = min(max_num_logprobs, MAX_LOGPROBS)
+    N = max_num_logprobs
 
     # Find sampled token rank in the already-sorted top-32
     # Cast both to int64 to avoid uint32/int32 promotion error
