@@ -1018,7 +1018,9 @@ class TTModelRunner:
                 return False
             if self.parallel_config.data_parallel_size != 1:
                 return False
-        return self.trace_mode != "none"
+        if self.trace_mode == "none":  # noqa: SIM103
+            return False
+        return True
 
     def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
         if not self._steady_decode_base_enabled(dp_gather=False):
@@ -1041,7 +1043,9 @@ class TTModelRunner:
         if model_input.bad_words_token_ids_list[0]:
             return False
         max_num_logprobs = model_input.max_num_logprobs[0]
-        return not (max_num_logprobs is not None and max_num_logprobs > 0)
+        if max_num_logprobs is not None and max_num_logprobs > 0:  # noqa: SIM103
+            return False
+        return True
 
     def _can_attempt_steady_decode_from_scheduler(
         self,
@@ -1073,7 +1077,7 @@ class TTModelRunner:
         max_num_logprobs = input_batch.max_num_logprobs
         if max_num_logprobs is not None and max_num_logprobs > 0:
             return False
-        if input_batch.sampling.has_active_logitsprocs():
+        if input_batch.sampling.has_active_logitsprocs():   # noqa: SIM103
             return False
         return True
 
@@ -1967,18 +1971,34 @@ class TTModelRunner:
             self.previous_req_ids = set(self.input_batch.req_ids)
 
         enable_trace = self.trace_mode in ["all", "decode_only"]
+        logger.info(
+            "TT decode submit: calling decode_forward "
+            "enable_trace=%s device_sampling=%s async_read=%s",
+            enable_trace,
+            perform_device_sampling,
+            async_read,
+        )
         tt_out = self.model.decode_forward(
             **kwargs,
             **enc_dec_kwargs,
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
+        logger.info("TT decode submit: decode_forward returned")
         read_events = None
         if async_read:
             if hasattr(self.model, "read_decode_output"):
+                logger.info(
+                    "TT decode submit: calling read_decode_output async_read=%s",
+                    async_read,
+                )
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
                     self.model.read_decode_output(tt_out, async_read=True),
+                )
+                logger.info(
+                    "TT decode submit: read_decode_output returned events=%d",
+                    len(read_events),
                 )
             else:
                 is_host_tensor = isinstance(tt_out, torch.Tensor)
