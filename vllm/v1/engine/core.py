@@ -493,6 +493,7 @@ class EngineCore:
                     "can_attempt_steady_decode_from_current_state"
                 )[0]
             )
+        tt_non_dp_steady_overlap_enabled = False
 
         if (
             current_platform.is_tt()
@@ -500,6 +501,7 @@ class EngineCore:
             and not has_active_structured_output_requests
             and not has_waiting_requests
             and tt_pre_schedule_steady_ok
+            and tt_non_dp_steady_overlap_enabled
         ):
             # TT steady decode branch.
             #

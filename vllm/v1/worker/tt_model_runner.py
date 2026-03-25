@@ -1077,7 +1077,7 @@ class TTModelRunner:
         max_num_logprobs = input_batch.max_num_logprobs
         if max_num_logprobs is not None and max_num_logprobs > 0:
             return False
-        if input_batch.sampling.has_active_logitsprocs():   # noqa: SIM103
+        if input_batch.sampling.has_active_logitsprocs():  # noqa: SIM103
             return False
         return True
 
