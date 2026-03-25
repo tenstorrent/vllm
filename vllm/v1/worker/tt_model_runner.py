@@ -901,7 +901,9 @@ class TTModelRunner:
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
-        max_num_logprobs_val = (model_input.max_num_logprobs[0] or 0) if model_input else 0
+        max_num_logprobs_val = (
+            (model_input.max_num_logprobs[0] or 0) if model_input else 0
+        )
         int_inputs = torch.cat(
             [
                 tokens.contiguous().view(-1),  # B
