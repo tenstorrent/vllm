@@ -81,7 +81,8 @@ def _build_logprobs_from_topk(
         sampled_token_ids = sampled_token_ids.unsqueeze(-1)
     sampled_expanded = sampled_token_ids.to(torch.int64)
     match_mask = (top_k_indices.to(torch.int64) == sampled_expanded)
-    ranks = match_mask.float().argmax(dim=-1)
+    # Convert mask to int since older versions of PyTorch don't support bool argmax.
+    ranks = match_mask.int().argmax(dim=-1)
 
     if ranks.dim() < top_k_logprobs.dim():
         ranks = ranks.unsqueeze(-1)
@@ -900,6 +901,7 @@ class TTModelRunner:
 
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
+        max_num_logprobs_val = model_input.max_num_logprobs[0] if model_input else 0
         int_inputs = torch.cat(
             [
                 tokens.contiguous().view(-1),  # B
@@ -911,6 +913,7 @@ class TTModelRunner:
                 enable_log_probs.contiguous()
                 .view(-1)
                 .to(torch.int32),  # B (bool->int32)
+                torch.tensor([max_num_logprobs_val], dtype=torch.int32),  # 1
             ],
             dim=0,
         ).contiguous()
@@ -953,7 +956,6 @@ class TTModelRunner:
             host_only_sample_params = {
                 "allowed_token_ids_mask": model_input.allowed_token_ids_mask_list[0],
                 "bad_words_token_ids": model_input.bad_words_token_ids_list[0],
-                "max_num_logprobs": model_input.max_num_logprobs[0],
                 "logitsprocs": model_input.logitsprocs_list[0],
                 "generators": model_input.generators_list[0],
             }
@@ -1076,6 +1078,12 @@ class TTModelRunner:
             # Convert back to bool tensor
             enable_log_probs = enable_log_probs_int > 0
 
+            # max_num_logprobs: one int per DP rank, always available
+            # (packed in int_inputs so it survives even when
+            # host_only_sample_params gather is skipped)
+            max_num_logprobs = stacked_int[:, off].tolist()
+            off += 1
+
             # Optional structured inputs: keep as list[Optional[tensor]]
             # per DP rank to match prefill behavior.
             grammar_bitmask_list = []
@@ -1107,21 +1115,20 @@ class TTModelRunner:
                             rank_params.get("bad_words_token_ids")
                         )
                         logitsprocs_list.append(rank_params.get("logitsprocs"))
-                        max_num_logprobs.append(rank_params.get("max_num_logprobs"))
                         generators_list.append(rank_params.get("generators", {}))
                     else:
                         allowed_token_ids_mask_list.append(None)
                         bad_words_token_ids_list.append({})
                         logitsprocs_list.append(None)
-                        max_num_logprobs.append(None)
                         generators_list.append({})
             else:
                 # No host-only sampling params - create empty lists
-                # Happens if we skipped gather (when device sampling)
+                # Happens when host_only_sample_params gather is skipped
+                # (device sampling). max_num_logprobs is already unpacked
+                # from int_inputs above.
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
-                max_num_logprobs = [None] * world
                 generators_list = [{}] * world
 
             off_f = 0
