@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for _build_logprobs_from_topk helper in tt_model_runner.
 
 These tests use synthetic data only (no device required) to verify
@@ -6,7 +7,6 @@ that the helper correctly packs top-K logprobs into LogprobsTensors
 for the downstream vLLM pipeline.
 """
 
-import pytest
 import torch
 
 from vllm.v1.worker.tt_model_runner import _build_logprobs_from_topk
@@ -22,13 +22,9 @@ class TestBuildLogprobsFromTopk:
         where logprobs are sorted descending per row.
         """
         # Generate sorted descending logprobs
-        logprobs = torch.sort(
-            torch.randn(sz, k), dim=-1, descending=True
-        ).values
+        logprobs = torch.sort(torch.randn(sz, k), dim=-1, descending=True).values
         # Generate unique token indices per row
-        indices = torch.stack([
-            torch.randperm(10000)[:k] for _ in range(sz)
-        ])
+        indices = torch.stack([torch.randperm(10000)[:k] for _ in range(sz)])
         return logprobs, indices.to(torch.int32)
 
     def test_basic_shape(self):
@@ -54,9 +50,7 @@ class TestBuildLogprobsFromTopk:
 
         assert torch.equal(result.logprob_token_ids[:, 0], sampled)
         expected_lps = logprobs[:, 3]
-        assert torch.allclose(
-            result.logprobs[:, 0], expected_lps, atol=1e-6
-        )
+        assert torch.allclose(result.logprobs[:, 0], expected_lps, atol=1e-6)
 
     def test_top_n_at_cols_1_to_n(self):
         """Columns 1..N contain top-N tokens from sorted list."""
@@ -67,11 +61,11 @@ class TestBuildLogprobsFromTopk:
         result = _build_logprobs_from_topk(logprobs, indices, sampled, N)
 
         assert torch.equal(
-            result.logprob_token_ids[:, 1:N + 1],
+            result.logprob_token_ids[:, 1 : N + 1],
             indices[:, :N].to(torch.int32),
         )
         assert torch.allclose(
-            result.logprobs[:, 1:N + 1],
+            result.logprobs[:, 1 : N + 1],
             logprobs[:, :N].to(torch.float32),
             atol=1e-6,
         )
@@ -137,9 +131,9 @@ class TestBuildLogprobsFromTopk:
         logprobs, indices = self._make_sorted_topk(sz)
         # User 0 sampled rank 0, user 1 rank 5, user 2 rank 31, user 3 rank 2
         ranks = [0, 5, 31, 2]
-        sampled = torch.tensor([
-            indices[i, r].item() for i, r in enumerate(ranks)
-        ], dtype=torch.int32)
+        sampled = torch.tensor(
+            [indices[i, r].item() for i, r in enumerate(ranks)], dtype=torch.int32
+        )
 
         result = _build_logprobs_from_topk(logprobs, indices, sampled, 10)
 
