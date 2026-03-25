@@ -1698,7 +1698,9 @@ class TTModelRunner:
                 # Get host-only sampling params from model_input
                 # (per-rank lists).
                 # These are populated for both DP and non-DP cases.
-                rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
+                rank_max_num_logprobs: int = (
+                    model_input.max_num_logprobs[dp_rank] or 0
+                )
                 allowed_token_ids_mask = model_input.allowed_token_ids_mask_list[  # noqa: E501
                     dp_rank
                 ]
@@ -1741,7 +1743,6 @@ class TTModelRunner:
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
                 next_token_ids = tt_out[start : start + sz]
-                rank_max_num_logprobs: int = model_input.max_num_logprobs[dp_rank] or 0
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
