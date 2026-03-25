@@ -1485,7 +1485,7 @@ class TTModelRunner:
         if perform_device_sampling:
             # On-device sampling currently needs sampling param attributes to
             # be lists instead of tensors.
-            sampling_param_dict = {}
+            sampling_param_dict: dict[str, Any] = {}
             for field in fields(sampling_params):
                 val = getattr(sampling_params, field.name)
                 if val is None:
@@ -1741,7 +1741,7 @@ class TTModelRunner:
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
                 next_token_ids = tt_out[start : start + sz]
-                rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
+                rank_max_num_logprobs: int = model_input.max_num_logprobs[dp_rank] or 0
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
