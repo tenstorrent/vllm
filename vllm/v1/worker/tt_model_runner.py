@@ -2032,8 +2032,22 @@ class TTModelRunner:
             return None
 
         if submission.read_events is not None:
-            for read_event in submission.read_events:
+            logger.info(
+                "TT finalize_decode: synchronizing %d read events",
+                len(submission.read_events),
+            )
+            for event_idx, read_event in enumerate(submission.read_events):
+                logger.info(
+                    "TT finalize_decode: waiting on read event %d/%d",
+                    event_idx + 1,
+                    len(submission.read_events),
+                )
                 ttnn.event_synchronize(read_event)
+                logger.info(
+                    "TT finalize_decode: read event %d/%d completed",
+                    event_idx + 1,
+                    len(submission.read_events),
+                )
             tt_out = submission.tt_out
         else:
             tt_out = submission.tt_out
@@ -2043,10 +2057,12 @@ class TTModelRunner:
         # lightweight/no-op test models that already return host tensors and do
         # not implement the newer hook.
         if hasattr(self.model, "process_decode_output_host"):
+            logger.info("TT finalize_decode: calling process_decode_output_host")
             tt_out = self.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
+            logger.info("TT finalize_decode: process_decode_output_host returned")
         else:
             is_host_tensor = isinstance(tt_out, torch.Tensor)
             is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
