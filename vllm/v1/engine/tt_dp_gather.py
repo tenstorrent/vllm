@@ -119,6 +119,10 @@ def step_dp_with_batch_queue(
         return {}, False
 
     forced_mode: int | None = None
+    # DP-gather forced scheduling mode:
+    #   None -> use the scheduler's default policy
+    #   0    -> force decode-only scheduling
+    #   1    -> force prefill-only scheduling
     scheduler_output: SchedulerOutput | None = None
     model_executed = False
     current_overlap_ok = False
@@ -131,7 +135,7 @@ def step_dp_with_batch_queue(
             _dp_update_decode_streak(core, scheduler_output, forced_mode)
             if not core.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
-        if forced_mode == 0:
+        if forced_mode == 0:  # decode-only scheduling
             # All DP ranks must enter this collective once decode mode is chosen,
             # even if a particular rank has no local batch this step. Ranks with
             # no local work pass scheduler_output=None, which the worker treats

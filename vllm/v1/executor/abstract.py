@@ -315,7 +315,10 @@ class Executor(ABC):
         if self.samples_tokens_in_execute_model():
             # Executors such as TT consume scheduler_output.grammar_bitmask
             # inside execute_model(), so computing the bitmask is a required
-            # side effect before submission.
+            # side effect before submission. The return value is ignored because
+            # execute_model() reads the bitmask back from scheduler_output; this
+            # call is only here to populate scheduler_output.grammar_bitmask and
+            # related fields.
             get_grammar_bitmask(scheduler_output)
             if non_block:
                 return cast(

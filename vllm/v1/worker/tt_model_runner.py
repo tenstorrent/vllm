@@ -1192,6 +1192,7 @@ class TTModelRunner:
             req_ids=completed.context.req_ids,
             row_indices=completed.context.row_indices,
         )
+
     def build_dp_decode_gather_input(
         self,
         model_input: TTModelInput | None,

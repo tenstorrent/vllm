@@ -429,7 +429,7 @@ class EngineCore:
             if not is_tt:
                 grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             with self.log_error_detail(scheduler_output):
-                model_output = future.result()
+                model_output = future.result()  # Wait right after execution.
                 if model_output is None:
                     # Most backends sample after execute_model(); TT keeps that
                     # work inside execute_model(), so this branch is skipped there.
@@ -456,29 +456,57 @@ class EngineCore:
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
         """Schedule and execute batches with the batch queue.
-        Note that if nothing to output in this step, None is returned.
 
-        The execution flow is as follows:
-        1. Try to schedule a new batch if the batch queue is not full.
-        If a new batch is scheduled, directly return an empty engine core
-        output. In other words, fulfilling the batch queue has a higher priority
-        than getting model outputs.
-        2. If there is no new scheduled batch, meaning that the batch queue
-        is full or no other requests can be scheduled, we block until the first
-        batch in the job queue is finished.
-        3. Update the scheduler from the output.
+        The queue stores `(future, scheduler_output)` pairs in FIFO order:
+        new submissions are pushed on the left with `appendleft()`, and the
+        oldest in-flight batch is consumed from the right with `pop()`.
+
+        There are two execution modes in this method:
+
+        1. Normal batch-queue mode:
+           submit more work whenever the queue is not full, and only block for a
+           result when we must make progress.
+        2. TT steady-decode mode:
+           when the queue is full, first consume the oldest completed decode,
+           update scheduler-visible state from it, and then submit the next
+           decode. This creates the intended one-step lag between host apply and
+           device submission.
+
+        Returns:
+            `(engine_core_outputs, model_executed)`.
+            `engine_core_outputs` is `None` when we only filled the queue and did
+            not consume any result in this call.
         """
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        if current_platform.is_tt() and len(batch_queue) == self.batch_queue_size:
-            # TT steady decode wants the main thread to first consume the
-            # oldest completed step (N-1), update scheduler-visible state from
-            # that result, then schedule/build/submit the newest step (N+1)
-            # while the previously submitted step (N) remains in flight.
+        active_requests = getattr(self.scheduler, "requests", {})
+        has_active_structured_output_requests = any(
+            getattr(request, "use_structured_output", False)
+            for request in active_requests.values()
+        )
+
+        if (
+            current_platform.is_tt()
+            and len(batch_queue) == self.batch_queue_size
+            and not has_active_structured_output_requests
+        ):
+            # TT steady decode branch.
+            #
+            # At this point the queue is already full, so we are in the steady
+            # state where older decode work is finishing while newer decode work
+            # can still be submitted. The ordering here is intentional:
+            #
+            # 1. Consume the oldest completed step from the queue.
+            # 2. Apply its result to the scheduler.
+            # 3. Ask the scheduler for the next step.
+            # 4. Submit that next step and put its future back into the queue.
+            #
+            # In timeline terms, this consumes N-1, then submits N+1, while N
+            # was already in flight before we entered this branch.
             completed_future, completed_scheduler_output = batch_queue.pop()
             with self.log_error_detail(completed_scheduler_output):
-                completed_model_output = completed_future.result()
+                completed_model_output = completed_future.result()  # Wait
 
             engine_core_outputs = self.scheduler.update_from_output(
                 completed_scheduler_output, completed_model_output
@@ -490,7 +518,6 @@ class EngineCore:
                 if not self.is_ec_producer:
                     model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-                deferred_scheduler_output = None
                 next_future: Future[ModelRunnerOutput] | None
                 if self.is_pooling_model or not model_executed:
                     next_future = cast(
@@ -508,26 +535,23 @@ class EngineCore:
                             failure_callback=self._log_err_callback(scheduler_output),
                         )
                     )
-
-                if deferred_scheduler_output:
-                    next_future = cast(
-                        Future[ModelRunnerOutput],
-                        self.model_executor.submit_deferred_scheduled_batch(
-                            deferred_scheduler_output,
-                            self.scheduler.get_grammar_bitmask,
-                            non_block=True,
-                        ),
+                    assert deferred_scheduler_output is None, (
+                        "TT steady decode branch excludes active structured-"
+                        "output requests, so submit_scheduled_batch() should "
+                        "not return a deferred structured-output batch here."
                     )
-                    scheduler_output = deferred_scheduler_output
 
                 if next_future is not None:
                     batch_queue.appendleft((next_future, scheduler_output))
 
             return engine_core_outputs, model_executed
 
-        # Try to schedule a new batch if the batch queue is not full, but
-        # the scheduler may return an empty batch if all requests are scheduled.
-        # Note that this is not blocking.
+        # Normal batch-queue branch.
+        #
+        # We only reach this block when the queue is not full. The preferred
+        # behavior is to keep the queue filled with work, so we first try to
+        # schedule and submit another batch without blocking. Only later, if we
+        # still need to make progress, do we wait for the oldest queued result.
         assert len(batch_queue) < self.batch_queue_size
 
         model_executed = False
@@ -556,7 +580,9 @@ class EngineCore:
                 )
 
             if not deferred_scheduler_output:
-                # Add this step's future to the queue.
+                # The future and scheduler_output must stay paired so that when
+                # the future completes we know exactly which scheduler decision
+                # produced that output.
                 assert future is not None
                 batch_queue.appendleft((future, scheduler_output))
                 if (
@@ -564,8 +590,11 @@ class EngineCore:
                     and len(batch_queue) < self.batch_queue_size
                     and not batch_queue[-1][0].done()
                 ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
+                    # We have successfully submitted more work and the oldest
+                    # queued batch is still running. Return early so the caller
+                    # can re-enter quickly and keep filling the queue, instead of
+                    # blocking here and turning the batch queue back into a
+                    # mostly synchronous pipeline.
                     return None, True
 
         elif not batch_queue:
@@ -574,10 +603,11 @@ class EngineCore:
             # is non-empty.
             return None, False
 
-        # Block until the next result is available.
+        # Either we could not submit more work, or we decided it is time to make
+        # progress on outputs. In both cases, consume the oldest queued batch.
         future, scheduler_output = batch_queue.pop()
         with self.log_error_detail(scheduler_output):
-            model_output = future.result()
+            model_output = future.result()  # Wait
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -587,6 +617,10 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
+            # `submit_scheduled_batch()` can return a deferred follow-up batch
+            # when grammar work must happen before the actual model submission.
+            # Once the current result has been consumed, submit that deferred
+            # batch and place it into the queue like any other in-flight step.
             future = cast(
                 Future[ModelRunnerOutput],
                 self.model_executor.submit_deferred_scheduled_batch(
