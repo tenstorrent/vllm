@@ -464,6 +464,10 @@ class TTModelRunner:
         multi_modal_kwargs: MultiModalKwargs = {
             "pixel_values": [],
             "image_grid_thw": [],
+            # Molmo2-specific fields
+            "image_grids": [],
+            "image_num_crops": [],
+            "image_token_pooling": [],
         }
 
         num_reqs = self.input_batch.num_reqs
@@ -475,24 +479,46 @@ class TTModelRunner:
             if not req_state.mm_features:
                 multi_modal_kwargs["pixel_values"].append(None)
                 multi_modal_kwargs["image_grid_thw"].append(None)
+                multi_modal_kwargs["image_grids"].append(None)
+                multi_modal_kwargs["image_num_crops"].append(None)
+                multi_modal_kwargs["image_token_pooling"].append(None)
                 continue
 
             pv_array: list[torch.Tensor | None] = []
             image_grid_thw_array: list[torch.Tensor | None] = []
+            image_grids_array: list[torch.Tensor | None] = []
+            image_num_crops_array: list[torch.Tensor | None] = []
+            image_token_pooling_array: list[torch.Tensor | None] = []
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
                 item = mm_feature.data
                 if item is None:
                     pv_array.append(None)
                     image_grid_thw_array.append(None)
+                    image_grids_array.append(None)
+                    image_num_crops_array.append(None)
+                    image_token_pooling_array.append(None)
                     continue
                 pv_array.append(item["pixel_values"].data)
                 image_grid_thw_array.append(
                     item["image_grid_thw"].data if "image_grid_thw" in item else None
                 )
+                # Molmo2-specific fields
+                image_grids_array.append(
+                    item["image_grids"].data if "image_grids" in item else None
+                )
+                image_num_crops_array.append(
+                    item["image_num_crops"].data if "image_num_crops" in item else None
+                )
+                image_token_pooling_array.append(
+                    item["image_token_pooling"].data if "image_token_pooling" in item else None
+                )
 
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
+            multi_modal_kwargs["image_grids"].append(image_grids_array)
+            multi_modal_kwargs["image_num_crops"].append(image_num_crops_array)
+            multi_modal_kwargs["image_token_pooling"].append(image_token_pooling_array)
 
         return multi_modal_kwargs
 
@@ -1201,17 +1227,41 @@ class TTModelRunner:
             multi_modal_kwargs: MultiModalKwargs = {
                 "pixel_values": [],
                 "image_grid_thw": [],
+                # Molmo2-specific fields
+                "image_grids": [],
+                "image_num_crops": [],
+                "image_token_pooling": [],
             }
             pixel_values = []
             image_grid_thw = []
+            image_grids = []
+            image_num_crops = []
+            image_token_pooling = []
             for mi in inputs:
                 if mi is not None:
-                    for pv in mi.multi_modal_kwargs["pixel_values"]:
-                        pixel_values.append(pv)
-                    for ig in mi.multi_modal_kwargs["image_grid_thw"]:
-                        image_grid_thw.append(ig)
+                    mm_kwargs = mi.multi_modal_kwargs
+                    # Standard fields (Qwen2.5-VL style)
+                    if "pixel_values" in mm_kwargs:
+                        for pv in mm_kwargs["pixel_values"]:
+                            pixel_values.append(pv)
+                    if "image_grid_thw" in mm_kwargs:
+                        for ig in mm_kwargs["image_grid_thw"]:
+                            image_grid_thw.append(ig)
+                    # Molmo2-specific fields
+                    if "image_grids" in mm_kwargs:
+                        for ig in mm_kwargs["image_grids"]:
+                            image_grids.append(ig)
+                    if "image_num_crops" in mm_kwargs:
+                        for inc in mm_kwargs["image_num_crops"]:
+                            image_num_crops.append(inc)
+                    if "image_token_pooling" in mm_kwargs:
+                        for itp in mm_kwargs["image_token_pooling"]:
+                            image_token_pooling.append(itp)
             multi_modal_kwargs["pixel_values"] = pixel_values
             multi_modal_kwargs["image_grid_thw"] = image_grid_thw
+            multi_modal_kwargs["image_grids"] = image_grids if image_grids else None
+            multi_modal_kwargs["image_num_crops"] = image_num_crops if image_num_crops else None
+            multi_modal_kwargs["image_token_pooling"] = image_token_pooling if image_token_pooling else None
         else:
             multi_modal_kwargs = {}
 

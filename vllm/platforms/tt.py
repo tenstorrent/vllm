@@ -133,6 +133,13 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.qwen3_vl.tt.generator_vllm:Qwen3VLForConditionalGeneration",
     )
 
+    # Molmo2 - Vision
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTMolmo2ForConditionalGeneration",
+        "models.demos.molmo2.tt.generator_vllm:Molmo2ForConditionalGeneration",
+    )
+
     # Mistral
     _register_model_if_missing(
         ModelRegistry,
