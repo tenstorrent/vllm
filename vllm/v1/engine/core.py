@@ -485,11 +485,21 @@ class EngineCore:
             getattr(request, "use_structured_output", False)
             for request in active_requests.values()
         )
+        has_waiting_requests = bool(getattr(self.scheduler, "waiting", False))
+        tt_pre_schedule_steady_ok = False
+        if current_platform.is_tt():
+            tt_pre_schedule_steady_ok = bool(
+                self.model_executor.collective_rpc(
+                    "can_attempt_steady_decode_from_current_state"
+                )[0]
+            )
 
         if (
             current_platform.is_tt()
             and len(batch_queue) == self.batch_queue_size
             and not has_active_structured_output_requests
+            and not has_waiting_requests
+            and tt_pre_schedule_steady_ok
         ):
             # TT steady decode branch.
             #

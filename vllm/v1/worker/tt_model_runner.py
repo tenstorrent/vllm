@@ -1051,6 +1051,32 @@ class TTModelRunner:
             return False
         return self._steady_decode_scheduler_invariants_met(scheduler_output)
 
+    def can_attempt_steady_decode_from_current_state(self) -> bool:
+        """Return whether the current non-DP runner state is steady-decode-safe.
+
+        This is a conservative pre-schedule guard used by `EngineCore` before it
+        enters the TT one-step-lagged branch. It intentionally answers "no" for
+        any state that might require draining pending decode work first, such as
+        a prefill/decode boundary or a changed padded decode layout.
+        """
+        if not self._steady_decode_base_enabled(dp_gather=False):
+            return False
+        if self._decode_layout_changed_since_last_decode:
+            return False
+        input_batch = self.input_batch
+        if not input_batch.no_penalties:
+            return False
+        if not input_batch.no_allowed_token_ids:
+            return False
+        if input_batch.sampling.bad_words_token_ids:
+            return False
+        max_num_logprobs = input_batch.max_num_logprobs
+        if max_num_logprobs is not None and max_num_logprobs > 0:
+            return False
+        if input_batch.sampling.has_active_logitsprocs():
+            return False
+        return True
+
     def _steady_decode_scheduler_invariants_met(
         self,
         scheduler_output: SchedulerOutput,
@@ -1872,6 +1898,29 @@ class TTModelRunner:
                 sampling_params=sampling_params,
                 perform_device_sampling=perform_device_sampling,
             )
+
+        with self._steady_decode_lock:
+            pending_async_count = len(self._pending_async_events)
+            completed_decode_count = len(self._completed_decode_steps)
+        logger.info(
+            "TT decode submit: reqs=%s batch_size_per_dp=%s "
+            "pending_async=%d completed_decode=%d "
+            "layout_changed=%s reset_batch=%s "
+            "device_sampling=%s async_read=%s read_from_device=%s "
+            "request_specific_rope=%s prompt_tokens=%s output_tokens=%s",
+            self.input_batch.num_reqs,
+            batch_size_per_dp,
+            pending_async_count,
+            completed_decode_count,
+            self._decode_layout_changed_since_last_decode,
+            model_input.reset_batch,
+            perform_device_sampling,
+            async_read,
+            read_from_device,
+            self.request_specific_rope,
+            model_input.prompt_tokens is not None,
+            model_input.output_tokens is not None,
+        )
 
         kwargs: dict[str, Any] = {
             "tokens": model_input.input_tokens,

@@ -257,6 +257,10 @@ class TTWorker(WorkerBase):
             scheduler_output
         )
 
+    def can_attempt_steady_decode_from_current_state(self) -> bool:
+        """Return whether non-DP steady decode is safe before scheduling."""
+        return self.model_runner.can_attempt_steady_decode_from_current_state()
+
     def build_dp_decode_gather_input(
         self,
         model_input: TTModelInput | None,
