@@ -860,6 +860,23 @@ class TTModelRunner:
 
         # If we're not using structured outputs, grammar_bitmask is None
         bitmask = scheduler_output.grammar_bitmask
+        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        scheduled_structured_req_ids = [
+            req_id
+            for req_id in scheduled_req_ids
+            if (req := self.requests.get(req_id)) is not None
+            and req.use_structured_output
+        ]
+        logger.info(
+            "TT sampling eligibility: scheduled_req_ids=%s "
+            "scheduled_structured_req_ids=%s pending_structured=%s "
+            "grammar_bitmask_present=%s structured_output_request_ids=%s",
+            scheduled_req_ids,
+            scheduled_structured_req_ids,
+            scheduler_output.pending_structured_output_tokens,
+            bitmask is not None,
+            scheduler_output.structured_output_request_ids,
+        )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
