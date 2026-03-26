@@ -115,6 +115,7 @@ def get_sample_multi_modal_inputs(model: str, multi_image: bool):
         # text-image and text-only inputs
         content += single_image_prompts_content
     elif "Mistral" in model:
+        # [INFO] Mistral-Small-3.1 does not support multi-image inputs
         content += text_prompts_content + single_image_prompts_content
     else:
         content += text_prompts_content + single_image_prompts_content
