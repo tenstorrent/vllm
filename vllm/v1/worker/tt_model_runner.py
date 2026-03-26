@@ -865,7 +865,8 @@ class TTModelRunner:
             req_id
             for req_id in scheduled_req_ids
             if (req := self.requests.get(req_id)) is not None
-            and req.use_structured_output
+            and req.sampling_params is not None
+            and req.sampling_params.structured_outputs is not None
         ]
         logger.info(
             "TT sampling eligibility: scheduled_req_ids=%s "
