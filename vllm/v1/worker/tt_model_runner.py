@@ -868,15 +868,22 @@ class TTModelRunner:
             and req.sampling_params is not None
             and req.sampling_params.structured_outputs is not None
         ]
+        has_structured_outputs = (
+            bitmask is not None
+            or scheduler_output.pending_structured_output_tokens
+            or bool(scheduled_structured_req_ids)
+        )
         logger.info(
             "TT sampling eligibility: scheduled_req_ids=%s "
             "scheduled_structured_req_ids=%s pending_structured=%s "
-            "grammar_bitmask_present=%s structured_output_request_ids=%s",
+            "grammar_bitmask_present=%s structured_output_request_ids=%s "
+            "has_structured_outputs=%s",
             scheduled_req_ids,
             scheduled_structured_req_ids,
             scheduler_output.pending_structured_output_tokens,
             bitmask is not None,
             scheduler_output.structured_output_request_ids,
+            has_structured_outputs,
         )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
@@ -910,7 +917,7 @@ class TTModelRunner:
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
-            has_structured_outputs=bitmask is not None,
+            has_structured_outputs=has_structured_outputs,
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
