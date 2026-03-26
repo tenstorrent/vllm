@@ -78,6 +78,10 @@ def _build_logprobs_from_topk(
     if sampled_token_ids.dim() == 1:
         sampled_token_ids = sampled_token_ids.unsqueeze(-1)
     sampled_expanded = sampled_token_ids.to(torch.int64)
+    # The sampled token is guaranteed to be in top-32 because ttnn.sampling
+    # selects from the same top-K candidates returned here. If this constraint
+    # changes (e.g., top-K is reduced), match_mask may be all-False and
+    # argmax will return 0, giving an incorrect rank and logprob.
     match_mask = top_k_indices.to(torch.int64) == sampled_expanded
     # Convert mask to int since older versions of PyTorch don't support bool argmax.
     ranks = match_mask.int().argmax(dim=-1)
@@ -115,7 +119,6 @@ class TTSamplingParams:
     repetition_penalty: torch.Tensor | list[float] | float = 1.0
     seed: torch.Tensor | list[int | None] | int = 0
     enable_log_probs: torch.Tensor | list[bool] | None = None
-    num_logprobs: torch.Tensor | list[int] | int = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,15 @@ class TTModelRunner:
         self.enable_model_warmup = enable_model_warmup
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
+        # Whether the model supports top-K logprobs on device.
+        # Detected from model_type (available to all DP ranks without
+        # requiring the model to be loaded). Models like gpt-oss-120b
+        # set use_topk_logprobs=True and return top-32 logprobs from device.
+        # TODO: Update this check as more models add top-K logprobs support.
+        # https://github.com/tenstorrent/tt-metal/issues/40810
+        self.supports_topk_logprobs = (
+            self.model_config.hf_config.model_type == "gpt_oss"
+        )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -865,6 +877,7 @@ class TTModelRunner:
             seed = sampling_default_tensors["seed"]
             # enable_log_probs: convert num_logprobs >= 0
             enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
+            max_num_logprobs_val = 0
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -893,12 +906,9 @@ class TTModelRunner:
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
             enable_log_probs = sampling_params.enable_log_probs
-
+            max_num_logprobs_val = model_input.max_num_logprobs[0] or 0
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
-        max_num_logprobs_val = (
-            (model_input.max_num_logprobs[0] or 0) if model_input else 0
-        )
         int_inputs = torch.cat(
             [
                 tokens.contiguous().view(-1),  # B
@@ -1121,8 +1131,6 @@ class TTModelRunner:
             else:
                 # No host-only sampling params - create empty lists
                 # Happens when host_only_sample_params gather is skipped
-                # (device sampling). max_num_logprobs is already unpacked
-                # from int_inputs above.
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
@@ -1413,15 +1421,21 @@ class TTModelRunner:
         if has_structured_outputs:
             return False
 
-        # Logprobs on device are only supported on multi-device setups
-        # (num_devices in {8,32})
-        # Also, only the sampled token's logprob is returned on device,
-        # not the top-k alternatives.
-        # On single device, logprobs require host sampling.
+        # Logprobs on device require multi-device setups (num_devices in {8,32}).
+        # On single device, all logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
+        #
+        # Top-K logprobs (max_lp > 0) are only supported on device by models
+        # that set use_topk_logprobs=True (e.g. gpt-oss-120b), which return
+        # top-32 logprobs as a (logprobs, indices) tuple. Other models only
+        # return the sampled token's logprob, so max_lp > 0 falls back to
+        # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
-        if max_lp is not None and (max_lp > 0 or num_devices not in (8, 32)):
-            return False
+        if max_lp is not None:
+            if num_devices not in (8, 32):
+                return False
+            if max_lp > 0 and not self.supports_topk_logprobs:
+                return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True
         # for random sampling,

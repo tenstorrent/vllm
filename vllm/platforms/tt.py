@@ -239,6 +239,22 @@ class TTPlatform(Platform):
         ), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, "LoRA is not supported for TT backend"
 
+        # Device computes top-32 logprobs but the OpenAI API limits to 20
+        # (ModelConfig.max_logprobs default). Clamp max_logprobs so that
+        # processor._validate_logprobs rejects requests exceeding this limit.
+        from vllm.config import ModelConfig
+
+        tt_max_logprobs = ModelConfig.max_logprobs  # default 20
+        model_config = vllm_config.model_config
+        if model_config.max_logprobs > tt_max_logprobs:
+            logger.warning(
+                "max_logprobs=%d exceeds TT device limit of %d, clamping to %d",
+                model_config.max_logprobs,
+                tt_max_logprobs,
+                tt_max_logprobs,
+            )
+            model_config.max_logprobs = tt_max_logprobs
+
         # Import and register models from tt-metal.
         #
         # NOTE: We also register TT models early in `vllm/v1/worker/tt_worker.py`
