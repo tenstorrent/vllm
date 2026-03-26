@@ -1791,6 +1791,20 @@ class TTModelRunner:
 
         is_decode = model_input.prompt_lens is None
         if self.async_scheduling and is_decode:
+            # Temporary debug path: bypass async decode completion for non-DP
+            # decode so we can tell whether TT async read/event completion is the
+            # source of the hang.
+            force_sync_non_dp_decode_readback = True
+            if force_sync_non_dp_decode_readback:
+                sampled_token_ids_per_dp, logprobs_per_dp = (
+                    self.execute_sync_with_model_input(model_input)
+                )
+                sampled_token_ids = sampled_token_ids_per_dp[0]
+                logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
+                logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+                return self.apply_and_build_runner_output(
+                    sampled_token_ids, logprobs
+                )
             steady_decode_fast_path = self._can_use_steady_decode_fast_path(model_input)
             return self.submit_async_non_dp_decode(
                 model_input,
@@ -2365,6 +2379,17 @@ class TTModelRunner:
         )
 
         if non_block and is_decode:
+            # Temporary debug path: bypass async DP decode completion so we can
+            # tell whether the hang is in TT async read/event completion versus
+            # merged decode execution itself.
+            force_sync_dp_decode_readback = True
+            if force_sync_dp_decode_readback:
+                sampled_token_ids_per_dp, logprobs_per_dp = (
+                    self.execute_sync_with_model_input(merged)
+                )
+                return self.pack_dp_results(
+                    sampled_token_ids_per_dp, logprobs_per_dp
+                )
             return self.submit_async_dp_decode(merged)
 
         sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(
