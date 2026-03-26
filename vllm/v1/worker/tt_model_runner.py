@@ -873,18 +873,6 @@ class TTModelRunner:
             or scheduler_output.pending_structured_output_tokens
             or bool(scheduled_structured_req_ids)
         )
-        logger.info(
-            "TT sampling eligibility: scheduled_req_ids=%s "
-            "scheduled_structured_req_ids=%s pending_structured=%s "
-            "grammar_bitmask_present=%s structured_output_request_ids=%s "
-            "has_structured_outputs=%s",
-            scheduled_req_ids,
-            scheduled_structured_req_ids,
-            scheduler_output.pending_structured_output_tokens,
-            bitmask is not None,
-            scheduler_output.structured_output_request_ids,
-            has_structured_outputs,
-        )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
@@ -1816,20 +1804,6 @@ class TTModelRunner:
 
         is_decode = model_input.prompt_lens is None
         if self.async_scheduling and is_decode:
-            # Temporary debug path: bypass async decode completion for non-DP
-            # decode so we can tell whether TT async read/event completion is the
-            # source of the hang.
-            force_sync_non_dp_decode_readback = True
-            if force_sync_non_dp_decode_readback:
-                sampled_token_ids_per_dp, logprobs_per_dp = (
-                    self.execute_sync_with_model_input(model_input)
-                )
-                sampled_token_ids = sampled_token_ids_per_dp[0]
-                logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
-                logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
-                return self.apply_and_build_runner_output(
-                    sampled_token_ids, logprobs
-                )
             steady_decode_fast_path = self._can_use_steady_decode_fast_path(model_input)
             return self.submit_async_non_dp_decode(
                 model_input,
@@ -1942,29 +1916,6 @@ class TTModelRunner:
                 perform_device_sampling=perform_device_sampling,
             )
 
-        with self._steady_decode_lock:
-            pending_async_count = len(self._pending_async_events)
-            completed_decode_count = len(self._completed_decode_steps)
-        logger.info(
-            "TT decode submit: reqs=%s batch_size_per_dp=%s "
-            "pending_async=%d completed_decode=%d "
-            "layout_changed=%s reset_batch=%s "
-            "device_sampling=%s async_read=%s read_from_device=%s "
-            "request_specific_rope=%s prompt_tokens=%s output_tokens=%s",
-            self.input_batch.num_reqs,
-            batch_size_per_dp,
-            pending_async_count,
-            completed_decode_count,
-            self._decode_layout_changed_since_last_decode,
-            model_input.reset_batch,
-            perform_device_sampling,
-            async_read,
-            read_from_device,
-            self.request_specific_rope,
-            model_input.prompt_tokens is not None,
-            model_input.output_tokens is not None,
-        )
-
         kwargs: dict[str, Any] = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
@@ -2010,34 +1961,18 @@ class TTModelRunner:
             self.previous_req_ids = set(self.input_batch.req_ids)
 
         enable_trace = self.trace_mode in ["all", "decode_only"]
-        logger.info(
-            "TT decode submit: calling decode_forward "
-            "enable_trace=%s device_sampling=%s async_read=%s",
-            enable_trace,
-            perform_device_sampling,
-            async_read,
-        )
         tt_out = self.model.decode_forward(
             **kwargs,
             **enc_dec_kwargs,
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
-        logger.info("TT decode submit: decode_forward returned")
         read_events = None
         if async_read:
             if hasattr(self.model, "read_decode_output"):
-                logger.info(
-                    "TT decode submit: calling read_decode_output async_read=%s",
-                    async_read,
-                )
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
                     self.model.read_decode_output(tt_out, async_read=True),
-                )
-                logger.info(
-                    "TT decode submit: read_decode_output returned events=%d",
-                    len(read_events),
                 )
             else:
                 is_host_tensor = isinstance(tt_out, torch.Tensor)
@@ -2071,22 +2006,8 @@ class TTModelRunner:
             return None
 
         if submission.read_events is not None:
-            logger.info(
-                "TT finalize_decode: synchronizing %d read events",
-                len(submission.read_events),
-            )
-            for event_idx, read_event in enumerate(submission.read_events):
-                logger.info(
-                    "TT finalize_decode: waiting on read event %d/%d",
-                    event_idx + 1,
-                    len(submission.read_events),
-                )
+            for read_event in submission.read_events:
                 ttnn.event_synchronize(read_event)
-                logger.info(
-                    "TT finalize_decode: read event %d/%d completed",
-                    event_idx + 1,
-                    len(submission.read_events),
-                )
             tt_out = submission.tt_out
         else:
             tt_out = submission.tt_out
@@ -2096,12 +2017,10 @@ class TTModelRunner:
         # lightweight/no-op test models that already return host tensors and do
         # not implement the newer hook.
         if hasattr(self.model, "process_decode_output_host"):
-            logger.info("TT finalize_decode: calling process_decode_output_host")
             tt_out = self.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
-            logger.info("TT finalize_decode: process_decode_output_host returned")
         else:
             is_host_tensor = isinstance(tt_out, torch.Tensor)
             is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
@@ -2404,17 +2323,6 @@ class TTModelRunner:
         )
 
         if non_block and is_decode:
-            # Temporary debug path: bypass async DP decode completion so we can
-            # tell whether the hang is in TT async read/event completion versus
-            # merged decode execution itself.
-            force_sync_dp_decode_readback = True
-            if force_sync_dp_decode_readback:
-                sampled_token_ids_per_dp, logprobs_per_dp = (
-                    self.execute_sync_with_model_input(merged)
-                )
-                return self.pack_dp_results(
-                    sampled_token_ids_per_dp, logprobs_per_dp
-                )
             return self.submit_async_dp_decode(merged)
 
         sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(

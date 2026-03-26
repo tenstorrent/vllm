@@ -145,23 +145,6 @@ def step_dp_with_batch_queue(
                 core, scheduler_output
             )
 
-    core.dlog(
-        "dp_step state: global_has_requests=%s forced_mode=%s "
-        "scheduler_has_requests=%s prev_in_flight=%s prev_overlap_ok=%s "
-        "current_overlap_ok=%s scheduler_output_tokens=%s",
-        global_has_requests,
-        forced_mode,
-        core.scheduler.has_requests(),
-        prev_handle is not None,
-        prev_handle.overlap_ok if prev_handle is not None else None,
-        current_overlap_ok,
-        (
-            scheduler_output.total_num_scheduled_tokens
-            if scheduler_output is not None
-            else None
-        ),
-    )
-
     def _finalize_previous(
         handle: DPGatherHandle,
     ) -> dict[int, EngineCoreOutputs]:
@@ -173,23 +156,10 @@ def step_dp_with_batch_queue(
     finalize_before_submit = prev_handle is not None and (
         not global_has_requests or not prev_handle.overlap_ok or not current_overlap_ok
     )
-    core.dlog(
-        "dp_step ordering: finalize_before_submit=%s "
-        "will_submit=%s will_finalize_after_submit=%s",
-        finalize_before_submit,
-        global_has_requests,
-        (not finalize_before_submit and prev_handle is not None),
-    )
 
     engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
     if finalize_before_submit:
         assert prev_handle is not None
-        core.dlog(
-            "dp_step action: finalizing previous before submit "
-            "prev_is_decode=%s prev_local_has_requests=%s",
-            prev_handle.is_decode,
-            prev_handle.local_has_requests,
-        )
         engine_core_outputs = _finalize_previous(prev_handle)
         prev_handle = None
 
@@ -201,11 +171,6 @@ def step_dp_with_batch_queue(
 
     next_handle: DPGatherHandle | None = None
     if global_has_requests:
-        core.dlog(
-            "dp_step action: submitting next scheduler_output_present=%s overlap_ok=%s",
-            scheduler_output is not None,
-            current_overlap_ok,
-        )
         next_handle = dp_gather_submit(
             core,
             scheduler_output,
@@ -213,12 +178,6 @@ def step_dp_with_batch_queue(
         )
 
     if not finalize_before_submit and prev_handle is not None:
-        core.dlog(
-            "dp_step action: finalizing previous after submit "
-            "prev_is_decode=%s prev_local_has_requests=%s",
-            prev_handle.is_decode,
-            prev_handle.local_has_requests,
-        )
         engine_core_outputs = _finalize_previous(prev_handle)
 
     core._dp_in_flight = next_handle
