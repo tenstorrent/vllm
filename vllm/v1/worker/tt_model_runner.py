@@ -46,6 +46,65 @@ logger = init_logger(__name__)
 MAX_K = 32
 
 
+def _build_logprobs_from_topk(
+    top_k_logprobs: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    max_num_logprobs: int,
+) -> LogprobsTensors:
+    """Build LogprobsTensors from device top-K logprobs.
+
+    Device always computes top-32 (MAX_K) logprobs sorted descending.
+    This function trims to max_num_logprobs which is in range (0-20) to
+    match the OpenAI API limit, then packs into LogprobsTensors format
+    expected by the downstream vLLM pipeline.
+
+    Args:
+        top_k_logprobs: [sz, 32] sorted descending logprobs from device.
+        top_k_indices: [sz, 32] corresponding token IDs, same order.
+        sampled_token_ids: [sz, 1] or [sz] sampled token IDs.
+        max_num_logprobs: max top_logprobs requested across batch (clamped to 20).
+
+    Returns:
+        LogprobsTensors with shape [sz, N+1] where N = min(max_num_logprobs, 20).
+        Column 0 = sampled token, columns 1..N = top-N from sorted list.
+    """
+    sz = top_k_logprobs.shape[0]
+    N = max_num_logprobs
+
+    # Find sampled token rank in the already-sorted top-32
+    # Cast both to int64 to avoid uint32/int32 promotion error
+    # sampled_token_ids is [sz, 1], top_k_indices is [sz, 32] — broadcasts directly
+    if sampled_token_ids.dim() == 1:
+        sampled_token_ids = sampled_token_ids.unsqueeze(-1)
+    sampled_expanded = sampled_token_ids.to(torch.int64)
+    # The sampled token is guaranteed to be in top-32 because ttnn.sampling selects
+    # from the same top-32 (hardcoded in ttnn.sampling no matter the value of k)
+    # candidates returned here. If this constraint changes in ttnn.sampling to
+    # more than 32 candidates, match_mask may be all-False and argmax
+    # will return 0, giving an incorrect rank and logprob.
+    match_mask = top_k_indices.to(torch.int64) == sampled_expanded
+    # Convert mask to int since older versions of PyTorch don't support bool argmax.
+    ranks = match_mask.int().argmax(dim=-1)
+
+    if ranks.dim() < top_k_logprobs.dim():
+        ranks = ranks.unsqueeze(-1)
+    # Extract sampled token logprob
+    sampled_logprob = top_k_logprobs.gather(1, ranks.long())
+    # Build output: col 0 = sampled, cols 1..N = top-N from sorted
+    logprob_token_ids = torch.zeros(sz, N + 1, dtype=torch.int32)
+    logprobs_values = torch.zeros(sz, N + 1, dtype=torch.float32)
+
+    logprob_token_ids[:, 0] = sampled_token_ids.squeeze(-1)
+    logprobs_values[:, 0] = sampled_logprob.squeeze(-1)
+    logprob_token_ids[:, 1 : N + 1] = top_k_indices[:, :N].to(torch.int32)
+    logprobs_values[:, 1 : N + 1] = top_k_logprobs[:, :N].to(torch.float32)
+
+    selected_token_ranks = ranks.squeeze(-1).to(torch.int32)
+
+    return LogprobsTensors(logprob_token_ids, logprobs_values, selected_token_ranks)
+
+
 @dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
@@ -140,6 +199,15 @@ class TTModelRunner:
         self.enable_model_warmup = enable_model_warmup
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
+        # Whether the model supports top-K logprobs on device.
+        # Detected from model_type (available to all DP ranks without
+        # requiring the model to be loaded). Models like gpt-oss-120b
+        # set use_topk_logprobs=True and return top-32 logprobs from device.
+        # TODO: Update this check as more models add top-K logprobs support.
+        # https://github.com/tenstorrent/tt-metal/issues/40810
+        self.supports_topk_logprobs = (
+            self.model_config.hf_config.model_type == "gpt_oss"
+        )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -810,6 +878,7 @@ class TTModelRunner:
             seed = sampling_default_tensors["seed"]
             # enable_log_probs: convert num_logprobs >= 0
             enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
+            max_num_logprobs_val = -2  # -2 means no logprobs
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -838,7 +907,9 @@ class TTModelRunner:
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
             enable_log_probs = sampling_params.enable_log_probs
-
+            max_num_logprobs_val = (
+                model_input.max_num_logprobs[0] or -2
+            )  # -2 means no logprobs
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
         int_inputs = torch.cat(
@@ -852,6 +923,7 @@ class TTModelRunner:
                 enable_log_probs.contiguous()
                 .view(-1)
                 .to(torch.int32),  # B (bool->int32)
+                torch.tensor([max_num_logprobs_val], dtype=torch.int32),  # 1
             ],
             dim=0,
         ).contiguous()
@@ -894,7 +966,6 @@ class TTModelRunner:
             host_only_sample_params = {
                 "allowed_token_ids_mask": model_input.allowed_token_ids_mask_list[0],
                 "bad_words_token_ids": model_input.bad_words_token_ids_list[0],
-                "max_num_logprobs": model_input.max_num_logprobs[0],
                 "logitsprocs": model_input.logitsprocs_list[0],
                 "generators": model_input.generators_list[0],
             }
@@ -1017,6 +1088,12 @@ class TTModelRunner:
             # Convert back to bool tensor
             enable_log_probs = enable_log_probs_int > 0
 
+            # max_num_logprobs: one int per DP rank, always available
+            # (packed in int_inputs so it survives even when
+            # host_only_sample_params gather is skipped)
+            max_num_logprobs = stacked_int[:, off].tolist()
+            off += 1
+
             # Optional structured inputs: keep as list[Optional[tensor]]
             # per DP rank to match prefill behavior.
             grammar_bitmask_list = []
@@ -1048,21 +1125,18 @@ class TTModelRunner:
                             rank_params.get("bad_words_token_ids")
                         )
                         logitsprocs_list.append(rank_params.get("logitsprocs"))
-                        max_num_logprobs.append(rank_params.get("max_num_logprobs"))
                         generators_list.append(rank_params.get("generators", {}))
                     else:
                         allowed_token_ids_mask_list.append(None)
                         bad_words_token_ids_list.append({})
                         logitsprocs_list.append(None)
-                        max_num_logprobs.append(None)
                         generators_list.append({})
             else:
                 # No host-only sampling params - create empty lists
-                # Happens if we skipped gather (when device sampling)
+                # Happens when host_only_sample_params gather is skipped
                 allowed_token_ids_mask_list = [None] * world
                 bad_words_token_ids_list = [{}] * world
                 logitsprocs_list = [None] * world
-                max_num_logprobs = [None] * world
                 generators_list = [{}] * world
 
             off_f = 0
@@ -1350,15 +1424,21 @@ class TTModelRunner:
         if has_structured_outputs:
             return False
 
-        # Logprobs on device are only supported on multi-device setups
-        # (num_devices in {8,32})
-        # Also, only the sampled token's logprob is returned on device,
-        # not the top-k alternatives.
-        # On single device, logprobs require host sampling.
+        # Logprobs on device require multi-device setups (num_devices in {8,32}).
+        # On single device, all logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
+        #
+        # Top-K logprobs (max_lp > 0) are only supported on device by models
+        # that set use_topk_logprobs=True (e.g. gpt-oss-120b), which return
+        # top-32 logprobs as a (logprobs, indices) tuple. Other models only
+        # return the sampled token's logprob, so max_lp > 0 falls back to
+        # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
-        if max_lp is not None and (max_lp > 0 or num_devices not in (8, 32)):
-            return False
+        if max_lp is not None:
+            if num_devices not in (8, 32):
+                return False
+            if max_lp > 0 and not self.supports_topk_logprobs:
+                return False
 
         # TTPlatform.non_greedy_decoding_on_device must be True
         # for random sampling,
@@ -1419,14 +1499,15 @@ class TTModelRunner:
         if perform_device_sampling:
             # On-device sampling currently needs sampling param attributes to
             # be lists instead of tensors.
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
+            sampling_param_dict: dict[str, Any] = {}
+            for field in fields(sampling_params):
+                val = getattr(sampling_params, field.name)
+                if val is None:
+                    sampling_param_dict[field.name] = None
+                elif hasattr(val, "tolist"):
+                    sampling_param_dict[field.name] = val.tolist()
+                else:
+                    sampling_param_dict[field.name] = val
             # Convert seed sentinel value back to None
             # (vLLM treats -1 as equivalent to None for seeds)
             sampling_param_dict["seed"] = [
@@ -1674,7 +1755,7 @@ class TTModelRunner:
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
                 next_token_ids = tt_out[start : start + sz]
-
+                rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
@@ -1685,23 +1766,33 @@ class TTModelRunner:
                     assert tt_log_probs is not None, (
                         "model should return logprobs when requested"
                     )
-                    # TT device returns raw logprobs as [batch_size] tensor
-                    # containing log probability of the sampled token only.
-                    # Convert to LogprobsTensors format with minimal info.
-                    sampled_log_probs = tt_log_probs[start : start + sz]
-
-                    # Create LogprobsTensors with only sampled token info
-                    # Shape: [sz, 1] for token_ids and logprobs
-                    logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
-                    logprobs_values = sampled_log_probs.unsqueeze(-1).to(torch.float32)
-                    # Rank is unknown with device sampling, use -1 to indicate
-                    selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
-
-                    logprobs_tensors = LogprobsTensors(
-                        logprob_token_ids=logprob_token_ids,
-                        logprobs=logprobs_values,
-                        selected_token_ranks=selected_token_ranks,
-                    )
+                    if isinstance(tt_log_probs, tuple):
+                        # New path: top-K logprobs from device
+                        # (gpt-oss-120b). Device returns already-sorted
+                        # (top_k_logprobs[B,32], top_k_indices[B,32]).
+                        top_k_logprobs, top_k_indices = tt_log_probs
+                        logprobs_tensors = _build_logprobs_from_topk(
+                            top_k_logprobs=top_k_logprobs[start : start + sz],
+                            top_k_indices=top_k_indices[start : start + sz],
+                            sampled_token_ids=next_token_ids,
+                            max_num_logprobs=rank_max_num_logprobs
+                            if rank_max_num_logprobs is not None
+                            else 0,
+                        )
+                    else:
+                        # Old path: single sampled-token logprob
+                        # (all other models). Device returns [B] tensor.
+                        sampled_log_probs = tt_log_probs[start : start + sz]
+                        logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
+                        logprobs_values = sampled_log_probs.unsqueeze(-1).to(
+                            torch.float32
+                        )
+                        selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
+                        logprobs_tensors = LogprobsTensors(
+                            logprob_token_ids=logprob_token_ids,
+                            logprobs=logprobs_values,
+                            selected_token_ranks=selected_token_ranks,
+                        )
                     logprobs_per_dp.append(logprobs_tensors)
                 else:
                     logprobs_per_dp.append(None)
