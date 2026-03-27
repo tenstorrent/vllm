@@ -65,18 +65,25 @@ def _dp_any_rank_has_scheduler_requests(core: DPEngineCoreProc) -> bool:
 
 
 def _dp_negotiate_forced_mode(core: DPEngineCoreProc) -> int:
-    # Max-consecutive-decoding guard: if there are waiting prefills
-    # and we decoded for dp_max_consec_decodes steps consecutively,
-    # force one prefill step. Otherwise, prefer decode while running.
-    # Can't automatically set intent to be prefill if there are any
-    # waiting requests since we could get stuck in a loop where intent
-    # is prefill but it doesn't get scheduled.
+    # Default policy: if there are waiting prefills and we decoded for
+    # dp_max_consec_decodes steps consecutively, force one prefill step.
+    # Opt-in policy (TT_DP_PREFILL_WAIT_FOR_CAPACITY=1): only force
+    # prefill when a rank has waiting work and local scheduler capacity
+    # to admit it, or when decode is otherwise idle.
     has_running = bool(getattr(core.scheduler, "running", []))
     has_waiting = bool(getattr(core.scheduler, "waiting", False))
-    must_prefill = has_waiting and core.dp_decode_streak >= core.dp_max_consec_decodes
-    local_prefill_intent = (
-        1 if (has_waiting and (must_prefill or not has_running)) else 0
-    )
+    wait_for_capacity = bool(getattr(core, "dp_prefill_wait_for_capacity", False))
+    if wait_for_capacity:
+        max_running = getattr(core.scheduler, "max_num_running_reqs", 0)
+        has_capacity = len(getattr(core.scheduler, "running", [])) < max_running
+        local_prefill_intent = (
+            1 if (has_waiting and ((not has_running) or has_capacity)) else 0
+        )
+    else:
+        must_prefill = has_waiting and core.dp_decode_streak >= core.dp_max_consec_decodes
+        local_prefill_intent = (
+            1 if (has_waiting and (must_prefill or not has_running)) else 0
+        )
     intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
     core.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
     dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=core.dp_group)

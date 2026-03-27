@@ -98,6 +98,7 @@ class EngineCore:
     requires_gather: bool
     dp_decode_streak: int
     dp_max_consec_decodes: int
+    dp_prefill_wait_for_capacity: bool
     _dp_gather_forced_mode: int
 
     def _dp_any_rank_has_scheduler_requests(self) -> bool:
@@ -1350,6 +1351,11 @@ class DPEngineCoreProc(EngineCoreProc):
             # Max consecutive decode iterations allowed before we must
             # admit at least one prefill if there are waiting requests.
             self.dp_max_consec_decodes: int = 16
+            # Optional experiment: emulate non-DP-style admission and only
+            # force prefill when there is local room to admit waiting requests.
+            self.dp_prefill_wait_for_capacity = (
+                os.environ.get("TT_DP_PREFILL_WAIT_FOR_CAPACITY") == "1"
+            )
 
             DEBUG_DPG = os.environ.get("DP_GATHER_DEBUG") == "1"
 
