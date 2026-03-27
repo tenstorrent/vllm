@@ -30,6 +30,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.tt_input_batch import (
+    LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
     CachedRequestState,
     InputBatch,
@@ -878,7 +879,7 @@ class TTModelRunner:
             seed = sampling_default_tensors["seed"]
             # enable_log_probs: convert num_logprobs >= 0
             enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
-            max_num_logprobs_val = -2  # -2 means no logprobs
+            max_num_logprobs_val = LOGPROBS_NONE_SENTINEL
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -908,8 +909,8 @@ class TTModelRunner:
             seed = sampling_params.seed
             enable_log_probs = sampling_params.enable_log_probs
             max_num_logprobs_val = (
-                model_input.max_num_logprobs[0] or -2
-            )  # -2 means no logprobs
+                model_input.max_num_logprobs[0] or LOGPROBS_NONE_SENTINEL
+            )
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
         int_inputs = torch.cat(
@@ -1091,7 +1092,11 @@ class TTModelRunner:
             # max_num_logprobs: one int per DP rank, always available
             # (packed in int_inputs so it survives even when
             # host_only_sample_params gather is skipped)
-            max_num_logprobs = stacked_int[:, off].tolist()
+            raw_max_num_logprobs = stacked_int[:, off].tolist()
+            max_num_logprobs = [
+                None if val == LOGPROBS_NONE_SENTINEL else val
+                for val in raw_max_num_logprobs
+            ]
             off += 1
 
             # Optional structured inputs: keep as list[Optional[tensor]]
@@ -1235,6 +1240,7 @@ class TTModelRunner:
                     )
                     bad_words_token_ids_list.append(mi.bad_words_token_ids_list[0])
                     logitsprocs_list.append(mi.logitsprocs_list[0])
+                    # TODO: Move up from host-only since it's working on device now
                     max_num_logprobs.append(mi.max_num_logprobs[0])
                     generators_list.append(mi.generators_list[0])
                 else:
