@@ -133,11 +133,18 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.qwen3_vl.tt.generator_vllm:Qwen3VLForConditionalGeneration",
     )
 
-    # Mistral
+    # Mistral - Text only
     _register_model_if_missing(
         ModelRegistry,
         "TTMistralForCausalLM",
         "models.tt_transformers.tt.generator_vllm:MistralForCausalLM",
+    )
+
+    # Mistral 3 - Multimodal (Vision + Text)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTMistral3ForConditionalGeneration",
+        "models.tt_transformers.tt.generator_vllm:Mistral3ForConditionalGeneration",
     )
 
     # Gemma3

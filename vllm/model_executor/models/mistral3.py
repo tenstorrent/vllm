@@ -40,6 +40,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.tokenizer import (
+    MistralTokenizer,
+    cached_tokenizer_from_config,
+)
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -48,7 +52,11 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsPP,
 )
-from .pixtral import PixtralHFEncoderInfo, PixtralHFVisionModel
+from .pixtral import (
+    PixtralHFEncoderInfo,
+    PixtralHFVisionModel,
+    PixtralProcessorAdapter,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -224,10 +232,10 @@ _I = TypeVar("_I", bound=BaseLlavaProcessingInfo)
 class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
-
-        processor = self.info.get_hf_processor()
-        image_token = processor.image_token
-
+        hf_config = self.info.get_hf_config()
+        image_token_id = hf_config.image_token_index
+        tokenizer = self.info.get_tokenizer()
+        image_token = tokenizer.decode([image_token_id])
         return image_token * num_images
 
     def get_dummy_mm_data(
@@ -254,6 +262,9 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 
 class Mistral3ProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
+        tokenizer = cached_tokenizer_from_config(self.ctx.model_config)
+        if isinstance(tokenizer, MistralTokenizer):
+            return PixtralProcessorAdapter(tokenizer)
         return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
 
 
@@ -303,12 +314,10 @@ class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         hf_config = self.info.get_hf_config()
-        tokenizer = self.info.get_tokenizer()
-        vocab = tokenizer.get_vocab()
 
-        image_break_id = vocab[processor.image_break_token]
+        image_break_id = processor.image_break_token_id
         image_token_id = hf_config.image_token_index
-        image_end_id = vocab[processor.image_end_token]
+        image_end_id = processor.image_end_token_id
 
         assert isinstance(hf_config.vision_config, PixtralVisionConfig)
         encoder_info = PixtralHFEncoderInfo(hf_config)
