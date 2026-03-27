@@ -425,9 +425,10 @@ class TTModelRunner:
         self.input_batch.refresh_logitsprocs()
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
-        """Validate the multimodal feature is an image."""
-        if mm_feature.modality != "image":
-            raise NotImplementedError("Only images are supported for now")
+        """Validate the multimodal feature is an image or video."""
+        # Video is supported via the same pipeline as images - frames are processed as image crops
+        if mm_feature.modality not in ("image", "video"):
+            raise NotImplementedError(f"Only images and videos are supported, got: {mm_feature.modality}")
 
     def _gather_multi_modal_inputs(self) -> dict[str, Any]:
         """
@@ -468,6 +469,10 @@ class TTModelRunner:
             "image_grids": [],
             "image_num_crops": [],
             "image_token_pooling": [],
+            # Video-specific fields (Molmo2 video support)
+            "pixel_values_videos": [],
+            "video_grid_thw": [],
+            "video_token_pooling": [],
         }
 
         num_reqs = self.input_batch.num_reqs
@@ -482,6 +487,9 @@ class TTModelRunner:
                 multi_modal_kwargs["image_grids"].append(None)
                 multi_modal_kwargs["image_num_crops"].append(None)
                 multi_modal_kwargs["image_token_pooling"].append(None)
+                multi_modal_kwargs["pixel_values_videos"].append(None)
+                multi_modal_kwargs["video_grid_thw"].append(None)
+                multi_modal_kwargs["video_token_pooling"].append(None)
                 continue
 
             pv_array: list[torch.Tensor | None] = []
@@ -489,36 +497,73 @@ class TTModelRunner:
             image_grids_array: list[torch.Tensor | None] = []
             image_num_crops_array: list[torch.Tensor | None] = []
             image_token_pooling_array: list[torch.Tensor | None] = []
+            # Video arrays
+            pvv_array: list[torch.Tensor | None] = []
+            video_grid_thw_array: list[torch.Tensor | None] = []
+            video_token_pooling_array: list[torch.Tensor | None] = []
+
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
                 item = mm_feature.data
+                is_video = mm_feature.modality == "video"
+
                 if item is None:
                     pv_array.append(None)
                     image_grid_thw_array.append(None)
                     image_grids_array.append(None)
                     image_num_crops_array.append(None)
                     image_token_pooling_array.append(None)
+                    pvv_array.append(None)
+                    video_grid_thw_array.append(None)
+                    video_token_pooling_array.append(None)
                     continue
-                pv_array.append(item["pixel_values"].data)
-                image_grid_thw_array.append(
-                    item["image_grid_thw"].data if "image_grid_thw" in item else None
-                )
-                # Molmo2-specific fields
-                image_grids_array.append(
-                    item["image_grids"].data if "image_grids" in item else None
-                )
-                image_num_crops_array.append(
-                    item["image_num_crops"].data if "image_num_crops" in item else None
-                )
-                image_token_pooling_array.append(
-                    item["image_token_pooling"].data if "image_token_pooling" in item else None
-                )
+
+                if is_video:
+                    # Video: use video-specific field names
+                    pvv_array.append(
+                        item["pixel_values_videos"].data if "pixel_values_videos" in item else None
+                    )
+                    video_grid_thw_array.append(
+                        item["video_grid_thw"].data if "video_grid_thw" in item else None
+                    )
+                    video_token_pooling_array.append(
+                        item["video_token_pooling"].data if "video_token_pooling" in item else None
+                    )
+                    # Fill image arrays with None for this slot
+                    pv_array.append(None)
+                    image_grid_thw_array.append(None)
+                    image_grids_array.append(None)
+                    image_num_crops_array.append(None)
+                    image_token_pooling_array.append(None)
+                else:
+                    # Image: use image field names
+                    pv_array.append(item["pixel_values"].data)
+                    image_grid_thw_array.append(
+                        item["image_grid_thw"].data if "image_grid_thw" in item else None
+                    )
+                    # Molmo2-specific fields
+                    image_grids_array.append(
+                        item["image_grids"].data if "image_grids" in item else None
+                    )
+                    image_num_crops_array.append(
+                        item["image_num_crops"].data if "image_num_crops" in item else None
+                    )
+                    image_token_pooling_array.append(
+                        item["image_token_pooling"].data if "image_token_pooling" in item else None
+                    )
+                    # Fill video arrays with None for this slot
+                    pvv_array.append(None)
+                    video_grid_thw_array.append(None)
+                    video_token_pooling_array.append(None)
 
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
             multi_modal_kwargs["image_grids"].append(image_grids_array)
             multi_modal_kwargs["image_num_crops"].append(image_num_crops_array)
             multi_modal_kwargs["image_token_pooling"].append(image_token_pooling_array)
+            multi_modal_kwargs["pixel_values_videos"].append(pvv_array)
+            multi_modal_kwargs["video_grid_thw"].append(video_grid_thw_array)
+            multi_modal_kwargs["video_token_pooling"].append(video_token_pooling_array)
 
         return multi_modal_kwargs
 
