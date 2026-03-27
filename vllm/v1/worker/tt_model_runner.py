@@ -78,10 +78,11 @@ def _build_logprobs_from_topk(
     if sampled_token_ids.dim() == 1:
         sampled_token_ids = sampled_token_ids.unsqueeze(-1)
     sampled_expanded = sampled_token_ids.to(torch.int64)
-    # The sampled token is guaranteed to be in top-32 because ttnn.sampling
-    # selects from the same top-K candidates returned here. If this constraint
-    # changes (e.g., top-K is reduced), match_mask may be all-False and
-    # argmax will return 0, giving an incorrect rank and logprob.
+    # The sampled token is guaranteed to be in top-32 because ttnn.sampling selects
+    # from the same top-32 (hardcoded in ttnn.sampling no matter the value of k)
+    # candidates returned here. If this constraint changes in ttnn.sampling to
+    # more than 32 candidates, match_mask may be all-False and argmax
+    # will return 0, giving an incorrect rank and logprob.
     match_mask = top_k_indices.to(torch.int64) == sampled_expanded
     # Convert mask to int since older versions of PyTorch don't support bool argmax.
     ranks = match_mask.int().argmax(dim=-1)
@@ -877,7 +878,7 @@ class TTModelRunner:
             seed = sampling_default_tensors["seed"]
             # enable_log_probs: convert num_logprobs >= 0
             enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
-            max_num_logprobs_val = 0
+            max_num_logprobs_val = -2  # -2 means no logprobs
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
@@ -906,7 +907,9 @@ class TTModelRunner:
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
             enable_log_probs = sampling_params.enable_log_probs
-            max_num_logprobs_val = model_input.max_num_logprobs[0] or 0
+            max_num_logprobs_val = (
+                model_input.max_num_logprobs[0] or -2
+            )  # -2 means no logprobs
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
         int_inputs = torch.cat(
