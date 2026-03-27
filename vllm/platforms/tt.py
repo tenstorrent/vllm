@@ -362,6 +362,11 @@ class TTPlatform(Platform):
         ):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
 
+        if model_class.__module__.startswith(
+            "models.demos.deepseek_v3.tt.generator_vllm"
+        ):
+            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
+
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
