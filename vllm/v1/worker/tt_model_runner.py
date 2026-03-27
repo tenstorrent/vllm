@@ -1240,6 +1240,7 @@ class TTModelRunner:
                     )
                     bad_words_token_ids_list.append(mi.bad_words_token_ids_list[0])
                     logitsprocs_list.append(mi.logitsprocs_list[0])
+                    # TODO: Move up from host-only since it's working on device now
                     max_num_logprobs.append(mi.max_num_logprobs[0])
                     generators_list.append(mi.generators_list[0])
                 else:
