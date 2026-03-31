@@ -909,7 +909,9 @@ class TTModelRunner:
             seed = sampling_params.seed
             enable_log_probs = sampling_params.enable_log_probs
             max_num_logprobs_val = (
-                model_input.max_num_logprobs[0] or LOGPROBS_NONE_SENTINEL
+                model_input.max_num_logprobs[0]
+                if model_input.max_num_logprobs[0] is not None
+                else LOGPROBS_NONE_SENTINEL
             )
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
