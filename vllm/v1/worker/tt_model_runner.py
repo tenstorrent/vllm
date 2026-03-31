@@ -1023,6 +1023,15 @@ class TTModelRunner:
         )
 
     def _steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
+        """Check if steady decode is generallyenabled based on the gather
+        type and configuration.
+
+        Args:
+            dp_gather: Whether the gather is data parallel.
+
+        Returns:
+            True if steady decode is enabled, False otherwise.
+        """
         if dp_gather:
             if not self.scheduler_config.async_scheduling:
                 return False
@@ -1035,46 +1044,15 @@ class TTModelRunner:
             return False
         return True
 
-    def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
-        if not self._steady_decode_base_enabled(dp_gather=False):
-            return False
-        if model_input.prompt_lens is not None:
-            return False
-        if not model_input.perform_device_sampling:
-            return False
-        if model_input.reset_batch:
-            return False
-        if model_input.grammar_bitmask[0] is not None:
-            return False
-        if (
-            model_input.prompt_tokens is not None
-            or model_input.output_tokens is not None
-        ):
-            return False
-        if model_input.allowed_token_ids_mask_list[0] is not None:
-            return False
-        if model_input.bad_words_token_ids_list[0]:
-            return False
-        max_num_logprobs = model_input.max_num_logprobs[0]
-        if max_num_logprobs is not None and max_num_logprobs > 0:  # noqa: SIM103
-            return False
-        return True
-
-    def _can_attempt_steady_decode_from_scheduler(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> bool:
-        if not self._steady_decode_base_enabled(dp_gather=False):
-            return False
-        return self._steady_decode_scheduler_invariants_met(scheduler_output)
-
     def can_attempt_steady_decode_from_current_state(self) -> bool:
         """Return whether the current non-DP runner state is steady-decode-safe.
 
-        This is a conservative pre-schedule guard used by `EngineCore` before it
-        enters the TT one-step-lagged branch. It intentionally answers "no" for
-        any state that might require draining pending decode work first, such as
-        a prefill/decode boundary or a changed padded decode layout.
+        Call this before `schedule()`, when the engine has not produced a
+        `SchedulerOutput` yet. This is a conservative pre-schedule guard used
+        by `EngineCore` before it enters the TT one-step-lagged branch. It
+        intentionally answers "no" for any current state that might require
+        draining pending decode work first, such as a prefill/decode boundary
+        or a changed padded decode layout.
         """
         if not self._steady_decode_base_enabled(dp_gather=False):
             return False
@@ -1098,6 +1076,14 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
     ) -> bool:
+        """Validate scheduler-level invariants shared by steady decode checks.
+
+        Call this only after `schedule()` has produced a concrete
+        `SchedulerOutput`. It captures the scheduler-visible conditions that
+        must hold for steady decode, but it does not inspect the final built
+        `TTModelInput`, so callers that need submission-time guarantees must
+        still perform a later model-input-level check.
+        """
         cached_reqs = scheduler_output.scheduled_cached_reqs
         is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
             cached_reqs.resumed_req_ids
@@ -1128,15 +1114,70 @@ class TTModelRunner:
             has_structured_outputs=False,
         )
 
+    def _can_attempt_steady_decode_from_scheduler(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> bool:
+        """Check a non-DP scheduled step before building the TT model input.
+
+        Call this after `schedule()` but before `build_model_input()`. It uses
+        `SchedulerOutput` to decide whether the scheduled work still looks like
+        decode-only steady state, which is enough to decide whether pending
+        async decode steps must be drained before preparing the next step.
+        """
+        if not self._steady_decode_base_enabled(dp_gather=False):
+            return False
+        return self._steady_decode_scheduler_invariants_met(scheduler_output)
+
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
     ) -> bool:
+        """Check whether one DP rank can participate in steady gathered decode.
+
+        Call this in the gathered-DP path after local scheduling has happened.
+        Unlike the non-DP variant, `scheduler_output=None` or a zero-token step
+        is treated as steady-eligible because a rank may have no local decode
+        work while the global gathered step still overlaps safely.
+        """
         if not self._steady_decode_base_enabled(dp_gather=True):
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
         return self._steady_decode_scheduler_invariants_met(scheduler_output)
+
+    def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
+        """Check the final non-DP decode submission for steady fast-path safety.
+
+        Call this only after `build_model_input()` has produced the concrete
+        `TTModelInput` that would be submitted to the device. This is the
+        latest and strongest steady-decode predicate: it inspects actual
+        submission details such as reset-batch, grammar bitmasks, host-only
+        sampling state, and whether device sampling is active.
+        """
+        if not self._steady_decode_base_enabled(dp_gather=False):
+            return False
+        if model_input.prompt_lens is not None:
+            return False
+        if not model_input.perform_device_sampling:
+            return False
+        if model_input.reset_batch:
+            return False
+        if model_input.grammar_bitmask[0] is not None:
+            return False
+        if (
+            model_input.prompt_tokens is not None
+            or model_input.output_tokens is not None
+        ):
+            return False
+        if model_input.allowed_token_ids_mask_list[0] is not None:
+            return False
+        if model_input.bad_words_token_ids_list[0]:
+            return False
+        max_num_logprobs = model_input.max_num_logprobs[0]
+        if max_num_logprobs is not None and max_num_logprobs > 0:  # noqa: SIM103
+            return False
+        return True
 
     def enqueue_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
         with self._steady_decode_lock:

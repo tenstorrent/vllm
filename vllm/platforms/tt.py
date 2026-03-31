@@ -385,8 +385,7 @@ class TTPlatform(Platform):
             logger.warning(
                 "Async scheduling was requested, but TT model %s (%s) does not "
                 "declare support (`model_capabilities['supports_async_decode']`). "
-                "Disabling async execution overlap while keeping the TT "
-                "scheduler.",
+                "Disabling async scheduling.",
                 model_class.__name__,
                 model_class.__module__,
             )

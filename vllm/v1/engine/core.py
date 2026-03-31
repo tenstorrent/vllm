@@ -96,9 +96,6 @@ class EngineCore:
     # Gathered-DP subclasses initialize these before guarded access sites use
     # them. Declaring them here lets mypy type-check direct attribute access.
     requires_gather: bool
-    dp_decode_streak: int
-    dp_max_consec_decodes: int
-    dp_prefill_wait_for_capacity: bool
     _dp_gather_forced_mode: int
 
     def _dp_any_rank_has_scheduler_requests(self) -> bool:
@@ -108,11 +105,6 @@ class EngineCore:
         raise NotImplementedError
 
     def _dp_apply_forced_mode(self, forced_mode: int | None) -> None:
-        raise NotImplementedError
-
-    def _dp_update_decode_streak(
-        self, scheduler_output: SchedulerOutput | None, forced_mode: int | None
-    ) -> None:
         raise NotImplementedError
 
     def _execute_model_dp_gather(
@@ -406,7 +398,6 @@ class EngineCore:
 
         if requires_gather and forced_mode is not None:
             self._dp_apply_forced_mode(None)
-            self._dp_update_decode_streak(scheduler_output, forced_mode)
 
         is_tt = current_platform.is_tt()
         grammar_output = None
@@ -486,7 +477,6 @@ class EngineCore:
             getattr(request, "use_structured_output", False)
             for request in active_requests.values()
         )
-        has_waiting_requests = bool(getattr(self.scheduler, "waiting", False))
         tt_pre_schedule_steady_ok = False
         if current_platform.is_tt():
             tt_pre_schedule_steady_ok = bool(
@@ -499,7 +489,6 @@ class EngineCore:
             current_platform.is_tt()
             and len(batch_queue) == self.batch_queue_size
             and not has_active_structured_output_requests
-            and not has_waiting_requests
             and tt_pre_schedule_steady_ok
         ):
             # TT steady decode branch.
@@ -531,6 +520,8 @@ class EngineCore:
 
                 next_future: Future[ModelRunnerOutput] | None
                 if self.is_pooling_model or not model_executed:
+                    # Pooling models and empty scheduling steps do not have a
+                    # follow-up sampling submission path.
                     next_future = cast(
                         Future[ModelRunnerOutput],
                         self.model_executor.execute_model(
@@ -1346,17 +1337,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
         self.requires_gather = current_platform.requires_gathered_batch_dp()
         if self.requires_gather:
-            # Track decode streak for DP gather fairness policy.
-            self.dp_decode_streak: int = 0
-            # Max consecutive decode iterations allowed before we must
-            # admit at least one prefill if there are waiting requests.
-            self.dp_max_consec_decodes: int = 16
-            # Optional experiment: emulate non-DP-style admission and only
-            # force prefill when there is local room to admit waiting requests.
-            self.dp_prefill_wait_for_capacity = (
-                os.environ.get("TT_DP_PREFILL_WAIT_FOR_CAPACITY") == "1"
-            )
-
             DEBUG_DPG = os.environ.get("DP_GATHER_DEBUG") == "1"
 
             def dlog_logger(msg: str, *a: object) -> None:
@@ -1626,11 +1606,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def _dp_apply_forced_mode(self, forced_mode: int | None) -> None:
         tt_dp_gather._dp_apply_forced_mode(self, forced_mode)
-
-    def _dp_update_decode_streak(
-        self, scheduler_output: SchedulerOutput | None, forced_mode: int | None
-    ) -> None:
-        tt_dp_gather._dp_update_decode_streak(self, scheduler_output, forced_mode)
 
     def step_dp_with_batch_queue(
         self,

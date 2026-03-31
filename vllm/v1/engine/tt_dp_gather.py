@@ -65,25 +65,15 @@ def _dp_any_rank_has_scheduler_requests(core: DPEngineCoreProc) -> bool:
 
 
 def _dp_negotiate_forced_mode(core: DPEngineCoreProc) -> int:
-    # Default policy: if there are waiting prefills and we decoded for
-    # dp_max_consec_decodes steps consecutively, force one prefill step.
-    # Opt-in policy (TT_DP_PREFILL_WAIT_FOR_CAPACITY=1): only force
-    # prefill when a rank has waiting work and local scheduler capacity
+    # Prefer prefill when a rank has waiting work and local scheduler capacity
     # to admit it, or when decode is otherwise idle.
     has_running = bool(getattr(core.scheduler, "running", []))
     has_waiting = bool(getattr(core.scheduler, "waiting", False))
-    wait_for_capacity = bool(getattr(core, "dp_prefill_wait_for_capacity", False))
-    if wait_for_capacity:
-        max_running = getattr(core.scheduler, "max_num_running_reqs", 0)
-        has_capacity = len(getattr(core.scheduler, "running", [])) < max_running
-        local_prefill_intent = (
-            1 if (has_waiting and ((not has_running) or has_capacity)) else 0
-        )
-    else:
-        must_prefill = has_waiting and core.dp_decode_streak >= core.dp_max_consec_decodes
-        local_prefill_intent = (
-            1 if (has_waiting and (must_prefill or not has_running)) else 0
-        )
+    max_running = getattr(core.scheduler, "max_num_running_reqs", 0)
+    has_capacity = len(getattr(core.scheduler, "running", [])) < max_running
+    local_prefill_intent = (
+        1 if (has_waiting and ((not has_running) or has_capacity)) else 0
+    )
     intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
     core.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
     dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=core.dp_group)
@@ -100,24 +90,24 @@ def _dp_apply_forced_mode(core: DPEngineCoreProc, forced_mode: int | None) -> No
         set_mode(forced_mode)
 
 
-def _dp_update_decode_streak(
-    core: DPEngineCoreProc,
-    scheduler_output: SchedulerOutput | None,
-    forced_mode: int | None,
-) -> None:
-    if scheduler_output is None or forced_mode is None:
-        return
-    # This is intentionally stale by at most one step in async DP mode:
-    # forced-mode negotiation for step N+1 runs before update_from_output(N).
-    if scheduler_output.total_num_scheduled_tokens > 0 and forced_mode == 0:
-        core.dp_decode_streak += 1
-    else:
-        core.dp_decode_streak = 0
-
-
 def step_dp_with_batch_queue(
     core: DPEngineCoreProc,
 ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+    """Schedule and execute one gathered-DP engine step.
+
+    This path keeps at most one gathered submission in flight in
+    `core._dp_in_flight`. Each call may:
+    - Negotiate a global forced scheduling mode across DP ranks.
+    - Schedule the local rank under that mode.
+    - Decide whether steady decode overlap is safe.
+    - Finalize the previous gathered step either before or after
+      submitting the next one.
+
+    Returns:
+        `(engine_core_outputs, model_executed)`.
+        `engine_core_outputs` is empty when no completed gathered result
+        was consumed in this call.
+    """
     assert core.batch_queue is not None
 
     global_has_requests = _dp_any_rank_has_scheduler_requests(core)
@@ -139,7 +129,6 @@ def step_dp_with_batch_queue(
             _dp_apply_forced_mode(core, forced_mode)
             scheduler_output = core.scheduler.schedule()
             _dp_apply_forced_mode(core, None)
-            _dp_update_decode_streak(core, scheduler_output, forced_mode)
             if not core.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
         if forced_mode == 0:  # decode-only scheduling
