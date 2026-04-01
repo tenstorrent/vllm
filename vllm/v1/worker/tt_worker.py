@@ -261,6 +261,14 @@ class TTWorker(WorkerBase):
         """Return whether non-DP steady decode is safe before scheduling."""
         return self.model_runner.can_attempt_steady_decode_from_current_state()
 
+    def can_attempt_steady_decode_from_scheduler(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        """Return whether a scheduled non-DP step can overlap steady decode."""
+        return self.model_runner.can_attempt_steady_decode_from_scheduler(
+            scheduler_output
+        )
+
     def build_dp_decode_gather_input(
         self,
         model_input: TTModelInput | None,

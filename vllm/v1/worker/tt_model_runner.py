@@ -124,6 +124,7 @@ class TTSamplingParams:
     frequency_penalty: torch.Tensor | list[float] | float = 0.0
     repetition_penalty: torch.Tensor | list[float] | float = 1.0
     seed: torch.Tensor | list[int | None] | int = 0
+    num_logprobs: torch.Tensor | list[int] | int | None = None
     enable_log_probs: torch.Tensor | list[bool] | None = None
 
 
@@ -835,6 +836,7 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty[:num_reqs],
                 repetition_penalty=sample_params.repetition_penalty[:num_reqs],
                 seed=sample_params.seed[:num_reqs],
+                num_logprobs=sample_params.num_logprobs[:num_reqs],
                 enable_log_probs=enable_log_probs,
             )
         else:
@@ -850,6 +852,7 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty,
                 repetition_penalty=sample_params.repetition_penalty,
                 seed=sample_params.seed,
+                num_logprobs=sample_params.num_logprobs,
                 enable_log_probs=enable_log_probs,
             )
 
@@ -1129,6 +1132,13 @@ class TTModelRunner:
             return False
         return self._steady_decode_scheduler_invariants_met(scheduler_output)
 
+    def can_attempt_steady_decode_from_scheduler(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> bool:
+        """Return whether a scheduled non-DP step can overlap steady decode."""
+        return self._can_attempt_steady_decode_from_scheduler(scheduler_output)
+
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
@@ -1315,6 +1325,7 @@ class TTModelRunner:
             frequency_penalty = sampling_default_tensors["frequency_penalty"]
             repetition_penalty = sampling_default_tensors["repetition_penalty"]
             seed = sampling_default_tensors["seed"]
+            num_logprobs = sampling_default_tensors["num_logprobs"]
             # enable_log_probs: convert num_logprobs >= 0
             enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
             max_num_logprobs_val = LOGPROBS_NONE_SENTINEL
@@ -1345,6 +1356,7 @@ class TTModelRunner:
             frequency_penalty = sampling_params.frequency_penalty
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
+            num_logprobs = sampling_params.num_logprobs
             enable_log_probs = sampling_params.enable_log_probs
             max_num_logprobs_val = (
                 model_input.max_num_logprobs[0]
@@ -1361,6 +1373,7 @@ class TTModelRunner:
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # B
                 seed.contiguous().view(-1),  # B
+                num_logprobs.contiguous().view(-1),  # B
                 enable_log_probs.contiguous()
                 .view(-1)
                 .to(torch.int32),  # B (bool->int32)
@@ -1469,7 +1482,8 @@ class TTModelRunner:
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W),
-            #        bs(1), top_k(B), seed(B), enable_log_probs(B)]
+            #        bs(1), top_k(B), seed(B), num_logprobs(B),
+            #        enable_log_probs(B)]
             #   - If any_structured_inputs, also has at the end of the list:
             #     [has_structured_inputs(1), bitmasks(B*bitmask_size)]
             # Floats: [temperature(B), top_p(B), presence_penalty(B),
@@ -1523,6 +1537,8 @@ class TTModelRunner:
             top_k = stacked_int[:, off : off + B].reshape(total_B)
             off += B
             seed = stacked_int[:, off : off + B].reshape(total_B)
+            off += B
+            num_logprobs = stacked_int[:, off : off + B].reshape(total_B)
             off += B
             enable_log_probs_int = stacked_int[:, off : off + B].reshape(total_B)
             off += B
@@ -1614,6 +1630,7 @@ class TTModelRunner:
             frequency_penalty_list: list[torch.Tensor] = []
             repetition_penalty_list: list[torch.Tensor] = []
             seed_list: list[torch.Tensor] = []
+            num_logprobs_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
             reset_batch = False
 
@@ -1664,6 +1681,7 @@ class TTModelRunner:
                     frequency_penalty_list.append(sp.frequency_penalty)
                     repetition_penalty_list.append(sp.repetition_penalty)
                     seed_list.append(sp.seed)
+                    num_logprobs_list.append(sp.num_logprobs)
                     enable_log_probs_list.append(sp.enable_log_probs)
 
                 # We know it's not a list here before concatenation
@@ -1703,6 +1721,7 @@ class TTModelRunner:
             frequency_penalty = torch.cat(frequency_penalty_list, dim=0)
             repetition_penalty = torch.cat(repetition_penalty_list, dim=0)
             seed = torch.cat(seed_list, dim=0)
+            num_logprobs = torch.cat(num_logprobs_list, dim=0)
             enable_log_probs = torch.cat(enable_log_probs_list, dim=0)
 
         tt_sampling_params = TTSamplingParams(
@@ -1713,6 +1732,7 @@ class TTModelRunner:
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             seed=seed,
+            num_logprobs=num_logprobs,
             enable_log_probs=enable_log_probs,
         )
 
