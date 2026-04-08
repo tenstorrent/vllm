@@ -205,6 +205,7 @@ class SubmittedStepContext:
 
     req_ids: list[str]
     req_id_to_index: dict[str, int]
+    request_states: tuple[CachedRequestState, ...]
     row_indices: tuple[int, ...]
     submit_time_ns: int
 
@@ -1019,6 +1020,7 @@ class TTModelRunner:
         return SubmittedStepContext(
             req_ids=req_ids,
             req_id_to_index=dict(self.input_batch.req_id_to_index),
+            request_states=tuple(self.requests[req_id] for req_id in req_ids),
             row_indices=tuple(
                 self.input_batch.req_id_to_index[req_id] for req_id in req_ids
             ),
@@ -1026,7 +1028,7 @@ class TTModelRunner:
         )
 
     def _steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
-        """Check if steady decode is generallyenabled based on the gather
+        """Check if steady decode is generally enabled based on the gather
         type and configuration.
 
         Args:
@@ -1284,6 +1286,7 @@ class TTModelRunner:
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
+            request_states=completed.context.request_states,
             row_indices=completed.context.row_indices,
         )
 
@@ -2701,6 +2704,7 @@ class TTModelRunner:
         self,
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
+        request_states: tuple[CachedRequestState, ...] | None = None,
         row_indices: tuple[int, ...] | None = None,
     ) -> None:
         use_captured_req_ids = req_ids is not None
@@ -2738,28 +2742,28 @@ class TTModelRunner:
 
         assert req_ids is not None
         captured_req_ids = req_ids
-        current_rows: list[int | None] = []
         for req_idx, req_id in enumerate(captured_req_ids):
-            current_row = self.input_batch.req_id_to_index.get(req_id)
-            current_rows.append(current_row)
-            if current_row is None:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
-            start_idx = int(self.input_batch.num_tokens[current_row])
-            end_idx = start_idx + 1
-            assert end_idx <= self.model_config.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.model_config.max_model_len}"
-            )
-            self.input_batch.token_ids_cpu[current_row, start_idx] = (
-                sampled_token_ids_np[req_idx]
-            )
-            self.input_batch.num_tokens[current_row] = end_idx
+            current_row = self.input_batch.req_id_to_index.get(req_id)
+            if current_row is not None:
+                start_idx = int(self.input_batch.num_tokens[current_row])
+                end_idx = start_idx + 1
+                assert end_idx <= self.model_config.max_model_len, (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: "
+                    f"{self.model_config.max_model_len}"
+                )
+                self.input_batch.token_ids_cpu[current_row, start_idx] = (
+                    sampled_token_ids_np[req_idx]
+                )
+                self.input_batch.num_tokens[current_row] = end_idx
 
-        for req_idx, req_id in enumerate(captured_req_ids):
-            output_token_ids = self.requests[req_id].output_token_ids
-            output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+            req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
     def apply_and_build_runner_output(
         self,

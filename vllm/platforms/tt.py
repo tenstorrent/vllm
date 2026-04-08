@@ -393,11 +393,7 @@ class TTPlatform(Platform):
 
         # TT uses a single scheduler implementation for both sync and async
         # execution modes; async_scheduling only controls execution overlap.
-        if vllm_config.scheduler_config.scheduler_cls in (
-            TT_SCHEDULER_CLS,
-            "vllm.v1.core.sched.ascend_scheduler.AscendScheduler",
-        ):
-            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+        vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

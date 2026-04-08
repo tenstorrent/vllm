@@ -407,11 +407,6 @@ class EngineCore:
             # Gathered-DP routes through the TT helper, which coordinates the
             # cross-rank gather/execute/scatter sequence before local results
             # can be applied.
-            if not is_tt:
-                # Non-TT backends keep the standard vLLM split: grammar bitmask
-                # first, then model execution/sampling.
-                # Currently unreachable outside TT, kept for future.
-                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             assert hasattr(self, "_execute_model_dp_gather")
             model_output = self._execute_model_dp_gather(scheduler_output)
         else:
@@ -1506,9 +1501,6 @@ class DPEngineCoreProc(EngineCoreProc):
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
 
-    def _completed_dp_gather_future(self) -> Future[tuple[torch.Tensor, list]]:
-        return tt_dp_gather._completed_dp_gather_future(self)
-
     def _dp_any_rank_has_scheduler_requests(self) -> bool:
         return tt_dp_gather._dp_any_rank_has_scheduler_requests(self)
 
@@ -1522,21 +1514,6 @@ class DPEngineCoreProc(EngineCoreProc):
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
         return tt_dp_gather.step_dp_with_batch_queue(self)
-
-    def dp_gather_submit(
-        self,
-        scheduler_output: SchedulerOutput | None,
-        *,
-        overlap_ok: bool = False,
-    ) -> DPGatherHandle:
-        return tt_dp_gather.dp_gather_submit(
-            self,
-            scheduler_output,
-            overlap_ok=overlap_ok,
-        )
-
-    def dp_gather_finalize(self, handle: DPGatherHandle) -> ModelRunnerOutput:
-        return tt_dp_gather.dp_gather_finalize(self, handle)
 
     def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput | None):
         return tt_dp_gather._execute_model_dp_gather(self, scheduler_output)
