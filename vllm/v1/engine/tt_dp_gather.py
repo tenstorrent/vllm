@@ -155,6 +155,7 @@ def step_with_batch_queue_tt(
 
     return engine_core_outputs, model_executed
 
+
 def step_dp_with_batch_queue(
     core: DPEngineCoreProc,
 ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
