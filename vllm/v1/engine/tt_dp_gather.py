@@ -15,7 +15,7 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 if TYPE_CHECKING:
-    from vllm.v1.engine.core import DPEngineCoreProc, DPGatherHandle
+    from vllm.v1.engine.core import DPEngineCoreProc, DPGatherHandle, EngineCore
 
 logger = init_logger(__name__)
 _T = TypeVar("_T")
@@ -89,6 +89,71 @@ def _dp_apply_forced_mode(core: DPEngineCoreProc, forced_mode: int | None) -> No
     if callable(set_mode):
         set_mode(forced_mode)
 
+
+def step_with_batch_queue_tt(
+    core: EngineCore,
+) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+    """TT-specific async batch-queue path for non-DP execution."""
+    batch_queue = core.batch_queue
+    assert batch_queue is not None
+
+    # Match the shared queue behavior: prefer keeping the queue filled before
+    # blocking on the oldest in-flight result.
+    assert len(batch_queue) < core.batch_queue_size
+
+    model_executed = False
+    deferred_scheduler_output: SchedulerOutput | None = None
+    if core.scheduler.has_requests():
+        scheduler_output = core.scheduler.schedule()
+        if not core.is_ec_producer:
+            model_executed = scheduler_output.total_num_scheduled_tokens > 0
+
+        if core.is_pooling_model or not model_executed:
+            future = cast(
+                Future[ModelRunnerOutput],
+                core.model_executor.execute_model(scheduler_output, non_block=True),
+            )
+        elif scheduler_output.pending_structured_output_tokens:
+            # TT consumes structured-output state inside execute_model(), so the
+            # grammar bitmask must be populated before submission.
+            deferred_scheduler_output = scheduler_output
+        else:
+            future = cast(
+                Future[ModelRunnerOutput],
+                core.model_executor.execute_model(scheduler_output, non_block=True),
+            )
+
+        if deferred_scheduler_output is None:
+            batch_queue.appendleft((future, scheduler_output))
+            if (
+                model_executed
+                and len(batch_queue) < core.batch_queue_size
+                and not batch_queue[-1][0].done()
+            ):
+                return None, True
+
+    elif not batch_queue:
+        return None, False
+
+    future, scheduler_output = batch_queue.pop()
+    with core.log_error_detail(scheduler_output):
+        model_output = future.result()
+
+    engine_core_outputs = core.scheduler.update_from_output(
+        scheduler_output, model_output
+    )
+
+    if deferred_scheduler_output is not None:
+        core.scheduler.get_grammar_bitmask(deferred_scheduler_output)
+        future = cast(
+            Future[ModelRunnerOutput],
+            core.model_executor.execute_model(
+                deferred_scheduler_output, non_block=True
+            ),
+        )
+        batch_queue.appendleft((future, deferred_scheduler_output))
+
+    return engine_core_outputs, model_executed
 
 def step_dp_with_batch_queue(
     core: DPEngineCoreProc,
