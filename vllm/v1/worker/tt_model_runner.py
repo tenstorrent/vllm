@@ -1908,23 +1908,57 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
-        # Warmup prefill
+        # Two-phase warmup: compile first, then capture traces.
+        #
+        # Phase 1 compiles all op variants (prefill + decode) into the
+        # program cache WITHOUT capturing any traces.  Phase 2 then
+        # captures traces with every op already compiled, so no new
+        # kernel-cache allocations occur that could corrupt trace memory.
+        #
+        # Assumptions / limitations:
+        #   1. Traced and non-traced code paths must use the same ops.
+        #      If a model uses different operators when enable_trace=False
+        #      vs True, Phase 1 will not compile the ops that Phase 2
+        #      traces, and new compilations during trace capture will
+        #      allocate corruptible buffers.
+        #   2. Prefill warmup must cover all supported sequence lengths.
+        #      If a new sequence length appears during inference, its
+        #      first compilation will allocate new kernel cache entries
+        #      (including reshape caches) that can corrupt active traces.
+        #
+        # Phase 1 uses read_from_device=False because some generators
+        # (e.g. llama3_70b_galaxy) only handle the traced return format
+        # in read_decode_output.
+        #
+        # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
         trace_prefill_mode = self.trace_mode in ["all"]
-        self.model.warmup_model_prefill(
+        trace_decode_mode = self.trace_mode in ["all", "decode_only"]
+        prefill_kwargs = dict(
             kv_cache=self.kv_caches,
-            enable_trace=trace_prefill_mode,
             can_sample_on_device=TTPlatform.sample_on_device_mode == "all",
             non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
         )
-
-        # Warmup decode
-        trace_decode_mode = self.trace_mode in ["all", "decode_only"]
-        self.model.warmup_model_decode(
+        decode_kwargs = dict(
             kv_cache=self.kv_caches,
-            enable_trace=trace_decode_mode,
             max_batch_size=self.scheduler_config.max_num_seqs
             * self.parallel_config.data_parallel_size,
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=self.sample_on_device_mode in ["all", "decode_only"],
             non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
         )
+
+        # Phase 1: compile all code paths (no trace capture)
+        self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
+        self.model.warmup_model_decode(
+            enable_trace=False, read_from_device=False, **decode_kwargs
+        )
+
+        # Reset prefill warmup flag so Phase 2 re-runs with tracing
+        if hasattr(self.model, "already_warmed_up_prefill"):
+            self.model.already_warmed_up_prefill = False
+
+        # Phase 2: capture traces (all ops already compiled)
+        if trace_prefill_mode:
+            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+        if trace_decode_mode:
+            self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
