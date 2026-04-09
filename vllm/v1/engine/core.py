@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
-import vllm.v1.engine.tt_dp_gather as tt_dp_gather
+import vllm.v1.engine.tt_engine_step as tt_engine_step
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
@@ -239,6 +239,7 @@ class EngineCore:
                 scheduler_block_size, caching_hash_fn
             )
 
+        self.step_fn: Callable[[], tuple[dict[int, EngineCoreOutputs] | None, bool]]
         if self.batch_queue is None:
             self.step_fn = self.step
         elif (
@@ -544,7 +545,7 @@ class EngineCore:
     def step_with_batch_queue_tt(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        return tt_dp_gather.step_with_batch_queue_tt(self)
+        return tt_engine_step.step_with_batch_queue_tt(self)
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
@@ -1507,21 +1508,21 @@ class DPEngineCoreProc(EngineCoreProc):
             )
 
     def _dp_any_rank_has_scheduler_requests(self) -> bool:
-        return tt_dp_gather._dp_any_rank_has_scheduler_requests(self)
+        return tt_engine_step._dp_any_rank_has_scheduler_requests(self)
 
     def _dp_negotiate_forced_mode(self) -> int:
-        return tt_dp_gather._dp_negotiate_forced_mode(self)
+        return tt_engine_step._dp_negotiate_forced_mode(self)
 
     def _dp_apply_forced_mode(self, forced_mode: int | None) -> None:
-        tt_dp_gather._dp_apply_forced_mode(self, forced_mode)
+        tt_engine_step._dp_apply_forced_mode(self, forced_mode)
 
     def step_dp_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        return tt_dp_gather.step_dp_with_batch_queue(self)
+        return tt_engine_step.step_dp_with_batch_queue(self)
 
     def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput | None):
-        return tt_dp_gather._execute_model_dp_gather(self, scheduler_output)
+        return tt_engine_step._execute_model_dp_gather(self, scheduler_output)
 
 
 class DPEngineCoreActor(DPEngineCoreProc):

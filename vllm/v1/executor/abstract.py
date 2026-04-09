@@ -225,17 +225,6 @@ class Executor(ABC):
         )
         return output[0]
 
-    def samples_tokens_in_execute_model(self) -> bool:
-        """Return True when execute_model() already applies sampling/output work.
-
-        Most executors follow the default vLLM flow: execute_model() produces
-        model state/logits, then sample_tokens() consumes the grammar bitmask
-        and returns the final ModelRunnerOutput. TT keeps that sampling/output
-        path inside execute_model(), so the engine must defer execute_model()
-        itself until structured-output grammar is available.
-        """
-        return self.device_config.device_type == "tt"
-
     @staticmethod
     def _as_future(value: _R) -> Future[_R]:
         future: Future[_R] = Future()
@@ -259,7 +248,7 @@ class Executor(ABC):
         Executors that keep sampling separate submit execute_model() first and,
         when possible, immediately enqueue sample_tokens().
         """
-        if self.samples_tokens_in_execute_model():
+        if self.device_config.device_type == "tt":
             if scheduler_output.pending_structured_output_tokens:
                 return None, scheduler_output
             if non_block:
@@ -303,43 +292,6 @@ class Executor(ABC):
                 self._as_future(self.sample_tokens(grammar_output, non_block=False)),
             )
         return future, None
-
-    def submit_deferred_scheduled_batch(
-        self,
-        scheduler_output: SchedulerOutput,
-        get_grammar_bitmask: Callable[[SchedulerOutput], GrammarOutput | None],
-        *,
-        non_block: bool,
-    ) -> Future[ModelRunnerOutput]:
-        """Submit a batch whose structured-output grammar became available later."""
-        if self.samples_tokens_in_execute_model():
-            # Executors such as TT consume scheduler_output.grammar_bitmask
-            # inside execute_model(), so computing the bitmask is a required
-            # side effect before submission. The return value is ignored because
-            # execute_model() reads the bitmask back from scheduler_output; this
-            # call is only here to populate scheduler_output.grammar_bitmask and
-            # related fields.
-            get_grammar_bitmask(scheduler_output)
-            if non_block:
-                return cast(
-                    Future[ModelRunnerOutput],
-                    self.execute_model(scheduler_output, non_block=True),
-                )
-            return cast(
-                Future[ModelRunnerOutput],
-                self._as_future(self.execute_model(scheduler_output, non_block=False)),
-            )
-
-        grammar_output = get_grammar_bitmask(scheduler_output)
-        if non_block:
-            return cast(
-                Future[ModelRunnerOutput],
-                self.sample_tokens(grammar_output, non_block=True),
-            )
-        return cast(
-            Future[ModelRunnerOutput],
-            self._as_future(self.sample_tokens(grammar_output, non_block=False)),
-        )
 
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")

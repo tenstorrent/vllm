@@ -240,8 +240,11 @@ class TTWorker(WorkerBase):
     ]:
         """Build the local DP payload consumed by gathered-DP orchestration.
 
-        Returns the local TT input and the per-rank metadata required by
-        gathered-DP orchestration in `core.py`.
+        Returns `(local_input, max_blocks, has_structured_input,
+        has_penalties, reset_batch, can_sample_device, needs_logprobs,
+        req_ids, req_id_to_index)`, where `local_input` is this rank's
+        TT model input (or `None`) and the remaining fields are the
+        per-rank metadata consumed by gathered-DP orchestration.
         """
         return self.model_runner.prepare_dp_model_input(scheduler_output)
 
@@ -256,10 +259,6 @@ class TTWorker(WorkerBase):
         return self.model_runner.can_attempt_steady_dp_decode_from_scheduler(
             scheduler_output
         )
-
-    def can_attempt_steady_decode_from_current_state(self) -> bool:
-        """Return whether non-DP steady decode is safe before scheduling."""
-        return self.model_runner.can_attempt_steady_decode_from_current_state()
 
     def can_attempt_steady_decode_from_scheduler(
         self, scheduler_output: "SchedulerOutput"

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
@@ -25,7 +24,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
-    AsyncModelRunnerOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -33,6 +31,11 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.tt_async_decode import (
+    AsyncTTModelRunnerOutput,
+    CompletedDecodeStep,
+    TTAsyncDecodeController,
+)
 from vllm.v1.worker.tt_input_batch import (
     LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
@@ -169,146 +172,6 @@ class TTModelInput:
     reset_batch: bool = False
 
 
-@dataclass(frozen=True)
-class TTDecodeSubmission:
-    """Carries the raw result of decode submission until finalization.
-
-    Decode submission and decode finalization happen on different threads in
-    async mode, but they are one logical service. This record gives both sync
-    and async paths one shared hand-off format instead of open-coded tuples and
-    ad hoc unpacking.
-    """
-
-    tt_out: Any | None
-    read_events: list[Any] | None
-    batch_size_per_dp: list[int]
-    sampling_params: TTSamplingParams
-    perform_device_sampling: bool
-
-
-@dataclass(frozen=True)
-class TTFinalizedDecode:
-    """Normalized decode result after any TT event waits and host processing.
-
-    Every decode path eventually needs the same two things: postprocessed TT
-    outputs plus optional device logprobs. Centralizing that contract keeps
-    token extraction independent from how the decode completed.
-    """
-
-    tt_out: torch.Tensor
-    tt_log_probs: torch.Tensor | None
-
-
-@dataclass(frozen=True)
-class SubmittedStepContext:
-    """Immutable snapshot of the host state associated with one decode submit."""
-
-    req_ids: list[str]
-    req_id_to_index: dict[str, int]
-    request_states: tuple[CachedRequestState, ...]
-    row_indices: tuple[int, ...]
-    submit_time_ns: int
-
-
-@dataclass(frozen=True)
-class CompletedDecodeStep:
-    """Decode output that has completed readback but is not yet applied."""
-
-    sampled_token_ids: torch.Tensor
-    logprobs: LogprobsLists | None
-    context: SubmittedStepContext
-    completion_time_ns: int
-
-
-class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
-    """Wraps a non-blocking TT decode submission plus async read submit.
-
-    Returned by ``submit_async_non_dp_decode`` so that the executor can
-    defer the blocking event wait / host postprocessing to a worker thread while the
-    main thread continues scheduling the next batch.
-
-    ``req_ids`` and ``req_id_to_index`` are captured at submit time because
-    ``input_batch`` may be overwritten by the next step before
-    ``get_output()`` runs.
-    """
-
-    def __init__(
-        self,
-        runner: TTModelRunner,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-        completion_event: threading.Event,
-        context: SubmittedStepContext,
-    ):
-        self._runner = runner
-        self._submission = submission
-        self._model_input = model_input
-        self._completion_event = completion_event
-        self._context = context
-
-    def get_output(self) -> ModelRunnerOutput:
-        try:
-            return self._get_output_impl()
-        finally:
-            self._completion_event.set()
-
-    def _get_output_impl(self) -> ModelRunnerOutput:
-        runner = self._runner
-        completed = runner.complete_non_dp_decode_step(
-            submission=self._submission,
-            model_input=self._model_input,
-            context=self._context,
-        )
-        runner.enqueue_completed_decode_step(completed)
-        return runner.build_runner_output_from_completed_step(completed)
-
-
-class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
-    """Wraps a non-blocking DP>1 decode submission plus async read submit.
-
-    Returned by ``submit_async_dp_decode`` so that the executor can
-    defer the blocking event wait / host postprocessing / token extraction to its
-    async output thread while the main thread continues scheduling.
-
-    ``get_output()`` returns ``tuple[torch.Tensor, list]`` (stacked
-    per-DP sampled ids + per-DP logprobs lists) rather than a
-    ``ModelRunnerOutput``, matching the contract expected by
-    ``dp_gather_finalize``.
-    """
-
-    def __init__(
-        self,
-        runner: TTModelRunner,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-    ):
-        self._runner = runner
-        self._submission = submission
-        self._model_input = model_input
-
-    def get_output(self) -> tuple[torch.Tensor, list]:  # type: ignore[override]
-        runner = self._runner
-        finalized = runner.finalize_decode(self._submission)
-        if finalized is None:
-            return runner.pack_dp_results(
-                [torch.tensor([], dtype=torch.int32)]
-                * len(self._submission.batch_size_per_dp),
-                [None] * len(self._submission.batch_size_per_dp),
-            )
-
-        sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
-            tt_out=finalized.tt_out,
-            tt_log_probs=finalized.tt_log_probs,
-            sampling_params=self._submission.sampling_params,
-            model_input=self._model_input,
-            batch_size_per_dp=self._submission.batch_size_per_dp,
-            perform_device_sampling=self._submission.perform_device_sampling,
-            is_decode=True,
-        )
-
-        return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
-
-
 class TTModelRunner:
     def __init__(
         self,
@@ -383,9 +246,9 @@ class TTModelRunner:
         # sticky flag and clear it only after a decode input consumes it.
         self._decode_layout_changed_since_last_decode: bool = True
 
-        # Async scheduling: overlap CPU scheduling with device execution.
+        # Non-DP async scheduling: overlap CPU scheduling with device execution.
         # Only supported for DP=1 (DP>1 uses a different execution path).
-        self.async_scheduling = (
+        self.non_dp_async_scheduling = (
             self.scheduler_config.async_scheduling
             and self.parallel_config.data_parallel_size == 1
         )
@@ -393,6 +256,7 @@ class TTModelRunner:
         self._pending_async_events: deque[threading.Event] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
+        self.async_decode = TTAsyncDecodeController(self)
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -1014,132 +878,14 @@ class TTModelRunner:
         model_input = self._prepare_model_inputs(scheduler_output)
         return model_input
 
-    def _capture_submitted_step_context(self) -> SubmittedStepContext:
-        num_reqs = self.input_batch.num_reqs
-        req_ids = list(self.input_batch.req_ids[:num_reqs])
-        return SubmittedStepContext(
-            req_ids=req_ids,
-            req_id_to_index=dict(self.input_batch.req_id_to_index),
-            request_states=tuple(self.requests[req_id] for req_id in req_ids),
-            row_indices=tuple(
-                self.input_batch.req_id_to_index[req_id] for req_id in req_ids
-            ),
-            submit_time_ns=time.perf_counter_ns(),
-        )
-
-    def _steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
-        """Check if steady decode is generally enabled based on the gather
-        type and configuration.
-
-        Args:
-            dp_gather: Whether the gather is data parallel.
-
-        Returns:
-            True if steady decode is enabled, False otherwise.
-        """
-        if dp_gather:
-            if not self.scheduler_config.async_scheduling:
-                return False
-        else:
-            if not self.async_scheduling:
-                return False
-            if self.parallel_config.data_parallel_size != 1:
-                return False
-        if self.trace_mode == "none":  # noqa: SIM103
-            return False
-        return True
-
-    def can_attempt_steady_decode_from_current_state(self) -> bool:
-        """Return whether the current non-DP runner state is steady-decode-safe.
-
-        Call this before `schedule()`, when the engine has not produced a
-        `SchedulerOutput` yet. This is a conservative pre-schedule guard used
-        by `EngineCore` before it enters the TT one-step-lagged branch. It
-        intentionally answers "no" for any current state that might require
-        draining pending decode work first, such as a prefill/decode boundary
-        or a changed padded decode layout.
-        """
-        if not self._steady_decode_base_enabled(dp_gather=False):
-            return False
-        if self._decode_layout_changed_since_last_decode:
-            return False
-        input_batch = self.input_batch
-        if not input_batch.no_penalties:
-            return False
-        if not input_batch.no_allowed_token_ids:
-            return False
-        if input_batch.sampling.bad_words_token_ids:
-            return False
-        max_num_logprobs = input_batch.max_num_logprobs
-        if max_num_logprobs is not None and max_num_logprobs > 0:
-            return False
-        if input_batch.sampling.has_active_logitsprocs():  # noqa: SIM103
-            return False
-        return True
-
-    def _steady_decode_scheduler_invariants_met(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> bool:
-        """Validate scheduler-level invariants shared by steady decode checks.
-
-        Call this only after `schedule()` has produced a concrete
-        `SchedulerOutput`. It captures the scheduler-visible conditions that
-        must hold for steady decode, but it does not inspect the final built
-        `TTModelInput`, so callers that need submission-time guarantees must
-        still perform a later model-input-level check.
-        """
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
-            cached_reqs.resumed_req_ids
-        )
-        if is_prompt or self._decode_layout_changed_since_last_decode:
-            return False
-        if (
-            scheduler_output.pending_structured_output_tokens
-            or scheduler_output.grammar_bitmask is not None
-        ):
-            return False
-        input_batch = self.input_batch
-        if not input_batch.no_penalties:
-            return False
-        if not input_batch.no_allowed_token_ids:
-            return False
-        if input_batch.sampling.bad_words_token_ids:
-            return False
-        max_num_logprobs = input_batch.max_num_logprobs
-        if max_num_logprobs is not None and max_num_logprobs > 0:
-            return False
-        if input_batch.sampling.has_active_logitsprocs():
-            return False
-        if self.model_config.logits_processors:
-            return False
-        return self.check_perform_device_sampling(
-            is_decode=True,
-            has_structured_outputs=False,
-        )
-
-    def _can_attempt_steady_decode_from_scheduler(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> bool:
-        """Check a non-DP scheduled step before building the TT model input.
-
-        Call this after `schedule()` but before `build_model_input()`. It uses
-        `SchedulerOutput` to decide whether the scheduled work still looks like
-        decode-only steady state, which is enough to decide whether pending
-        async decode steps must be drained before preparing the next step.
-        """
-        if not self._steady_decode_base_enabled(dp_gather=False):
-            return False
-        return self._steady_decode_scheduler_invariants_met(scheduler_output)
-
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
     ) -> bool:
         """Return whether a scheduled non-DP step can overlap steady decode."""
-        return self._can_attempt_steady_decode_from_scheduler(scheduler_output)
+        return self.async_decode.can_attempt_steady_decode_from_scheduler(
+            scheduler_output
+        )
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
@@ -1152,142 +898,8 @@ class TTModelRunner:
         is treated as steady-eligible because a rank may have no local decode
         work while the global gathered step still overlaps safely.
         """
-        if not self._steady_decode_base_enabled(dp_gather=True):
-            return False
-        if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
-            return True
-        return self._steady_decode_scheduler_invariants_met(scheduler_output)
-
-    def _can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
-        """Check the final non-DP decode submission for steady fast-path safety.
-
-        Call this only after `build_model_input()` has produced the concrete
-        `TTModelInput` that would be submitted to the device. This is the
-        latest and strongest steady-decode predicate: it inspects actual
-        submission details such as reset-batch, grammar bitmasks, host-only
-        sampling state, and whether device sampling is active.
-        """
-        if not self._steady_decode_base_enabled(dp_gather=False):
-            return False
-        if model_input.prompt_lens is not None:
-            return False
-        if not model_input.perform_device_sampling:
-            return False
-        if model_input.reset_batch:
-            return False
-        if model_input.grammar_bitmask[0] is not None:
-            return False
-        if (
-            model_input.prompt_tokens is not None
-            or model_input.output_tokens is not None
-        ):
-            return False
-        if model_input.allowed_token_ids_mask_list[0] is not None:
-            return False
-        if model_input.bad_words_token_ids_list[0]:
-            return False
-        max_num_logprobs = model_input.max_num_logprobs[0]
-        if max_num_logprobs is not None and max_num_logprobs > 0:  # noqa: SIM103
-            return False
-        return True
-
-    def enqueue_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
-        with self._steady_decode_lock:
-            self._completed_decode_steps.append(completed)
-
-    def _register_pending_async_event(
-        self,
-        event: threading.Event,
-        *,
-        overlap_ok: bool,
-    ) -> None:
-        with self._steady_decode_lock:
-            self._pending_async_events.append(event)
-            self._pending_async_overlap_ok.append(overlap_ok)
-
-    def _prune_finished_async_events(self) -> None:
-        with self._steady_decode_lock:
-            while self._pending_async_events and self._pending_async_events[0].is_set():
-                self._pending_async_events.popleft()
-                self._pending_async_overlap_ok.popleft()
-
-    def _drain_completed_decode_steps(self) -> list[CompletedDecodeStep]:
-        completed: list[CompletedDecodeStep] = []
-        with self._steady_decode_lock:
-            while self._completed_decode_steps:
-                completed.append(self._completed_decode_steps.popleft())
-        return completed
-
-    def _apply_ready_completed_decode_steps(self) -> None:
-        for completed in self._drain_completed_decode_steps():
-            self.apply_completed_decode_step(completed)
-        self._prune_finished_async_events()
-
-    def _wait_for_all_pending_async_steps(self) -> None:
-        with self._steady_decode_lock:
-            events = list(self._pending_async_events)
-        for event in events:
-            event.wait()
-        self._apply_ready_completed_decode_steps()
-
-    def _must_drain_pending_async_steps(
-        self,
-        steady_decode_candidate: bool,
-    ) -> bool:
-        with self._steady_decode_lock:
-            if not self._pending_async_events:
-                return False
-            if not steady_decode_candidate:
-                return True
-            return any(not overlap_ok for overlap_ok in self._pending_async_overlap_ok)
-
-    def complete_non_dp_decode_step(
-        self,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-        context: SubmittedStepContext,
-    ) -> CompletedDecodeStep:
-        finalized = self.finalize_decode(submission)
-        if finalized is None:
-            sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
-            logprobs = None
-        else:
-            sampled_token_ids_per_dp, logprobs_per_dp = self._get_output_tokens(
-                tt_out=finalized.tt_out,
-                tt_log_probs=finalized.tt_log_probs,
-                sampling_params=submission.sampling_params,
-                model_input=model_input,
-                batch_size_per_dp=submission.batch_size_per_dp,
-                perform_device_sampling=submission.perform_device_sampling,
-                is_decode=True,
-            )
-            sampled_token_ids = sampled_token_ids_per_dp[0]
-            logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
-            logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
-        return CompletedDecodeStep(
-            sampled_token_ids=sampled_token_ids,
-            logprobs=logprobs,
-            context=context,
-            completion_time_ns=time.perf_counter_ns(),
-        )
-
-    def build_runner_output_from_completed_step(
-        self,
-        completed: CompletedDecodeStep,
-    ) -> ModelRunnerOutput:
-        return self._build_runner_output(
-            sampled_token_ids=completed.sampled_token_ids,
-            logprobs=completed.logprobs,
-            req_ids=completed.context.req_ids,
-            req_id_to_index=completed.context.req_id_to_index,
-        )
-
-    def apply_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
-        self._apply_sampled_tokens_to_state(
-            sampled_token_ids=completed.sampled_token_ids,
-            req_ids=completed.context.req_ids,
-            request_states=completed.context.request_states,
-            row_indices=completed.context.row_indices,
+        return self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
+            scheduler_output
         )
 
     def build_dp_decode_gather_input(
@@ -1854,12 +1466,12 @@ class TTModelRunner:
         # thread. In steady decode mode we intentionally allow one step of
         # lag between host application and device submission, but we never let
         # completed work pile up unbounded.
-        self._apply_ready_completed_decode_steps()
-        steady_decode_candidate = self._can_attempt_steady_decode_from_scheduler(
-            scheduler_output
+        self.async_decode.apply_ready_completed_decode_steps()
+        steady_decode_candidate = (
+            self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
-        if self._must_drain_pending_async_steps(steady_decode_candidate):
-            self._wait_for_all_pending_async_steps()
+        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+            self.async_decode.wait_for_all_pending_async_steps()
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
@@ -1867,9 +1479,11 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if self.async_scheduling and is_decode:
-            steady_decode_fast_path = self._can_use_steady_decode_fast_path(model_input)
-            return self.submit_async_non_dp_decode(
+        if self.non_dp_async_scheduling and is_decode:
+            steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
+                model_input
+            )
+            return self.async_decode.submit_async_non_dp_decode(
                 model_input,
                 steady_decode_fast_path=steady_decode_fast_path,
             )
@@ -1883,231 +1497,6 @@ class TTModelRunner:
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
         output = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
         return output
-
-    def submit_async_non_dp_decode(
-        self,
-        model_input: TTModelInput,
-        *,
-        steady_decode_fast_path: bool,
-    ) -> AsyncTTModelRunnerOutput:
-        """Submit non-DP decode work for async completion.
-
-        Returns an `AsyncTTModelRunnerOutput` after issuing TT decode work and
-        async read submission. The wrapper carries the captured request
-        identity needed to build the final non-DP output on the async thread.
-        """
-        event = threading.Event()
-        context = self._capture_submitted_step_context()
-        submission = self.submit_decode(
-            model_input, read_from_device=False, async_read=True
-        )
-        self._register_pending_async_event(
-            event,
-            overlap_ok=steady_decode_fast_path,
-        )
-
-        if submission.tt_out is None:
-            # No decode work was submitted to the device for this step
-            # (for example, the merged batch was effectively empty), so the
-            # async output wrapper should be marked complete immediately.
-            event.set()
-            return AsyncTTModelRunnerOutput(
-                runner=self,
-                submission=submission,
-                model_input=model_input,
-                completion_event=event,
-                context=context,
-            )
-
-        # Capture req_ids/req_id_to_index now - input_batch will be
-        # overwritten by the next step's build_model_input before
-        # get_output() runs on the async thread.
-        return AsyncTTModelRunnerOutput(
-            runner=self,
-            submission=submission,
-            model_input=model_input,
-            completion_event=event,
-            context=context,
-        )
-
-    def submit_async_dp_decode(
-        self,
-        model_input: TTModelInput,
-    ) -> AsyncTTDPGatherOutput:
-        """Submit merged DP decode work for async completion.
-
-        Returns an `AsyncTTDPGatherOutput` after issuing merged DP decode work
-        and either async read submission (`event` mode) or deferred blocking
-        readback on the worker thread (`blocking_worker` mode). The wrapper
-        later produces the packed per-DP payload consumed by gathered-DP
-        finalization.
-        """
-        submission = self.submit_decode(
-            model_input, read_from_device=False, async_read=True
-        )
-
-        return AsyncTTDPGatherOutput(
-            runner=self,
-            submission=submission,
-            model_input=model_input,
-        )
-
-    def submit_decode(
-        self,
-        model_input: TTModelInput,
-        *,
-        read_from_device: bool,
-        async_read: bool = False,
-    ) -> TTDecodeSubmission:
-        """Submit decode work and return a normalized submission record.
-
-        Launches TT decode and returns a normalized record consumed by sync and
-        async completion paths. In async mode, this always submits non-blocking
-        readback on the caller thread and later waits on the returned events.
-        """
-        batch_size_per_dp = model_input.unpadded_batch_size
-        if not isinstance(batch_size_per_dp, list):
-            batch_size_per_dp = [batch_size_per_dp]
-
-        sampling_params = model_input.tt_sampling_params
-        perform_device_sampling = model_input.perform_device_sampling
-        if not any(bs > 0 for bs in batch_size_per_dp):
-            return TTDecodeSubmission(
-                tt_out=None,
-                read_events=None,
-                batch_size_per_dp=batch_size_per_dp,
-                sampling_params=sampling_params,
-                perform_device_sampling=perform_device_sampling,
-            )
-
-        kwargs: dict[str, Any] = {
-            "tokens": model_input.input_tokens,
-            "page_table": model_input.block_tables,
-            "kv_cache": self.kv_caches,
-            "start_pos": model_input.input_positions,
-        }
-        if perform_device_sampling:
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
-
-            if model_input.prompt_tokens is not None:
-                assert model_input.output_tokens is not None
-                kwargs["prompt_tokens"] = model_input.prompt_tokens
-                kwargs["output_tokens"] = model_input.output_tokens
-
-            kwargs["reset_batch"] = model_input.reset_batch
-
-        enc_dec_kwargs: dict[str, Any] = {}
-        if self.request_specific_rope:
-            if any(
-                req_id not in self.previous_req_ids
-                for req_id in self.input_batch.req_ids
-            ):
-                enc_dec_kwargs = {
-                    "rope_deltas_all_users": [
-                        self.requests[req_id].mrope_position_delta
-                        for req_id in self.input_batch.req_ids
-                    ]
-                }
-            else:
-                enc_dec_kwargs = {"rope_deltas_all_users": None}
-            self.previous_req_ids = set(self.input_batch.req_ids)
-
-        enable_trace = self.trace_mode in ["all", "decode_only"]
-        tt_out = self.model.decode_forward(
-            **kwargs,
-            **enc_dec_kwargs,
-            enable_trace=enable_trace,
-            read_from_device=read_from_device,
-        )
-        read_events = None
-        if async_read:
-            if hasattr(self.model, "read_decode_output"):
-                tt_out, read_events = cast(
-                    tuple[Any, list[Any]],
-                    self.model.read_decode_output(tt_out, async_read=True),
-                )
-            else:
-                is_host_tensor = isinstance(tt_out, torch.Tensor)
-                is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                    tensor is None or isinstance(tensor, torch.Tensor)
-                    for tensor in tt_out
-                )
-                if not (is_host_tensor or is_host_tensor_tuple):
-                    raise AttributeError(
-                        "TT model must implement read_decode_output() "
-                        "unless decode_forward() already returns host tensors"
-                    )
-        return TTDecodeSubmission(
-            tt_out=tt_out,
-            read_events=read_events,
-            batch_size_per_dp=batch_size_per_dp,
-            sampling_params=sampling_params,
-            perform_device_sampling=perform_device_sampling,
-        )
-
-    def finalize_decode(
-        self,
-        submission: TTDecodeSubmission,
-    ) -> TTFinalizedDecode | None:
-        """Finish decode after submission and normalize TT outputs.
-
-        Waits for any pending TT read events, runs host-side postprocessing,
-        and returns normalized decode outputs plus optional device logprobs.
-        """
-        if submission.tt_out is None:
-            return None
-
-        if submission.read_events is not None:
-            for read_event in submission.read_events:
-                ttnn.event_synchronize(read_event)
-            tt_out = submission.tt_out
-        else:
-            tt_out = submission.tt_out
-
-        # Real TT generator models expose `process_decode_output_host()` to
-        # convert readback tensors into torch outputs. Keep compatibility with
-        # lightweight/no-op test models that already return host tensors and do
-        # not implement the newer hook.
-        if hasattr(self.model, "process_decode_output_host"):
-            tt_out = self.model.process_decode_output_host(
-                tt_out,
-                is_tokens=submission.perform_device_sampling,
-            )
-        else:
-            is_host_tensor = isinstance(tt_out, torch.Tensor)
-            is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
-            )
-            if not (is_host_tensor or is_host_tensor_tuple):
-                raise AttributeError(
-                    "TT model must implement process_decode_output_host() "
-                    "unless decode output is already a torch tensor"
-                )
-
-        tt_log_probs = None
-        assert isinstance(submission.sampling_params.enable_log_probs, torch.Tensor)
-        if (
-            submission.perform_device_sampling
-            and submission.sampling_params.enable_log_probs.any()
-        ):
-            assert isinstance(tt_out, tuple) and len(tt_out) == 2
-            tt_out, tt_log_probs = tt_out
-        elif isinstance(tt_out, tuple):
-            tt_out, _ = tt_out
-
-        return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=tt_log_probs)
 
     def pack_dp_results(
         self,
@@ -2287,10 +1676,10 @@ class TTModelRunner:
         if not is_decode:
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
         else:
-            submission = self.submit_decode(
+            submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
-            finalized = self.finalize_decode(submission)
+            finalized = self.async_decode.finalize_decode(submission)
             assert finalized is not None
             tt_out = finalized.tt_out
             tt_log_probs = finalized.tt_log_probs
@@ -2387,7 +1776,7 @@ class TTModelRunner:
         )
 
         if non_block and is_decode:
-            return self.submit_async_dp_decode(merged)
+            return self.async_decode.submit_async_dp_decode(merged)
 
         sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(
             merged

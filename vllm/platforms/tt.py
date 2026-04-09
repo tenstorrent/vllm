@@ -280,7 +280,6 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.tt_worker.TTWorker"
-            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"

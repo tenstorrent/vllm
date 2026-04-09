@@ -35,7 +35,7 @@ ALLOWED_FILES = {
     "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
     "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
     "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
-    "vllm/v1/engine/tt_dp_gather.py",  # extracted DP gather serialization path
+    "vllm/v1/engine/tt_engine_step.py",  # extracted TT engine step serialization path
     # cloudpickle
     "vllm/v1/executor/multiproc_executor.py",
     "vllm/v1/executor/ray_executor.py",
