@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-import pickle
 import queue
 import signal
 import threading
@@ -10,6 +9,7 @@ from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, TypeVar, cast
@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
+import vllm.v1.engine.tt_engine_step as tt_engine_step
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
@@ -27,6 +28,7 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import engine_receiver_cache_from_config
+from vllm.platforms import current_platform
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils.gc_utils import (
@@ -45,6 +47,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.tt_scheduler import TTSchedulingMode
 from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
@@ -62,7 +65,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
@@ -76,8 +79,39 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+@dataclass
+class DPGatherHandle:
+    future: Future[tuple[torch.Tensor, list]]
+    scheduler_output: SchedulerOutput | None
+    local_has_requests: bool
+    is_decode: bool
+    overlap_ok: bool
+    any_needs_logprobs: bool
+    req_ids: list[str]
+    req_id_to_index: dict[str, int]
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
+
+    # Gathered-DP subclasses initialize these before guarded access sites use
+    # them. Declaring them here lets mypy type-check direct attribute access.
+    requires_gather: bool
+    _dp_gather_forced_mode: TTSchedulingMode
+
+    def _dp_any_rank_has_scheduler_requests(self) -> bool:
+        raise NotImplementedError
+
+    def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
+        raise NotImplementedError
+
+    def _dp_apply_forced_mode(self, forced_mode: TTSchedulingMode) -> None:
+        raise NotImplementedError
+
+    def _execute_model_dp_gather(
+        self, scheduler_output: SchedulerOutput | None
+    ) -> ModelRunnerOutput:
+        raise NotImplementedError
 
     def __init__(
         self,
@@ -121,6 +155,11 @@ class EngineCore:
 
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        logger.info(
+            "Scheduler class: %s, async_scheduling=%s",
+            Scheduler.__name__,
+            vllm_config.scheduler_config.async_scheduling,
+        )
 
         if len(kv_cache_config.kv_cache_groups) == 0:
             # Encoder models without KV cache don't support
@@ -201,9 +240,17 @@ class EngineCore:
                 scheduler_block_size, caching_hash_fn
             )
 
-        self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
-        )
+        self.step_fn: Callable[[], tuple[dict[int, EngineCoreOutputs] | None, bool]]
+        if self.batch_queue is None:
+            self.step_fn = self.step
+        elif (
+            current_platform.is_tt()
+            and vllm_config.scheduler_config.async_scheduling
+            and vllm_config.parallel_config.data_parallel_size == 1
+        ):
+            self.step_fn = self.step_with_batch_queue_tt
+        else:
+            self.step_fn = self.step_with_batch_queue
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         # Mark the startup heap as static so that it's ignored by GC.
@@ -335,58 +382,14 @@ class EngineCore:
         was executed.
         """
 
-        # For gathered DP execution, agree on mode BEFORE any early returns,
-        # and only apply it if we will schedule locally.
-        forced_mode: int | None = None
+        forced_mode = TTSchedulingMode.DEFAULT
         requires_gather = hasattr(self, "requires_gather") and self.requires_gather
         if requires_gather:
-            assert hasattr(self, "dp_max_consec_decodes")
-            assert hasattr(self, "dp_decode_streak")
-            assert hasattr(self, "dlog")
-            assert hasattr(self, "dp_group")
-            # Check if any rank has work before doing intent all_reduce.
-            local_has_requests = 1 if self.scheduler.has_requests() else 0
-            has_requests_t = torch.tensor([local_has_requests], dtype=torch.int32)
-            try:
-                dist.all_reduce(
-                    has_requests_t, op=dist.ReduceOp.SUM, group=self.dp_group
-                )
-            except RuntimeError as e:
-                # During shutdown, peers may close connections mid-collective.
-                # Exit gracefully to allow coordinated shutdown.
-                if "Connection closed by peer" in str(e):
-                    logger.debug(
-                        "Collective failed during shutdown, exiting gracefully"
-                    )
-                    raise SystemExit() from e
-                raise
-            if int(has_requests_t.item()) == 0:
+            # For gathered DP execution, agree on mode before any early returns.
+            if not self._dp_any_rank_has_scheduler_requests():
                 # No rank has work, return early without scheduling.
                 return {}, False
-
-            # Max-consecutive-decoding guard: if there are waiting prefills
-            # and we decoded for dp_max_consec_decodes steps consecutively,
-            # force one prefill step. Otherwise, prefer decode while running.
-            # Can't automatically set intent to be prefill if there are any
-            # waiting requests since we could get stuck in a loop where intent
-            # is prefill but it doesn't get scheduled.
-            has_running = bool(getattr(self.scheduler, "running", []))
-            has_waiting = bool(getattr(self.scheduler, "waiting", False))
-            must_prefill = (
-                has_waiting
-                and self.dp_decode_streak  # type: ignore[has-type]
-                >= self.dp_max_consec_decodes
-            )
-            local_prefill_intent = (
-                1 if (has_waiting and (must_prefill or not has_running)) else 0
-            )
-            intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
-            self.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
-            dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=self.dp_group)
-            forced_mode = int(intent_tensor.item())  # 1=prefill, 0=decode
-            self.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
-            # Record forced_mode so it can be used by _execute_model_dp_gather.
-            self._dp_gather_forced_mode = forced_mode
+            forced_mode = self._dp_negotiate_forced_mode()
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -397,38 +400,41 @@ class EngineCore:
                 _ = self._execute_model_dp_gather(None)
             return {}, False
 
-        # Apply the forced mode only for ranks that will call schedule().
-        if requires_gather and forced_mode is not None:
-            set_mode = getattr(self.scheduler, "set_forced_mode", None)
-            if callable(set_mode):
-                set_mode(forced_mode)
+        if requires_gather:
+            self._dp_apply_forced_mode(forced_mode)
 
         scheduler_output = self.scheduler.schedule()
 
-        if requires_gather and forced_mode is not None:
-            # Reset forced mode after scheduling to leave no residual state.
-            set_mode = getattr(self.scheduler, "set_forced_mode", None)
-            if callable(set_mode):
-                set_mode(None)
+        if requires_gather:
+            # Reset the forced mode to the default for the next step
+            self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
 
-            # Update decode streak: increment only when decode scheduled tokens;
-            # reset to 0 when prefill runs OR when nothing was scheduled.
-            if scheduler_output.total_num_scheduled_tokens > 0 and forced_mode == 0:
-                self.dp_decode_streak += 1  # type: ignore[has-type]
-            else:
-                self.dp_decode_streak = 0
+        is_tt = current_platform.is_tt()
+        grammar_output = None
+        model_output: ModelRunnerOutput | None
 
-        if hasattr(self, "requires_gather") and self.requires_gather:
-            # Different execution path for gathered batch DP.
+        if requires_gather:
+            # Gathered-DP routes through the TT helper, which coordinates the
+            # cross-rank gather/execute/scatter sequence before local results
+            # can be applied.
             assert hasattr(self, "_execute_model_dp_gather")
             model_output = self._execute_model_dp_gather(scheduler_output)
         else:
+            # Regular execution can launch the model first and overlap grammar
+            # work while the executor is running.
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            if not is_tt:
+                # TT scheduler outputs already include the grammar bitmask:
+                # `TTScheduler.schedule()` calls `_finalize_scheduler_output()`,
+                # which calls `get_grammar_bitmask()` before we reach EngineCore.
+                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             with self.log_error_detail(scheduler_output):
-                model_output = future.result()
+                model_output = future.result()  # Wait right after execution.
                 if model_output is None:
+                    # Most backends sample after execute_model(); TT keeps that
+                    # work inside execute_model(), so this branch is skipped there.
                     model_output = self.model_executor.sample_tokens(grammar_output)
+        assert model_output is not None
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -540,6 +546,11 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output))
 
         return engine_core_outputs, model_executed
+
+    def step_with_batch_queue_tt(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        return tt_engine_step.step_with_batch_queue_tt(self)
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
@@ -956,6 +967,7 @@ class EngineCoreProc(EngineCore):
             not self.engines_running
             and not self.scheduler.has_requests()
             and not self.batch_queue
+            and not getattr(self, "_dp_in_flight", None)
         ):
             if hasattr(self, "requires_gather") and self.requires_gather:
                 # Non-blocking input polling so idle ranks can progress
@@ -1021,7 +1033,6 @@ class EngineCoreProc(EngineCore):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
-
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             self.add_request(req, request_wave)
@@ -1243,12 +1254,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
         self.requires_gather = current_platform.requires_gathered_batch_dp()
         if self.requires_gather:
-            # Track decode streak for DP gather fairness policy.
-            self.dp_decode_streak: int = 0
-            # Max consecutive decode iterations allowed before we must
-            # admit at least one prefill if there are waiting requests.
-            self.dp_max_consec_decodes: int = 16
-
             DEBUG_DPG = os.environ.get("DP_GATHER_DEBUG") == "1"
 
             def dlog_logger(msg: str, *a: object) -> None:
@@ -1269,6 +1274,10 @@ class DPEngineCoreProc(EngineCoreProc):
             client_handshake_address,
             dp_rank,
         )
+        if self.requires_gather:
+            self._dp_in_flight: DPGatherHandle | None = None
+            if self.batch_queue is not None:
+                self.step_fn = self.step_dp_with_batch_queue
 
     def _init_dp_group(self, parallel_config: ParallelConfig) -> None:
         """Initialize DP group in self.dp_group. For DP gather execution, also
@@ -1503,298 +1512,22 @@ class DPEngineCoreProc(EngineCoreProc):
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
 
-    def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput):
-        parallel_config = self.vllm_config.parallel_config
-        group = self.dp_group
-        rank = self.dp_rank
-        local_rank = parallel_config.data_parallel_rank_local
-        world = parallel_config.data_parallel_size
+    def _dp_any_rank_has_scheduler_requests(self) -> bool:
+        return tt_engine_step._dp_any_rank_has_scheduler_requests(self)
 
-        local_has_requests = scheduler_output is not None
-        if local_has_requests:
-            self.dlog(
-                "enter_gather tokens=%d", scheduler_output.total_num_scheduled_tokens
-            )
+    def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
+        return tt_engine_step._dp_negotiate_forced_mode(self)
 
-        # Detect decode vs prefill using forced_mode negotiated earlier.
-        # 0=decode, 1=prefill.
-        assert hasattr(self, "_dp_gather_forced_mode"), "forced_mode not set"
-        is_decode = self._dp_gather_forced_mode == 0
+    def _dp_apply_forced_mode(self, forced_mode: TTSchedulingMode) -> None:
+        tt_engine_step._dp_apply_forced_mode(self, forced_mode)
 
-        # Build local dp model input (or None).
-        all_local_inputs = self.model_executor.collective_rpc(
-            "build_dp_model_input", args=(scheduler_output,)
-        )[0]  # type: ignore[var-annotated]
-        (
-            local_input,
-            local_max_blocks,
-            local_has_structured,
-            local_has_penalties,
-            local_reset_batch,
-            local_can_sample_device,
-            local_needs_logprobs,
-        ) = all_local_inputs
-        max_blocks_decode = None  # Only used for decode.
-        any_structured_inputs = False  # Only used for decode.
-        any_needs_logprobs = False
+    def step_dp_with_batch_queue(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        return tt_engine_step.step_dp_with_batch_queue(self)
 
-        if is_decode:
-            # Gather max_blocks, has_structured, has_penalties, reset_batch,
-            # cannot_sample_on_device, and needs_logprobs from all ranks.
-            input_info_t = torch.tensor(
-                [
-                    local_max_blocks,
-                    local_has_structured,
-                    local_has_penalties,
-                    local_reset_batch,
-                    # Invert so we can use MAX reduction and still compute
-                    # "all ranks can sample on device".
-                    1 - local_can_sample_device,
-                    local_needs_logprobs,
-                ],
-                dtype=torch.int32,
-            )
-            dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
-            max_blocks_decode = int(input_info_t[0].item())
-            any_structured_inputs = input_info_t[1].item() > 0
-            any_penalties_inputs = input_info_t[2].item() > 0
-            any_reset_batch = input_info_t[3].item() > 0
-            all_sample_device = input_info_t[4].item() == 0
-            any_needs_logprobs = input_info_t[5].item() > 0
-
-            # Build tensorized gather input for decode.
-            decode_inputs: dict[str, Any] = self.model_executor.collective_rpc(
-                "build_dp_decode_gather_input",
-                args=(
-                    local_input,
-                    max_blocks_decode,
-                    any_structured_inputs,
-                    any_penalties_inputs,
-                ),
-            )[0]
-
-            # Decode: use gather with fixed-shape inputs.
-            int_local = decode_inputs["int_inputs"]  # 1D int32
-            float_local = decode_inputs["float_inputs"]  # 1D float32
-
-            # Only rank 0 needs buffers for the gather operation.
-            # Pre-allocate stacked tensors and create list views for gather.
-            stacked_int = None
-            stacked_float = None
-            gather_list_int = None
-            gather_list_float = None
-            if rank == 0:
-                stacked_int = torch.empty(
-                    (world, *int_local.shape), dtype=int_local.dtype
-                )
-                stacked_float = torch.empty(
-                    (world, *float_local.shape), dtype=float_local.dtype
-                )
-                gather_list_int = [stacked_int[i] for i in range(world)]
-                gather_list_float = [stacked_float[i] for i in range(world)]
-
-            # Gather to rank 0, then send to other device ranks (local rank 0).
-            # Note: if num device ranks == num world ranks, then this could be
-            # all_gather but we usually have device ranks << world.
-            dist.gather(int_local, gather_list_int, dst=0, group=group)
-            dist.gather(float_local, gather_list_float, dst=0, group=group)
-            if len(self.dp_device_ranks) > 1:
-                if rank == 0:
-                    # Rank 0 sends stacked tensors to other device ranks.
-                    for dst in self.dp_device_ranks[1:]:
-                        dist.send(stacked_int, dst=dst, group=group)
-                        dist.send(stacked_float, dst=dst, group=group)
-                elif local_rank == 0:  # other device ranks
-                    # Other device ranks receive from rank 0.
-                    stacked_int = torch.empty(
-                        (world, *int_local.shape), dtype=int_local.dtype
-                    )
-                    stacked_float = torch.empty(
-                        (world, *float_local.shape), dtype=float_local.dtype
-                    )
-                    dist.recv(stacked_int, src=0, group=group)
-                    dist.recv(stacked_float, src=0, group=group)
-
-            # Gather prompt/output tokens only when they are needed (penalties)
-            # and (if sampling on host or the decode batch layout changed).
-            gathered_tokens_inputs = None
-            if any_penalties_inputs and (not all_sample_device or any_reset_batch):
-                # Gather token dicts (containing tensors) to rank 0
-                if rank == 0:
-                    gathered_tokens_inputs = [None for _ in range(world)]
-                local_tokens_inputs = decode_inputs["sampling_tokens_inputs"]
-                dist.gather_object(
-                    local_tokens_inputs, gathered_tokens_inputs, dst=0, group=group
-                )
-
-                if len(self.dp_device_ranks) > 1:
-                    if rank == 0:
-                        # Rank 0 sends gathered tokens to other device ranks
-                        pickled_tokens = pickle.dumps(gathered_tokens_inputs)
-                        tokens_tensor = torch.frombuffer(
-                            pickled_tokens, dtype=torch.uint8
-                        )
-                        tokens_size = torch.tensor(
-                            [tokens_tensor.numel()], dtype=torch.long
-                        )
-                        for dst in self.dp_device_ranks[1:]:
-                            dist.send(tokens_size, dst=dst, group=group)
-                            dist.send(tokens_tensor, dst=dst, group=group)
-                    elif local_rank == 0:  # other device ranks
-                        # Other device ranks receive from rank 0
-                        tokens_size = torch.zeros(1, dtype=torch.long)
-                        dist.recv(tokens_size, src=0, group=group)
-                        tokens_tensor = torch.empty(
-                            tokens_size.item(), dtype=torch.uint8
-                        )
-                        dist.recv(tokens_tensor, src=0, group=group)
-                        gathered_tokens_inputs = pickle.loads(
-                            tokens_tensor.numpy().tobytes()
-                        )
-
-            # Gather host-only sampling params (logprobs, allowed_token_ids,
-            # bad_words, logit_bias, min_p, min_tokens) when sampling on host.
-            gathered_host_only_sample_params = None
-            if not all_sample_device:
-                if rank == 0:
-                    gathered_host_only_sample_params = [None for _ in range(world)]
-                local_host_only_sample_params = decode_inputs.get(
-                    "host_only_sample_params"
-                )
-                dist.gather_object(
-                    local_host_only_sample_params,
-                    gathered_host_only_sample_params,
-                    dst=0,
-                    group=group,
-                )
-
-                if len(self.dp_device_ranks) > 1:
-                    if rank == 0:
-                        # Rank 0 sends gathered host_only params to device ranks
-                        pickled_host_only = pickle.dumps(
-                            gathered_host_only_sample_params
-                        )
-                        host_only_tensor = torch.frombuffer(
-                            pickled_host_only, dtype=torch.uint8
-                        )
-                        host_only_size = torch.tensor(
-                            [host_only_tensor.numel()], dtype=torch.long
-                        )
-                        for dst in self.dp_device_ranks[1:]:
-                            dist.send(host_only_size, dst=dst, group=group)
-                            dist.send(host_only_tensor, dst=dst, group=group)
-                    elif local_rank == 0:  # other device ranks
-                        # Other device ranks receive from rank 0
-                        host_only_size = torch.zeros(1, dtype=torch.long)
-                        dist.recv(host_only_size, src=0, group=group)
-                        host_only_tensor = torch.empty(
-                            host_only_size.item(), dtype=torch.uint8
-                        )
-                        dist.recv(host_only_tensor, src=0, group=group)
-                        gathered_host_only_sample_params = pickle.loads(
-                            host_only_tensor.numpy().tobytes()
-                        )
-
-            if local_rank == 0:
-                gathered_inputs = {
-                    "int_inputs": stacked_int,
-                    "float_inputs": stacked_float,
-                    "sampling_tokens_inputs": gathered_tokens_inputs,
-                    "host_only_sample_params": gathered_host_only_sample_params,
-                    "reset_batch": any_reset_batch,
-                    "all_sample_device": all_sample_device,
-                }
-
-        else:
-            # Prefill: use gather_object with variable sized inputs.
-            gathered_inputs = None
-            if rank == 0:
-                gathered_inputs = [None for _ in range(world)]  # type: ignore
-
-            # All_reduce to determine if any rank needs logprobs (for prefill).
-            logprobs_flag_t = torch.tensor([local_needs_logprobs], dtype=torch.int32)
-            dist.all_reduce(logprobs_flag_t, op=dist.ReduceOp.MAX, group=group)
-            any_needs_logprobs = logprobs_flag_t[0].item() > 0
-
-            # Gather to rank 0, then send to other device ranks (local rank 0).
-            # Note: if num device ranks == num world ranks, then this could be
-            # all_gather_object but we usually have device ranks << world.
-            dist.gather_object(local_input, gathered_inputs, dst=0, group=group)
-            if len(self.dp_device_ranks) > 1:
-                if rank == 0:
-                    # Rank 0 sends gathered list to other device ranks only.
-                    pickled_data = pickle.dumps(gathered_inputs)
-                    object_tensor = torch.frombuffer(pickled_data, dtype=torch.uint8)
-                    size_tensor = torch.tensor(
-                        [object_tensor.numel()], dtype=torch.long
-                    )
-                    for dst in self.dp_device_ranks[1:]:
-                        dist.send(size_tensor, dst=dst, group=group)
-                        dist.send(object_tensor, dst=dst, group=group)
-                elif local_rank == 0:  # other device ranks
-                    # Other device ranks receive from rank 0.
-                    size_tensor = torch.zeros(1, dtype=torch.long)
-                    dist.recv(size_tensor, src=0, group=group)
-                    object_tensor = torch.empty(size_tensor.item(), dtype=torch.uint8)
-                    dist.recv(object_tensor, src=0, group=group)
-                    gathered_inputs = pickle.loads(object_tensor.numpy().tobytes())
-        self.dlog("after_inputs_gather")
-
-        # Concatenate and execute DP inputs on local DP rank 0 (device ranks).
-        logprobs_per_dp: list = [None] * world
-        if local_rank == 0 and (
-            is_decode
-            or (
-                isinstance(gathered_inputs, list)
-                and any(x is not None for x in gathered_inputs)
-            )
-        ):
-            result: tuple[torch.Tensor, list] = self.model_executor.collective_rpc(
-                "concat_and_execute_dp",
-                args=(
-                    gathered_inputs,
-                    is_decode,
-                    max_blocks_decode,
-                    any_structured_inputs,
-                ),
-            )[0]
-            # Result is (send_tensor, logprobs_lists_per_dp)
-            assert isinstance(result, tuple) and len(result) == 2
-            send_tensor, logprobs_per_dp = result
-            assert isinstance(send_tensor, torch.Tensor)
-        else:
-            B = self.vllm_config.scheduler_config.max_num_seqs
-            # Currently only supporting 1 output token per request.
-            send_tensor = torch.zeros((world, B, 1), dtype=torch.int32)
-
-        # Global rank 0 scatters results to all ranks
-        my_ids = torch.empty_like(send_tensor[0])  # Shape (B, 1)
-        scatter_list = None
-        if rank == 0:
-            # Prepare scatter list: split send_tensor along first dimension
-            scatter_list = [send_tensor[i] for i in range(world)]
-        dist.scatter(my_ids, scatter_list, src=0, group=group)
-        self.dlog("after_results_gather my_ids_shape=%s", tuple(my_ids.shape))
-
-        # Scatter logprobs only if any rank needs them
-        # (determined in all_reduce).
-        my_logprobs_val = None
-        if any_needs_logprobs:
-            my_logprobs: list = [None]
-            logprobs_scatter_list = logprobs_per_dp if rank == 0 else None
-            dist.scatter_object_list(
-                my_logprobs, logprobs_scatter_list, src=0, group=group
-            )
-            my_logprobs_val = my_logprobs[0]
-
-        # If rank had scheduled tokens, apply results locally and return output
-        if local_has_requests:
-            output: ModelRunnerOutput = self.model_executor.collective_rpc(
-                "apply_dp_execution_result", args=(my_ids, my_logprobs_val)
-            )[0]
-            return output
-        else:
-            return EMPTY_MODEL_RUNNER_OUTPUT
+    def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput | None):
+        return tt_engine_step._execute_model_dp_gather(self, scheduler_output)
 
 
 class DPEngineCoreActor(DPEngineCoreProc):
