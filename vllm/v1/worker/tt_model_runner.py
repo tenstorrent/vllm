@@ -1736,9 +1736,8 @@ class TTModelRunner:
                 reset_batch = int(model_input.reset_batch)
                 can_sample_device = int(model_input.perform_device_sampling)
                 max_num_logprobs = model_input.max_num_logprobs[0]
-                needs_logprobs = int(
-                    max_num_logprobs is not None and max_num_logprobs > 0
-                )
+                # max_num_logprobs=0 still requests the sampled token's logprob.
+                needs_logprobs = int(max_num_logprobs is not None)
                 num_reqs = self.input_batch.num_reqs
                 req_ids = list(self.input_batch.req_ids[:num_reqs])
                 req_id_to_index = dict(self.input_batch.req_id_to_index)

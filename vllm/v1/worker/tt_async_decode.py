@@ -186,7 +186,9 @@ class TTAsyncDecodeController:
         if input_batch.sampling.bad_words_token_ids:
             return False
         max_num_logprobs = input_batch.max_num_logprobs
-        if max_num_logprobs is not None and max_num_logprobs > 0:
+        # Treat logprobs=0 as a real logprobs request so decode does not
+        # bypass the slower path that preserves per-token logprob metadata.
+        if max_num_logprobs is not None:
             return False
         if input_batch.sampling.has_active_logitsprocs():
             return False
@@ -236,7 +238,7 @@ class TTAsyncDecodeController:
         if model_input.bad_words_token_ids_list[0]:
             return False
         max_num_logprobs = model_input.max_num_logprobs[0]
-        if max_num_logprobs is not None and max_num_logprobs > 0:  # noqa: SIM103
+        if max_num_logprobs is not None:  # noqa: SIM103
             return False
         return True
 
