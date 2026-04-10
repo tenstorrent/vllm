@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Literal, TypeVar, overload
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -230,68 +230,6 @@ class Executor(ABC):
         future: Future[_R] = Future()
         future.set_result(value)
         return future
-
-    def submit_scheduled_batch(
-        self,
-        scheduler_output: SchedulerOutput,
-        get_grammar_bitmask: Callable[[SchedulerOutput], GrammarOutput | None],
-        *,
-        non_block: bool,
-        failure_callback: Callable[[Future[ModelRunnerOutput | None]], None]
-        | None = None,
-    ) -> tuple[Future[ModelRunnerOutput] | None, SchedulerOutput | None]:
-        """Start work for one scheduled batch.
-
-        Returns a `(future, deferred_scheduler_output)` pair. Executors that
-        sample inside execute_model() return a future directly when grammar is
-        already available, or defer execute_model() itself until a later call.
-        Executors that keep sampling separate submit execute_model() first and,
-        when possible, immediately enqueue sample_tokens().
-        """
-        if self.device_config.device_type == "tt":
-            if scheduler_output.pending_structured_output_tokens:
-                return None, scheduler_output
-            if non_block:
-                future = cast(
-                    Future[ModelRunnerOutput],
-                    self.execute_model(scheduler_output, non_block=True),
-                )
-            else:
-                future = cast(
-                    Future[ModelRunnerOutput],
-                    self._as_future(
-                        self.execute_model(scheduler_output, non_block=False)
-                    ),
-                )
-            return future, None
-
-        if non_block:
-            exec_future = cast(
-                Future[ModelRunnerOutput | None],
-                self.execute_model(scheduler_output, non_block=True),
-            )
-        else:
-            exec_future = self._as_future(
-                self.execute_model(scheduler_output, non_block=False)
-            )
-        if failure_callback is not None:
-            exec_future.add_done_callback(failure_callback)
-
-        if scheduler_output.pending_structured_output_tokens:
-            return None, scheduler_output
-
-        grammar_output = get_grammar_bitmask(scheduler_output)
-        if non_block:
-            future = cast(
-                Future[ModelRunnerOutput],
-                self.sample_tokens(grammar_output, non_block=True),
-            )
-        else:
-            future = cast(
-                Future[ModelRunnerOutput],
-                self._as_future(self.sample_tokens(grammar_output, non_block=False)),
-            )
-        return future, None
 
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")

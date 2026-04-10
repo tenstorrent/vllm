@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from enum import Enum
 from typing import cast
 
 from vllm.logger import init_logger
@@ -10,6 +11,20 @@ from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class TTSchedulingMode(Enum):
+    DEFAULT = "default"
+    DECODE_ONLY = "decode_only"
+    PREFILL_ONLY = "prefill_only"
+
+    @classmethod
+    def from_prefill_intent(cls, prefill_intent: int) -> "TTSchedulingMode":
+        if prefill_intent == 0:
+            return cls.DECODE_ONLY
+        if prefill_intent == 1:
+            return cls.PREFILL_ONLY
+        raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
 
 
 class TTScheduler(AsyncScheduler):
@@ -29,12 +44,13 @@ class TTScheduler(AsyncScheduler):
       results, enabling host/device overlap
 
     Supports ``set_forced_mode`` for DP-gather coordination:
-    - ``0`` forces decode-only (even if waiting queue is non-empty).
-    - ``1`` forces prefill-only (and may return an empty batch when waiting
-      is empty).
-    - ``None`` uses the default policy: prefer prefill when waiting is
-      non-empty, but fall back to decode-only if prefill cannot admit any
-      request and running decode requests exist.
+    - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
+      queue is non-empty).
+    - ``TTSchedulingMode.PREFILL_ONLY`` forces prefill-only (and may return an
+      empty batch when waiting is empty).
+    - ``TTSchedulingMode.DEFAULT`` uses the default policy: prefer prefill
+      when waiting is non-empty, but fall back to decode-only if prefill
+      cannot admit any request and running decode requests exist.
     """
 
     waiting: RequestQueue
@@ -43,10 +59,9 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._forced_mode: int | None = None
+        self._forced_mode = TTSchedulingMode.DEFAULT
 
-    def set_forced_mode(self, mode: int | None) -> None:
-        assert mode in (None, 0, 1)
+    def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
 
     def schedule(self) -> SchedulerOutput:
@@ -54,14 +69,11 @@ class TTScheduler(AsyncScheduler):
         has_running = bool(self.running)
         mode = self._forced_mode
 
-        # Forced mode from DP-gather coordination:
-        #   mode == 1 -> prefill-only
-        #   mode == 0 -> decode-only
-        if mode == 1:
+        if mode == TTSchedulingMode.PREFILL_ONLY:
             # If waiting is empty, this intentionally returns an empty batch.
             result = self._schedule_prefill_only()
             return self._finalize_scheduler_output(result)
-        if mode == 0:
+        if mode == TTSchedulingMode.DECODE_ONLY:
             if has_waiting:
                 # Hide waiting so base scheduler cannot admit prefill.
                 result = self._schedule_decode_only()
@@ -70,28 +82,15 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
             return self._finalize_scheduler_output(result)
 
-        # Default mode (mode is None):
+        # Default mode:
         # Prefer prefill whenever waiting is non-empty to admit new requests.
         if has_waiting:
             prefill_result = self._schedule_prefill_only()
-            has_prefill_running = any(
-                req.num_computed_tokens < req.num_prompt_tokens for req in self.running
-            )
             # If waiting is non-empty but prefill cannot be admitted (e.g. KV
             # pressure and no chunked prefill), do not stall decode progress.
             # Fall back to decode-only so running requests can advance and free
             # capacity for later full-prefill admission.
-            #
-            # Guard: only apply this when running requests are already in
-            # decode phase. If any running request is still in prefill phase,
-            # forcing decode-only here can create scheduler/model-output
-            # mismatches in async TT flow.
-            if (
-                prefill_result.total_num_scheduled_tokens == 0
-                and has_running
-                and bool(self.waiting)
-                and not has_prefill_running
-            ):
+            if prefill_result.total_num_scheduled_tokens == 0 and has_running:
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)

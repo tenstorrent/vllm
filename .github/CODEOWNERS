@@ -175,6 +175,7 @@ mkdocs.yaml @hmellor
 /vllm/v1/engine/tt_core_launcher.py @skhorasganiTT @viktorpusTT
 /vllm/v1/engine/tt_dp_gather.py @viktorpusTT @tchedaTT
 /vllm/v1/engine/tt_engine_step.py @viktorpusTT @tchedaTT
+/vllm/v1/worker/tt_async_decode.py @viktorpusTT
 
 # Tests
 /tests/tt @tchedaTT @skhorasganiTT @viktorpusTT

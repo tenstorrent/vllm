@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.tt_scheduler import TTSchedulingMode
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
@@ -64,7 +65,7 @@ def _dp_any_rank_has_scheduler_requests(core: DPEngineCoreProc) -> bool:
     return int(has_requests_t.item()) > 0
 
 
-def _dp_negotiate_forced_mode(core: DPEngineCoreProc) -> int:
+def _dp_negotiate_forced_mode(core: DPEngineCoreProc) -> TTSchedulingMode:
     # Prefer prefill when a rank has waiting work and local scheduler capacity
     # to admit it, or when decode is otherwise idle.
     has_running = bool(getattr(core.scheduler, "running", []))
@@ -77,14 +78,16 @@ def _dp_negotiate_forced_mode(core: DPEngineCoreProc) -> int:
     intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
     core.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
     dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=core.dp_group)
-    forced_mode = int(intent_tensor.item())  # 1=prefill, 0=decode
-    core.dlog("after_intent_allreduce forced_mode=%d", forced_mode)
+    forced_mode = TTSchedulingMode.from_prefill_intent(int(intent_tensor.item()))
+    core.dlog("after_intent_allreduce forced_mode=%s", forced_mode)
     # Record forced_mode so it can be used by DP gather submission.
     core._dp_gather_forced_mode = forced_mode
     return forced_mode
 
 
-def _dp_apply_forced_mode(core: DPEngineCoreProc, forced_mode: int | None) -> None:
+def _dp_apply_forced_mode(
+    core: DPEngineCoreProc, forced_mode: TTSchedulingMode
+) -> None:
     set_mode = getattr(core.scheduler, "set_forced_mode", None)
     if callable(set_mode):
         set_mode(forced_mode)
@@ -181,11 +184,11 @@ def step_dp_with_batch_queue(
     if not global_has_requests and prev_handle is None:
         return {}, False
 
-    forced_mode: int | None = None
+    forced_mode = TTSchedulingMode.DEFAULT
     # DP-gather forced scheduling mode:
-    #   None -> use the scheduler's default policy
-    #   0    -> force decode-only scheduling
-    #   1    -> force prefill-only scheduling
+    #   DEFAULT      -> use the scheduler's default policy
+    #   DECODE_ONLY  -> force decode-only scheduling
+    #   PREFILL_ONLY -> force prefill-only scheduling
     scheduler_output: SchedulerOutput | None = None
     model_executed = False
     current_overlap_ok = False
@@ -194,10 +197,10 @@ def step_dp_with_batch_queue(
         if core.scheduler.has_requests():
             _dp_apply_forced_mode(core, forced_mode)
             scheduler_output = core.scheduler.schedule()
-            _dp_apply_forced_mode(core, None)
+            _dp_apply_forced_mode(core, TTSchedulingMode.DEFAULT)
             if not core.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
-        if forced_mode == 0:  # decode-only scheduling
+        if forced_mode == TTSchedulingMode.DECODE_ONLY:
             # All DP ranks must enter this collective once decode mode is chosen,
             # even if a particular rank has no local batch this step. Ranks with
             # no local work pass scheduler_output=None, which the worker treats
@@ -299,9 +302,8 @@ def dp_gather_submit(
         core.dlog("enter_gather tokens=%d", scheduler_output.total_num_scheduled_tokens)
 
     # Detect decode vs prefill using forced_mode negotiated earlier.
-    # 0=decode, 1=prefill.
     assert hasattr(core, "_dp_gather_forced_mode"), "forced_mode not set"
-    is_decode = core._dp_gather_forced_mode == 0
+    is_decode = core._dp_gather_forced_mode == TTSchedulingMode.DECODE_ONLY
 
     # Build local dp model input (or None).
     all_local_inputs = core.model_executor.collective_rpc(

@@ -47,6 +47,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.tt_scheduler import TTSchedulingMode
 from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
@@ -96,15 +97,15 @@ class EngineCore:
     # Gathered-DP subclasses initialize these before guarded access sites use
     # them. Declaring them here lets mypy type-check direct attribute access.
     requires_gather: bool
-    _dp_gather_forced_mode: int
+    _dp_gather_forced_mode: TTSchedulingMode
 
     def _dp_any_rank_has_scheduler_requests(self) -> bool:
         raise NotImplementedError
 
-    def _dp_negotiate_forced_mode(self) -> int:
+    def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
         raise NotImplementedError
 
-    def _dp_apply_forced_mode(self, forced_mode: int | None) -> None:
+    def _dp_apply_forced_mode(self, forced_mode: TTSchedulingMode) -> None:
         raise NotImplementedError
 
     def _execute_model_dp_gather(
@@ -381,7 +382,7 @@ class EngineCore:
         was executed.
         """
 
-        forced_mode: int | None = None
+        forced_mode = TTSchedulingMode.DEFAULT
         requires_gather = hasattr(self, "requires_gather") and self.requires_gather
         if requires_gather:
             # For gathered DP execution, agree on mode before any early returns.
@@ -399,13 +400,14 @@ class EngineCore:
                 _ = self._execute_model_dp_gather(None)
             return {}, False
 
-        if requires_gather and forced_mode is not None:
+        if requires_gather:
             self._dp_apply_forced_mode(forced_mode)
 
         scheduler_output = self.scheduler.schedule()
 
-        if requires_gather and forced_mode is not None:
-            self._dp_apply_forced_mode(None)
+        if requires_gather:
+            # Reset the forced mode to the default for the next step
+            self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
 
         is_tt = current_platform.is_tt()
         grammar_output = None
@@ -422,6 +424,9 @@ class EngineCore:
             # work while the executor is running.
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
             if not is_tt:
+                # TT scheduler outputs already include the grammar bitmask:
+                # `TTScheduler.schedule()` calls `_finalize_scheduler_output()`,
+                # which calls `get_grammar_bitmask()` before we reach EngineCore.
                 grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 model_output = future.result()  # Wait right after execution.
@@ -1510,10 +1515,10 @@ class DPEngineCoreProc(EngineCoreProc):
     def _dp_any_rank_has_scheduler_requests(self) -> bool:
         return tt_engine_step._dp_any_rank_has_scheduler_requests(self)
 
-    def _dp_negotiate_forced_mode(self) -> int:
+    def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
         return tt_engine_step._dp_negotiate_forced_mode(self)
 
-    def _dp_apply_forced_mode(self, forced_mode: int | None) -> None:
+    def _dp_apply_forced_mode(self, forced_mode: TTSchedulingMode) -> None:
         tt_engine_step._dp_apply_forced_mode(self, forced_mode)
 
     def step_dp_with_batch_queue(
