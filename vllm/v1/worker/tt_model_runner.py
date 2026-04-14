@@ -163,6 +163,11 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
+    # Per-rank slot remap from condense — remap[i]=j means slot i's data came
+    # from slot j.  Identity when nothing moved.  Shape: [total_B] (concat of
+    # per-rank [B] tensors for DP).
+    slot_remap: torch.Tensor | None = None
+
 
 class TTModelRunner:
     def __init__(
@@ -810,6 +815,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            slot_remap=input_batch.pop_slot_remap(),
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
@@ -913,6 +919,12 @@ class TTModelRunner:
                 if model_input.max_num_logprobs[0] is not None
                 else LOGPROBS_NONE_SENTINEL
             )
+        # Slot remap for seed manager reindexing after condense.
+        slot_remap = (
+            model_input.slot_remap
+            if model_input is not None and model_input.slot_remap is not None
+            else torch.arange(max_batch, dtype=torch.int32)
+        )
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req.
         int_inputs = torch.cat(
@@ -927,6 +939,7 @@ class TTModelRunner:
                 .view(-1)
                 .to(torch.int32),  # B (bool->int32)
                 torch.tensor([max_num_logprobs_val], dtype=torch.int32),  # 1
+                slot_remap.contiguous().view(-1),  # B
             ],
             dim=0,
         ).contiguous()
@@ -1027,6 +1040,7 @@ class TTModelRunner:
         logitsprocs_list: list[LogitsProcessors | None] = []
         max_num_logprobs: list[int | None] = []
         generators_list: list[dict[int, torch.Generator]] = []
+        slot_remap = None
 
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -1100,6 +1114,14 @@ class TTModelRunner:
                 for val in raw_max_num_logprobs
             ]
             off += 1
+
+            # Slot remap for seed manager: per-rank values are in [0,B), but
+            # the row-sharded SeedManager uses global indices [0, total_B).
+            # Offset each rank's remap values by rank * B.
+            raw_remap = stacked_int[:, off : off + B]  # [world, B]
+            offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * B
+            slot_remap = (raw_remap + offsets).reshape(total_B)
+            off += B
 
             # Optional structured inputs: keep as list[Optional[tensor]]
             # per DP rank to match prefill behavior.
@@ -1363,6 +1385,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            slot_remap=slot_remap,
             # Host-only sampling params (per-rank lists)
             allowed_token_ids_mask_list=allowed_token_ids_mask_list,
             bad_words_token_ids_list=bad_words_token_ids_list,
@@ -1536,6 +1559,8 @@ class TTModelRunner:
                 # reset_batch is precomputed (for non-DP in
                 # _prepare_model_inputs; for DP after inputs are gathered).
                 kwargs["reset_batch"] = model_input.reset_batch
+                if model_input.slot_remap is not None:
+                    kwargs["slot_remap"] = model_input.slot_remap
 
         # Execute model
         if not is_decode:
