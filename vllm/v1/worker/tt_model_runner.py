@@ -2077,12 +2077,14 @@ class TTModelRunner:
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
             (output_req_ids[i] for i in range(num_reqs)), None
         )
+        sampled_token_id_lists = [
+            [int(token_id)] for token_id in sampled_token_ids_np.tolist()
+        ]
+
         return ModelRunnerOutput(
             req_ids=output_req_ids,
             req_id_to_index=output_req_id_to_index,
-            sampled_token_ids=[
-                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
-            ],
+            sampled_token_ids=sampled_token_id_lists,
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
