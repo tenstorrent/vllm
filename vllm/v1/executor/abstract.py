@@ -225,6 +225,12 @@ class Executor(ABC):
         )
         return output[0]
 
+    @staticmethod
+    def _as_future(value: _R) -> Future[_R]:
+        future: Future[_R] = Future()
+        future.set_result(value)
+        return future
+
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")
 

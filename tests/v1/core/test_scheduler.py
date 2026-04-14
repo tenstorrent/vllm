@@ -587,6 +587,32 @@ def test_check_stop_min_tokens():
     assert request_stop.stop_reason == 42
 
 
+def test_check_stop_ignore_eos_with_stop_token_ids():
+    """Test that ignore_eos also skips stop_token_ids checking."""
+    from vllm.v1.core.sched.utils import check_stop
+
+    # When ignore_eos=True, stop_token_ids should also be ignored
+    sampling_params = SamplingParams(
+        ignore_eos=True,
+        max_tokens=20,
+        stop_token_ids=[42, 43],
+    )
+    request = Request(
+        request_id="0",
+        prompt_token_ids=[0, 1, 2],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+    # Generate tokens including a stop token and EOS
+    request.append_output_token_ids([10, 42, 11, EOS_TOKEN_ID, 43])
+
+    result = check_stop(request, max_model_len=100)
+    assert result is False, (
+        "Should not stop on stop_token_ids or EOS when ignore_eos=True"
+    )
+
+
 @pytest.mark.parametrize(
     "enable_prefix_caching, prompt_logprobs",
     [

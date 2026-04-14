@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from collections import deque
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
@@ -29,6 +31,11 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.tt_async_decode import (
+    AsyncTTModelRunnerOutput,
+    CompletedDecodeStep,
+    TTAsyncDecodeController,
+)
 from vllm.v1.worker.tt_input_batch import (
     LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
@@ -120,6 +127,7 @@ class TTSamplingParams:
     frequency_penalty: torch.Tensor | list[float] | float = 0.0
     repetition_penalty: torch.Tensor | list[float] | float = 1.0
     seed: torch.Tensor | list[int | None] | int = 0
+    num_logprobs: torch.Tensor | list[int] | int | None = None
     enable_log_probs: torch.Tensor | list[bool] | None = None
 
 
@@ -242,6 +250,18 @@ class TTModelRunner:
         # change during prefill steps (e.g. new requests added), so we keep a
         # sticky flag and clear it only after a decode input consumes it.
         self._decode_layout_changed_since_last_decode: bool = True
+
+        # Non-DP async scheduling: overlap CPU scheduling with device execution.
+        # Only supported for DP=1 (DP>1 uses a different execution path).
+        self.non_dp_async_scheduling = (
+            self.scheduler_config.async_scheduling
+            and self.parallel_config.data_parallel_size == 1
+        )
+        self._steady_decode_lock = threading.Lock()
+        self._pending_async_events: deque[threading.Event] = deque()
+        self._pending_async_overlap_ok: deque[bool] = deque()
+        self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
+        self.async_decode = TTAsyncDecodeController(self)
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -686,6 +706,7 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty[:num_reqs],
                 repetition_penalty=sample_params.repetition_penalty[:num_reqs],
                 seed=sample_params.seed[:num_reqs],
+                num_logprobs=sample_params.num_logprobs[:num_reqs],
                 enable_log_probs=enable_log_probs,
             )
         else:
@@ -701,6 +722,7 @@ class TTModelRunner:
                 frequency_penalty=sample_params.frequency_penalty,
                 repetition_penalty=sample_params.repetition_penalty,
                 seed=sample_params.seed,
+                num_logprobs=sample_params.num_logprobs,
                 enable_log_probs=enable_log_probs,
             )
 
@@ -711,6 +733,19 @@ class TTModelRunner:
 
         # If we're not using structured outputs, grammar_bitmask is None
         bitmask = scheduler_output.grammar_bitmask
+        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        scheduled_structured_req_ids = [
+            req_id
+            for req_id in scheduled_req_ids
+            if (req := self.requests.get(req_id)) is not None
+            and req.sampling_params is not None
+            and req.sampling_params.structured_outputs is not None
+        ]
+        has_structured_outputs = (
+            bitmask is not None
+            or scheduler_output.pending_structured_output_tokens
+            or bool(scheduled_structured_req_ids)
+        )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
@@ -743,7 +778,7 @@ class TTModelRunner:
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
-            has_structured_outputs=bitmask is not None,
+            has_structured_outputs=has_structured_outputs,
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
@@ -802,6 +837,10 @@ class TTModelRunner:
             # This means sampling is not perfectly deterministic
             # whenever device sampling is enabled.
 
+        max_num_logprobs = input_batch.max_num_logprobs
+        if max_num_logprobs is None:
+            max_num_logprobs = 0
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -819,7 +858,7 @@ class TTModelRunner:
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
-            max_num_logprobs=[input_batch.max_num_logprobs],
+            max_num_logprobs=[max_num_logprobs],
             logitsprocs_list=[input_batch.sampling.logitsprocs],
             generators_list=[generators],
         )
@@ -844,6 +883,30 @@ class TTModelRunner:
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output)
         return model_input
+
+    def can_attempt_steady_decode_from_scheduler(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> bool:
+        """Return whether a scheduled non-DP step can overlap steady decode."""
+        return self.async_decode.can_attempt_steady_decode_from_scheduler(
+            scheduler_output
+        )
+
+    def can_attempt_steady_dp_decode_from_scheduler(
+        self,
+        scheduler_output: SchedulerOutput | None,
+    ) -> bool:
+        """Check whether one DP rank can participate in steady gathered decode.
+
+        Call this in the gathered-DP path after local scheduling has happened.
+        Unlike the non-DP variant, `scheduler_output=None` or a zero-token step
+        is treated as steady-eligible because a rank may have no local decode
+        work while the global gathered step still overlaps safely.
+        """
+        return self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
+            scheduler_output
+        )
 
     def build_dp_decode_gather_input(
         self,
@@ -883,6 +946,7 @@ class TTModelRunner:
             frequency_penalty = sampling_default_tensors["frequency_penalty"]
             repetition_penalty = sampling_default_tensors["repetition_penalty"]
             seed = sampling_default_tensors["seed"]
+            num_logprobs = sampling_default_tensors["num_logprobs"]
             # enable_log_probs: convert num_logprobs >= 0
             enable_log_probs = sampling_default_tensors["num_logprobs"] >= 0
             max_num_logprobs_val = LOGPROBS_NONE_SENTINEL
@@ -913,6 +977,7 @@ class TTModelRunner:
             frequency_penalty = sampling_params.frequency_penalty
             repetition_penalty = sampling_params.repetition_penalty
             seed = sampling_params.seed
+            num_logprobs = sampling_params.num_logprobs
             enable_log_probs = sampling_params.enable_log_probs
             max_num_logprobs_val = (
                 model_input.max_num_logprobs[0]
@@ -935,6 +1000,7 @@ class TTModelRunner:
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # B
                 seed.contiguous().view(-1),  # B
+                num_logprobs.contiguous().view(-1),  # B
                 enable_log_probs.contiguous()
                 .view(-1)
                 .to(torch.int32),  # B (bool->int32)
@@ -1045,7 +1111,8 @@ class TTModelRunner:
         if is_decode:
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W),
-            #        bs(1), top_k(B), seed(B), enable_log_probs(B)]
+            #        bs(1), top_k(B), seed(B), num_logprobs(B),
+            #        enable_log_probs(B)]
             #   - If any_structured_inputs, also has at the end of the list:
             #     [has_structured_inputs(1), bitmasks(B*bitmask_size)]
             # Floats: [temperature(B), top_p(B), presence_penalty(B),
@@ -1099,6 +1166,8 @@ class TTModelRunner:
             top_k = stacked_int[:, off : off + B].reshape(total_B)
             off += B
             seed = stacked_int[:, off : off + B].reshape(total_B)
+            off += B
+            num_logprobs = stacked_int[:, off : off + B].reshape(total_B)
             off += B
             enable_log_probs_int = stacked_int[:, off : off + B].reshape(total_B)
             off += B
@@ -1198,6 +1267,7 @@ class TTModelRunner:
             frequency_penalty_list: list[torch.Tensor] = []
             repetition_penalty_list: list[torch.Tensor] = []
             seed_list: list[torch.Tensor] = []
+            num_logprobs_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
             reset_batch = False
 
@@ -1248,6 +1318,7 @@ class TTModelRunner:
                     frequency_penalty_list.append(sp.frequency_penalty)
                     repetition_penalty_list.append(sp.repetition_penalty)
                     seed_list.append(sp.seed)
+                    num_logprobs_list.append(sp.num_logprobs)
                     enable_log_probs_list.append(sp.enable_log_probs)
 
                 # We know it's not a list here before concatenation
@@ -1287,6 +1358,7 @@ class TTModelRunner:
             frequency_penalty = torch.cat(frequency_penalty_list, dim=0)
             repetition_penalty = torch.cat(repetition_penalty_list, dim=0)
             seed = torch.cat(seed_list, dim=0)
+            num_logprobs = torch.cat(num_logprobs_list, dim=0)
             enable_log_probs = torch.cat(enable_log_probs_list, dim=0)
 
         tt_sampling_params = TTSamplingParams(
@@ -1297,6 +1369,7 @@ class TTModelRunner:
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             seed=seed,
+            num_logprobs=num_logprobs,
             enable_log_probs=enable_log_probs,
         )
 
@@ -1400,28 +1473,91 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput:
-        """Execution path for non-DP case.
-        Execute the model with the given scheduler output."""
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Public non-DP runner entrypoint used by the TT worker.
+
+        Dispatches one non-DP step from scheduler output to the appropriate TT
+        execution path and returns either a completed `ModelRunnerOutput` or an
+        async decode wrapper.
+        """
         # In the DP case, this function is skipped!
-        # tt_worker.py directly calls execute_with_model_input
+        # tt_worker.py uses the dedicated DP facade instead.
         # With DP, the actual model pass happens on a batch
         # produced by concatenating the inputs from all DP ranks.
+
+        # Apply any decode steps that have already completed on the async
+        # thread. In steady decode mode we intentionally allow one step of
+        # lag between host application and device submission, but we never let
+        # completed work pile up unbounded.
+        self.async_decode.apply_ready_completed_decode_steps()
+        steady_decode_candidate = (
+            self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
+        )
+        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+            self.async_decode.wait_for_all_pending_async_steps()
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        # Only 1 DP rank here
-        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_with_model_input(  # noqa: E501
+        is_decode = model_input.prompt_lens is None
+        if self.non_dp_async_scheduling and is_decode:
+            steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
+                model_input
+            )
+            return self.async_decode.submit_async_non_dp_decode(
+                model_input,
+                steady_decode_fast_path=steady_decode_fast_path,
+            )
+
+        # Synchronous path (prefill, or decode without async scheduling)
+        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(  # noqa: E501
             model_input
         )
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
-        output = self.generate_runner_output(sampled_token_ids, logprobs)
+        output = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
         return output
+
+    def pack_dp_results(
+        self,
+        sampled_token_ids_per_dp: list[torch.Tensor],
+        logprobs_per_dp: list,
+    ) -> tuple[torch.Tensor, list]:
+        """Pack per-DP results into the gathered-DP wire format.
+
+        Converts per-DP sampled tokens and logprobs into the stacked tensor/list
+        payload consumed by gathered-DP finalization.
+        """
+        logprobs_lists_per_dp = [
+            lp.tolists() if lp is not None else None for lp in logprobs_per_dp
+        ]
+        world = self.parallel_config.data_parallel_size
+        B = int(self.scheduler_config.max_num_seqs)
+        for dp_rank in range(world):
+            token_ids = sampled_token_ids_per_dp[dp_rank].to(torch.int32)
+            if token_ids.numel() == 0:
+                token_ids = torch.zeros((B, 1), dtype=torch.int32)
+            else:
+                assert token_ids.dim() == 2 and token_ids.shape[1] == 1, (
+                    "Currently only supporting 1 output token per request"
+                )
+                pad_rows = B - token_ids.shape[0]
+                if pad_rows > 0:
+                    token_ids = torch.cat(
+                        [
+                            token_ids,
+                            torch.zeros(
+                                (pad_rows, token_ids.shape[1]),
+                                dtype=torch.int32,
+                            ),
+                        ],
+                        dim=0,
+                    )
+            sampled_token_ids_per_dp[dp_rank] = token_ids
+        return torch.stack(sampled_token_ids_per_dp), logprobs_lists_per_dp
 
     def check_perform_device_sampling(
         self, is_decode: bool, has_structured_outputs: bool
@@ -1479,14 +1615,67 @@ class TTModelRunner:
         )
         return params_device_supported
 
-    def execute_with_model_input(
+    def submit_prefill(
+        self,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+    ) -> Any:
+        """Submit a prefill step and return the raw TT output.
+
+        Launches TT prefill and returns the raw TT output used by the
+        synchronous extraction path.
+        """
+        kwargs = {
+            "tokens": model_input.input_tokens,
+            "page_table": model_input.block_tables,
+            "kv_cache": self.kv_caches,
+            "enable_trace": self.trace_mode in ["all"],
+            "prompt_lens": model_input.prompt_lens,
+            "start_pos": model_input.input_positions,
+        }
+        kwargs.update(model_input.multi_modal_kwargs)
+        if model_input.perform_device_sampling:
+            sampling_params = model_input.tt_sampling_params
+            sampling_param_dict = {
+                field.name: (
+                    getattr(sampling_params, field.name).tolist()
+                    if getattr(sampling_params, field.name) is not None
+                    else None
+                )
+                for field in fields(sampling_params)
+            }
+            sampling_param_dict["seed"] = [
+                None if s == SEED_NONE_SENTINEL else s
+                for s in sampling_param_dict["seed"]
+            ]
+            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+        if len(batch_size_per_dp) > 1:
+            # TODO: the model should only require DP ranks, but passing
+            # "global" user ids instead for backwards compatibility.
+            stride = int(self.scheduler_config.max_num_seqs)
+            empty_slots = []
+            for dp_rank, sz in enumerate(batch_size_per_dp):
+                for i in range(int(sz)):
+                    empty_slots.append(dp_rank * stride + i)
+            kwargs["empty_slots"] = empty_slots
+
+        if self.request_specific_rope:
+            tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
+            # Store rope_deltas for each prefilled request
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
+            return tt_out
+        return self.model.prefill_forward(**kwargs)
+
+    def execute_sync_with_model_input(
         self,
         model_input: TTModelInput,
     ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
-        """
-        Execute with a prebuilt input and return per-DP sampled ids without
-        mutating internal state. In DP case, called by DP rank 0 to run merged
-        batch. Note: currently does not support chunked prefill.
+        """Run a fully synchronous TT execution for a prebuilt model input.
+
+        Executes a prebuilt TT input to completion, including prefill or decode
+        submission, decode finalization when needed, and per-DP token/logprob
+        extraction.
 
         Returns:
             Tuple of (sampled_token_ids_per_dp, logprobs_per_dp).
@@ -1502,114 +1691,30 @@ class TTModelRunner:
             num_dp = len(batch_size_per_dp)
             return ([torch.tensor([], dtype=torch.int32)] * num_dp, [None] * num_dp)
 
-        kwargs = {
-            "tokens": model_input.input_tokens,
-            "page_table": model_input.block_tables,
-            "kv_cache": self.kv_caches,
-        }
-
-        if not is_decode:
-            kwargs["enable_trace"] = self.trace_mode in ["all"]
-            kwargs["prompt_lens"] = model_input.prompt_lens
-            kwargs.update(model_input.multi_modal_kwargs)
-            if len(batch_size_per_dp) > 1:
-                # TODO: the model should only require DP ranks, but passing
-                # "global" user ids instead for backwards compatibility.
-                stride = int(self.scheduler_config.max_num_seqs)
-                empty_slots = []
-                for dp_rank, sz in enumerate(batch_size_per_dp):
-                    for i in range(int(sz)):
-                        empty_slots.append(dp_rank * stride + i)
-                kwargs["empty_slots"] = empty_slots
-
-        kwargs["start_pos"] = model_input.input_positions
-
-        # Sampling decision
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
-        if perform_device_sampling:
-            # On-device sampling currently needs sampling param attributes to
-            # be lists instead of tensors.
-            sampling_param_dict: dict[str, Any] = {}
-            for field in fields(sampling_params):
-                val = getattr(sampling_params, field.name)
-                if val is None:
-                    sampling_param_dict[field.name] = None
-                elif hasattr(val, "tolist"):
-                    sampling_param_dict[field.name] = val.tolist()
-                else:
-                    sampling_param_dict[field.name] = val
-            # Convert seed sentinel value back to None
-            # (vLLM treats -1 as equivalent to None for seeds)
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
-
-            # Pass prompt and output tokens for decode with sampling penalties
-            if is_decode and model_input.prompt_tokens is not None:
-                assert model_input.output_tokens is not None
-                kwargs["prompt_tokens"] = model_input.prompt_tokens
-                kwargs["output_tokens"] = model_input.output_tokens
-
-            # For decode on-device sampling, signal whether the decode batch
-            # layout changed since the previous step.
-            if is_decode:
-                # reset_batch is precomputed (for non-DP in
-                # _prepare_model_inputs; for DP after inputs are gathered).
-                kwargs["reset_batch"] = model_input.reset_batch
-                if model_input.slot_remap is not None:
-                    kwargs["slot_remap"] = model_input.slot_remap
+        tt_log_probs = None
 
         # Execute model
         if not is_decode:
-            if self.request_specific_rope:
-                tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
-                # Store rope_deltas for each prefilled request
-                for i, req_id in enumerate(self.input_batch.req_ids):
-                    self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
-            else:
-                tt_out = self.model.prefill_forward(**kwargs)
+            tt_out = self.submit_prefill(model_input, batch_size_per_dp)
         else:
-            # TODO: Add encoder-decoder support
-            enc_dec_kwargs: dict[str, Any] = {}
-            if self.request_specific_rope:
-                if any(
-                    req_id not in self.previous_req_ids
-                    for req_id in self.input_batch.req_ids
-                ):
-                    # Gather and pass rope_deltas from prefill step to decode
-                    enc_dec_kwargs = {
-                        "rope_deltas_all_users": [
-                            self.requests[req_id].mrope_position_delta
-                            for req_id in self.input_batch.req_ids
-                        ]
-                    }
-                else:
-                    enc_dec_kwargs = {"rope_deltas_all_users": None}
-                self.previous_req_ids = set(self.input_batch.req_ids)
-
-            enable_trace = self.trace_mode in ["all", "decode_only"]
-            # In the DP case, the model outputs for all ranks are concatenated.
-            tt_out = self.model.decode_forward(
-                **kwargs,
-                **enc_dec_kwargs,
-                enable_trace=enable_trace,
-                read_from_device=True,
+            submission = self.async_decode.submit_decode(
+                model_input, read_from_device=False, async_read=False
             )
+            finalized = self.async_decode.finalize_decode(submission)
+            assert finalized is not None
+            tt_out = finalized.tt_out
+            tt_log_probs = finalized.tt_log_probs
+            batch_size_per_dp = submission.batch_size_per_dp
+            sampling_params = submission.sampling_params
+            perform_device_sampling = submission.perform_device_sampling
 
-        # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
-        # sampling is enabled with logprobs. Extract both components.
-        tt_log_probs = None
-
-        # Always tensors - turned into lists only right before passing to model
         assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
         if perform_device_sampling and sampling_params.enable_log_probs.any():
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
         elif isinstance(tt_out, tuple):
-            # Model may return (logits, dummy_logprobs) even when not requested
             tt_out, _ = tt_out
 
         return self._get_output_tokens(
@@ -1620,6 +1725,105 @@ class TTModelRunner:
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
+        )
+
+    def prepare_dp_model_input(
+        self, scheduler_output: SchedulerOutput | None
+    ) -> tuple[
+        TTModelInput | None,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        list[str],
+        dict[str, int],
+    ]:
+        """Build the per-rank DP payload consumed by gather orchestration.
+
+        Returns the local TT model input plus the per-rank metadata needed by
+        gathered-DP negotiation and input gathering.
+        """
+        model_input = None
+        has_penalties = 0
+        reset_batch = 0
+        can_sample_device = 1
+        needs_logprobs = 0
+        req_ids: list[str] = []
+        req_id_to_index: dict[str, int] = {}
+        if scheduler_output is not None:
+            model_input = self.build_model_input(scheduler_output)
+            if model_input is not None:
+                has_penalties = int(not self.input_batch.no_penalties)
+                reset_batch = int(model_input.reset_batch)
+                can_sample_device = int(model_input.perform_device_sampling)
+                max_num_logprobs = model_input.max_num_logprobs[0]
+                # max_num_logprobs=0 still requests the sampled token's logprob.
+                needs_logprobs = int(max_num_logprobs is not None)
+                num_reqs = self.input_batch.num_reqs
+                req_ids = list(self.input_batch.req_ids[:num_reqs])
+                req_id_to_index = dict(self.input_batch.req_id_to_index)
+        max_blocks = model_input.block_tables.shape[1] if model_input else 0
+        has_structured_input = (
+            int(model_input.grammar_bitmask[0] is not None) if model_input else 0
+        )
+        return (
+            model_input,
+            max_blocks,
+            has_structured_input,
+            has_penalties,
+            reset_batch,
+            can_sample_device,
+            needs_logprobs,
+            req_ids,
+            req_id_to_index,
+        )
+
+    def submit_dp_execution(
+        self,
+        inputs: list[TTModelInput | None] | dict[str, Any],
+        is_decode: bool,
+        max_blocks_decode_batch: int | None,
+        any_structured_inputs: bool,
+        non_block: bool = False,
+    ) -> Any:
+        """Execute one merged DP batch and return the DP-facing result shape.
+
+        Merges gathered DP inputs, selects sync or async decode execution, and
+        returns the packed DP-facing result expected by the worker facade.
+        """
+        merged = self.concat_dp_model_inputs(
+            inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
+        )
+
+        if non_block and is_decode:
+            return self.async_decode.submit_async_dp_decode(merged)
+
+        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(
+            merged
+        )
+        return self.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
+
+    def apply_dp_execution_result(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs_lists: LogprobsLists | None = None,
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        """Apply the local DP rank result to runner state and build output.
+
+        Converts the local gathered-DP result into the same state update and
+        `ModelRunnerOutput` used by non-DP execution.
+        """
+        num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
+        sampled_token_ids = sampled_token_ids[:num_reqs]
+        return self.apply_and_build_runner_output(
+            sampled_token_ids,
+            logprobs_lists,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
         )
 
     def _get_output_tokens(
@@ -1866,20 +2070,56 @@ class TTModelRunner:
         ]
         logits.masked_fill_(unpacked_bitmask, -float("inf"))
 
-    def generate_runner_output(
+    def _build_runner_output(
         self,
         sampled_token_ids: torch.Tensor,
         logprobs: LogprobsLists | None = None,
-    ):
-        """Generate ModelRunnerOutput from sampled tokens and optional logprobs.
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
+        output_req_ids = (
+            list(req_ids)
+            if req_ids is not None
+            else list(self.input_batch.req_ids[:num_reqs])
+        )
+        output_req_id_to_index = (
+            dict(req_id_to_index)
+            if req_id_to_index is not None
+            else {req_id: idx for idx, req_id in enumerate(output_req_ids)}
+        )
+        assert sampled_token_ids.shape[0] == num_reqs, (
+            f"Number of request outputs {sampled_token_ids.shape[0]} != "
+            f"number of requests in input batch {num_reqs}"
+        )
 
-        Args:
-            sampled_token_ids: Sampled token IDs tensor.
-            logprobs: LogprobsLists (already converted from tensors).
-        """
-        # Cache the sampled tokens in the model runner, so that the scheduler
-        # doesn't need to send them back.
-        num_reqs = self.input_batch.num_reqs
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if sampled_token_ids_np.dtype != np.int32:
+            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
+            (output_req_ids[i] for i in range(num_reqs)), None
+        )
+        return ModelRunnerOutput(
+            req_ids=output_req_ids,
+            req_id_to_index=output_req_id_to_index,
+            sampled_token_ids=[
+                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
+            ],
+            logprobs=logprobs,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            pooler_output=[],
+        )
+
+    def _apply_sampled_tokens_to_state(
+        self,
+        sampled_token_ids: torch.Tensor,
+        req_ids: list[str] | None = None,
+        request_states: tuple[CachedRequestState, ...] | None = None,
+        row_indices: tuple[int, ...] | None = None,
+    ) -> None:
+        use_captured_req_ids = req_ids is not None
+        num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         assert sampled_token_ids.shape[0] == num_reqs, (
             f"Number of request outputs {sampled_token_ids.shape[0]} != "
             f"number of requests in input batch {num_reqs}"
@@ -1891,45 +2131,72 @@ class TTModelRunner:
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
-        # Vectorized update of persistent batch token storage.
-        start_idxs = self.input_batch.num_tokens[:num_reqs]
-        end_idxs = start_idxs + 1
-        max_end = int(end_idxs.max()) if num_reqs > 0 else 0
-        assert max_end <= self.model_config.max_model_len, (
-            "Sampled token IDs exceed the max model length. "
-            f"Total number of tokens: {max_end} > max_model_len: "
-            f"{self.model_config.max_model_len}"
+        if not use_captured_req_ids:
+            rows = np.arange(num_reqs)
+            start_idxs = self.input_batch.num_tokens[rows]
+            end_idxs = start_idxs + 1
+            max_end = int(end_idxs.max()) if num_reqs > 0 else 0
+            assert max_end <= self.model_config.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {max_end} > max_model_len: "
+                f"{self.model_config.max_model_len}"
+            )
+
+            self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
+            self.input_batch.num_tokens[rows] = end_idxs
+
+            for req_idx in range(num_reqs):
+                output_token_ids = self.input_batch.req_output_token_ids[req_idx]
+                assert output_token_ids is not None
+                output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+            return
+
+        assert req_ids is not None
+        captured_req_ids = req_ids
+        for req_idx, req_id in enumerate(captured_req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if request_states is not None and req_state is not request_states[req_idx]:
+                continue
+
+            current_row = self.input_batch.req_id_to_index.get(req_id)
+            if current_row is not None:
+                start_idx = int(self.input_batch.num_tokens[current_row])
+                end_idx = start_idx + 1
+                assert end_idx <= self.model_config.max_model_len, (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: "
+                    f"{self.model_config.max_model_len}"
+                )
+                self.input_batch.token_ids_cpu[current_row, start_idx] = (
+                    sampled_token_ids_np[req_idx]
+                )
+                self.input_batch.num_tokens[current_row] = end_idx
+
+            req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+
+    def apply_and_build_runner_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None = None,
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
+    ):
+        """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
+
+        Updates persistent runner state from sampled tokens and returns the
+        `ModelRunnerOutput` consumed by the rest of vLLM.
+        """
+        self._apply_sampled_tokens_to_state(
+            sampled_token_ids=sampled_token_ids,
+            req_ids=req_ids,
         )
-
-        rows = np.arange(num_reqs)
-        self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
-        self.input_batch.num_tokens[:num_reqs] = end_idxs
-
-        # Update request state (output token lists) without dict lookups.
-        # NOTE: `InputBatch.req_output_token_ids[i]` is a direct reference to
-        # the underlying `CachedRequestState.output_token_ids` list (stored in
-        # `self.requests[req_id]`). Appending here updates request state too,
-        # while avoiding a per-request dict lookup.
-        for req_idx in range(num_reqs):
-            output_token_ids = self.input_batch.req_output_token_ids[req_idx]
-            assert output_token_ids is not None
-            output_token_ids.append(int(sampled_token_ids_np[req_idx]))
-
-        # Empty prompt log probs
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
-            self.input_batch.req_ids[:num_reqs], None
-        )
-
-        # Note: currently does not support speculative decoding or pooling.
-        return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[
-                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
-            ],
+        return self._build_runner_output(
+            sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
         )
 
     def warmup_model(self) -> None:
@@ -1939,6 +2206,22 @@ class TTModelRunner:
         # program cache WITHOUT capturing any traces.  Phase 2 then
         # captures traces with every op already compiled, so no new
         # kernel-cache allocations occur that could corrupt trace memory.
+        #
+        # Assumptions / limitations:
+        #   1. Traced and non-traced code paths must use the same ops.
+        #      If a model uses different operators when enable_trace=False
+        #      vs True, Phase 1 will not compile the ops that Phase 2
+        #      traces, and new compilations during trace capture will
+        #      allocate corruptible buffers.
+        #   2. Prefill warmup must cover all supported sequence lengths.
+        #      If a new sequence length appears during inference, its
+        #      first compilation will allocate new kernel cache entries
+        #      (including reshape caches) that can corrupt active traces.
+        #
+        # Phase 1 uses read_from_device=False because some generators
+        # (e.g. llama3_70b_galaxy) only handle the traced return format
+        # in read_decode_output.
+        #
         # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
         trace_prefill_mode = self.trace_mode in ["all"]
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
@@ -1958,7 +2241,9 @@ class TTModelRunner:
 
         # Phase 1: compile all code paths (no trace capture)
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
-        self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
+        self.model.warmup_model_decode(
+            enable_trace=False, read_from_device=False, **decode_kwargs
+        )
 
         # Reset prefill warmup flag so Phase 2 re-runs with tracing
         if hasattr(self.model, "already_warmed_up_prefill"):

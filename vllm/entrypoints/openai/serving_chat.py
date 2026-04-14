@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -722,7 +723,8 @@ class OpenAIServingChat(OpenAIServing):
                         prev_recipient = harmony_parser.current_recipient
                         delta_text = ""
                         for token_id in output.token_ids:
-                            harmony_parser.process(token_id)
+                            with contextlib.suppress(Exception):
+                                harmony_parser.process(token_id)
                             delta_text += harmony_parser.last_content_delta or ""
                         cur_channel = harmony_parser.current_channel
                         cur_recipient = harmony_parser.current_recipient

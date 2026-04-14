@@ -210,6 +210,11 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
+        """Expose the non-DP TT execution service to the executor layer.
+
+        Returns the runner's non-DP execution result for the provided
+        scheduler output.
+        """
         assert self.is_driver_worker, "There should only be one Worker for TT"
         output = self.model_runner.execute_model(scheduler_output)
         return output
@@ -222,35 +227,45 @@ class TTWorker(WorkerBase):
 
     def build_dp_model_input(
         self, scheduler_output: Optional["SchedulerOutput"]
-    ) -> tuple[TTModelInput | None, int, int, int, int, int, int]:
-        """Called by each DP rank to build model input from scheduler output.
-        Returns: (model_input, max_blocks, has_structured_input, has_penalties,
-        reset_batch, can_sample_device, needs_logprobs)
+    ) -> tuple[
+        TTModelInput | None,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        list[str],
+        dict[str, int],
+    ]:
+        """Build the local DP payload consumed by gathered-DP orchestration.
+
+        Returns `(local_input, max_blocks, has_structured_input,
+        has_penalties, reset_batch, can_sample_device, needs_logprobs,
+        req_ids, req_id_to_index)`, where `local_input` is this rank's
+        TT model input (or `None`) and the remaining fields are the
+        per-rank metadata consumed by gathered-DP orchestration.
         """
-        model_input = None
-        has_penalties = 0
-        reset_batch = 0
-        can_sample_device = 1
-        needs_logprobs = 0
-        if scheduler_output is not None:
-            model_input = self.model_runner.build_model_input(scheduler_output)
-            if model_input is not None:
-                has_penalties = int(not self.model_runner.input_batch.no_penalties)
-                reset_batch = int(model_input.reset_batch)
-                can_sample_device = int(model_input.perform_device_sampling)
-                needs_logprobs = int(model_input.max_num_logprobs[0] is not None)
-        max_blocks = model_input.block_tables.shape[1] if model_input else 0
-        has_structured_input = (
-            int(model_input.grammar_bitmask[0] is not None) if model_input else 0
+        return self.model_runner.prepare_dp_model_input(scheduler_output)
+
+    def can_attempt_steady_dp_decode_from_scheduler(
+        self, scheduler_output: Optional["SchedulerOutput"]
+    ) -> bool:
+        """Return whether this rank can submit decode one step ahead.
+
+        This checks only local runner invariants. The engine combines all ranks'
+        answers into a single global decision before using the DP steady path.
+        """
+        return self.model_runner.can_attempt_steady_dp_decode_from_scheduler(
+            scheduler_output
         )
-        return (
-            model_input,
-            max_blocks,
-            has_structured_input,
-            has_penalties,
-            reset_batch,
-            can_sample_device,
-            needs_logprobs,
+
+    def can_attempt_steady_decode_from_scheduler(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        """Return whether a scheduled non-DP step can overlap steady decode."""
+        return self.model_runner.can_attempt_steady_decode_from_scheduler(
+            scheduler_output
         )
 
     def build_dp_decode_gather_input(
@@ -260,6 +275,11 @@ class TTWorker(WorkerBase):
         any_structured_inputs: bool,
         any_penalties_inputs: bool,
     ) -> dict[str, Any]:
+        """Prepare the fixed-shape decode gather payload for DP orchestration.
+
+        Returns the fixed-shape decode gather payload used by gathered-DP
+        orchestration.
+        """
         return self.model_runner.build_dp_decode_gather_input(
             model_input,
             max_blocks_decode_batch,
@@ -273,75 +293,55 @@ class TTWorker(WorkerBase):
         is_decode: bool,
         max_blocks_decode_batch: int | None,
         any_structured_inputs: bool,
-    ) -> tuple[torch.Tensor, list]:
-        """Called by TT device ranks (local DP rank 0) to concatenate DP-sized
-        inputs and execute. Returns a tuple of:
-        - stacked tensor [world, max_num_seqs, 1] of sampled ids
-        - list of logprobs per DP rank (as picklable lists, or None)
-        Each DP slice is right-padded with zeros to max_num_seqs; empty entries
-        are zeros. Same behavior for both prefill and decode."""
+        non_block: bool = False,
+    ) -> Any:
+        """Execute one merged DP batch through the worker facade.
 
-        assert self.parallel_config.data_parallel_rank_local == 0, (
-            "concat_and_execute_dp must run on local DP rank 0 (device rank)"
-        )
+        Returns either the packed DP execution result or an async DP decode
+        wrapper for the merged batch. The worker also enforces the "device rank
+        0 only" rule for merged TT execution.
+        """
         assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
-        merged = self.model_runner.concat_dp_model_inputs(
-            inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
-        )
-        sampled_token_ids_per_dp, logprobs_per_dp = (
-            self.model_runner.execute_with_model_input(merged)
+
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
+        if local_dp_rank != 0:
+            return self._empty_dp_execute_result()
+
+        return self.model_runner.submit_dp_execution(
+            inputs,
+            is_decode,
+            max_blocks_decode_batch,
+            any_structured_inputs,
+            non_block=non_block,
         )
 
-        # Convert LogprobsTensors to picklable lists for scatter
-        logprobs_lists_per_dp = [
-            lp.tolists() if lp is not None else None for lp in logprobs_per_dp
-        ]
+    def _empty_dp_execute_result(self) -> tuple[torch.Tensor, list]:
+        """Return the neutral DP payload for non-device local ranks.
 
-        # Pad each DP result to uniform shape for tensor all_gather.
+        Produces the correctly shaped no-op DP payload for colocated ranks that
+        do not execute the merged TT batch.
+        """
         world = self.parallel_config.data_parallel_size
-        assert len(sampled_token_ids_per_dp) == world
-        B = int(self.model_runner.scheduler_config.max_num_seqs)
-        for dp_rank in range(world):
-            token_ids = sampled_token_ids_per_dp[dp_rank].to(torch.int32)
-            if token_ids.numel() == 0:
-                token_ids = torch.zeros((B, 1), dtype=torch.int32)
-            else:
-                assert token_ids.dim() == 2 and token_ids.shape[1] == 1, (
-                    "Currently only supporting 1 output token per request"
-                )
-                pad_rows = B - token_ids.shape[0]
-                if pad_rows > 0:
-                    token_ids = torch.cat(
-                        [
-                            token_ids,
-                            torch.zeros(
-                                (pad_rows, token_ids.shape[1]), dtype=torch.int32
-                            ),
-                        ],
-                        dim=0,
-                    )
-            sampled_token_ids_per_dp[dp_rank] = token_ids
-        return torch.stack(
-            sampled_token_ids_per_dp
-        ), logprobs_lists_per_dp  # [world, B, 1], [world]
+        batch_size = int(self.model_runner.scheduler_config.max_num_seqs)
+        return torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world
 
     def apply_dp_execution_result(
         self,
         sampled_token_ids: torch.Tensor,
         logprobs_lists: Optional["LogprobsLists"] = None,
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
     ) -> ModelRunnerOutput:
-        """Called by each DP rank to apply sampled tokens to internal caches.
+        """Apply the local DP rank result through the worker facade.
 
-        Args:
-            sampled_token_ids: Sampled token IDs for this DP rank.
-            logprobs_lists: Logprobs as lists (already converted from tensors)
-                for this DP rank, or None if not requested.
+        Applies the local DP rank result and returns the corresponding
+        `ModelRunnerOutput`.
         """
-        # Trim to active local batch size to drop padding rows.
-        num_reqs = self.model_runner.input_batch.num_reqs
-        sampled_token_ids = sampled_token_ids[:num_reqs]
-        return self.model_runner.generate_runner_output(
-            sampled_token_ids, logprobs_lists
+        return self.model_runner.apply_dp_execution_result(
+            sampled_token_ids,
+            logprobs_lists,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
         )
 
     # ---- Destructor (used to close devices) ----

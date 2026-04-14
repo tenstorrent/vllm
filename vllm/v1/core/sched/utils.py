@@ -59,7 +59,9 @@ def check_stop(
         request.status = RequestStatus.FINISHED_STOPPED
         return True
 
-    if last_token_id in (sampling_params.stop_token_ids or ()):
+    if not sampling_params.ignore_eos and last_token_id in (
+        sampling_params.stop_token_ids or ()
+    ):
         request.status = RequestStatus.FINISHED_STOPPED
         request.stop_reason = last_token_id
         return True

@@ -36,7 +36,7 @@ CMakeLists.txt @tlrmchlsmth @LucasWilkinson
 /vllm/v1/offloading @ApostaC
 
 # Test ownership
-/.buildkite/lm-eval-harness @mgoin 
+/.buildkite/lm-eval-harness @mgoin
 /tests/distributed/test_multi_node_assignment.py @youkaichao
 /tests/distributed/test_pipeline_parallel.py @youkaichao
 /tests/distributed/test_same_node.py @youkaichao
@@ -157,21 +157,25 @@ mkdocs.yaml @hmellor
 # TT-Fork Specific
 
 # Generic
-/examples/offline_inference_tt.py @skhorasganiTT @ppetrovicTT
-/examples/server_example_tt.py @skhorasganiTT @ppetrovicTT
-/requirements/tt* @skhorasganiTT @ppetrovicTT
+* @viktorpusTT
+/examples/offline_inference_tt.py @skhorasganiTT @ppetrovicTT @viktorpusTT
+/examples/server_example_tt.py @skhorasganiTT @ppetrovicTT @viktorpusTT
+/requirements/tt* @skhorasganiTT @ppetrovicTT @viktorpusTT
 /tt_metal @skhorasganiTT @viktorpusTT
 /vllm/platforms/tt.py @skhorasganiTT @tchedaTT @viktorpusTT
-/vllm/model_executor/model_loader/tt_loader.py @skhorasganiTT
+/vllm/model_executor/model_loader/tt_loader.py @skhorasganiTT @viktorpusTT
 
 # V1
-/vllm/v1/worker/tt_worker.py @skhorasganiTT @tchedaTT @ppetrovicTT
+/vllm/v1/worker/tt_worker.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
 /vllm/v1/worker/tt_model_runner.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
 /vllm/v1/worker/tt_input_batch.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
-/vllm/v1/core/sched/ascend_scheduler.py @skhorasganiTT @tchedaTT
-/vllm/v1/engine/core.py @skhorasganiTT @tchedaTT
-/vllm/v1/engine/utils.py @skhorasganiTT
-/vllm/v1/engine/tt_core_launcher.py @skhorasganiTT
+/vllm/v1/core/sched/tt_scheduler.py @viktorpusTT
+/vllm/v1/engine/core.py @skhorasganiTT @tchedaTT @viktorpusTT
+/vllm/v1/engine/utils.py @skhorasganiTT @viktorpusTT
+/vllm/v1/engine/tt_core_launcher.py @skhorasganiTT @viktorpusTT
+/vllm/v1/engine/tt_dp_gather.py @viktorpusTT @tchedaTT
+/vllm/v1/engine/tt_engine_step.py @viktorpusTT @tchedaTT
+/vllm/v1/worker/tt_async_decode.py @viktorpusTT
 
 # Tests
-/tests/tt @tchedaTT @skhorasganiTT
+/tests/tt @tchedaTT @skhorasganiTT @viktorpusTT
