@@ -201,7 +201,7 @@ class TTModelRunner:
             self.previous_req_ids: set[str] = set()
 
         # Currently, TT model runner doesn't support chunked prefill.
-        assert self.scheduler_config.chunked_prefill_enabled is False
+        assert self.scheduler_config.enable_chunked_prefill is False
 
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode

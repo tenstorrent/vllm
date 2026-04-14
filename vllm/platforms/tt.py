@@ -236,7 +236,7 @@ class TTPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        assert not vllm_config.scheduler_config.chunked_prefill_enabled, (
+        assert not vllm_config.scheduler_config.enable_chunked_prefill, (
             "Chunked prefill is not yet supported for TT backend"
         )
         assert not vllm_config.speculative_config, (
@@ -446,15 +446,17 @@ class TTPlatform(Platform):
         processed_inputs: "ProcessorInputs",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
+        from vllm.sampling_params import SamplingParams
 
         dev = cls.device_name
 
-        if params.best_of is not None:
-            raise ValueError(f"Not yet supporting best_of on {dev}")
-        if params.prompt_logprobs is not None:
-            raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
-        if params.logits_processors:
-            raise ValueError(f"Custom logits_processors not supported on {dev} in V1")
+        if isinstance(params, SamplingParams):
+            if params.prompt_logprobs is not None:
+                raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+            if params.logits_processors:
+                raise ValueError(
+                    f"Custom logits_processors not supported on {dev} in V1"
+                )
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
