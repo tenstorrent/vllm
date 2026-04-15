@@ -1991,7 +1991,10 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
-                next_token_ids = tt_out[start : start + sz]
+                # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
+                # while decode may return [sz, 1]; downstream logprobs packing
+                # expects a flat vector here.
+                next_token_ids = tt_out[start : start + sz].reshape(sz)
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
@@ -2019,7 +2022,7 @@ class TTModelRunner:
                     else:
                         # Old path: single sampled-token logprob
                         # (all other models). Device returns [B] tensor.
-                        sampled_log_probs = tt_log_probs[start : start + sz]
+                        sampled_log_probs = tt_log_probs[start : start + sz].reshape(sz)
                         logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
                         logprobs_values = sampled_log_probs.unsqueeze(-1).to(
                             torch.float32
