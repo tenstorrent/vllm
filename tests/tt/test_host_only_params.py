@@ -38,7 +38,7 @@ class TestHostOnlyParameters:
             # Run multiple times with high temperature to increase coverage
             RequestConfig(
                 prompt="Say hello to me",
-                max_tokens=20,
+                max_tokens=100,
                 bad_words=bad_words,
                 temperature=1.0,
                 seed=i,
@@ -50,8 +50,11 @@ class TestHostOnlyParameters:
         assert len(results) == len(configs)
 
         for i, text in enumerate(results):
-            # Extract words by splitting and stripping punctuation
-            words = [word.strip(string.punctuation) for word in text.split()]
+            assert text is not None, f"Response {i} content is None"
+            # Strip punctuation except '>' to avoid false positives from
+            # BPE-merged tokens like ">Hello" (a single token distinct from "Hello")
+            punct = string.punctuation.replace(">", "")
+            words = [word.strip(punct) for word in text.split()]
 
             # Check if any bad word appears as a whole word (case-insensitive)
             for bad_word in bad_words:
@@ -104,7 +107,7 @@ class TestHostOnlyParameters:
         min_tokens = 5
         configs = [
             # Use a prompt that might naturally produce short output
-            RequestConfig(prompt="Say OK.", max_tokens=20, min_tokens=min_tokens),
+            RequestConfig(prompt="Say OK.", max_tokens=100, min_tokens=min_tokens),
         ]
         results = run_concurrent_batch(
             tt_server, tt_model_name, configs, return_full_response=True
