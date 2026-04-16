@@ -176,6 +176,16 @@ class InputBatch:
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
 
+        # Slot remap for seed manager: remap[i] = j means slot i's data came
+        # from slot j after condense.  Identity when nothing moved.
+        self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
+
+    def pop_slot_remap(self) -> torch.Tensor:
+        """Return pending slot remap and reset to identity."""
+        remap = self._slot_remap
+        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
+        return remap
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -376,6 +386,8 @@ class InputBatch:
             self.sampling.batch_update_builder.moved.append(
                 (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
             )
+            # Track for on-device seed manager slot reindexing.
+            self._slot_remap[empty_index] = self._slot_remap[last_req_index]
 
             # Swap the states.
             req_id = self._req_ids[last_req_index]
