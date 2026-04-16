@@ -525,7 +525,7 @@ def parse_chat_output(
     if len(output_msgs) == 0:
         # The generation has stopped during reasoning.
         reasoning = parser.current_content
-        final_content = None
+        final_content = ""
     elif len(output_msgs) == 1:
         # The generation has stopped during final message.
         reasoning = output_msgs[0].content[0].text
