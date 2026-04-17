@@ -362,9 +362,8 @@ class TTModelRunner:
         # TODO: move this into model.allocate_kv_cache.
         model_config = self.model_config
         data_parallel = self.parallel_config.data_parallel_size
-        num_devices = getattr(self.device_config, "num_devices")
-        assert isinstance(num_devices, int)
-        num_devices = num_devices // data_parallel
+        assert self.device_config.num_devices is not None
+        num_devices = self.device_config.num_devices // data_parallel
         total_kv_heads = kv_cache_spec.num_kv_heads
         num_kv_heads = total_kv_heads // min(num_devices, total_kv_heads)
 
@@ -1393,7 +1392,7 @@ class TTModelRunner:
             multi_modal_kwargs["pixel_values"] = pixel_values
             multi_modal_kwargs["image_grid_thw"] = image_grid_thw
         else:
-            multi_modal_kwargs: dict[str, Any] = {}
+            multi_modal_kwargs = {}
 
         # Extract prompt and output tokens for decode with sampling penalties
         prompt_tokens = None
@@ -1572,9 +1571,8 @@ class TTModelRunner:
             return False
 
         # Calculate number of devices per DP rank
-        num_devices = getattr(self.device_config, "num_devices")
-        assert isinstance(num_devices, int)
-        num_devices = num_devices // self.parallel_config.data_parallel_size
+        assert self.device_config.num_devices is not None
+        num_devices = self.device_config.num_devices // self.parallel_config.data_parallel_size
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.

@@ -92,12 +92,12 @@ class TTWorker(WorkerBase):
             )
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
-            setattr(self.device_config, "num_devices", self.mesh_device.get_num_devices())
+            self.device_config.num_devices = self.mesh_device.get_num_devices()
         else:
             mesh_grid = get_mesh_grid(local_dp_rank)
             self.mesh_device = None
             # Num devices is required for determining num blocks in KV cache.
-            setattr(self.device_config, "num_devices", mesh_grid[0] * mesh_grid[1])
+            self.device_config.num_devices = mesh_grid[0] * mesh_grid[1]
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -377,9 +377,8 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     data_parallel = vllm_config.parallel_config.data_parallel_size
 
     is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
-    num_devices = getattr(device_config, "num_devices")
-    assert isinstance(num_devices, int)
-    devices_per_dp_cache = num_devices // data_parallel
+    assert device_config.num_devices is not None
+    devices_per_dp_cache = device_config.num_devices // data_parallel
 
     if (
         "Llama-3.1-8B" in model_config.model

@@ -28,6 +28,9 @@ class DeviceConfig:
     device_type: str = field(init=False)
     """Device type from the current platform. This is set in
     `__post_init__`."""
+    num_devices: int | None = field(default=None, init=False)
+    """Runtime-only device count for backends that manage multiple devices
+    inside a single worker, such as TT."""
 
     def compute_hash(self) -> str:
         """
