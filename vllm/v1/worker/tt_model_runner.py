@@ -2230,10 +2230,6 @@ class TTModelRunner:
         #      first compilation will allocate new kernel cache entries
         #      (including reshape caches) that can corrupt active traces.
         #
-        # Phase 1 uses read_from_device=False because some generators
-        # (e.g. llama3_70b_galaxy) only handle the traced return format
-        # in read_decode_output.
-        #
         # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
         trace_prefill_mode = self.trace_mode in ["all"]
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
@@ -2259,9 +2255,7 @@ class TTModelRunner:
 
         # Phase 1: compile all code paths (no trace capture)
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
-        self.model.warmup_model_decode(
-            enable_trace=False, read_from_device=False, **decode_kwargs
-        )
+        self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
 
         # Reset prefill warmup flag so Phase 2 re-runs with tracing
         if hasattr(self.model, "already_warmed_up_prefill"):
