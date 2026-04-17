@@ -4,7 +4,7 @@
 import json
 import os
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
@@ -205,6 +205,7 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.TT
     device_name: str = "tt"
     device_type: str = "tt"
+    sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
