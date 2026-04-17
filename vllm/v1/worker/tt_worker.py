@@ -151,6 +151,7 @@ class TTWorker(WorkerBase):
 
         use_mla = model_config.use_mla
         sliding_window = model_config.get_sliding_window()
+        attn_spec: KVCacheSpec
         if use_mla:
             assert not sliding_window, "MLA not supported for sliding window"
             attn_spec = MLAAttentionSpec(
@@ -376,6 +377,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     data_parallel = vllm_config.parallel_config.data_parallel_size
 
     is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
+    assert device_config.num_devices is not None
     devices_per_dp_cache = device_config.num_devices // data_parallel
 
     if (

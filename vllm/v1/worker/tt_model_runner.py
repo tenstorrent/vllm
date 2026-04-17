@@ -15,7 +15,7 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tt_loader import TTModelLoader
-from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargs
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms.tt import TTPlatform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -206,13 +206,14 @@ class TTModelRunner:
             self.previous_req_ids: set[str] = set()
 
         # Currently, TT model runner doesn't support chunked prefill.
-        assert self.scheduler_config.chunked_prefill_enabled is False
+        assert self.scheduler_config.enable_chunked_prefill is False
 
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         # Whether to sample on device
-        self.sample_on_device_mode = TTPlatform.sample_on_device_mode
+        self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
+        assert self.sample_on_device_mode in (None, "all", "decode_only")
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
         # requiring the model to be loaded). Models like gpt-oss-120b
@@ -361,6 +362,7 @@ class TTModelRunner:
         # TODO: move this into model.allocate_kv_cache.
         model_config = self.model_config
         data_parallel = self.parallel_config.data_parallel_size
+        assert self.device_config.num_devices is not None
         num_devices = self.device_config.num_devices // data_parallel
         total_kv_heads = kv_cache_spec.num_kv_heads
         num_kv_heads = total_kv_heads // min(num_devices, total_kv_heads)
@@ -555,7 +557,7 @@ class TTModelRunner:
         }
         """
 
-        multi_modal_kwargs: MultiModalKwargs = {
+        multi_modal_kwargs: dict[str, Any] = {
             "pixel_values": [],
             "image_grid_thw": [],
         }
@@ -1375,7 +1377,7 @@ class TTModelRunner:
 
         if self.model_config.is_multimodal_model and not is_decode:
             # Gather multi-modal inputs from all DP ranks
-            multi_modal_kwargs: MultiModalKwargs = {
+            multi_modal_kwargs: dict[str, Any] = {
                 "pixel_values": [],
                 "image_grid_thw": [],
             }
@@ -1569,6 +1571,7 @@ class TTModelRunner:
             return False
 
         # Calculate number of devices per DP rank
+        assert self.device_config.num_devices is not None
         num_devices = (
             self.device_config.num_devices // self.parallel_config.data_parallel_size
         )
@@ -1610,7 +1613,11 @@ class TTModelRunner:
         # TTPlatform.non_greedy_decoding_on_device must be True
         # for random sampling,
         # or all requests must be greedy without penalties.
-        params_device_supported = TTPlatform.non_greedy_decoding_on_device or (
+        non_greedy_decoding_on_device = getattr(
+            TTPlatform, "non_greedy_decoding_on_device", False
+        )
+        assert isinstance(non_greedy_decoding_on_device, bool)
+        params_device_supported = non_greedy_decoding_on_device or (
             self.input_batch.all_greedy and self.input_batch.no_penalties
         )
         return params_device_supported
@@ -2103,12 +2110,14 @@ class TTModelRunner:
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
             (output_req_ids[i] for i in range(num_reqs)), None
         )
+        sampled_token_id_lists = [
+            [int(token_id)] for token_id in sampled_token_ids_np.tolist()
+        ]
+
         return ModelRunnerOutput(
             req_ids=output_req_ids,
             req_id_to_index=output_req_id_to_index,
-            sampled_token_ids=[
-                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
-            ],
+            sampled_token_ids=sampled_token_id_lists,
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
@@ -2228,10 +2237,16 @@ class TTModelRunner:
         # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
         trace_prefill_mode = self.trace_mode in ["all"]
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
+        sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
+        assert sample_on_device_mode in (None, "all", "decode_only")
+        non_greedy_decoding_on_device = getattr(
+            TTPlatform, "non_greedy_decoding_on_device", False
+        )
+        assert isinstance(non_greedy_decoding_on_device, bool)
         prefill_kwargs = dict(
             kv_cache=self.kv_caches,
-            can_sample_on_device=TTPlatform.sample_on_device_mode == "all",
-            non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
+            can_sample_on_device=sample_on_device_mode == "all",
+            non_greedy_decoding_on_device=non_greedy_decoding_on_device,
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
@@ -2239,7 +2254,7 @@ class TTModelRunner:
             * self.parallel_config.data_parallel_size,
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=self.sample_on_device_mode in ["all", "decode_only"],
-            non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
+            non_greedy_decoding_on_device=non_greedy_decoding_on_device,
         )
 
         # Phase 1: compile all code paths (no trace capture)
