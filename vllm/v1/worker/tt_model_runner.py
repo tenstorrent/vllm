@@ -473,6 +473,9 @@ class TTModelRunner:
             "pixel_values_videos": [],
             "video_grid_thw": [],
             "video_token_pooling": [],
+            # HF multimodal attention (Molmo2): full-length token_type_ids / attention_mask
+            "mm_token_type_ids": [],
+            "mm_attention_mask": [],
         }
 
         num_reqs = self.input_batch.num_reqs
@@ -490,6 +493,8 @@ class TTModelRunner:
                 multi_modal_kwargs["pixel_values_videos"].append(None)
                 multi_modal_kwargs["video_grid_thw"].append(None)
                 multi_modal_kwargs["video_token_pooling"].append(None)
+                multi_modal_kwargs["mm_token_type_ids"].append(None)
+                multi_modal_kwargs["mm_attention_mask"].append(None)
                 continue
 
             pv_array: list[torch.Tensor | None] = []
@@ -501,6 +506,8 @@ class TTModelRunner:
             pvv_array: list[torch.Tensor | None] = []
             video_grid_thw_array: list[torch.Tensor | None] = []
             video_token_pooling_array: list[torch.Tensor | None] = []
+            mm_token_type_ids_array: list[torch.Tensor | None] = []
+            mm_attention_mask_array: list[torch.Tensor | None] = []
 
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
@@ -516,6 +523,8 @@ class TTModelRunner:
                     pvv_array.append(None)
                     video_grid_thw_array.append(None)
                     video_token_pooling_array.append(None)
+                    mm_token_type_ids_array.append(None)
+                    mm_attention_mask_array.append(None)
                     continue
 
                 if is_video:
@@ -528,6 +537,12 @@ class TTModelRunner:
                     )
                     video_token_pooling_array.append(
                         item["video_token_pooling"].data if "video_token_pooling" in item else None
+                    )
+                    mm_token_type_ids_array.append(
+                        item["mm_token_type_ids"].data if "mm_token_type_ids" in item else None
+                    )
+                    mm_attention_mask_array.append(
+                        item["mm_attention_mask"].data if "mm_attention_mask" in item else None
                     )
                     # Fill image arrays with None for this slot
                     pv_array.append(None)
@@ -555,6 +570,8 @@ class TTModelRunner:
                     pvv_array.append(None)
                     video_grid_thw_array.append(None)
                     video_token_pooling_array.append(None)
+                    mm_token_type_ids_array.append(None)
+                    mm_attention_mask_array.append(None)
 
             multi_modal_kwargs["pixel_values"].append(pv_array)
             multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
@@ -564,6 +581,8 @@ class TTModelRunner:
             multi_modal_kwargs["pixel_values_videos"].append(pvv_array)
             multi_modal_kwargs["video_grid_thw"].append(video_grid_thw_array)
             multi_modal_kwargs["video_token_pooling"].append(video_token_pooling_array)
+            multi_modal_kwargs["mm_token_type_ids"].append(mm_token_type_ids_array)
+            multi_modal_kwargs["mm_attention_mask"].append(mm_attention_mask_array)
 
         return multi_modal_kwargs
 
@@ -1276,12 +1295,23 @@ class TTModelRunner:
                 "image_grids": [],
                 "image_num_crops": [],
                 "image_token_pooling": [],
+                # Molmo2 video + HF mm masks
+                "pixel_values_videos": [],
+                "video_grid_thw": [],
+                "video_token_pooling": [],
+                "mm_token_type_ids": [],
+                "mm_attention_mask": [],
             }
             pixel_values = []
             image_grid_thw = []
             image_grids = []
             image_num_crops = []
             image_token_pooling = []
+            pixel_values_videos = []
+            video_grid_thw = []
+            video_token_pooling = []
+            mm_token_type_ids = []
+            mm_attention_mask = []
             for mi in inputs:
                 if mi is not None:
                     mm_kwargs = mi.multi_modal_kwargs
@@ -1302,11 +1332,39 @@ class TTModelRunner:
                     if "image_token_pooling" in mm_kwargs:
                         for itp in mm_kwargs["image_token_pooling"]:
                             image_token_pooling.append(itp)
+                    if "pixel_values_videos" in mm_kwargs:
+                        for pvv in mm_kwargs["pixel_values_videos"]:
+                            pixel_values_videos.append(pvv)
+                    if "video_grid_thw" in mm_kwargs:
+                        for vg in mm_kwargs["video_grid_thw"]:
+                            video_grid_thw.append(vg)
+                    if "video_token_pooling" in mm_kwargs:
+                        for vtp in mm_kwargs["video_token_pooling"]:
+                            video_token_pooling.append(vtp)
+                    if "mm_token_type_ids" in mm_kwargs:
+                        for mt in mm_kwargs["mm_token_type_ids"]:
+                            mm_token_type_ids.append(mt)
+                    if "mm_attention_mask" in mm_kwargs:
+                        for ma in mm_kwargs["mm_attention_mask"]:
+                            mm_attention_mask.append(ma)
             multi_modal_kwargs["pixel_values"] = pixel_values
             multi_modal_kwargs["image_grid_thw"] = image_grid_thw
             multi_modal_kwargs["image_grids"] = image_grids if image_grids else None
             multi_modal_kwargs["image_num_crops"] = image_num_crops if image_num_crops else None
             multi_modal_kwargs["image_token_pooling"] = image_token_pooling if image_token_pooling else None
+            multi_modal_kwargs["pixel_values_videos"] = (
+                pixel_values_videos if pixel_values_videos else None
+            )
+            multi_modal_kwargs["video_grid_thw"] = video_grid_thw if video_grid_thw else None
+            multi_modal_kwargs["video_token_pooling"] = (
+                video_token_pooling if video_token_pooling else None
+            )
+            multi_modal_kwargs["mm_token_type_ids"] = (
+                mm_token_type_ids if mm_token_type_ids else None
+            )
+            multi_modal_kwargs["mm_attention_mask"] = (
+                mm_attention_mask if mm_attention_mask else None
+            )
         else:
             multi_modal_kwargs = {}
 

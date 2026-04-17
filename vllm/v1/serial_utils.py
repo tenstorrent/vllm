@@ -271,6 +271,13 @@ class MsgpackEncoder:
             # Although it violates NestedTensors type, MultiModalKwargs
             # values are sometimes floats.
             return nt
+        # Handle numpy scalar types (e.g., numpy.int64, numpy.float32)
+        # Check for numpy scalar by verifying it has ndim=0 (scalar has no dimensions)
+        if hasattr(nt, 'item') and hasattr(nt, 'ndim') and nt.ndim == 0:
+            return nt.item()
+        # Handle numpy arrays
+        if hasattr(nt, 'tolist'):
+            return nt.tolist()
         return [self._encode_nested_tensors(x) for x in nt]
 
     def _encode_mm_field(self, field: BaseMultiModalField):

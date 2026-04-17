@@ -422,6 +422,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         max_tokens_all_users = 65536
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
+    elif (
+        "Molmo2" in model_config.model
+        and devices_per_dp_cache == 8
+        and is_wormhole
+    ):
+        # Molmo2-8B on T3K: match demo.py num_blocks=512 to keep DRAM available
+        # for 8192-token non-traced prefill activations.  demo.py uses num_blocks=512
+        # which is 32768 tokens; exceeding that exhausts DRAM on 12 GB devices.
+        max_tokens_all_users = 32768
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072

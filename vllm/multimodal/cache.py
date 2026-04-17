@@ -646,7 +646,13 @@ class MultiModalReceiverCache(BaseMultiModalReceiverCache):
         if (cached_item := self._cache.get(mm_hash)) is not None:
             return cached_item
 
-        assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
+        if mm_item is None:
+            import traceback
+            import sys
+            print(f"ERROR: MultiModalReceiverCache cache miss for {mm_hash=}", file=sys.stderr)
+            print(f"  Cache size: {len(self._cache)}, keys: {list(self._cache.keys())[:5]}...", file=sys.stderr)
+            traceback.print_stack(file=sys.stderr)
+            raise AssertionError(f"Expected a cached item for {mm_hash=}")
 
         self._cache[mm_hash] = mm_item
         return mm_item
