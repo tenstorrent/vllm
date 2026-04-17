@@ -12,6 +12,7 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader import get_model_architecture
 from vllm.platforms.tt import (
     TTPlatform,
     _should_pre_register_tt_test_models_from_cli,
@@ -373,29 +374,21 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
+    # region Get default or model- and device-specific `max_tokens_all_users`
     data_parallel = vllm_config.parallel_config.data_parallel_size
+
+    model_class, _ = get_model_architecture(model_config)
+    max_tokens_all_users = model_class.get_max_tokens_all_users(
+        model_name=model_config.model,
+        num_devices=device_config.num_devices,
+        tt_data_parallel=data_parallel,
+    )
 
     is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
     devices_per_dp_cache = device_config.num_devices // data_parallel
 
+    # TODO: Move the remaining logic to corresponding classes.
     if (
-        "Llama-3.1-8B" in model_config.model
-        and devices_per_dp_cache == 1
-        and is_wormhole
-    ):
-        # Llama8B on N150
-        max_tokens_all_users = 32768
-    elif "Qwen3-8B" in model_config.model and devices_per_dp_cache == 1 and is_wormhole:
-        # Qwen3-8B on N150 (same constraint as Llama8B-N150)
-        max_tokens_all_users = 32768
-    elif (
-        ("Mistral-7B" in model_config.model or "gemma-3-4b" in model_config.model)
-        and devices_per_dp_cache == 1
-        and is_wormhole
-    ):
-        # Mistral7B, and gemma3-4b on N150
-        max_tokens_all_users = 65536
-    elif (
         (
             "DeepSeek-R1-Distill-Qwen-14B" in model_config.model
             or "Qwen2.5-14B" in model_config.model
@@ -407,13 +400,6 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         # Qwen2.5-14B and gemma3-4b on N300
         max_tokens_all_users = 65536
     elif (
-        "Llama-3.2-90B" in model_config.model
-        and devices_per_dp_cache == 8
-        and is_wormhole
-    ):
-        # Llama90B on WH T3K
-        max_tokens_all_users = 65536
-    elif (
         "Qwen2.5-VL-72B" in model_config.model
         and devices_per_dp_cache == 8
         and is_wormhole
@@ -422,9 +408,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         max_tokens_all_users = 65536
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
-    else:
-        # Note: includes num vision tokens for multi-modal
-        max_tokens_all_users = 131072
+    # endregion
 
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
     # allocate an extra block_size per user since vLLM uses a worst-case
