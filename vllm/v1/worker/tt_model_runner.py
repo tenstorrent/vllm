@@ -1572,7 +1572,9 @@ class TTModelRunner:
 
         # Calculate number of devices per DP rank
         assert self.device_config.num_devices is not None
-        num_devices = self.device_config.num_devices // self.parallel_config.data_parallel_size
+        num_devices = (
+            self.device_config.num_devices // self.parallel_config.data_parallel_size
+        )
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
