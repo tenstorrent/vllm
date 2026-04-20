@@ -263,12 +263,14 @@ class CoreEngineActorManager:
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+        from vllm.platforms import current_platform
         from vllm.v1.engine.core import DPMoEEngineCoreActor, EngineCoreActor
 
         dp_size = vllm_config.parallel_config.data_parallel_size
         actor_class = (
             DPMoEEngineCoreActor
-            if dp_size > 1 and vllm_config.model_config.is_moe
+            if dp_size > 1
+            and (vllm_config.model_config.is_moe or current_platform.is_tt())
             else EngineCoreActor
         )
 
@@ -651,11 +653,12 @@ class CoreEngineActorManager:
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+        from vllm.platforms import current_platform
         from vllm.v1.engine.core import DPMoEEngineCoreActor, EngineCoreActor
 
         actor_class = (
             DPMoEEngineCoreActor
-            if cur_vllm_config.model_config.is_moe
+            if cur_vllm_config.model_config.is_moe or current_platform.is_tt()
             else EngineCoreActor
         )
 

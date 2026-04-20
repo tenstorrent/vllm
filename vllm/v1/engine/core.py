@@ -1078,7 +1078,9 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
+            if data_parallel and (
+                vllm_config.model_config.is_moe or current_platform.is_tt()
+            ):
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
@@ -1455,8 +1457,8 @@ class DPEngineCoreProc(EngineCoreProc):
         log_stats: bool,
         client_handshake_address: str | None = None,
     ):
-        assert vllm_config.model_config.is_moe, (
-            "DPEngineCoreProc should only be used for MoE models"
+        assert vllm_config.model_config.is_moe or current_platform.is_tt(), (
+            "DPEngineCoreProc should only be used for MoE models or TT DP"
         )
 
         # Counts forward-passes of the model so that we can synchronize
@@ -1464,8 +1466,6 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter = 0
         self.current_wave = 0
         self.last_counts = (0, 0)
-
-        from vllm.platforms import current_platform
 
         self.requires_gather = current_platform.requires_gathered_batch_dp()
         if self.requires_gather:
