@@ -388,6 +388,7 @@ class InputPreprocessor:
         if "prompt_token_ids" in prompt:
             return self._process_tokens(
                 prompt,  # type: ignore[arg-type]
+                tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )
 
