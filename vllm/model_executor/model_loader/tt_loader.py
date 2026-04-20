@@ -29,8 +29,10 @@ class TTModelLoader(BaseModelLoader):
             ], f"""Invalid optimizations configuration `{optimizations}`, 
             allowed values are 'performance' or 'accuracy'"""
 
-        # Model receives max_batch_size as batch_size_per_dp * dp_size
-        data_parallel = vllm_config.parallel_config.data_parallel_size
+        # Dense V1 engine cores rewrite data_parallel_size to 1 per process,
+        # but TT model init still needs the original user-configured DP size.
+        parallel_config = vllm_config.parallel_config
+        data_parallel = parallel_config.data_parallel_size_original
         max_batch_size = scheduler_config.max_num_seqs * data_parallel
 
         model = model_class.initialize_vllm_model(

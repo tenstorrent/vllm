@@ -276,6 +276,9 @@ class ParallelConfig:
     """Equal to the data parallel rank but not used for torch process groups
     and not overridden for dense models."""
 
+    data_parallel_size_original: int = Field(init=False)
+    """Original configured data parallel size before any per-process rewrites."""
+
     _api_process_count: int = Field(default=1, gt=0)
     """
     The number of API processes initialized.
@@ -303,6 +306,8 @@ class ParallelConfig:
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
+        self.data_parallel_size_original = self.data_parallel_size
+
         if self._api_process_rank >= self._api_process_count:
             raise ValueError(
                 "Invalid value of `_api_process_rank`. "
@@ -574,6 +579,7 @@ class ParallelConfig:
             "data_parallel_rank",
             "data_parallel_rank_local",
             "data_parallel_size_local",
+            "data_parallel_size_original",
             "data_parallel_index",
             "data_parallel_backend",
             "data_parallel_external_lb",
