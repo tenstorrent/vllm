@@ -377,37 +377,53 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # region Get default or model- and device-specific `max_tokens_all_users`
     data_parallel = vllm_config.parallel_config.data_parallel_size
 
-    model_class, _ = get_model_architecture(model_config)
-    max_tokens_all_users = model_class.get_max_tokens_all_users(
-        model_name=model_config.model,
-        num_devices=device_config.num_devices,
-        tt_data_parallel=data_parallel,
-    )
-
-    is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
-    devices_per_dp_cache = device_config.num_devices // data_parallel
-
-    # TODO: Move the remaining logic to corresponding classes.
-    if (
-        (
-            "DeepSeek-R1-Distill-Qwen-14B" in model_config.model
-            or "Qwen2.5-14B" in model_config.model
-            or "gemma-3-4b" in model_config.model
+    try:
+        model_class, _ = get_model_architecture(model_config)
+        max_tokens_all_users = model_class.get_max_tokens_all_users(
+            model_name=model_config.model,
+            num_devices=device_config.num_devices,
+            tt_data_parallel=data_parallel,
         )
-        and devices_per_dp_cache == 2
-        and is_wormhole
-    ):
-        # Qwen2.5-14B and gemma3-4b on N300
-        max_tokens_all_users = 65536
-    elif (
-        "Qwen2.5-VL-72B" in model_config.model
-        and devices_per_dp_cache == 8
-        and is_wormhole
-    ):
-        # Qwen2.5-VL-72B on WH T3K
-        max_tokens_all_users = 65536
-    elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
-        max_tokens_all_users = 32768
+
+        logger.info(
+            "Getting max_tokens_all_users=%d for number of blocks in KV cache "
+            "from generator '%s'.",
+            max_tokens_all_users,
+            model_class.__class__.__name__,
+        )
+    except AttributeError:
+        is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
+        devices_per_dp_cache = device_config.num_devices // data_parallel
+
+        # TODO: Move the remaining logic to corresponding classes.
+        if (
+            (
+                "DeepSeek-R1-Distill-Qwen-14B" in model_config.model
+                or "Qwen2.5-14B" in model_config.model
+                or "gemma-3-4b" in model_config.model
+            )
+            and devices_per_dp_cache == 2
+            and is_wormhole
+        ):
+            # Qwen2.5-14B and gemma3-4b on N300
+            max_tokens_all_users = 65536
+        elif (
+            "Qwen2.5-VL-72B" in model_config.model
+            and devices_per_dp_cache == 8
+            and is_wormhole
+        ):
+            # Qwen2.5-VL-72B on WH T3K
+            max_tokens_all_users = 65536
+        elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
+            max_tokens_all_users = 32768
+        else:
+            max_tokens_all_users = 131072
+
+        logger.info(
+            "Setting max_tokens_all_users=%d for number of blocks in KV cache "
+            "using rules in `get_num_available_blocks_tt`.",
+            max_tokens_all_users,
+        )
     # endregion
 
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
