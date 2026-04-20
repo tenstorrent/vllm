@@ -31,9 +31,10 @@ class TTModelLoader(BaseModelLoader):
 
         # Dense V1 engine cores rewrite data_parallel_size to 1 per process,
         # but TT model init still needs the original user-configured DP size.
+        # max_batch_size remains per engine (`max_num_seqs`), not global DP-wide.
         parallel_config = vllm_config.parallel_config
         data_parallel = parallel_config.data_parallel_size_original
-        max_batch_size = scheduler_config.max_num_seqs * data_parallel
+        max_batch_size = scheduler_config.max_num_seqs
 
         model = model_class.initialize_vllm_model(
             model_config.hf_config,
