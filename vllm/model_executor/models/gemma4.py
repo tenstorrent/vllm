@@ -35,7 +35,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -79,6 +79,13 @@ def _get_text_config(config):
     if hasattr(config, "text_config"):
         return config.text_config
     return config
+
+
+class FP32ReplicatedLinear(ReplicatedLinear):
+    """Replicated linear layer that always computes in fp32."""
+
+    def forward(self, x: torch.Tensor):
+        return super().forward(x.to(torch.float32))
 
 
 class Gemma4MLP(nn.Module):
@@ -150,14 +157,12 @@ class Gemma4Router(nn.Module):
             torch.tensor(self.hidden_size**-0.5),
             persistent=False,
         )
-        # Project to expert logits; replicated across TP for consistent routing
-        # GateLinear supports bf16 W/A → fp32 output, which is important
-        # because the topk kernel often needs fp32 for stable routing.
-        self.proj = GateLinear(
+        # Project to expert logits in fp32 for stable router top-k selection.
+        self.proj = FP32ReplicatedLinear(
             self.hidden_size,
             config.num_experts,
             bias=False,
-            out_dtype=torch.float32,
+            params_dtype=torch.float32,
             prefix=f"{prefix}.proj",
         )
 
