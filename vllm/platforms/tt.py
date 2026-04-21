@@ -452,7 +452,7 @@ class TTPlatform(Platform):
 
         dev = cls.device_name
 
-        if isinstance(params, SamplingParams)and params.prompt_logprobs is not None:
+        if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
 
     @staticmethod
