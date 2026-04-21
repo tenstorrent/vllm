@@ -48,11 +48,13 @@ CHECK_IMPORTS = {
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
             "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
+            "vllm/v1/engine/tt_engine_step.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",
             "vllm/entrypoints/llm.py",
             "tests/utils.py",
+            "vllm/v1/engine/tt_core_launcher.py",
             # pickle and cloudpickle
             "vllm/v1/serial_utils.py",
         },
