@@ -157,6 +157,13 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
 
+    # Gemma4 - TT support is text-only.
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTGemma4ForCausalLM",
+        "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM",
+    )
+
     # DeepseekV3
     _register_model_if_missing(
         ModelRegistry,
@@ -289,6 +296,14 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+
+        # Gemma4 text checkpoints currently advertise
+        # "Gemma4ForConditionalGeneration" at the HF config level even when the
+        # request is plain text. TT support only wires up the text path,
+        # so route that architecture to the TT causal LM wrapper.
+        for i in range(len(arch_names)):
+            if arch_names[i] == "TTGemma4ForConditionalGeneration":
+                arch_names[i] = "TTGemma4ForCausalLM"
 
         # Verify that the TT architecture is registered in the model registry
         from vllm.model_executor.models.registry import ModelRegistry
