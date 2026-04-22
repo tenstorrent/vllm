@@ -28,4 +28,3 @@ def test_preprocessor_always_mm_code_path(model_id, prompt):
 
     processed_inputs = input_preprocessor.preprocess(prompt)
     assert sep_token_id in processed_inputs["prompt_token_ids"]
-

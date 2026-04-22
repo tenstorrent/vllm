@@ -386,7 +386,7 @@ class OpenAIServingChat(OpenAIServing):
                 input_length = self._extract_prompt_len(engine_prompt)
                 if request.truncate_prompt_tokens is not None:
                     if request.truncate_prompt_tokens == -1:
-                        truncated_length = self.max_model_len
+                        truncated_length = max_model_len
                     else:
                         truncated_length = request.truncate_prompt_tokens
                     input_length = min(input_length, truncated_length)
