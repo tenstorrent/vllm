@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.inputs import ProcessorInputs, PromptType
     from vllm.pooling_params import PoolingParams
+    from vllm.renderers.inputs import DictPrompt, TokPrompt
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 else:
@@ -442,7 +443,7 @@ class TTPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: "PromptType",
+        prompt: "PromptType | DictPrompt | TokPrompt",
         params: "SamplingParams | PoolingParams",
         processed_inputs: "ProcessorInputs",
     ) -> None:
@@ -451,13 +452,8 @@ class TTPlatform(Platform):
 
         dev = cls.device_name
 
-        if isinstance(params, SamplingParams):
-            if params.prompt_logprobs is not None:
-                raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
-            if params.logits_processors:
-                raise ValueError(
-                    f"Custom logits_processors not supported on {dev} in V1"
-                )
+        if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
+            raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
@@ -482,8 +478,7 @@ class TTPlatform(Platform):
                 and len(sampling_params.bad_words) > 0
             )
             or sampling_params.prompt_logprobs is not None
-            or sampling_params.logits_processors is not None
-            or sampling_params.guided_decoding is not None
+            or sampling_params.structured_outputs is not None
             or sampling_params.logit_bias is not None
             or sampling_params.allowed_token_ids is not None
             or sampling_params.min_tokens != 0
