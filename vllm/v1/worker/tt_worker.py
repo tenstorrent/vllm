@@ -152,6 +152,7 @@ class TTWorker(WorkerBase):
 
         use_mla = model_config.use_mla
         sliding_window = model_config.get_sliding_window()
+        attn_spec: KVCacheSpec
         if use_mla:
             assert not sliding_window, "MLA not supported for sliding window"
             attn_spec = MLAAttentionSpec(

@@ -4,7 +4,7 @@
 import json
 import os
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.inputs import ProcessorInputs, PromptType
     from vllm.pooling_params import PoolingParams
+    from vllm.renderers.inputs import DictPrompt, TokPrompt
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 else:
@@ -205,6 +206,7 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.TT
     device_name: str = "tt"
     device_type: str = "tt"
+    sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
@@ -236,7 +238,7 @@ class TTPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        assert not vllm_config.scheduler_config.chunked_prefill_enabled, (
+        assert not vllm_config.scheduler_config.enable_chunked_prefill, (
             "Chunked prefill is not yet supported for TT backend"
         )
         assert not vllm_config.speculative_config, (
@@ -441,20 +443,17 @@ class TTPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: "PromptType",
+        prompt: "PromptType | DictPrompt | TokPrompt",
         params: "SamplingParams | PoolingParams",
         processed_inputs: "ProcessorInputs",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
+        from vllm.sampling_params import SamplingParams
 
         dev = cls.device_name
 
-        if params.best_of is not None:
-            raise ValueError(f"Not yet supporting best_of on {dev}")
-        if params.prompt_logprobs is not None:
+        if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
-        if params.logits_processors:
-            raise ValueError(f"Custom logits_processors not supported on {dev} in V1")
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
@@ -479,8 +478,7 @@ class TTPlatform(Platform):
                 and len(sampling_params.bad_words) > 0
             )
             or sampling_params.prompt_logprobs is not None
-            or sampling_params.logits_processors is not None
-            or sampling_params.guided_decoding is not None
+            or sampling_params.structured_outputs is not None
             or sampling_params.logit_bias is not None
             or sampling_params.allowed_token_ids is not None
             or sampling_params.min_tokens != 0

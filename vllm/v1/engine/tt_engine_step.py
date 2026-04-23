@@ -127,7 +127,7 @@ def step_with_batch_queue_tt(
             )
 
         if deferred_scheduler_output is None:
-            batch_queue.appendleft((future, scheduler_output))
+            batch_queue.appendleft((future, scheduler_output, future))
             if (
                 model_executed
                 and len(batch_queue) < core.batch_queue_size
@@ -138,7 +138,7 @@ def step_with_batch_queue_tt(
     elif not batch_queue:
         return None, False
 
-    future, scheduler_output = batch_queue.pop()
+    future, scheduler_output, _ = batch_queue.pop()
     with core.log_error_detail(scheduler_output):
         model_output = future.result()
 
@@ -154,7 +154,7 @@ def step_with_batch_queue_tt(
                 deferred_scheduler_output, non_block=True
             ),
         )
-        batch_queue.appendleft((future, deferred_scheduler_output))
+        batch_queue.appendleft((future, deferred_scheduler_output, future))
 
     return engine_core_outputs, model_executed
 
