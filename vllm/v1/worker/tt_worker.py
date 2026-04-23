@@ -388,7 +388,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
             "Getting max_tokens_all_users=%d for number of blocks in KV cache "
             "from generator '%s'.",
             max_tokens_all_users,
-            model_class.__class__.__name__,
+            model_class,
         )
     except AttributeError:
         max_tokens_all_users = 131_072
