@@ -254,6 +254,10 @@ class TTPlatform(Platform):
         MAX_TOP_K = 20
 
         model_config = vllm_config.model_config
+        if model_config.logits_processors:
+            raise ValueError(
+                f"Custom logits_processors not supported on {cls.device_name} in V1"
+            )
         if model_config.max_logprobs > MAX_TOP_K:
             logger.warning(
                 "max_logprobs=%d exceeds TT device limit of %d, clamping to %d",
