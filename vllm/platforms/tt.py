@@ -126,7 +126,7 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(
         ModelRegistry,
         "TTQwen3_5ForConditionalGeneration",
-        "models.demos.qwen35_27b.tt.generator_vllm.py:Qwen35ForCausalLM",
+        "models.demos.qwen35_27b.tt.generator_vllm:Qwen35ForCausalLM",
     )
 
     # Qwen2.5 - Vision
