@@ -7,6 +7,7 @@ import sys
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
+import transformers
 
 from vllm.logger import init_logger
 
@@ -25,6 +26,19 @@ else:
 logger = init_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm.v1.core.sched.tt_scheduler.TTScheduler"
+
+
+def _install_transformers_compat_shims() -> None:
+    # Compatibility with newer transformers: TT multimodal helpers still
+    # import the pre-5.x AutoModelForVision2Seq name, but transformers 5.x
+    # renamed that factory to AutoModelForImageTextToText.
+    if (
+        not hasattr(transformers, "AutoModelForVision2Seq")
+        and hasattr(transformers, "AutoModelForImageTextToText")
+    ):
+        transformers.AutoModelForVision2Seq = (
+            transformers.AutoModelForImageTextToText
+        )
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -73,6 +87,7 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
 
 
 def register_tt_models(register_test_models=False) -> None:
+    _install_transformers_compat_shims()
     from vllm.model_executor.models.registry import ModelRegistry
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
@@ -304,6 +319,15 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if arch_names[i] == "TTGemma4ForConditionalGeneration":
                 arch_names[i] = "TTGemma4ForCausalLM"
+
+        if "TTGemma4ForCausalLM" in arch_names:
+            # TEMPORARY:
+            # Compatibility with current TT Gemma4 bring-up: HF advertises a
+            # very large default context, but the text-only TT path currently
+            # needs a smaller startup KV footprint to fit on 8-device meshes.
+            vllm_config.model_config.max_model_len = min(
+                vllm_config.model_config.max_model_len, 8192
+            )
 
         # Verify that the TT architecture is registered in the model registry
         from vllm.model_executor.models.registry import ModelRegistry

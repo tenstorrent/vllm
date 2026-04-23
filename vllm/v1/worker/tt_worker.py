@@ -140,9 +140,6 @@ class TTWorker(WorkerBase):
         parallel_config = self.parallel_config
         cache_config = self.cache_config
 
-        # Excludes TP factor since that is handled on the model side for TT.
-        total_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-        head_size = model_config.get_head_size()
         dtype = (
             model_config.dtype
             if cache_config.cache_dtype == "auto"
@@ -153,6 +150,9 @@ class TTWorker(WorkerBase):
         sliding_window = model_config.get_sliding_window()
         attn_spec: KVCacheSpec
         if use_mla:
+            # Excludes TP factor since that is handled on the model side for TT.
+            total_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+            head_size = model_config.get_head_size()
             assert not sliding_window, "MLA not supported for sliding window"
             attn_spec = MLAAttentionSpec(
                 block_size=cache_config.block_size,
@@ -160,14 +160,58 @@ class TTWorker(WorkerBase):
                 head_size=head_size,
                 dtype=dtype,
             )
-        else:
-            attn_spec = FullAttentionSpec(
-                block_size=cache_config.block_size,
-                num_kv_heads=total_num_kv_heads,
-                head_size=head_size,
-                dtype=dtype,
-                sliding_window=sliding_window,
+            kv_cache_spec: dict[str, KVCacheSpec] = {"foo": attn_spec}
+            return kv_cache_spec
+
+        hf_text_config = model_config.hf_text_config
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        head_dim = getattr(hf_text_config, "head_dim", None)
+
+        # TT still uses one full-length KV-cache regime for all attention
+        # layers, but Gemma4 needs per-layer head sizes. Derive a per-layer
+        # FullAttentionSpec directly from the HF config instead of relying on
+        # the single dummy spec.
+        if (
+            layer_types is not None
+            and head_dim is not None
+            and global_head_dim is not None
+            and head_dim != global_head_dim
+        ):
+            kv_cache_spec = {}
+            num_global_kv_heads = getattr(
+                hf_text_config,
+                "num_global_key_value_heads",
+                getattr(hf_text_config, "num_key_value_heads"),
             )
+            for layer_idx, layer_type in enumerate(layer_types):
+                is_sliding = layer_type == "sliding_attention"
+                kv_cache_spec[f"layer_{layer_idx}"] = FullAttentionSpec(
+                    block_size=cache_config.block_size,
+                    num_kv_heads=(
+                        getattr(hf_text_config, "num_key_value_heads")
+                        if is_sliding
+                        else num_global_kv_heads
+                    ),
+                    head_size=(
+                        getattr(hf_text_config, "head_dim")
+                        if is_sliding
+                        else global_head_dim
+                    ),
+                    dtype=dtype,
+                )
+            return kv_cache_spec
+
+        # Excludes TP factor since that is handled on the model side for TT.
+        total_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        head_size = model_config.get_head_size()
+        attn_spec = FullAttentionSpec(
+            block_size=cache_config.block_size,
+            num_kv_heads=total_num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            sliding_window=sliding_window,
+        )
         kv_cache_spec: dict[str, KVCacheSpec] = {"foo": attn_spec}
         return kv_cache_spec
 
@@ -427,6 +471,12 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
+
+    # TEMPORARY:
+    # Compatibility with current TT bring-up: if vLLM already clamped the
+    # model's effective max length, honor that here instead of allocating KV
+    # blocks for a much larger generic fallback budget.
+    max_tokens_all_users = min(max_tokens_all_users, model_config.max_model_len)
 
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
     # allocate an extra block_size per user since vLLM uses a worst-case

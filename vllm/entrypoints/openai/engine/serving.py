@@ -111,6 +111,7 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -997,6 +998,7 @@ class OpenAIServing:
         default_template_kwargs: dict[str, Any] | None,
         tool_dicts: list[dict[str, Any]] | None = None,
         tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
+        reasoning_parser: Callable[[TokenizerLike], ReasoningParser] | None = None,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         from vllm.tokenizers.mistral import MistralTokenizer
 
@@ -1025,6 +1027,10 @@ class OpenAIServing:
                 if (v := getattr(request, k, None)) is not None
             },
         )
+
+        if reasoning_parser is not None:
+            tokenizer = renderer.get_tokenizer()
+            request = reasoning_parser(tokenizer).adjust_request(request=request)
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -1060,6 +1066,7 @@ class OpenAIServing:
         messages: list[ResponseInputOutputItem],
         tool_dicts: list[dict[str, Any]] | None,
         tool_parser: Callable[[TokenizerLike], ToolParser] | None,
+        reasoning_parser: Callable[[TokenizerLike], ReasoningParser] | None,
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
     ):
@@ -1075,6 +1082,7 @@ class OpenAIServing:
             default_template_kwargs=None,
             tool_dicts=tool_dicts,
             tool_parser=tool_parser,
+            reasoning_parser=reasoning_parser,
         )
         return engine_prompts
 
@@ -1156,6 +1164,7 @@ class OpenAIServing:
                     context.parser.response_messages,
                     context.tool_dicts,
                     context.tool_parser_cls,
+                    context.reasoning_parser_cls,
                     context.chat_template,
                     context.chat_template_content_format,
                 )

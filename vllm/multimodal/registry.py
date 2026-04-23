@@ -130,6 +130,21 @@ class MultiModalRegistry:
         if not model_config.is_multimodal_model:
             return False
 
+        # Compatibility with newer transformers + TT Gemma4: the HF config is
+        # still multimodal (`Gemma4ForConditionalGeneration`), but the TT
+        # integration currently registers only a text-only wrapper.
+        from vllm.model_executor.model_loader import get_model_architecture
+
+        model_cls, _ = get_model_architecture(model_config)
+        if not hasattr(model_cls, "_processor_factory"):
+            logger.info_once(
+                "Model %s advertises multimodal config, but %s has no "
+                "registered multimodal processor. Running in text-only mode.",
+                model_config.model,
+                model_cls.__name__,
+            )
+            return False
+
         mm_config = model_config.get_multimodal_config()
         info = self._create_processing_info(model_config, tokenizer=None)
 

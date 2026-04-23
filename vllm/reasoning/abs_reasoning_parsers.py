@@ -6,7 +6,7 @@ import os
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.entrypoints.mcp.tool_server import ToolServer
 from vllm.logger import init_logger
@@ -145,6 +145,12 @@ class ReasoningParser:
         the current tokens/diffs, but also the information about what has
         previously been parsed and extracted (see constructor)
         """
+
+    def adjust_request(
+        self, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> "ChatCompletionRequest | ResponsesRequest":
+        """Adjust request parameters; override in subclasses as needed."""
+        return request
 
     def prepare_structured_tag(
         self,
@@ -294,7 +300,7 @@ class ReasoningParserManager:
             if isinstance(name, str):
                 names = [name]
             elif is_list_of(name, str):
-                names = name
+                names = cast(list[str], name)
             else:
                 names = [class_name]
 

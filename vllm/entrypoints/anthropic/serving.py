@@ -170,7 +170,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                 elif not tool_calls:
                     continue
 
-            openai_messages.append(openai_msg)
+            if not (msg.role == "user" and "content" not in openai_msg):
+                openai_messages.append(openai_msg)
 
         req = ChatCompletionRequest(
             model=anthropic_request.model,

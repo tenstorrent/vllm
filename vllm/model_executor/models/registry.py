@@ -797,6 +797,19 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
         return mi
 
     def load_model_cls(self) -> type[nn.Module]:
+        if self.module_name.startswith("models."):
+            import transformers
+
+            # Compatibility with newer transformers: external TT modules under
+            # tt-metal still import AutoModelForVision2Seq, but transformers
+            # 5.x renamed that factory to AutoModelForImageTextToText.
+            if (
+                not hasattr(transformers, "AutoModelForVision2Seq")
+                and hasattr(transformers, "AutoModelForImageTextToText")
+            ):
+                transformers.AutoModelForVision2Seq = (
+                    transformers.AutoModelForImageTextToText
+                )
         mod = importlib.import_module(self.module_name)
         return getattr(mod, self.class_name)
 

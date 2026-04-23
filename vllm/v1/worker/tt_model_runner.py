@@ -21,7 +21,11 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     LogprobsLists,
@@ -320,8 +324,12 @@ class TTModelRunner:
             )
         if isinstance(kv_cache_groups[0].kv_cache_spec, AttentionSpec):
             kv_cache_spec = kv_cache_groups[0].kv_cache_spec
+            per_layer_specs = None
+        elif isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
+            per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+            kv_cache_spec = next(iter(per_layer_specs.values()))
         else:
-            raise TypeError("Expected AttentionSpec")
+            raise TypeError("Expected AttentionSpec-compatible KV cache spec")
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             assert len(kv_cache_tensor.shared_by) == 1, (
@@ -374,11 +382,38 @@ class TTModelRunner:
             kv_cache_spec.head_size,
         )
         dtype = kv_cache_spec.dtype
+
+        if per_layer_specs is not None:
+            kv_cache_shapes: list[tuple[int, int, int, int]] = []
+            dtypes: list[torch.dtype] = []
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                layer_name = next(iter(kv_cache_tensor.shared_by))
+                layer_spec = per_layer_specs[layer_name]
+                assert isinstance(layer_spec, AttentionSpec)
+                layer_total_kv_heads = layer_spec.num_kv_heads
+                layer_num_kv_heads = layer_total_kv_heads // min(
+                    num_devices, layer_total_kv_heads
+                )
+                kv_cache_shapes.append(
+                    (
+                        kv_cache_config.num_blocks,
+                        layer_num_kv_heads,
+                        layer_spec.block_size,
+                        layer_spec.head_size,
+                    )
+                )
+                dtypes.append(layer_spec.dtype)
+
+            self.kv_caches = self.model.allocate_kv_cache(
+                kv_cache_shapes,
+                dtypes,
+                len(kv_cache_shapes),
+            )
+            return
+
         num_layers = model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
-
-        # Allocate KV cache tensors.
         self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape, dtype, num_layers)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:

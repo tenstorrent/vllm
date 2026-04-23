@@ -627,6 +627,7 @@ class OpenAIServingResponses(OpenAIServing):
             default_template_kwargs=None,
             tool_dicts=tool_dicts,
             tool_parser=self.parser.tool_parser_cls if self.parser else None,
+            reasoning_parser=self.parser.reasoning_parser_cls if self.parser else None,
         )
         return messages, engine_prompts
 

@@ -163,10 +163,15 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
 
         Setting ``add_special_tokens=False`` here prevents the duplicate and
         ensures both ``llm.generate()`` and the chat/completions API behave
-        correctly.
+        correctly for IT models. For PT models (without chat template), we
+        keep the default (True) to ensure BOS is added for raw prompts.
         """
+        tokenizer = self.ctx.get_tokenizer()
+        has_chat_template = getattr(tokenizer, "chat_template", None) is not None
+
         params = super().get_default_tok_params()
-        params = params.with_kwargs(add_special_tokens=False)
+        if has_chat_template:
+            params = params.with_kwargs(add_special_tokens=False)
         return params
 
     def get_hf_processor(self, **kwargs: object) -> Gemma4Processor:
@@ -848,7 +853,11 @@ class Gemma4MultimodalEmbedder(nn.Module):
     info=Gemma4ProcessingInfo,
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
-class Gemma4ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class Gemma4ForConditionalGeneration(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",

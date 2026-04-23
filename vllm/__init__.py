@@ -8,10 +8,21 @@ from .version import __version__, __version_tuple__  # isort:skip
 
 import typing
 
+import transformers
+
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
 import vllm.env_override  # noqa: F401
+
+# Compatibility with newer transformers: TT multimodal helpers still import
+# the pre-5.x AutoModelForVision2Seq name, but transformers 5.x renamed that
+# factory to AutoModelForImageTextToText.
+if (
+    not hasattr(transformers, "AutoModelForVision2Seq")
+    and hasattr(transformers, "AutoModelForImageTextToText")
+):
+    transformers.AutoModelForVision2Seq = transformers.AutoModelForImageTextToText
 
 MODULE_ATTRS = {
     "bc_linter_skip": "._bc_linter:bc_linter_skip",

@@ -204,6 +204,7 @@ class OpenAIServingChat(OpenAIServing):
                 default_template=self.chat_template,
                 default_template_content_format=self.chat_template_content_format,
                 default_template_kwargs=self.default_chat_template_kwargs,
+                reasoning_parser=self.reasoning_parser_cls,
             )
 
             elapsed = (time.perf_counter() - start_time) * 1000
@@ -300,6 +301,7 @@ class OpenAIServingChat(OpenAIServing):
                     default_template_kwargs=self.default_chat_template_kwargs,
                     tool_dicts=tool_dicts,
                     tool_parser=tool_parser,
+                    reasoning_parser=self.reasoning_parser_cls,
                 )
             else:
                 # For GPT-OSS.
