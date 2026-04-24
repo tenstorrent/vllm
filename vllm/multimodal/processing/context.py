@@ -433,7 +433,7 @@ class InputProcessingContext:
             requires_kw_only=False,
             allow_var_kwargs=True,
         )
-
+        logger.info("kwargs:", merged_kwargs, "allowed kwargs", allowed_kwargs)
         try:
             output = hf_processor(**data, **allowed_kwargs, return_tensors="pt")
         except Exception as exc:
@@ -459,6 +459,7 @@ class InputProcessingContext:
                     max_tries=max_tries,
                 )
 
+            logger.info(exc)
             msg = (
                 f"Failed to apply {type(hf_processor).__name__} "
                 f"on data={data} with kwargs={allowed_kwargs}"
