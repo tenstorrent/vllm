@@ -161,6 +161,15 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
+    # OLMo3 - Text
+    olmo3_text_version = os.getenv("TT_OLMO3_TEXT_VER", "olmo3_32b_galaxy")
+    if olmo3_text_version == "olmo3_32b_galaxy":
+        path_olmo3_text = (
+            "models.demos.olmo_galaxy.tt.generator_vllm:OLMo3ForCausalLM"
+        )
+        _register_model_if_missing(ModelRegistry, "TTOlmo2ForCausalLM", path_olmo3_text)
+        _register_model_if_missing(ModelRegistry, "TTOlmo3ForCausalLM", path_olmo3_text)
+
     # Optionally register test models if explicitly enabled
     if register_test_models:
         register_tt_test_models()
