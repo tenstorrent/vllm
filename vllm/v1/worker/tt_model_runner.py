@@ -1483,7 +1483,13 @@ class TTModelRunner:
                 **enc_dec_kwargs,
                 enable_trace=enable_trace,
                 read_from_device=True,
+                async_read=perform_device_sampling,
             )
+            if perform_device_sampling:
+                tt_out = self._finalize_async_decode_output(
+                    tt_out,
+                    is_tokens=True,
+                )
 
         # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
         # sampling is enabled with logprobs. Extract both components.
@@ -1507,6 +1513,16 @@ class TTModelRunner:
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
         )
+
+    def _finalize_async_decode_output(
+        self,
+        tt_out: tuple[tuple[Any, Any], list[Any]],
+        is_tokens: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tt_out_host, read_events = tt_out
+        for read_event in read_events:
+            ttnn.event_synchronize(read_event)
+        return self.model.process_decode_output_host(tt_out_host, is_tokens=is_tokens)
 
     def _get_output_tokens(
         self,
@@ -1545,7 +1561,15 @@ class TTModelRunner:
                     # Fixed stride segments per DP rank for decode
                     start += self.scheduler_config.max_num_seqs
                 continue
-            if not perform_device_sampling:
+            prefill_tokens_already_sampled = (
+                not perform_device_sampling and not is_decode and tt_out.ndim == 1
+            )
+            if prefill_tokens_already_sampled:
+                # Some TT model wrappers return sampled first-token IDs from
+                # prefill even when decode sampling will run on device later.
+                next_token_ids = tt_out[start : start + sz]
+                logprobs_per_dp.append(None)
+            elif not perform_device_sampling:
                 logits = tt_out[start : start + sz, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
