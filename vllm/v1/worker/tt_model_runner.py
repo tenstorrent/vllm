@@ -1832,7 +1832,6 @@ class TTModelRunner:
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
-
     def _get_output_tokens(
         self,
         tt_out: torch.Tensor,
@@ -1870,7 +1869,15 @@ class TTModelRunner:
                     # Fixed stride segments per DP rank for decode
                     start += self.scheduler_config.max_num_seqs
                 continue
-            if not perform_device_sampling:
+            prefill_tokens_already_sampled = (
+                not perform_device_sampling and not is_decode and tt_out.ndim == 1
+            )
+            if prefill_tokens_already_sampled:
+                # Some TT model wrappers return sampled first-token IDs from
+                # prefill even when decode sampling will run on device later.
+                next_token_ids = tt_out[start : start + sz]
+                logprobs_per_dp.append(None)
+            elif not perform_device_sampling:
                 logits = tt_out[start : start + sz, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]

@@ -182,10 +182,12 @@ class TTWorker(WorkerBase):
         Spyre/Neuron backends and override the number of kv cache blocks.
         """
 
-        # TODO: Once we can run profiling, return real available memory
-        # instead of overriding the number of blocks.
-        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)
-        self.cache_config.num_gpu_blocks_override = num_tt_blocks
+        # TODO: Once we can run profiling, return real available memory.
+        # Preserve explicit model/user overrides; otherwise provide TT's
+        # static block estimate because this backend does not profile memory.
+        if self.cache_config.num_gpu_blocks_override is None:
+            num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)
+            self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return 1 << 64
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
