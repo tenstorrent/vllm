@@ -8,7 +8,7 @@ The emphasis here is on the concepts:
 - non-DP vs gathered-DP
 - what is scheduled locally vs what is coordinated globally
 
-Code pointers are intentionally minimal. If you need them, the main entry points are `vllm/v1/core/sched/tt_scheduler.py`, `vllm/v1/engine/tt_engine_step.py`, and `vllm/v1/worker/tt_async_decode.py` in the TT vLLM tree.
+Code pointers are intentionally minimal. If you need them, the main entry points are `plugins/vllm-tt-plugin/src/vllm_tt_plugin/scheduler.py`, `vllm/v1/engine/tt_engine_step.py`, and `plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py` in the TT vLLM tree.
 
 ## Short Version
 

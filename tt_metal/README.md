@@ -5,6 +5,7 @@
 - [vLLM and TT-Metal Branches](#vllm-and-tt-metal-branches)
 - [System Requirements](#system-requirements)
 - [Environment Creation](#environment-creation)
+- [TT Plugin Package](#tt-plugin-package)
 - [Accessing the Meta-Llama Hugging Face Models](#accessing-the-meta-llama-hugging-face-models)
 - [Preparing the TT-Metal Models](#preparing-the-tt-metal-models)
 - [Running the Offline Inference Example](#running-the-offline-inference-example)
@@ -38,6 +39,12 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
     source tt_metal/install-vllm-tt.sh
     ```
 
+3. Install the TT backend plugin package from the vLLM repo:
+
+    ```sh
+    uv pip install --no-deps -e plugins/vllm-tt-plugin
+    ```
+
 > **Note for developers**: Optionally install pre-commit hooks for linting, formatting, and static type checking on commits by running `pre-commit install`.
 
 **To activate the vLLM+tt-metal environment (after the first time):**
@@ -49,6 +56,41 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
     ```
 
 2. Ensure that the `PYTHONPATH` environment variable contains the path to tt-metal (should already have been set when installing tt-metal).
+
+3. Ensure the TT backend plugin is installed in the active environment:
+
+    ```sh
+    python -c "import vllm_tt_plugin; print(vllm_tt_plugin.__file__)"
+    ```
+
+## TT Plugin Package
+
+The TT backend is in a Phase 1 out-of-tree plugin package located at:
+
+```text
+plugins/vllm-tt-plugin
+```
+
+Install it once per Python environment after installing vLLM:
+
+```sh
+uv pip install --no-deps -e plugins/vllm-tt-plugin
+```
+
+The editable install registers two vLLM entry points:
+
+- `vllm.general_plugins`: registers TT model architectures.
+- `vllm.platform_plugins`: activates `vllm_tt_plugin.platform.TTPlatform` when `ttnn` is available.
+
+The plugin currently owns TT model registration, platform/config logic, worker, model runner, input batch, async decode helpers, scheduler, and model loader. The vLLM fork still contains TT compatibility files and fork-only execution paths, including gathered-DP execution and TT launcher support. Those pieces remain in the fork until the execution and launcher abstractions are generalized in a later phase.
+
+Because the plugin is installed in editable mode, normal Python changes under `plugins/vllm-tt-plugin/src/vllm_tt_plugin/` take effect after restarting the Python or vLLM process. Reinstall the plugin only when package metadata or entry points change, such as changes to `plugins/vllm-tt-plugin/pyproject.toml`.
+
+If `VLLM_PLUGINS` is set, it must allow both TT plugin entry point names:
+
+```sh
+export VLLM_PLUGINS=tt,tt_model_registry
+```
 
 ## Accessing the Meta-Llama Hugging Face Models
 

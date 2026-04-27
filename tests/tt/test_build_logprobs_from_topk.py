@@ -7,9 +7,13 @@ that the helper correctly packs top-K logprobs into LogprobsTensors
 for the downstream vLLM pipeline.
 """
 
+from importlib import import_module
+
 import torch
 
-from vllm.v1.worker.tt_model_runner import _build_logprobs_from_topk
+_build_logprobs_from_topk = import_module(
+    "vllm_tt_plugin.model_runner"
+)._build_logprobs_from_topk
 
 
 class TestBuildLogprobsFromTopk:
