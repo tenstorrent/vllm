@@ -14,9 +14,7 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm_tt_plugin.loader import TTModelLoader
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm_tt_plugin.platform import TTPlatform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -42,6 +40,8 @@ from vllm_tt_plugin.input_batch import (
     CachedRequestState,
     InputBatch,
 )
+from vllm_tt_plugin.loader import TTModelLoader
+from vllm_tt_plugin.platform import TTPlatform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput

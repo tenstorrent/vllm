@@ -12,11 +12,6 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm_tt_plugin.platform import (
-    TTPlatform,
-    _should_pre_register_tt_test_models_from_cli,
-    register_tt_models,
-)
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (
@@ -26,8 +21,13 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _should_pre_register_tt_test_models_from_cli,
+    register_tt_models,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
