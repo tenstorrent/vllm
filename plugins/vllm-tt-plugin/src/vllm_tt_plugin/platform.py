@@ -4,14 +4,13 @@
 import json
 import os
 import sys
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
 from vllm.logger import init_logger
 
-from .interface import Platform, PlatformEnum
+from vllm.platforms.interface import Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -25,21 +24,7 @@ else:
 
 logger = init_logger(__name__)
 
-def _prefer_tt_plugin_cls(plugin_qualname: str, fallback_qualname: str) -> str:
-    """Use the TT plugin class when the Phase 1 plugin is installed."""
-    if find_spec("vllm_tt_plugin") is not None:
-        return plugin_qualname
-    return fallback_qualname
-
-
-TT_SCHEDULER_CLS = _prefer_tt_plugin_cls(
-    "vllm_tt_plugin.scheduler.TTScheduler",
-    "vllm.v1.core.sched.tt_scheduler.TTScheduler",
-)
-TT_WORKER_CLS = _prefer_tt_plugin_cls(
-    "vllm_tt_plugin.worker.TTWorker",
-    "vllm.v1.worker.tt_worker.TTWorker",
-)
+TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -296,7 +281,7 @@ class TTPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = TT_WORKER_CLS
+            parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"

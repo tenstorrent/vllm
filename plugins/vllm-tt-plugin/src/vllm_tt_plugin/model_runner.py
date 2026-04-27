@@ -7,18 +7,16 @@ import os
 import threading
 from collections import deque
 from dataclasses import dataclass, fields
-from importlib import import_module
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
-import numpy as np
 import torch
 import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm_tt_plugin.loader import TTModelLoader
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.platforms.tt import TTPlatform
+from vllm_tt_plugin.platform import TTPlatform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -33,25 +31,22 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.tt_async_decode import (
+from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     TTAsyncDecodeController,
 )
-from vllm.v1.worker.tt_input_batch import (
+from vllm_tt_plugin.input_batch import (
     LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
     CachedRequestState,
     InputBatch,
 )
 
-if find_spec("vllm_tt_plugin") is not None:
-    TTModelLoader = import_module("vllm_tt_plugin.loader").TTModelLoader
-else:
-    from vllm.model_executor.model_loader.tt_loader import TTModelLoader
-
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+import numpy as np
 
 logger = init_logger(__name__)
 
