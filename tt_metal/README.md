@@ -33,16 +33,10 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 **To create the vLLM+tt-metal environment (first time):**
 
 1. Install tt-metal following the instructions in [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) (build and create the virtual environment if [installing tt-metal from source](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md#source)). Ensure that the necessary environment variables for running tt-metal tests were set.
-2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM (Note: `dev` is the main vLLM branch):
+2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM and the TT backend plugin (Note: `dev` is the main vLLM branch):
 
     ```sh
     source tt_metal/install-vllm-tt.sh
-    ```
-
-3. Install the TT backend plugin package from the vLLM repo:
-
-    ```sh
-    uv pip install --no-deps -e plugins/vllm-tt-plugin
     ```
 
 > **Note for developers**: Optionally install pre-commit hooks for linting, formatting, and static type checking on commits by running `pre-commit install`.
@@ -71,11 +65,13 @@ The TT backend is in a Phase 1 out-of-tree plugin package located at:
 plugins/vllm-tt-plugin
 ```
 
-Install it once per Python environment after installing vLLM:
+The `tt_metal/install-vllm-tt.sh` script installs this package after installing vLLM:
 
 ```sh
-uv pip install --no-deps -e plugins/vllm-tt-plugin
+source tt_metal/install-vllm-tt.sh
 ```
+
+To install or refresh only the plugin package, run `uv pip install --no-deps -e plugins/vllm-tt-plugin`.
 
 The editable install registers two vLLM entry points:
 
