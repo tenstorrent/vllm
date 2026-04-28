@@ -616,9 +616,6 @@ class ModelConfig:
         # Avoid running try_verify_and_update_config multiple times
         self.config_updated = False
 
-        if not current_platform.is_tt() and self.override_tt_config:
-            raise ValueError("`override_tt_config` is only supported on TT devices.")
-
         self._try_verify_and_update_model_config()
         self._verify_quantization()
         self._verify_cuda_graph()

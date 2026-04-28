@@ -9,7 +9,6 @@ from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, TypeVar, cast
@@ -19,7 +18,6 @@ import torch
 import torch.distributed as dist
 import zmq
 
-import vllm.v1.engine.tt_engine_step as tt_engine_step
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
@@ -36,6 +34,7 @@ from vllm.utils.gc_utils import (
     maybe_attach_gc_debug_callback,
 )
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
@@ -47,7 +46,6 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.tt_scheduler import TTSchedulingMode
 from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -82,39 +80,8 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
-@dataclass
-class DPGatherHandle:
-    future: Future[tuple[torch.Tensor, list]]
-    scheduler_output: SchedulerOutput | None
-    local_has_requests: bool
-    is_decode: bool
-    overlap_ok: bool
-    any_needs_logprobs: bool
-    req_ids: list[str]
-    req_id_to_index: dict[str, int]
-
-
 class EngineCore:
     """Inner loop of vLLM's Engine."""
-
-    # Gathered-DP subclasses initialize these before guarded access sites use
-    # them. Declaring them here lets mypy type-check direct attribute access.
-    requires_gather: bool
-    _dp_gather_forced_mode: TTSchedulingMode
-
-    def _dp_any_rank_has_scheduler_requests(self) -> bool:
-        raise NotImplementedError
-
-    def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
-        raise NotImplementedError
-
-    def _dp_apply_forced_mode(self, forced_mode: TTSchedulingMode) -> None:
-        raise NotImplementedError
-
-    def _execute_model_dp_gather(
-        self, scheduler_output: SchedulerOutput | None
-    ) -> ModelRunnerOutput:
-        raise NotImplementedError
 
     def __init__(
         self,
@@ -248,12 +215,6 @@ class EngineCore:
         self.step_fn: Callable[[], tuple[dict[int, EngineCoreOutputs] | None, bool]]
         if self.batch_queue is None:
             self.step_fn = self.step
-        elif (
-            current_platform.is_tt()
-            and vllm_config.scheduler_config.async_scheduling
-            and vllm_config.parallel_config.data_parallel_size == 1
-        ):
-            self.step_fn = self.step_with_batch_queue_tt
         else:
             self.step_fn = self.step_with_batch_queue
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
@@ -446,61 +407,27 @@ class EngineCore:
         if self._scheduler_paused:
             return {}, False
 
-        forced_mode = TTSchedulingMode.DEFAULT
-        requires_gather = hasattr(self, "requires_gather") and self.requires_gather
-        if requires_gather:
-            # For gathered DP execution, agree on mode before any early returns.
-            if not self._dp_any_rank_has_scheduler_requests():
-                # No rank has work, return early without scheduling.
-                return {}, False
-            forced_mode = self._dp_negotiate_forced_mode()
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            if requires_gather:
-                # Enter DP-gather every iteration to keep collectives ordered.
-                assert hasattr(self, "_execute_model_dp_gather")
-                _ = self._execute_model_dp_gather(None)
             return {}, False
-
-        if requires_gather:
-            self._dp_apply_forced_mode(forced_mode)
 
         scheduler_output = self.scheduler.schedule()
 
-        if requires_gather:
-            # Reset the forced mode to the default for the next step
-            self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
-
-        is_tt = current_platform.is_tt()
         grammar_output = None
         model_output: ModelRunnerOutput | None
 
-        if requires_gather:
-            # Gathered-DP routes through the TT helper, which coordinates the
-            # cross-rank gather/execute/scatter sequence before local results
-            # can be applied.
-            assert hasattr(self, "_execute_model_dp_gather")
-            model_output = self._execute_model_dp_gather(scheduler_output)
-        else:
-            # Regular execution can launch the model first and overlap grammar
-            # work while the executor is running.
-            future = self.model_executor.execute_model(scheduler_output, non_block=True)
-            if not is_tt:
-                # TT scheduler outputs already include the grammar bitmask:
-                # `TTScheduler.schedule()` calls `_finalize_scheduler_output()`,
-                # which calls `get_grammar_bitmask()` before we reach EngineCore.
-                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-            with (
-                self.log_error_detail(scheduler_output),
-                self.log_iteration_details(scheduler_output),
-            ):
-                model_output = future.result()  # Wait right after execution.
-                if model_output is None:
-                    # Most backends sample after execute_model(); TT keeps that
-                    # work inside execute_model(), so this branch is skipped there.
-                    model_output = self.model_executor.sample_tokens(grammar_output)
+        # Regular execution can launch the model first and overlap grammar
+        # work while the executor is running.
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
+            model_output = future.result()  # Wait right after execution.
+            if model_output is None:
+                model_output = self.model_executor.sample_tokens(grammar_output)
         assert model_output is not None
 
         # Before processing the model output, process any aborts that happened
@@ -641,11 +568,6 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
-
-    def step_with_batch_queue_tt(
-        self,
-    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        return tt_engine_step.step_with_batch_queue_tt(self)
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -1078,12 +1000,17 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and (
-                vllm_config.model_config.is_moe or current_platform.is_tt()
-            ):
+            uses_dp_engine_core = (
+                parallel_config.dp_engine_core_proc_cls
+                != "vllm.v1.engine.core.DPEngineCoreProc"
+            )
+            if data_parallel and (vllm_config.model_config.is_moe or uses_dp_engine_core):
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
-                engine_core = DPEngineCoreProc(*args, **kwargs)
+                engine_core_cls = resolve_obj_by_qualname(
+                    parallel_config.dp_engine_core_proc_cls
+                )
+                engine_core = engine_core_cls(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
@@ -1091,7 +1018,12 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                engine_core_cls = resolve_obj_by_qualname(
+                    parallel_config.engine_core_proc_cls
+                )
+                engine_core = engine_core_cls(
+                    *args, engine_index=dp_rank, **kwargs
+                )
 
             assert engine_core is not None
             engine_core.run_busy_loop()
@@ -1457,8 +1389,13 @@ class DPEngineCoreProc(EngineCoreProc):
         log_stats: bool,
         client_handshake_address: str | None = None,
     ):
-        assert vllm_config.model_config.is_moe or current_platform.is_tt(), (
-            "DPEngineCoreProc should only be used for MoE models or TT DP"
+        uses_dp_engine_core = (
+            vllm_config.parallel_config.dp_engine_core_proc_cls
+            != "vllm.v1.engine.core.DPEngineCoreProc"
+        )
+        assert vllm_config.model_config.is_moe or uses_dp_engine_core, (
+            "DPEngineCoreProc should only be used for MoE models or a selected "
+            "DP engine-core subclass"
         )
 
         # Counts forward-passes of the model so that we can synchronize
@@ -1490,7 +1427,7 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
         )
         if self.requires_gather:
-            self._dp_in_flight: DPGatherHandle | None = None
+            self._dp_in_flight: Any | None = None
             if self.batch_queue is not None:
                 self.step_fn = self.step_dp_with_batch_queue
 
@@ -1739,24 +1676,6 @@ class DPEngineCoreProc(EngineCoreProc):
             logger.info(
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
-
-    def _dp_any_rank_has_scheduler_requests(self) -> bool:
-        return tt_engine_step._dp_any_rank_has_scheduler_requests(self)
-
-    def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
-        return tt_engine_step._dp_negotiate_forced_mode(self)
-
-    def _dp_apply_forced_mode(self, forced_mode: TTSchedulingMode) -> None:
-        tt_engine_step._dp_apply_forced_mode(self, forced_mode)
-
-    def step_dp_with_batch_queue(
-        self,
-    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        return tt_engine_step.step_dp_with_batch_queue(self)
-
-    def _execute_model_dp_gather(self, scheduler_output: SchedulerOutput | None):
-        return tt_engine_step._execute_model_dp_gather(self, scheduler_output)
-
 
 class EngineCoreActorMixin:
     """

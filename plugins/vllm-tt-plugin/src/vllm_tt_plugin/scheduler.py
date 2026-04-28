@@ -2,15 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import cast
+from enum import Enum
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.core.sched.tt_scheduler import TTSchedulingMode
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class TTSchedulingMode(Enum):
+    DEFAULT = "default"
+    DECODE_ONLY = "decode_only"
+    PREFILL_ONLY = "prefill_only"
+
+    @classmethod
+    def from_prefill_intent(cls, prefill_intent: int) -> "TTSchedulingMode":
+        if prefill_intent == 0:
+            return cls.DECODE_ONLY
+        if prefill_intent == 1:
+            return cls.PREFILL_ONLY
+        raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
 
 
 class TTScheduler(AsyncScheduler):

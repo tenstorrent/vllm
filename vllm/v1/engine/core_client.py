@@ -26,6 +26,7 @@ from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.async_utils import in_loop
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import (
     close_sockets,
     get_open_port,
@@ -41,7 +42,7 @@ from vllm.v1.engine import (
     UtilityOutput,
 )
 from vllm.v1.engine.coordinator import DPCoordinator
-from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -274,7 +275,11 @@ class InprocClient(EngineCoreClient):
     """
 
     def __init__(self, *args, **kwargs):
-        self.engine_core = EngineCore(*args, **kwargs)
+        vllm_config: VllmConfig = args[0] if args else kwargs["vllm_config"]
+        engine_core_cls = resolve_obj_by_qualname(
+            vllm_config.parallel_config.engine_core_cls
+        )
+        self.engine_core = engine_core_cls(*args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()

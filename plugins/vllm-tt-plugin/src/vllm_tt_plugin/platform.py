@@ -10,6 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
+from vllm_tt_plugin.config import get_tt_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -279,7 +280,7 @@ class TTPlatform(Platform):
         # engine/worker subprocess startup ordering where model architectures
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
-        override_tt_config = vllm_config.model_config.override_tt_config
+        override_tt_config = get_tt_config(vllm_config)
         register_test_models = False
         if override_tt_config and "register_test_models" in override_tt_config:
             register_test_models = override_tt_config["register_test_models"]
@@ -291,6 +292,16 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+        parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
+        parallel_config.engine_core_proc_cls = (
+            "vllm_tt_plugin.engine.TTEngineCoreProc"
+        )
+        parallel_config.dp_engine_core_proc_cls = (
+            "vllm_tt_plugin.engine.TTDPEngineCoreProc"
+        )
+        parallel_config.engine_core_launcher_cls = (
+            "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
+        )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"

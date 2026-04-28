@@ -20,6 +20,7 @@ from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -75,6 +76,57 @@ class EngineHandshakeMetadata:
 
     addresses: EngineZmqAddresses
     parallel_config: dict[str, int | str | list[int]]
+
+
+@dataclass
+class EngineLaunchPlan:
+    remote_launched: bool = False
+    non_device_dp_ranks: set[int] | None = None
+
+
+class CoreEngineLauncher:
+    """Default engine-core launcher extension point."""
+
+    def prepare_launch(self, vllm_config: VllmConfig) -> EngineLaunchPlan:
+        return EngineLaunchPlan()
+
+    def get_engines_to_handshake(
+        self,
+        vllm_config: VllmConfig,
+        local_engine_count: int,
+        local_start_index: int | None,
+        dp_rank: int,
+        dp_size: int,
+        local_engines_only: bool,
+        offline_mode: bool,
+        plan: EngineLaunchPlan,
+    ) -> list[CoreEngine]:
+        if offline_mode:
+            assert local_engine_count == 1
+            return [CoreEngine(index=dp_rank, local=True)]
+        if dp_rank == 0:
+            return [
+                CoreEngine(index=i, local=(i < local_engine_count))
+                for i in range(dp_size)
+            ]
+        assert local_engines_only, (
+            "Attempting to launch core_engines from dp_rank > 0, but "
+            "found internal DPLB, which is incompatible."
+        )
+        return [
+            CoreEngine(index=i, local=True)
+            for i in range(dp_rank, dp_rank + local_engine_count)
+        ]
+
+    def launch_remote_engines(
+        self,
+        plan: EngineLaunchPlan,
+        handshake_address: str,
+        vllm_config: VllmConfig,
+        log_stats: bool,
+        cleanup_target: object,
+    ) -> None:
+        return None
 
 
 class CoreEngineProcManager:
@@ -263,16 +315,17 @@ class CoreEngineActorManager:
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        from vllm.platforms import current_platform
-        from vllm.v1.engine.core import DPMoEEngineCoreActor, EngineCoreActor
-
         dp_size = vllm_config.parallel_config.data_parallel_size
-        actor_class = (
-            DPMoEEngineCoreActor
-            if dp_size > 1
-            and (vllm_config.model_config.is_moe or current_platform.is_tt())
-            else EngineCoreActor
+        uses_dp_actor = (
+            vllm_config.parallel_config.dp_engine_core_actor_cls
+            != "vllm.v1.engine.core.DPMoEEngineCoreActor"
         )
+        actor_cls_qualname = (
+            vllm_config.parallel_config.dp_engine_core_actor_cls
+            if dp_size > 1 and (vllm_config.model_config.is_moe or uses_dp_actor)
+            else vllm_config.parallel_config.engine_core_actor_cls
+        )
+        actor_class = resolve_obj_by_qualname(actor_cls_qualname)
 
         self.local_engine_actors: list[ray.ActorHandle] = []
         self.remote_engine_actors: list[ray.ActorHandle] = []
@@ -653,14 +706,16 @@ class CoreEngineActorManager:
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        from vllm.platforms import current_platform
-        from vllm.v1.engine.core import DPMoEEngineCoreActor, EngineCoreActor
-
-        actor_class = (
-            DPMoEEngineCoreActor
-            if cur_vllm_config.model_config.is_moe or current_platform.is_tt()
-            else EngineCoreActor
+        uses_dp_actor = (
+            cur_vllm_config.parallel_config.dp_engine_core_actor_cls
+            != "vllm.v1.engine.core.DPMoEEngineCoreActor"
         )
+        actor_cls_qualname = (
+            cur_vllm_config.parallel_config.dp_engine_core_actor_cls
+            if cur_vllm_config.model_config.is_moe or uses_dp_actor
+            else cur_vllm_config.parallel_config.engine_core_actor_cls
+        )
+        actor_class = resolve_obj_by_qualname(actor_cls_qualname)
 
         cur_data_parallel_size = len(self.local_engine_actors) + len(
             self.remote_engine_actors
@@ -806,24 +861,10 @@ def launch_core_engines(
 ]:
     """Launch engine and DP coordinator processes as needed."""
 
-    # Parse TT-MPI args as early as possible so address topology reflects
-    # remote MPI-launched device ranks. This may change local_engine_count.
-    use_tt_mpi = False
-    from vllm.platforms import current_platform
-
-    if current_platform.is_tt():
-        from vllm.v1.engine.tt_core_launcher import parse_tt_mpi_params
-
-        rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
-        use_tt_mpi = rank_binding_file is not None
-        if use_tt_mpi:
-            # Device ranks (one per host) are launched via MPI and considered
-            # remote here; only non-device ranks are local on host 0.
-            vllm_config.parallel_config.data_parallel_size_local = len(
-                non_device_dp_ranks
-            )
-
     parallel_config = vllm_config.parallel_config
+    launcher_cls = resolve_obj_by_qualname(parallel_config.engine_core_launcher_cls)
+    launcher: CoreEngineLauncher = launcher_cls()
+    launch_plan = launcher.prepare_launch(vllm_config)
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
     local_start_index = parallel_config.data_parallel_rank_local
@@ -892,36 +933,16 @@ def launch_core_engines(
         yield engine_actor_manager, coordinator, addresses
         return
 
-    if use_tt_mpi:
-        # Override local DP size to exclude device DP ranks.
-        # Device ranks are considered remote since they're launched via MPI,
-        # and are expected to connect over the handshake socket as they have no
-        # local process sentinel.
-        engines_to_handshake = [
-            CoreEngine(index=i, local=(i in non_device_dp_ranks))
-            for i in range(vllm_config.parallel_config.data_parallel_size)
-        ]
-    elif offline_mode:
-        assert local_engine_count == 1
-        engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
-    elif dp_rank == 0:
-        # Rank 0 holds Coordinator, so it handshakes with all Cores
-        # in both external dplb and internal dplb mode.
-        # Note this also covers the case where we have zero local engines
-        # and rank 0 is headless.
-        engines_to_handshake = [
-            CoreEngine(index=i, local=(i < local_engine_count)) for i in range(dp_size)
-        ]
-    else:
-        # Rank > 0 handshakes with just the local cores it is managing.
-        assert local_engines_only, (
-            "Attempting to launch core_engines from dp_rank > 0, but "
-            "found internal DPLB, which is incompatible."
-        )
-        engines_to_handshake = [
-            CoreEngine(index=i, local=True)
-            for i in range(dp_rank, dp_rank + local_engine_count)
-        ]
+    engines_to_handshake = launcher.get_engines_to_handshake(
+        vllm_config,
+        local_engine_count,
+        local_start_index,
+        dp_rank,
+        dp_size,
+        local_engines_only,
+        offline_mode,
+        launch_plan,
+    )
 
     # Whether the started engines will handshake only with co-located
     # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
@@ -944,47 +965,26 @@ def launch_core_engines(
     with zmq_socket_ctx(
         local_handshake_address, zmq.ROUTER, bind=True
     ) as handshake_socket:
-        from vllm.v1.engine.core import EngineCoreProc
-
         local_engine_dp_ranks = None
-        if use_tt_mpi:
-            # Mixed-launch: start all non-device DP ranks locally on host 0 and
-            # launch device ranks (including on other hosts) via tt-run (MPI).
-            # Device ranks have local_dp_rank=0 and
-            # dp_rank = mpi_rank * (dp_size // mpi_world).
-            # Non-device ranks have local_dp_rank=1..len(non_device_dp_ranks).
-            logger.info(
-                "TT-MPI mixed launch: dp_size=%d local_count=%d "
-                "non_device_ranks=%s handshake=%s",
-                parallel_config.data_parallel_size,
-                parallel_config.data_parallel_size_local,
-                non_device_dp_ranks,
+        engine_core_proc_cls = resolve_obj_by_qualname(
+            parallel_config.engine_core_proc_cls
+        )
+        if launch_plan.remote_launched:
+            launcher.launch_remote_engines(
+                launch_plan,
                 handshake_address,
+                vllm_config,
+                log_stats,
+                addresses,
             )
-            assert dp_rank == 0, "TT MPI must be launched from rank 0"
-            from vllm.v1.engine.tt_core_launcher import tt_run_launch
-
-            # Pass addresses so finalizer persists while engines run.
-            assert isinstance(rank_binding_file, str), (
-                "rank_binding_file must be a non-empty string"
-            )
-            tt_run_launch(
-                handshake_address=handshake_address,
-                vllm_config=vllm_config,
-                rank_binding_file=rank_binding_file,
-                log_stats=log_stats,
-                cleanup_target=addresses,
-            )
-            if non_device_dp_ranks:
-                # Use CoreEngineProcManager with explicit dp_ranks list.
-                # local_dp_rank starts at 1 (0 is reserved for device rank).
-                local_engine_dp_ranks = sorted(non_device_dp_ranks)
+            if launch_plan.non_device_dp_ranks:
+                local_engine_dp_ranks = sorted(launch_plan.non_device_dp_ranks)
                 local_start_index = 1
 
         # Start local engines.
         if local_engine_count:
             local_engine_manager = CoreEngineProcManager(
-                EngineCoreProc.run_engine_core,
+                engine_core_proc_cls.run_engine_core,
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=log_stats,

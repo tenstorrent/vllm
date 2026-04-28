@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm_tt_plugin.config import get_tt_config
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
@@ -60,7 +61,7 @@ class TTWorker(WorkerBase):
         self.mesh_device = None
 
         # Whether to use ttnn tracing for model execution
-        override_tt_config = self.model_config.override_tt_config
+        override_tt_config = get_tt_config(self.vllm_config)
         trace_key = "trace_mode"
         self.trace_mode = "all"
         if override_tt_config and trace_key in override_tt_config:
@@ -89,7 +90,7 @@ class TTWorker(WorkerBase):
         # Open mesh only on local DP rank 0 (device ranks).
         if local_dp_rank == 0:
             self.mesh_device = open_mesh_device(
-                self.model_config.override_tt_config, self.trace_mode, local_dp_rank
+                get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
             )
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
@@ -417,7 +418,7 @@ class TTWorker(WorkerBase):
 
             if self.mesh_device:
                 close_mesh_device(
-                    self.mesh_device, self.model_config.override_tt_config
+                    self.mesh_device, get_tt_config(self.vllm_config)
                 )
                 del self.mesh_device
 

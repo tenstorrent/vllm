@@ -273,6 +273,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    plugin_config: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    """Plugin-owned configuration keyed by plugin namespace."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1477,7 +1479,7 @@ class VllmConfig:
             f"enable_prefix_caching={self.cache_config.enable_prefix_caching}, "
             f"enable_chunked_prefill={self.scheduler_config.enable_chunked_prefill}, "  # noqa
             f"pooler_config={self.model_config.pooler_config!r}, "
-            f"override_tt_config={self.model_config.override_tt_config!r}, "
+            f"plugin_config={self.plugin_config!r}, "
             f"compilation_config={self.compilation_config!r}"
         )
 
