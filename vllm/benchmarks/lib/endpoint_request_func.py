@@ -345,7 +345,13 @@ async def async_request_openai_chat_completions(
                             data = json.loads(chunk)
 
                             if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
+                                delta = choices[0]["delta"]
+                                # Count reasoning_content tokens (e.g. GPT-OSS
+                                # harmony reasoning channel) the same as
+                                # regular content; both are produced tokens.
+                                content = delta.get("content") or delta.get(
+                                    "reasoning_content"
+                                )
                                 # First token
                                 if ttft == 0.0:
                                     ttft = timestamp - st
@@ -453,7 +459,10 @@ async def async_request_openai_audio(
                                 data = json.loads(chunk)
 
                                 if choices := data.get("choices"):
-                                    content = choices[0]["delta"].get("content")
+                                    delta = choices[0]["delta"]
+                                    content = delta.get("content") or delta.get(
+                                        "reasoning_content"
+                                    )
                                     # First token
                                     if ttft == 0.0:
                                         ttft = timestamp - st
