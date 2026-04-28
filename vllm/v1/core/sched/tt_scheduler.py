@@ -48,9 +48,9 @@ class TTScheduler(AsyncScheduler):
       queue is non-empty).
     - ``TTSchedulingMode.PREFILL_ONLY`` forces prefill-only (and may return an
       empty batch when waiting is empty).
-    - ``TTSchedulingMode.DEFAULT`` uses the default policy: prefer prefill
-      when waiting is non-empty, but fall back to decode-only if prefill
-      cannot admit any request and running decode requests exist.
+    - ``TTSchedulingMode.DEFAULT`` uses the default policy: prefer decode
+      while requests are running, but fall back to prefill if decode cannot
+      advance.
     """
 
     waiting: RequestQueue
@@ -83,15 +83,20 @@ class TTScheduler(AsyncScheduler):
             return self._finalize_scheduler_output(result)
 
         # Default mode:
-        # Prefer prefill whenever waiting is non-empty to admit new requests.
+        # TT cannot mix prefill and decode in one batch. Once decode is active,
+        # prioritize it so new prefills do not create long inter-token gaps.
+        if has_running:
+            decode_result = self._schedule_decode_only()
+            if decode_result.total_num_scheduled_tokens > 0 or not has_waiting:
+                return self._finalize_scheduler_output(decode_result)
+            # If decode cannot advance, admit prefill work to avoid stalling.
+            result = self._schedule_prefill_only()
+            return self._finalize_scheduler_output(result)
+
         if has_waiting:
             prefill_result = self._schedule_prefill_only()
-            # If waiting is non-empty but prefill cannot be admitted (e.g. KV
-            # pressure and no chunked prefill), do not stall decode progress.
-            # Fall back to decode-only so running requests can advance and free
-            # capacity for later full-prefill admission.
-            if prefill_result.total_num_scheduled_tokens == 0 and has_running:
-                result = self._schedule_decode_only()
+            if prefill_result.total_num_scheduled_tokens == 0:
+                result = super().schedule()
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
@@ -156,3 +161,4 @@ class TTScheduler(AsyncScheduler):
                 saved_waiting.prepend_requests(self.waiting)
             self.waiting = saved_waiting
         return result
+

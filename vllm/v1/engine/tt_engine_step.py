@@ -66,19 +66,26 @@ def _dp_any_rank_has_scheduler_requests(core: DPEngineCoreProc) -> bool:
 
 
 def _dp_negotiate_forced_mode(core: DPEngineCoreProc) -> TTSchedulingMode:
-    # Prefer prefill when a rank has waiting work and local scheduler capacity
-    # to admit it, or when decode is otherwise idle.
-    has_running = bool(getattr(core.scheduler, "running", []))
-    has_waiting = bool(getattr(core.scheduler, "waiting", False))
-    max_running = getattr(core.scheduler, "max_num_running_reqs", 0)
-    has_capacity = len(getattr(core.scheduler, "running", [])) < max_running
-    local_prefill_intent = (
-        1 if (has_waiting and ((not has_running) or has_capacity)) else 0
+    # TT cannot mix prefill and decode in one gathered DP batch. If any rank
+    # has decode work, keep all ranks in decode mode to avoid prefill-induced
+    # inter-token gaps for already-running requests.
+    local_state = torch.tensor(
+        [
+            1 if getattr(core.scheduler, "running", []) else 0,
+            1 if getattr(core.scheduler, "waiting", False) else 0,
+        ],
+        dtype=torch.int32,
     )
-    intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
-    core.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
-    dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=core.dp_group)
-    forced_mode = TTSchedulingMode.from_prefill_intent(int(intent_tensor.item()))
+    core.dlog("before_state_allreduce state=%s", local_state)
+    dist.all_reduce(local_state, op=dist.ReduceOp.MAX, group=core.dp_group)
+    any_running = bool(local_state[0].item())
+    any_waiting = bool(local_state[1].item())
+    if any_running:
+        forced_mode = TTSchedulingMode.DECODE_ONLY
+    elif any_waiting:
+        forced_mode = TTSchedulingMode.PREFILL_ONLY
+    else:
+        forced_mode = TTSchedulingMode.DEFAULT
     core.dlog("after_intent_allreduce forced_mode=%s", forced_mode)
     # Record forced_mode so it can be used by DP gather submission.
     core._dp_gather_forced_mode = forced_mode
@@ -603,3 +610,4 @@ def _execute_model_dp_gather(
 ) -> ModelRunnerOutput:
     handle = dp_gather_submit(core, scheduler_output, overlap_ok=False)
     return dp_gather_finalize(core, handle)
+
