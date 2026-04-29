@@ -94,9 +94,7 @@ class TTExecutionMixin:
             if self.is_pooling_model or not model_executed:
                 future = cast(
                     Future[ModelRunnerOutput],
-                    self.model_executor.execute_model(
-                        scheduler_output, non_block=True
-                    ),
+                    self.model_executor.execute_model(scheduler_output, non_block=True),
                 )
             elif scheduler_output.pending_structured_output_tokens:
                 # TT consumes structured-output state inside execute_model(), so
@@ -105,9 +103,7 @@ class TTExecutionMixin:
             else:
                 future = cast(
                     Future[ModelRunnerOutput],
-                    self.model_executor.execute_model(
-                        scheduler_output, non_block=True
-                    ),
+                    self.model_executor.execute_model(scheduler_output, non_block=True),
                 )
 
             if deferred_scheduler_output is None:
@@ -232,9 +228,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 scheduler_output = self.scheduler.schedule()
                 self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
                 if not self.is_ec_producer:
-                    model_executed = (
-                        scheduler_output.total_num_scheduled_tokens > 0
-                    )
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
             if forced_mode == TTSchedulingMode.DECODE_ONLY:
                 current_overlap_ok = self._dp_can_attempt_steady_decode_from_scheduler(
                     scheduler_output
@@ -510,9 +504,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 elif local_rank == 0:
                     size_tensor = torch.zeros(1, dtype=torch.long)
                     dist.recv(size_tensor, src=0, group=group)
-                    object_tensor = torch.empty(
-                        size_tensor.item(), dtype=torch.uint8
-                    )
+                    object_tensor = torch.empty(size_tensor.item(), dtype=torch.uint8)
                     dist.recv(object_tensor, src=0, group=group)
                     gathered_inputs = pickle.loads(object_tensor.numpy().tobytes())
         self.dlog("after_inputs_gather")

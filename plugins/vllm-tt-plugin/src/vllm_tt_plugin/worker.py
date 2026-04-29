@@ -417,9 +417,7 @@ class TTWorker(WorkerBase):
             del self.model_runner
 
             if self.mesh_device:
-                close_mesh_device(
-                    self.mesh_device, get_tt_config(self.vllm_config)
-                )
+                close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
                 del self.mesh_device
 
         if hasattr(super(), "__del__"):

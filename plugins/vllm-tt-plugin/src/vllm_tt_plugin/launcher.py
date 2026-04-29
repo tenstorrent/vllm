@@ -35,9 +35,7 @@ class TTCoreEngineLauncher(CoreEngineLauncher):
         if rank_binding_file is None:
             return EngineLaunchPlan()
 
-        vllm_config.parallel_config.data_parallel_size_local = len(
-            non_device_dp_ranks
-        )
+        vllm_config.parallel_config.data_parallel_size_local = len(non_device_dp_ranks)
         plan = TTLaunchPlan(
             remote_launched=True,
             non_device_dp_ranks=non_device_dp_ranks,

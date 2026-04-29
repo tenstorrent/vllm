@@ -1004,7 +1004,9 @@ class EngineCoreProc(EngineCore):
                 parallel_config.dp_engine_core_proc_cls
                 != "vllm.v1.engine.core.DPEngineCoreProc"
             )
-            if data_parallel and (vllm_config.model_config.is_moe or uses_dp_engine_core):
+            if data_parallel and (
+                vllm_config.model_config.is_moe or uses_dp_engine_core
+            ):
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core_cls = resolve_obj_by_qualname(
@@ -1021,9 +1023,7 @@ class EngineCoreProc(EngineCore):
                 engine_core_cls = resolve_obj_by_qualname(
                     parallel_config.engine_core_proc_cls
                 )
-                engine_core = engine_core_cls(
-                    *args, engine_index=dp_rank, **kwargs
-                )
+                engine_core = engine_core_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
             engine_core.run_busy_loop()
@@ -1676,6 +1676,7 @@ class DPEngineCoreProc(EngineCoreProc):
             logger.info(
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
+
 
 class EngineCoreActorMixin:
     """

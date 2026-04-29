@@ -293,9 +293,7 @@ class TTPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
         parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
-        parallel_config.engine_core_proc_cls = (
-            "vllm_tt_plugin.engine.TTEngineCoreProc"
-        )
+        parallel_config.engine_core_proc_cls = "vllm_tt_plugin.engine.TTEngineCoreProc"
         parallel_config.dp_engine_core_proc_cls = (
             "vllm_tt_plugin.engine.TTDPEngineCoreProc"
         )
