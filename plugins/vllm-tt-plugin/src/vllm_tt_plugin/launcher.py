@@ -208,6 +208,9 @@ def tt_run_launch(
     log_stats: bool,
     cleanup_target: object,
 ) -> None:
+    if not rank_binding_file:
+        raise RuntimeError("rank_binding_file must be a non-empty string")
+
     override_tt_config = get_tt_config(vllm_config)
     mpi_args = override_tt_config.get("mpi_args", "")
     extra_ttrun_args = override_tt_config.get("extra_ttrun_args")
@@ -323,6 +326,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if not os.path.isfile(args.config_pkl):
+        raise RuntimeError(f"Config file is not a file: {args.config_pkl}")
+    if os.path.islink(args.config_pkl):
+        raise RuntimeError(f"Config file is a symlink: {args.config_pkl}")
+
     with open(args.config_pkl, "rb") as f:
         vllm_config: VllmConfig = cloudpickle.load(f)
 
