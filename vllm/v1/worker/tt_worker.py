@@ -424,6 +424,17 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         max_tokens_all_users = 65536
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
+    elif (
+        "OLMo-3.1-32B" in model_config.model
+        and devices_per_dp_cache == 32
+        and is_wormhole
+    ):
+        # OLMo-3.1-32B on WH Galaxy. 160K covers 32 users at 4K ISL (max
+        # supported batched config) with ~25K margin (kv_cache_usage stays
+        # around 85% at b=32 4K, vs 98% with the default 131K which triggered
+        # a hang). Small enough to keep DRAM available for traced 64K b=1
+        # all-gather buffers (4×64K = 262K caused OOM there).
+        max_tokens_all_users = 160000
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
