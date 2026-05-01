@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from collections import deque
 from dataclasses import dataclass, fields
@@ -52,6 +53,30 @@ logger = init_logger(__name__)
 
 # Maximum top_k value for on-device sampling
 MAX_K = 32
+
+
+# Matches the upstream attention-layer naming convention used by registered
+# vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
+# bare "layers.5" forms used in TT spec hooks. The first capture group is
+# the integer layer index.
+_LAYER_NAME_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _parse_layer_index(layer_name: str) -> int:
+    """Extract the integer layer index from a layer name.
+
+    Used to map ``KVCacheGroupSpec.layer_names`` back to model-side layer
+    indices when distributing per-group KV cache shapes across the
+    layer-indexed allocator. The hook author is expected to follow the
+    ``...layers.<idx>...`` convention.
+    """
+    match = _LAYER_NAME_RE.search(layer_name)
+    if match is None:
+        raise ValueError(
+            f"Could not parse a layer index from layer name '{layer_name}'. "
+            "TT spec hooks must use the '...layers.<idx>...' naming convention."
+        )
+    return int(match.group(1))
 
 
 def _build_logprobs_from_topk(
@@ -389,37 +414,77 @@ class TTModelRunner:
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
     def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> Any:
-        """Hand off allocation to the TT model.
+        """Allocate KV cache tensors via the TT model's per-layer entry point.
 
-        Single-group path is the legacy shape (``shape, dtype, num_layers``)
-        and is bit-for-bit identical to pre-refactor behaviour.
+        Builds a ``per_layer_specs`` list of ``(shape, dtype)`` tuples — one
+        entry per attention layer in model layer-index order — and hands it
+        to ``model.allocate_kv_cache_per_layer``. Hybrid attention models
+        thus get sliding-window layers backed by a smaller paged pool than
+        full-attention layers; uniform-attention models pass an
+        all-identical list and see byte-equivalent allocation.
 
-        Multi-group (hybrid attention) is not yet wired through to the
-        model's allocate_kv_cache; that lands when the per-group model
-        adapter (Phase 7) and the per-group allocate_kv_cache signature
-        (Phase 3) are in place.
+        The TT model is expected to expose ``allocate_kv_cache_per_layer``;
+        the legacy ``allocate_kv_cache(shape, dtype, num_layers)`` entry
+        point on the model side is kept as a thin compatibility shim.
         """
-        kv_cache_groups = kv_cache_config.kv_cache_groups
-
-        if len(kv_cache_groups) > 1:
-            raise NotImplementedError(
-                "Hybrid kv cache groups are not yet wired through to the "
-                "TT model's allocate_kv_cache. Pending Phase 3+7 of the "
-                "kv-cache-groups effort."
-            )
-
-        # Legacy single-group path.
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            assert len(kv_cache_tensor.shared_by) == 1, (
-                "KV cache shared by multiple layers is not supported in "
-                "the single-group path"
-            )
-        spec = kv_cache_groups[0].kv_cache_spec
-        shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
         num_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
-        return self.model.allocate_kv_cache(shape, spec.dtype, num_layers)
+        per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
+        return self.model.allocate_kv_cache_per_layer(per_layer_specs)
+
+    def _build_per_layer_specs(
+        self, kv_cache_config: KVCacheConfig, num_layers: int
+    ) -> list[tuple[tuple[int, int, int, int], Any]]:
+        """Resolve ``KVCacheConfig`` → list of ``(shape, dtype)`` per layer.
+
+        Single-group: every layer gets the same shape/dtype.
+
+        Multi-group: each layer's spec comes from its containing
+        ``KVCacheGroupSpec`` and shape is derived per group (sliding-window
+        layers can therefore receive a smaller paged pool than full
+        attention). Layer index is parsed from the layer name; the hook
+        author is expected to follow the ``...layers.<idx>...`` convention
+        used by upstream attention layer naming.
+        """
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+
+        if len(kv_cache_groups) == 1:
+            spec = kv_cache_groups[0].kv_cache_spec
+            shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+            return [(shape, spec.dtype)] * num_layers
+
+        # Multi-group: walk groups, parse layer index from each layer name,
+        # and slot each layer's (shape, dtype) into the per-layer list.
+        per_layer: list[tuple[tuple[int, int, int, int], Any] | None] = [
+            None
+        ] * num_layers
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+            entry = (shape, spec.dtype)
+            for layer_name in group.layer_names:
+                idx = _parse_layer_index(layer_name)
+                if not 0 <= idx < num_layers:
+                    raise ValueError(
+                        f"Layer index {idx} parsed from '{layer_name}' is "
+                        f"out of range for {num_layers} attention layers"
+                    )
+                if per_layer[idx] is not None:
+                    raise ValueError(
+                        f"Layer index {idx} (from '{layer_name}') already "
+                        "assigned to another group; layer names must be unique"
+                    )
+                per_layer[idx] = entry
+
+        missing = [i for i, e in enumerate(per_layer) if e is None]
+        if missing:
+            raise ValueError(
+                f"No KVCacheGroupSpec covers layer indices {missing}; "
+                "the model's get_kv_cache_spec hook must return a spec "
+                f"for every attention layer (expected {num_layers})"
+            )
+        return per_layer  # type: ignore[return-value]
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the

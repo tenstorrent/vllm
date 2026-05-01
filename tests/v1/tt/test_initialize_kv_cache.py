@@ -121,19 +121,65 @@ def test_kv_cache_shape_when_kv_heads_below_tp(runner):
 
 
 def test_initialize_single_group_calls_model_allocate(runner):
+    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
     spec = _full_spec(num_kv_heads=8, head_size=128, block_size=64)
     config = _config([KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=spec)])
 
     runner.initialize_kv_cache(config)
 
-    runner.model.allocate_kv_cache.assert_called_once()
-    args, _ = runner.model.allocate_kv_cache.call_args
-    shape, dtype, num_layers = args
-    assert shape == (2048, 8 // min(2, 8), 64, 128)
-    assert dtype == torch.bfloat16
-    assert num_layers == 32
+    runner.model.allocate_kv_cache_per_layer.assert_called_once()
+    (per_layer_specs,), _ = runner.model.allocate_kv_cache_per_layer.call_args
+    expected_shape = (2048, 8 // min(2, 8), 64, 128)
+    assert len(per_layer_specs) == 32
+    assert all(s == (expected_shape, torch.bfloat16) for s in per_layer_specs)
     assert runner.kv_caches == "kv-caches-sentinel"
     assert runner.kv_cache_config is config
+
+
+def test_initialize_multi_group_assigns_specs_per_layer(runner):
+    """Hybrid configuration: 2 full-attention layers + 4 sliding-window
+    layers should produce a per-layer spec list where each layer's shape
+    matches its group's spec.
+    """
+    runner.model_config.get_num_layers_by_block_type.return_value = 6
+    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
+    full = _full_spec(num_kv_heads=4, head_size=128, block_size=64)
+    sliding = _sliding_spec(
+        num_kv_heads=4, head_size=128, block_size=64, sliding_window=1024
+    )
+    config = _config(
+        [
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn", "model.layers.5.self_attn"],
+                kv_cache_spec=full,
+            ),
+            KVCacheGroupSpec(
+                layer_names=[
+                    "model.layers.1.self_attn",
+                    "model.layers.2.self_attn",
+                    "model.layers.3.self_attn",
+                    "model.layers.4.self_attn",
+                ],
+                kv_cache_spec=sliding,
+            ),
+        ],
+        num_blocks=512,
+    )
+
+    runner.initialize_kv_cache(config)
+
+    (per_layer_specs,), _ = runner.model.allocate_kv_cache_per_layer.call_args
+    assert len(per_layer_specs) == 6
+    full_shape = (512, 4 // min(2, 4), 64, 128)
+    sliding_shape = (512, 4 // min(2, 4), 64, 128)
+    # Layer indices 0 and 5 are full attention; 1-4 are sliding window.
+    # (Shapes happen to match since both groups share kv-heads/head-size in
+    # this fixture; the spec types differ, which is the structural change
+    # that propagates downstream once forward routing lands.)
+    assert per_layer_specs[0][0] == full_shape
+    assert per_layer_specs[5][0] == full_shape
+    assert per_layer_specs[1][0] == sliding_shape
+    assert per_layer_specs[4][0] == sliding_shape
 
 
 def test_initialize_stores_config_even_when_not_dp_rank_zero(runner):
@@ -150,13 +196,70 @@ def test_initialize_stores_config_even_when_not_dp_rank_zero(runner):
     assert runner.input_batch is not None
 
 
-def test_initialize_multi_group_raises_until_phase_3(runner):
-    full = KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec())
-    sliding = KVCacheGroupSpec(layer_names=["l.1"], kv_cache_spec=_sliding_spec())
-    config = _config([full, sliding])
+def test_build_per_layer_specs_rejects_unparseable_layer_name(runner):
+    runner.model_config.get_num_layers_by_block_type.return_value = 2
+    full = _full_spec()
+    sliding = _sliding_spec()
+    config = _config(
+        [
+            KVCacheGroupSpec(layer_names=["foo"], kv_cache_spec=full),
+            KVCacheGroupSpec(layer_names=["bar"], kv_cache_spec=sliding),
+        ]
+    )
+    with pytest.raises(ValueError, match="parse a layer index"):
+        runner._build_per_layer_specs(config, num_layers=2)
 
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        runner.initialize_kv_cache(config)
+
+def test_build_per_layer_specs_rejects_missing_layers(runner):
+    """If the spec hook didn't return a spec for every attention layer,
+    we should fail loudly in the multi-group path rather than silently
+    allocating None for the missing layers."""
+    runner.model_config.get_num_layers_by_block_type.return_value = 4
+    config = _config(
+        [
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn"], kv_cache_spec=_full_spec()
+            ),
+            KVCacheGroupSpec(
+                layer_names=["model.layers.1.self_attn"], kv_cache_spec=_sliding_spec()
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match=r"layer indices \[2, 3\]"):
+        runner._build_per_layer_specs(config, num_layers=4)
+
+
+def test_build_per_layer_specs_rejects_duplicate_layer(runner):
+    config = _config(
+        [
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn"], kv_cache_spec=_full_spec()
+            ),
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn"], kv_cache_spec=_sliding_spec()
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="already.*assigned"):
+        runner._build_per_layer_specs(config, num_layers=2)
+
+
+def test_build_per_layer_specs_rejects_out_of_range_index(runner):
+    """Layer index from a group's layer name must be within
+    [0, num_layers); otherwise we'd silently corrupt the per-layer list.
+    Forces the multi-group path so the parsing branch runs."""
+    config = _config(
+        [
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn"], kv_cache_spec=_full_spec()
+            ),
+            KVCacheGroupSpec(
+                layer_names=["model.layers.5.self_attn"], kv_cache_spec=_sliding_spec()
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="out of range"):
+        runner._build_per_layer_specs(config, num_layers=2)
 
 
 def test_initialize_mixed_block_sizes_rejected(runner):
