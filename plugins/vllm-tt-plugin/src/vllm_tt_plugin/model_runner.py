@@ -161,7 +161,17 @@ class TTModelInput:
     input_tokens: torch.Tensor
     input_positions: torch.Tensor
     prompt_lens: list[int] | None
+    # Group-0 block table, retained as a tensor for back-compat with the
+    # many DP padding/gather/pack paths that read it as ``block_tables``.
+    # Hybrid models must additionally consult ``block_tables_per_group``
+    # below; legacy single-group models can continue to use this field.
     block_tables: torch.Tensor
+    # Per-group block tables in upstream's KVCacheConfig group order; one
+    # entry for uniform models, ``len(kv_cache_groups)`` entries for
+    # hybrid attention. Group g's tensor maps the model's layer-→group
+    # routing onto the right paged pool. Phase 5 wires this through to
+    # the model's prefill/decode forward; Phase 4 just plumbs it.
+    block_tables_per_group: list[torch.Tensor]
     unpadded_batch_size: int | list[int]  # List is used for DP
     tt_sampling_params: TTSamplingParams
     multi_modal_kwargs: dict[str, Any]
@@ -352,11 +362,17 @@ class TTModelRunner:
         # the existing block-table plumbing intact we additionally require
         # a single block_size across groups for now. Different block_sizes
         # per group can be enabled when the input batch + block table
-        # consumers learn to address per-group block tables.
+        # consumers learn to address per-group block tables with mixed
+        # block sizes (Phase 8+).
         block_size = kv_cache_groups[0].kv_cache_spec.block_size
         assert all(
             g.kv_cache_spec.block_size == block_size for g in kv_cache_groups
         ), "Mixed block sizes across kv_cache_groups not yet supported"
+
+        # One block table per group, all with the same block_size. The
+        # MultiGroupBlockTable then has ``len(kv_cache_groups)`` entries
+        # — single-group models keep the previous shape (length 1).
+        per_group_block_sizes = [block_size] * len(kv_cache_groups)
 
         max_num_reqs = self.scheduler_config.max_num_seqs
         max_model_len = self.model_config.max_model_len
@@ -366,8 +382,8 @@ class TTModelRunner:
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             vocab_size=self.vocab_size,
-            block_sizes=[block_size],
-            kernel_block_sizes=[block_size],
+            block_sizes=per_group_block_sizes,
+            kernel_block_sizes=per_group_block_sizes,
             logitsprocs=self._host_logitsprocs,
         )
 
@@ -705,16 +721,14 @@ class TTModelRunner:
         input_batch = self.input_batch
         num_reqs = input_batch.num_reqs
         assert num_reqs > 0
-        assert len(input_batch.block_table.block_tables) == 1, (
-            "Currently only supporting 1 KV cache group"
-        )
 
-        # Second dim of block table is (ceil(max_model_len / block_size)).
+        # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice to self.max_num_blocks_per_req which also takes into
         # account max num blocks in KV cache in case max KV blocks is smaller.
         # Constant shape is required for ttnn tracing to work.
-        block_tables = input_batch.block_table[0].get_cpu_tensor()[
-            :num_reqs, : self.max_num_blocks_per_req
+        block_tables_per_group = [
+            bt.get_cpu_tensor()[:num_reqs, : self.max_num_blocks_per_req]
+            for bt in input_batch.block_table.block_tables
         ]
 
         # DP optimization: don't send padding blocks if possible to reduce
@@ -725,7 +739,26 @@ class TTModelRunner:
             max_blocks_in_batch = cdiv(
                 max_tokens_in_batch, self.cache_config.block_size
             )
-            block_tables = block_tables[:, :max_blocks_in_batch]
+            block_tables_per_group = [
+                bt[:, :max_blocks_in_batch] for bt in block_tables_per_group
+            ]
+
+        # Group-0 view kept on TTModelInput.block_tables for back-compat with
+        # the existing single-tensor consumers (DP pack/gather, decode_forward
+        # page_table arg). Hybrid models additionally consult
+        # ``block_tables_per_group``; the model's forward routes by layer→
+        # group when len > 1 (Phase 5).
+        block_tables = block_tables_per_group[0]
+        # Guard: until Phase 5 wires per-group page_tables through to the
+        # model's prefill_forward / decode_forward, multi-group input batches
+        # would silently send only group 0 to the model and corrupt KV state
+        # for the other groups. Fail loudly until then. No registered model
+        # currently emits multi-group specs, so this never trips today.
+        assert len(block_tables_per_group) == 1, (
+            "Multi-group block tables are plumbed through TTModelInput but "
+            "model.forward routing is pending Phase 5 of the kv-cache-groups "
+            "effort"
+        )
 
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
@@ -953,6 +986,7 @@ class TTModelRunner:
             input_positions=input_positions,
             prompt_lens=prompt_lens,
             block_tables=block_tables,
+            block_tables_per_group=block_tables_per_group,
             unpadded_batch_size=num_reqs,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
@@ -1557,6 +1591,10 @@ class TTModelRunner:
             input_positions=input_positions,
             prompt_lens=prompt_lens,
             block_tables=block_tables,
+            # DP merged path collapses to group-0 only for now; full
+            # per-group DP gather lands in Phase 8. Hybrid models on DP > 1
+            # are gated by tt_worker.get_kv_cache_spec until then.
+            block_tables_per_group=[block_tables],
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,

@@ -262,6 +262,65 @@ def test_build_per_layer_specs_rejects_out_of_range_index(runner):
         runner._build_per_layer_specs(config, num_layers=2)
 
 
+def test_initialize_creates_one_block_table_per_group(runner, monkeypatch):
+    """For hybrid models, InputBatch must receive block_sizes with one
+    entry per kv_cache_group so its MultiGroupBlockTable produces the
+    matching number of per-group block tables."""
+    from vllm.v1.worker import tt_model_runner as runner_module
+
+    captured = {}
+
+    def fake_input_batch(**kw):
+        captured["block_sizes"] = kw["block_sizes"]
+        captured["kernel_block_sizes"] = kw["kernel_block_sizes"]
+        return MagicMock(name="fake-input-batch")
+
+    monkeypatch.setattr(runner_module, "InputBatch", fake_input_batch)
+
+    runner.model_config.get_num_layers_by_block_type.return_value = 6
+    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
+    full = _full_spec()
+    sliding = _sliding_spec()
+    config = _config(
+        [
+            KVCacheGroupSpec(
+                layer_names=[f"model.layers.{i}.self_attn" for i in (0, 5)],
+                kv_cache_spec=full,
+            ),
+            KVCacheGroupSpec(
+                layer_names=[f"model.layers.{i}.self_attn" for i in (1, 2, 3, 4)],
+                kv_cache_spec=sliding,
+            ),
+        ]
+    )
+
+    runner.initialize_kv_cache(config)
+
+    # Two groups → two block tables, both with the same block_size.
+    assert captured["block_sizes"] == [64, 64]
+    assert captured["kernel_block_sizes"] == [64, 64]
+
+
+def test_initialize_single_group_keeps_one_block_table(runner, monkeypatch):
+    """Single-group (uniform attention) is the legacy contract: exactly
+    one block table in the input batch — confirms Phase 4 didn't change
+    the wire shape for uniform models."""
+    from vllm.v1.worker import tt_model_runner as runner_module
+
+    captured = {}
+
+    def fake_input_batch(**kw):
+        captured["block_sizes"] = kw["block_sizes"]
+        return MagicMock(name="fake-input-batch")
+
+    monkeypatch.setattr(runner_module, "InputBatch", fake_input_batch)
+
+    config = _config([KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec())])
+    runner.initialize_kv_cache(config)
+
+    assert captured["block_sizes"] == [64]
+
+
 def test_initialize_mixed_block_sizes_rejected(runner):
     """The persistent input batch currently only supports a single
     block_size; uneven block sizes across groups must error early."""
