@@ -164,10 +164,7 @@ class TTWorker(WorkerBase):
         effort; until then, fail fast at config time.
         """
         spec_types = {type(s) for s in spec.values()}
-        if (
-            len(spec_types) > 1
-            and self.parallel_config.data_parallel_size > 1
-        ):
+        if len(spec_types) > 1 and self.parallel_config.data_parallel_size > 1:
             raise NotImplementedError(
                 "Hybrid attention models with mixed kv cache types are not "
                 "yet supported with data_parallel_size > 1 on the TT backend. "
@@ -194,8 +191,7 @@ class TTWorker(WorkerBase):
         if spec is None:
             return None
         if not isinstance(spec, dict) or not all(
-            isinstance(k, str) and isinstance(v, KVCacheSpec)
-            for k, v in spec.items()
+            isinstance(k, str) and isinstance(v, KVCacheSpec) for k, v in spec.items()
         ):
             raise TypeError(
                 f"{model_cls.__name__}.get_kv_cache_spec() must return "

@@ -315,7 +315,9 @@ def test_initialize_single_group_keeps_one_block_table(runner, monkeypatch):
 
     monkeypatch.setattr(runner_module, "InputBatch", fake_input_batch)
 
-    config = _config([KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec())])
+    config = _config(
+        [KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec())]
+    )
     runner.initialize_kv_cache(config)
 
     assert captured["block_sizes"] == [64]

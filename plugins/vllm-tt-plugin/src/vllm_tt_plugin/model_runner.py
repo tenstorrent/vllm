@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import os
-import re
 import threading
 from collections import deque
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
+import regex as re
 import torch
 import ttnn
 
@@ -365,9 +365,9 @@ class TTModelRunner:
         # consumers learn to address per-group block tables with mixed
         # block sizes (Phase 8+).
         block_size = kv_cache_groups[0].kv_cache_spec.block_size
-        assert all(
-            g.kv_cache_spec.block_size == block_size for g in kv_cache_groups
-        ), "Mixed block sizes across kv_cache_groups not yet supported"
+        assert all(g.kv_cache_spec.block_size == block_size for g in kv_cache_groups), (
+            "Mixed block sizes across kv_cache_groups not yet supported"
+        )
 
         # One block table per group, all with the same block_size. The
         # MultiGroupBlockTable then has ``len(kv_cache_groups)`` entries
