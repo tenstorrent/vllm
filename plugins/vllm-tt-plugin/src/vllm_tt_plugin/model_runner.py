@@ -467,6 +467,9 @@ class TTModelRunner:
 
         if len(kv_cache_groups) == 1:
             spec = kv_cache_groups[0].kv_cache_spec
+            # Already enforced by ``_validate_kv_cache_groups`` at the
+            # top of ``initialize_kv_cache``; assert for mypy.
+            assert isinstance(spec, AttentionSpec)
             shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
             return [(shape, spec.dtype)] * num_layers
 
@@ -477,6 +480,7 @@ class TTModelRunner:
         ] * num_layers
         for group in kv_cache_groups:
             spec = group.kv_cache_spec
+            assert isinstance(spec, AttentionSpec)
             shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
             entry = (shape, spec.dtype)
             for layer_name in group.layer_names:
