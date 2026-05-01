@@ -745,20 +745,12 @@ class TTModelRunner:
 
         # Group-0 view kept on TTModelInput.block_tables for back-compat with
         # the existing single-tensor consumers (DP pack/gather, decode_forward
-        # page_table arg). Hybrid models additionally consult
-        # ``block_tables_per_group``; the model's forward routes by layer→
-        # group when len > 1 (Phase 5).
+        # page_table arg). Hybrid models additionally consume
+        # ``block_tables_per_group`` via the ``page_tables_per_group`` kwarg
+        # in submit_prefill / submit_decode; the legacy generator_vllm
+        # wrappers strip it on the way through and raise loudly if the list
+        # has more than one entry.
         block_tables = block_tables_per_group[0]
-        # Guard: until Phase 5 wires per-group page_tables through to the
-        # model's prefill_forward / decode_forward, multi-group input batches
-        # would silently send only group 0 to the model and corrupt KV state
-        # for the other groups. Fail loudly until then. No registered model
-        # currently emits multi-group specs, so this never trips today.
-        assert len(block_tables_per_group) == 1, (
-            "Multi-group block tables are plumbed through TTModelInput but "
-            "model.forward routing is pending Phase 5 of the kv-cache-groups "
-            "effort"
-        )
 
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
@@ -1778,6 +1770,11 @@ class TTModelRunner:
         kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
+            # Hybrid attention models route per-layer to per-group block
+            # tables; uniform models receive a one-element list and the
+            # generator_vllm wrappers drop it before delegating to the
+            # legacy text forward path.
+            "page_tables_per_group": model_input.block_tables_per_group,
             "kv_cache": self.kv_caches,
             "enable_trace": self.trace_mode in ["all"],
             "prompt_lens": model_input.prompt_lens,

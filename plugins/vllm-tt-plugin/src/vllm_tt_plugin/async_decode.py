@@ -414,6 +414,11 @@ class TTAsyncDecodeController:
         kwargs: dict[str, Any] = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
+            # Hybrid attention models route per-layer to per-group block
+            # tables; uniform models receive a one-element list and the
+            # generator_vllm wrappers drop it before delegating to the
+            # legacy text forward path.
+            "page_tables_per_group": model_input.block_tables_per_group,
             "kv_cache": runner.kv_caches,
             "start_pos": model_input.input_positions,
         }
