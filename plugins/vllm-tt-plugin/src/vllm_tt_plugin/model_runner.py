@@ -307,30 +307,32 @@ class TTModelRunner:
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
-        Initialize KV cache based on `kv_cache_config`.
+        Initialize KV cache based on ``kv_cache_config``.
+
         Args:
-            kv_cache_config: Configuration for the KV cache, including the KV
-            cache size of each layer
+            kv_cache_config: Configuration for the KV cache. May contain one
+                group (uniform attention) or multiple groups (hybrid models
+                like Gemma3/4 / GPT-OSS that mix sliding-window and full
+                attention layers).
         """
-
         kv_cache_groups = kv_cache_config.kv_cache_groups
-        if len(kv_cache_groups) > 1:
-            raise NotImplementedError(
-                "Hybrid models with more than one KV cache type are not supported yet."
-            )
-        if isinstance(kv_cache_groups[0].kv_cache_spec, AttentionSpec):
-            kv_cache_spec = kv_cache_groups[0].kv_cache_spec
-        else:
-            raise TypeError("Expected AttentionSpec")
+        self._validate_kv_cache_groups(kv_cache_groups)
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            assert len(kv_cache_tensor.shared_by) == 1, (
-                "KV cache shared by multiple layers is not supported for TT"
-            )
+        # Stash on the runner for downstream phases that need to walk the
+        # group structure during input prep / forward.
+        self.kv_cache_config = kv_cache_config
 
-        # Initialize persistent input batch with block size from kv_cache_spec.
-        # The persistent batch optimization reduces overhead between steps
-        # when consecutive batches contain mostly the same requests.
+        # Build the persistent input batch. Upstream's hybrid kv cache
+        # manager enforces a uniform page_size across groups, and to keep
+        # the existing block-table plumbing intact we additionally require
+        # a single block_size across groups for now. Different block_sizes
+        # per group can be enabled when the input batch + block table
+        # consumers learn to address per-group block tables.
+        block_size = kv_cache_groups[0].kv_cache_spec.block_size
+        assert all(
+            g.kv_cache_spec.block_size == block_size for g in kv_cache_groups
+        ), "Mixed block sizes across kv_cache_groups not yet supported"
+
         max_num_reqs = self.scheduler_config.max_num_seqs
         max_model_len = self.model_config.max_model_len
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -339,47 +341,85 @@ class TTModelRunner:
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             vocab_size=self.vocab_size,
-            block_sizes=[kv_cache_spec.block_size],
-            kernel_block_sizes=[kv_cache_spec.block_size],
+            block_sizes=[block_size],
+            kernel_block_sizes=[block_size],
             logitsprocs=self._host_logitsprocs,
         )
 
         # The block tables in the persistent input batch have
         # max_num_blocks_per_req = cdiv(max_model_len, block_size) but this
-        # does not take into account num blocks in KV cache. Actual max is min
-        # of these two. Used to slice block tables during input prep.
+        # does not take into account num blocks in KV cache. Actual max is
+        # min of these two. Used to slice block tables during input prep.
         self.max_num_blocks_per_req = min(
-            cdiv(self.model_config.max_model_len, self.cache_config.block_size),
+            cdiv(max_model_len, self.cache_config.block_size),
             kv_cache_config.num_blocks,
         )
 
-        # Only DP rank 0 allocates KV cache
+        # Only DP rank 0 allocates KV cache.
         if self.parallel_config.data_parallel_rank_local != 0:
             return
 
-        # Make the assumption that we are tensor parallel by
-        # min(number of devices, number of KV heads).
-        # TODO: move this into model.allocate_kv_cache.
-        model_config = self.model_config
+        self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+
+    @staticmethod
+    def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
+        if not kv_cache_groups:
+            raise ValueError("kv_cache_config has no groups")
+        for group in kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                raise TypeError(
+                    f"Expected AttentionSpec for group {group.layer_names}, "
+                    f"got {type(group.kv_cache_spec).__name__}"
+                )
+
+    def _kv_cache_shape(
+        self, spec: AttentionSpec, num_blocks: int
+    ) -> tuple[int, int, int, int]:
+        """Per-buffer shape ``(num_blocks, num_kv_heads, block_size,
+        head_size)`` from a group's attention spec.
+
+        TP factor is folded in here because it is handled on the model
+        side for TT (caches are replicated per submesh and each device
+        carries ``num_kv_heads // tp`` heads internally).
+        """
         data_parallel = self.parallel_config.data_parallel_size
         assert self.device_config.num_devices is not None
         num_devices = self.device_config.num_devices // data_parallel
-        total_kv_heads = kv_cache_spec.num_kv_heads
-        num_kv_heads = total_kv_heads // min(num_devices, total_kv_heads)
+        num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
+        return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
-        kv_cache_shape = (
-            kv_cache_config.num_blocks,
-            num_kv_heads,
-            kv_cache_spec.block_size,
-            kv_cache_spec.head_size,
-        )
-        dtype = kv_cache_spec.dtype
-        num_layers = model_config.get_num_layers_by_block_type(
+    def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> Any:
+        """Hand off allocation to the TT model.
+
+        Single-group path is the legacy shape (``shape, dtype, num_layers``)
+        and is bit-for-bit identical to pre-refactor behaviour.
+
+        Multi-group (hybrid attention) is not yet wired through to the
+        model's allocate_kv_cache; that lands when the per-group model
+        adapter (Phase 7) and the per-group allocate_kv_cache signature
+        (Phase 3) are in place.
+        """
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+
+        if len(kv_cache_groups) > 1:
+            raise NotImplementedError(
+                "Hybrid kv cache groups are not yet wired through to the "
+                "TT model's allocate_kv_cache. Pending Phase 3+7 of the "
+                "kv-cache-groups effort."
+            )
+
+        # Legacy single-group path.
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            assert len(kv_cache_tensor.shared_by) == 1, (
+                "KV cache shared by multiple layers is not supported in "
+                "the single-group path"
+            )
+        spec = kv_cache_groups[0].kv_cache_spec
+        shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+        num_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
-
-        # Allocate KV cache tensors.
-        self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape, dtype, num_layers)
+        return self.model.allocate_kv_cache(shape, spec.dtype, num_layers)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the

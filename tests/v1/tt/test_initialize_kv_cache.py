@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Unit tests for ``TTModelRunner.initialize_kv_cache`` and helpers.
+
+Phase 2 of kv-cache-groups: the runner now refactors group handling into
+helpers, validates AttentionSpec on every group, stores ``kv_cache_config``
+for downstream phases, and explicitly errors on multi-group configs (the
+end-to-end hybrid path lands in Phase 3 + 7).
+"""
+
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MambaSpec,
+    SlidingWindowSpec,
+)
+
+
+def _full_spec(block_size=64, num_kv_heads=8, head_size=128):
+    return FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.bfloat16,
+    )
+
+
+def _sliding_spec(block_size=64, num_kv_heads=8, head_size=128, sliding_window=1024):
+    return SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+    )
+
+
+def _config(groups, num_blocks=2048, tensors=None):
+    if tensors is None:
+        tensors = [
+            KVCacheTensor(size=1, shared_by=[name])
+            for g in groups
+            for name in g.layer_names
+        ]
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=groups,
+    )
+
+
+@pytest.fixture
+def runner():
+    """Synthetic TTModelRunner skipping the real ``__init__``."""
+    from vllm.v1.worker.tt_model_runner import TTModelRunner
+
+    r = TTModelRunner.__new__(TTModelRunner)
+    r.model_config = MagicMock()
+    r.parallel_config = MagicMock()
+    r.cache_config = MagicMock()
+    r.device_config = MagicMock()
+    r.scheduler_config = MagicMock()
+    r.model = MagicMock()
+    r._host_logitsprocs = MagicMock()
+    r.vocab_size = 32000
+
+    r.model_config.max_model_len = 8192
+    r.cache_config.block_size = 64
+    r.parallel_config.data_parallel_size = 1
+    r.parallel_config.data_parallel_rank_local = 0
+    r.device_config.num_devices = 2
+    r.scheduler_config.max_num_seqs = 32
+    r.scheduler_config.max_num_batched_tokens = 8192
+
+    # Default: single-attention model, 32 layers
+    r.model_config.get_num_layers_by_block_type.return_value = 32
+    r.model.allocate_kv_cache.return_value = "kv-caches-sentinel"
+    return r
+
+
+def test_validate_groups_empty_raises(runner):
+    with pytest.raises(ValueError, match="no groups"):
+        runner._validate_kv_cache_groups([])
+
+
+def test_validate_groups_non_attention_raises(runner):
+    mamba_group = KVCacheGroupSpec(
+        layer_names=["m.0"],
+        kv_cache_spec=MambaSpec(
+            shapes=((2, 4),),
+            dtypes=(torch.bfloat16,),
+            block_size=-1,
+        ),
+    )
+    with pytest.raises(TypeError, match="Expected AttentionSpec"):
+        runner._validate_kv_cache_groups([mamba_group])
+
+
+def test_kv_cache_shape_folds_in_tp(runner):
+    runner.device_config.num_devices = 4  # 4 devices, 1 DP rank
+    spec = _full_spec(num_kv_heads=8, head_size=64, block_size=32)
+    shape = runner._kv_cache_shape(spec, num_blocks=128)
+    # tp = min(4, 8) = 4 → num_kv_heads_per_device = 8 // 4 = 2
+    assert shape == (128, 2, 32, 64)
+
+
+def test_kv_cache_shape_when_kv_heads_below_tp(runner):
+    """When kv heads < tp, each device carries one head (existing behavior)."""
+    runner.device_config.num_devices = 8  # tp = 8 but only 2 kv heads
+    spec = _full_spec(num_kv_heads=2)
+    shape = runner._kv_cache_shape(spec, num_blocks=64)
+    # min(8, 2) = 2 → num_kv_heads_per_device = 2 // 2 = 1
+    assert shape[1] == 1
+
+
+def test_initialize_single_group_calls_model_allocate(runner):
+    spec = _full_spec(num_kv_heads=8, head_size=128, block_size=64)
+    config = _config([KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=spec)])
+
+    runner.initialize_kv_cache(config)
+
+    runner.model.allocate_kv_cache.assert_called_once()
+    args, _ = runner.model.allocate_kv_cache.call_args
+    shape, dtype, num_layers = args
+    assert shape == (2048, 8 // min(2, 8), 64, 128)
+    assert dtype == torch.bfloat16
+    assert num_layers == 32
+    assert runner.kv_caches == "kv-caches-sentinel"
+    assert runner.kv_cache_config is config
+
+
+def test_initialize_stores_config_even_when_not_dp_rank_zero(runner):
+    """Non-driver DP ranks skip allocation but should still build the input
+    batch so they can participate in input prep / DP gather."""
+    runner.parallel_config.data_parallel_rank_local = 1
+    spec = _full_spec()
+    config = _config([KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=spec)])
+
+    runner.initialize_kv_cache(config)
+
+    runner.model.allocate_kv_cache.assert_not_called()
+    assert runner.kv_cache_config is config
+    assert runner.input_batch is not None
+
+
+def test_initialize_multi_group_raises_until_phase_3(runner):
+    full = KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec())
+    sliding = KVCacheGroupSpec(layer_names=["l.1"], kv_cache_spec=_sliding_spec())
+    config = _config([full, sliding])
+
+    with pytest.raises(NotImplementedError, match="Phase 3"):
+        runner.initialize_kv_cache(config)
+
+
+def test_initialize_mixed_block_sizes_rejected(runner):
+    """The persistent input batch currently only supports a single
+    block_size; uneven block sizes across groups must error early."""
+    g1 = KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec(block_size=32))
+    g2 = KVCacheGroupSpec(layer_names=["l.1"], kv_cache_spec=_full_spec(block_size=64))
+    config = _config([g1, g2])
+
+    with pytest.raises(AssertionError, match="block size"):
+        runner.initialize_kv_cache(config)
