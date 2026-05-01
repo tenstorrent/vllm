@@ -123,19 +123,65 @@ class TTWorker(WorkerBase):
         memory info from a profiling run to determine num blocks.
 
         For the TT backend, the static forward context is not populated since
-        the modelling code is independent so we currently skip creating a
-        kv cache spec for each layer, similar to the Spyre/Neuron backends.
-        Currently we also don't run profiling to determine available memory.
+        the modelling code is independent. Two paths are supported:
 
-        Return a dummy single layer KVCacheSpec and in the
-        determine_available_memory function override num blocks using
-        self.cache_config.num_gpu_blocks_override.
+        1. Hybrid models (mixed sliding-window + full-attention layers, e.g.
+           Gemma3/4 / GPT-OSS) opt in by defining a ``get_kv_cache_spec``
+           classmethod on the registered TT model class:
+
+               @classmethod
+               def get_kv_cache_spec(
+                   cls, vllm_config
+               ) -> dict[str, KVCacheSpec] | None:
+                   ...
+
+           The returned dict maps a layer name to its per-layer spec. This
+           lets upstream's hybrid kv cache manager pack each attention type
+           into its own group with its own per-request block budget.
+
+        2. Models without the hook (and models that return ``None``) fall
+           back to a single homogeneous spec under the dummy ``"foo"`` layer
+           name, the same behaviour the TT backend has always had. As before
+           we don't run profiling for available memory and instead override
+           num blocks via ``self.cache_config.num_gpu_blocks_override``.
         """
+        spec_from_hook = self._try_get_spec_from_model_hook()
+        if spec_from_hook is not None:
+            return spec_from_hook
 
-        # TODO: Once we're able to populate a static forward context,
-        # generate separate specs per layer (e.g. also sliding window, local
-        # attention).
+        return self._build_default_kv_cache_spec()
 
+    def _try_get_spec_from_model_hook(self) -> dict[str, KVCacheSpec] | None:
+        """If the resolved TT model class implements ``get_kv_cache_spec``,
+        invoke it and return the result. Returns ``None`` when the hook is
+        absent or explicitly returns ``None`` (signalling fallback to the
+        single-spec default).
+        """
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            self.model_config.architecture, model_config=self.model_config
+        )
+        hook = getattr(model_cls, "get_kv_cache_spec", None)
+        if hook is None:
+            return None
+        spec = hook(self.vllm_config)
+        if spec is None:
+            return None
+        if not isinstance(spec, dict) or not all(
+            isinstance(k, str) and isinstance(v, KVCacheSpec)
+            for k, v in spec.items()
+        ):
+            raise TypeError(
+                f"{model_cls.__name__}.get_kv_cache_spec() must return "
+                f"dict[str, KVCacheSpec] or None, got {type(spec).__name__}"
+            )
+        return spec
+
+    def _build_default_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Single-layer spec used by the legacy non-hybrid path. Downstream
+        sizing is overridden via ``cache_config.num_gpu_blocks_override``.
+        """
         model_config = self.model_config
         parallel_config = self.parallel_config
         cache_config = self.cache_config
@@ -168,8 +214,7 @@ class TTWorker(WorkerBase):
                 dtype=dtype,
                 sliding_window=sliding_window,
             )
-        kv_cache_spec: dict[str, KVCacheSpec] = {"foo": attn_spec}
-        return kv_cache_spec
+        return {"foo": attn_spec}
 
     def determine_available_memory(self) -> int:
         """
