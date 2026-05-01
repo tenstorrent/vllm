@@ -43,6 +43,9 @@ def worker():
     w.model_config.get_sliding_window.return_value = None
     w.cache_config.cache_dtype = "auto"
     w.cache_config.block_size = 64
+    # Default to non-DP so the hybrid-under-DP guard doesn't fire on
+    # the legacy / single-DP test paths.
+    w.parallel_config.data_parallel_size = 1
     return w
 
 
@@ -135,3 +138,41 @@ def test_default_spec_passes_sliding_window(resolve, worker):
 
     assert isinstance(spec["foo"], FullAttentionSpec)
     assert spec["foo"].sliding_window == 4096
+
+
+@patch("vllm.model_executor.models.registry.ModelRegistry.resolve_model_cls")
+def test_hybrid_under_dp_rejected(resolve, worker):
+    """Hybrid spec (mixed FullAttention + SlidingWindow) under DP > 1 is
+    rejected at spec-resolution time. The DP merged path doesn't yet
+    gather per-group block tables, so silent group-0 collapse would
+    corrupt KV state for the sliding-window groups."""
+    resolve.return_value = (_ModelHookReturningSpecs, "TestArch")
+    worker.parallel_config.data_parallel_size = 2
+
+    with pytest.raises(NotImplementedError, match="data_parallel_size"):
+        worker.get_kv_cache_spec()
+
+
+@patch("vllm.model_executor.models.registry.ModelRegistry.resolve_model_cls")
+def test_uniform_spec_under_dp_allowed(resolve, worker):
+    """A spec hook returning all-FullAttention layers (uniform) is fine
+    under DP — only mixed-type hybrids are gated."""
+
+    class _UniformHook:
+        @classmethod
+        def get_kv_cache_spec(cls, vllm_config):
+            common = dict(
+                block_size=64, num_kv_heads=4, head_size=128, dtype=torch.bfloat16
+            )
+            return {
+                "model.layers.0.self_attn": FullAttentionSpec(**common),
+                "model.layers.1.self_attn": FullAttentionSpec(**common),
+            }
+
+    resolve.return_value = (_UniformHook, "TestArch")
+    worker.parallel_config.data_parallel_size = 4
+
+    spec = worker.get_kv_cache_spec()
+
+    assert len(spec) == 2
+    assert all(isinstance(v, FullAttentionSpec) for v in spec.values())
