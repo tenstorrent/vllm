@@ -12,12 +12,12 @@ import torch
 import ttnn
 
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
-from vllm.v1.worker.tt_input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.worker.tt_input_batch import CachedRequestState
-    from vllm.v1.worker.tt_model_runner import TTModelInput, TTModelRunner
+    from vllm_tt_plugin.input_batch import CachedRequestState
+    from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 
 
 @dataclass(frozen=True)
