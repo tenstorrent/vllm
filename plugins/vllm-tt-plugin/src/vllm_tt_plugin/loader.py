@@ -33,7 +33,7 @@ class TTModelLoader(BaseModelLoader):
         # TT model init expects the global DP-sized batch contract:
         # batch_size_per_dp * total_dp.
         parallel_config = vllm_config.parallel_config
-        data_parallel = parallel_config.data_parallel_size_original
+        data_parallel = parallel_config.data_parallel_size
         max_batch_size = scheduler_config.max_num_seqs * data_parallel
 
         model = model_class.initialize_vllm_model(

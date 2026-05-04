@@ -14,8 +14,6 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
-import torch
-import torch.distributed as dist
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -25,7 +23,6 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms import current_platform
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -1063,60 +1060,26 @@ class EngineCoreProc(EngineCore):
             not self.engines_running
             and not self.scheduler.has_requests()
             and not self.batch_queue
-            and not getattr(self, "_dp_in_flight", None)
             and not self._scheduler_paused
         ):
-            if hasattr(self, "requires_gather") and self.requires_gather:
-                # Non-blocking input polling so idle ranks can progress
-                try:
-                    req = self.input_queue.get_nowait()
-                    self._handle_client_request(*req)
+            if self.input_queue.empty():
+                # Drain aborts queue; all aborts are also processed via
+                # input_queue.
+                with self.aborts_queue.mutex:
+                    self.aborts_queue.queue.clear()
+                if logger.isEnabledFor(DEBUG):
+                    logger.debug("EngineCore waiting for work.")
                     waited = True
-                except queue.Empty:
-                    break
-            else:
-                if self.input_queue.empty():
-                    # Drain aborts queue; all aborts are also processed via
-                    # input_queue.
-                    with self.aborts_queue.mutex:
-                        self.aborts_queue.queue.clear()
-                    if logger.isEnabledFor(DEBUG):
-                        logger.debug("EngineCore waiting for work.")
-                        waited = True
-                req = self.input_queue.get()
-                self._handle_client_request(*req)
+            req = self.input_queue.get()
+            self._handle_client_request(*req)
 
         if waited:
             logger.debug("EngineCore loop active.")
-
-        # Optionally add a delay to allow more requests to arrive if no
-        # requests are running and there aren't already enough requests for a
-        # full batch waiting.
-        delay = self.vllm_config.scheduler_config.input_queue_batching_delay
-
-        def _should_add_queue_delay() -> bool:
-            if delay <= 0:
-                return False
-            num_running, num_waiting = self.scheduler.get_request_counts()
-            has_running = num_running > 0
-            max_batch_waiting = (
-                num_waiting >= self.vllm_config.scheduler_config.max_num_seqs
-            )
-            return not has_running and not max_batch_waiting
-
-        if _should_add_queue_delay():
-            time.sleep(delay)
 
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
-
-            # Optionally add a delay to allow more requests to arrive.
-            # Don't add delays beyond the initial delay if there are more
-            # requests in the queue.
-            if self.input_queue.empty() and _should_add_queue_delay():
-                time.sleep(delay)
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -1404,17 +1367,6 @@ class DPEngineCoreProc(EngineCoreProc):
         self.current_wave = 0
         self.last_counts = (0, 0)
 
-        self.requires_gather = current_platform.requires_gathered_batch_dp()
-        if self.requires_gather:
-            DEBUG_DPG = os.environ.get("DP_GATHER_DEBUG") == "1"
-
-            def dlog_logger(msg: str, *a: object) -> None:
-                if DEBUG_DPG:
-                    formatted = (msg % a) if a else msg
-                    logger.info("dp_gather r%d: %s", self.dp_rank, formatted)
-
-            self.dlog = dlog_logger
-
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(
@@ -1426,39 +1378,6 @@ class DPEngineCoreProc(EngineCoreProc):
             client_handshake_address,
             engine_index=dp_rank,
         )
-        if self.requires_gather:
-            self._dp_in_flight: Any | None = None
-            if self.batch_queue is not None:
-                self.step_fn = self.step_dp_with_batch_queue
-
-    def _init_dp_group(self, parallel_config: ParallelConfig) -> None:
-        """Initialize DP group in self.dp_group. For DP gather execution, also
-        store the device ranks (local_dp_rank==0) in self.dp_device_ranks.
-        """
-        if self.requires_gather:
-            # Use normal init to support rooted collectives like gather.
-            self.dp_group = parallel_config.normal_init_dp_group()
-
-            # Get device ranks (local_dp_rank==0) using all-gather
-            local_dp_rank = parallel_config.data_parallel_rank_local
-            dp_size = parallel_config.data_parallel_size
-            local_dp_rank_tensor = torch.tensor(
-                [local_dp_rank], dtype=torch.int32, device="cpu"
-            )
-            gathered_local_ranks = [
-                torch.zeros(1, dtype=torch.int32) for _ in range(dp_size)
-            ]
-            dist.all_gather(
-                gathered_local_ranks, local_dp_rank_tensor, group=self.dp_group
-            )
-            self.dp_device_ranks = [
-                i
-                for i, rank_tensor in enumerate(gathered_local_ranks)
-                if rank_tensor.item() == 0
-            ]
-            logger.info("DP device ranks: %s", self.dp_device_ranks)
-        else:
-            self.dp_group = parallel_config.stateless_init_dp_group()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
@@ -1471,16 +1390,12 @@ class DPEngineCoreProc(EngineCoreProc):
         assert 0 <= local_dp_rank <= dp_rank < dp_size
 
         self.dp_rank = dp_rank
-        self._init_dp_group(vllm_config.parallel_config)
+        self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
 
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
-            if self.requires_gather:
-                # Normal group: use standard destroy
-                dist.destroy_process_group(dp_group)
-            else:
-                stateless_destroy_torch_distributed_process_group(dp_group)
+            stateless_destroy_torch_distributed_process_group(dp_group)
 
     def add_request(self, request: Request, request_wave: int = 0):
         start_wave = False
@@ -1561,9 +1476,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
 
-            # In gathered-DP mode, avoid early-continue to keep
-            # the global finish all-reduce aligned across ranks.
-            if not executed and not self.requires_gather:
+            if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
                     continue
@@ -1593,22 +1506,6 @@ class DPEngineCoreProc(EngineCoreProc):
                             EngineCoreOutputs(wave_complete=self.current_wave),
                         )
                     )
-                    # Mirror to client only for gathered-DP path when
-                    # a coordinator is present, without altering regular path.
-                    if (
-                        self.has_coordinator
-                        and self.requires_gather
-                        and client_index == -1
-                    ):
-                        self.output_queue.put_nowait(
-                            (
-                                0,
-                                EngineCoreOutputs(
-                                    wave_complete=self.current_wave,
-                                    scheduler_stats=self.scheduler.make_stats(),
-                                ),
-                            )
-                        )
                 # Increment wave count and reset step counter.
                 self.current_wave += 1
                 self.step_counter = 0
@@ -1624,11 +1521,7 @@ class DPEngineCoreProc(EngineCoreProc):
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
     ) -> None:
-        if self.requires_gather:
-            # Normal group: use standard destroy
-            dist.destroy_process_group(self.dp_group)
-        else:
-            stateless_destroy_torch_distributed_process_group(self.dp_group)
+        stateless_destroy_torch_distributed_process_group(self.dp_group)
         self.shutdown()
 
         parallel_config = self.vllm_config.parallel_config
@@ -1649,7 +1542,7 @@ class DPEngineCoreProc(EngineCoreProc):
         )
         if reconfig_request.new_data_parallel_rank != -2:
             self.dp_rank = parallel_config.data_parallel_rank
-            self._init_dp_group(parallel_config)
+            self.dp_group = parallel_config.stateless_init_dp_group()
         reconfig_request.new_data_parallel_master_port = (
             parallel_config.data_parallel_master_port
         )

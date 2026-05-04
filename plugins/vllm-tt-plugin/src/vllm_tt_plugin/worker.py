@@ -32,7 +32,7 @@ from vllm_tt_plugin.platform import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import LogprobsLists
 
 logger = init_logger(__name__)
@@ -279,8 +279,16 @@ class TTWorker(WorkerBase):
         Returns the runner's non-DP execution result for the provided
         scheduler output.
         """
+        return self.execute_model_with_grammar(scheduler_output, None)
+
+    def execute_model_with_grammar(
+        self,
+        scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput | None:
+        """Execute a non-DP TT step with plugin-owned structured-output data."""
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        output = self.model_runner.execute_model(scheduler_output)
+        output = self.model_runner.execute_model(scheduler_output, grammar_output)
         return output
 
     def check_health(self) -> None:
@@ -290,7 +298,9 @@ class TTWorker(WorkerBase):
     # ---- DP gather hooks called by DPEngineCoreProc in core.py ----
 
     def build_dp_model_input(
-        self, scheduler_output: Optional["SchedulerOutput"]
+        self,
+        scheduler_output: Optional["SchedulerOutput"],
+        grammar_output: Optional["GrammarOutput"],
     ) -> tuple[
         TTModelInput | None,
         int,
@@ -310,10 +320,14 @@ class TTWorker(WorkerBase):
         TT model input (or `None`) and the remaining fields are the
         per-rank metadata consumed by gathered-DP orchestration.
         """
-        return self.model_runner.prepare_dp_model_input(scheduler_output)
+        return self.model_runner.prepare_dp_model_input(
+            scheduler_output, grammar_output
+        )
 
     def can_attempt_steady_dp_decode_from_scheduler(
-        self, scheduler_output: Optional["SchedulerOutput"]
+        self,
+        scheduler_output: Optional["SchedulerOutput"],
+        grammar_output: Optional["GrammarOutput"],
     ) -> bool:
         """Return whether this rank can submit decode one step ahead.
 
@@ -321,15 +335,17 @@ class TTWorker(WorkerBase):
         answers into a single global decision before using the DP steady path.
         """
         return self.model_runner.can_attempt_steady_dp_decode_from_scheduler(
-            scheduler_output
+            scheduler_output, grammar_output
         )
 
     def can_attempt_steady_decode_from_scheduler(
-        self, scheduler_output: "SchedulerOutput"
+        self,
+        scheduler_output: "SchedulerOutput",
+        grammar_output: Optional["GrammarOutput"],
     ) -> bool:
         """Return whether a scheduled non-DP step can overlap steady decode."""
         return self.model_runner.can_attempt_steady_decode_from_scheduler(
-            scheduler_output
+            scheduler_output, grammar_output
         )
 
     def build_dp_decode_gather_input(

@@ -1,2 +1,0 @@
-qwen-vl-utils
-tblib==3.1.0

@@ -34,10 +34,10 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 **To create the vLLM+tt-metal environment (first time):**
 
 1. Install tt-metal following the instructions in [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) (build and create the virtual environment if [installing tt-metal from source](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md#source)). Ensure that the necessary environment variables for running tt-metal tests were set.
-2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM and the TT backend plugin (Note: `dev` is the main vLLM branch):
+2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM and the TT backend plugin with its runtime extra (Note: `dev` is the main vLLM branch):
 
     ```sh
-    source tt_metal/install-vllm-tt.sh
+    source plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh
     ```
 
 > **Note for developers**: Optionally install pre-commit hooks for linting, formatting, and static type checking on commits by running `pre-commit install`.
@@ -66,13 +66,19 @@ The TT backend is in a Phase 1 out-of-tree plugin package located at:
 plugins/vllm-tt-plugin
 ```
 
-The `tt_metal/install-vllm-tt.sh` script installs this package after installing vLLM:
+The `plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh` script installs this package after installing vLLM:
 
 ```sh
-source tt_metal/install-vllm-tt.sh
+source plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh
 ```
 
-To install or refresh only the plugin package, run `uv pip install --no-deps -e plugins/vllm-tt-plugin`.
+To install or refresh only the plugin package and its runtime dependencies, run:
+
+```sh
+uv pip install -e "plugins/vllm-tt-plugin[runtime]" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+```
+
+Use `uv pip install --no-deps -e plugins/vllm-tt-plugin` only when the active tt-metal environment already owns the TT runtime dependencies.
 
 The editable install registers two vLLM entry points:
 
@@ -116,18 +122,18 @@ For the desired model, follow the setup instructions (if any) for the correspond
 To generate tokens (Llama70B on QuietBox) for sample prompts (with batch size 32):
 
 ```sh
-MESH_DEVICE=T3K python examples/offline_inference_tt.py
+MESH_DEVICE=T3K python plugins/vllm-tt-plugin/examples/offline_inference_tt.py
 ```
 
 To measure performance (Llama70B on QuietBox) for a single batch of 32 prompts (with the default prompt length of 128 tokens):
 
 ```sh
-MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
+MESH_DEVICE=T3K python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --measure_perf
 ```
 
 > **⚠️ Notes on V1 Backend**: To disable multiprocessing in V1 (to step through code or make scheduling deterministic), set `VLLM_ENABLE_V1_MULTIPROCESSING=0` (note: not compatible with DP models). To run a model with DP attention, set the DP factor with `--data_parallel_size`, set the max batch size as the max batch per DP group, and set `--async_engine` (only for offline script) for proper load balancing.
 
-**Note 1**: Custom TT options can be set using `--override_tt_config` with a json string, e.g. `--override_tt_config '{"sample_on_device_mode": "all"}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters are:
+**Note 1**: Custom TT options can be set using `--plugin-config` with a JSON string, e.g. `--plugin-config '{"tt": {"sample_on_device_mode": "all"}}'`, however these shouldn't be used unless the model supports them (most currently do not). Supported parameters under the `tt` namespace are:
 
 - `sample_on_device_mode`: ["all", "decode_only"]
 - `trace_mode`: ["all", "decode_only", "none"], default: all (Determines if tracing will be enabled both in prefill and decode, decode only, or it won't be enabled for both prefill and decode)
@@ -140,6 +146,7 @@ MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 - `dispatch_core_axis`: ["row", "col"]
 - `data_parallel`: [default: 1]
 - `always_compat_sampling`: [true, false], default: false (If true, use vLLM's full LogitProcessor+Sampler pipeline instead of custom sampling even when not required by the batch)
+- `input_queue_batching_delay`: [float seconds], default: 0.002 (Delay before processing queued requests when TT is idle, to allow more requests to batch together. Set to 0 to disable.)
 - `optimizations`: ["accuracy", "performance"], default: None
 - `register_test_models`: [true, false], default: false (If true, register non-production models for testing infrastructure)
 
@@ -163,22 +170,22 @@ MESH_DEVICE=T3K python examples/offline_inference_tt.py --measure_perf
 
 Example commands:
 
-- To run the Llama70B model on Galaxy: `MESH_DEVICE=TG LLAMA_DIR=<path to weights> TT_LLAMA_TEXT_VER="llama3_70b_galaxy" python examples/offline_inference_tt.py --model "meta-llama/Llama-3.1-70B-Instruct" --override_tt_config '{"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}'`
+- To run the Llama70B model on Galaxy: `MESH_DEVICE=TG LLAMA_DIR=<path to weights> TT_LLAMA_TEXT_VER="llama3_70b_galaxy" python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --model "meta-llama/Llama-3.1-70B-Instruct" --plugin-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'`
 
-- To run the 20B gpt-oss model on Galaxy: `MESH_DEVICE="(4,8)" python examples/offline_inference_tt.py --model "openai/gpt-oss-20b" --max_seqs_in_batch 1 --override_tt_config '{"fabric_config": "FABRIC_1D_RING"}'`
+- To run the 20B gpt-oss model on Galaxy: `MESH_DEVICE="(4,8)" python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --model "openai/gpt-oss-20b" --max_seqs_in_batch 1 --plugin-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'`
 
 ### Llama-3.2 (11B and 90B) and Qwen-2.5-VL (32B and 72B) Vision Models
 
 To generate tokens (Llama-3.2-11B on N300) for sample prompts:
 
 ```sh
-MESH_DEVICE=N300 python examples/offline_inference_tt.py --model "meta-llama/Llama-3.2-11B-Vision-Instruct" --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 8
+MESH_DEVICE=N300 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --model "meta-llama/Llama-3.2-11B-Vision-Instruct" --multi_modal --max_seqs_in_batch 16 --num_repeat_prompts 8
 ```
 
 To measure performance (Llama-3.2-11B on N300) for a single batch (with the default prompt length of 128 tokens):
 
 ```sh
-MESH_DEVICE=N300 python examples/offline_inference_tt.py --model "meta-llama/Llama-3.2-11B-Vision-Instruct" --measure_perf --multi_modal --max_seqs_in_batch 16
+MESH_DEVICE=N300 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --model "meta-llama/Llama-3.2-11B-Vision-Instruct" --measure_perf --multi_modal --max_seqs_in_batch 16
 ```
 
 > **Notes:**
@@ -186,8 +193,8 @@ MESH_DEVICE=N300 python examples/offline_inference_tt.py --model "meta-llama/Lla
 > - To run the 11B Llama-3.2 model on QuietBox, set `MESH_DEVICE=T3K` and `--max_seqs_in_batch 32`.
 > - To run the 90B Llama-3.2 model, set `MESH_DEVICE=T3K`, `--model "meta-llama/Llama-3.2-90B-Vision-Instruct"` and `--max_seqs_in_batch 4`.
 > - To run the 32B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-32B"` and `--max_seqs_in_batch 32`.
-> - To run the 72B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, `--max_model_len 2048`, and `--override_tt_config '{"trace_region_size": 28467200}'`. Note that this model currently is limited to 2048 tokens per user with batch size 32 to avoid OOM error on T3K.
-> - To run the 27B gemma-3 model, set `MESH_DEVICE=T3K --model "google/gemma-3-27b-it" --max_seqs_in_batch 32 --override_tt_config '{"l1_small_size": 768, "fabric_config": "FABRIC_1D"} --multi_modal --multi_image --mm_processor_kwargs '{"use_fast": true, "do_convert_rgb": true}'`.
+> - To run the 72B Qwen-2.5-VL model, set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, `--max_model_len 2048`, and `--plugin-config '{"tt": {"trace_region_size": 28467200}}'`. Note that this model currently is limited to 2048 tokens per user with batch size 32 to avoid OOM error on T3K.
+> - To run the 27B gemma-3 model, set `MESH_DEVICE=T3K --model "google/gemma-3-27b-it" --max_seqs_in_batch 32 --plugin-config '{"tt": {"l1_small_size": 768, "fabric_config": "FABRIC_1D"}}' --multi_modal --multi_image --mm_processor_kwargs '{"use_fast": true, "do_convert_rgb": true}'`.
 
 ## Running the Server Example
 
@@ -200,7 +207,7 @@ VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K python examples/server_example_tt.py
 > **Notes:**
 >
 > - By default, the server will run with Llama-3.1-70B-Instruct. To run with other models, set `MESH_DEVICE` and `--model` as described in [Running the Offline Inference Example](#running-the-offline-inference-example).
-> - Custom TT options can be set using `--override_tt_config` as described in [Running the Offline Inference Example](#running-the-offline-inference-example).
+> - Custom TT options can be set using `--plugin-config` as described in [Running the Offline Inference Example](#running-the-offline-inference-example).
 >
 
 To send a request to the server:
@@ -305,7 +312,7 @@ prefix caching for the inference, if supported by the model.
 To trigger this feature, you also need prompts that share prefixes.
 One option for offline inference is to provide a custom prompt file
 to the `offline_inference_tt.py` script,
-for example `--prompts_json tt_metal/prompts_overlapping.json`
+for example `--prompts_json plugins/vllm-tt-plugin/docs/tt_metal/prompts_overlapping.json`
 
 There is also a dedicated script for offline testing of prefix caching. Example:
 
@@ -323,7 +330,7 @@ For client-server benchmarking, the `vllm bench serve` command can be used with 
 To run sampling tests, first start a vllm server as usual, then run (substituting the address and model name):
 
 ```sh
-pytest tests/tt -v --tt-server-url=http://localhost:8000 --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
+pytest plugins/vllm-tt-plugin/tests/tt -v --tt-server-url=http://localhost:8000 --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ## Running on Multi-Host Systems (V1 only)
@@ -331,7 +338,7 @@ pytest tests/tt -v --tt-server-url=http://localhost:8000 --tt-model-name=meta-ll
 To run offline inference or a server on a multi-host system, vLLM needs to be launched from the host that has MPI rank 0 (determined from the rankfile). Underneath the hood, the `tt-run` utility from tt-metal will be used to spawn MPI processes on each host. For example, for offline inference on 2 Wormhole Galaxy hosts with DP=2 (distributed across hosts):
 
 ```sh
-MESH_DEVICE=(8,8) python -u examples/offline_inference_tt.py --model <MODEL_NAME> --data_parallel_size 2 --async_engine --override_tt_config '{"rank_binding": "<PATH_TO_TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml", "extra_ttrun_args": "--tcp-interface cnx1", "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile", "config_pkl_dir": "<PATH_TO_SHARED_TMP_DIR>", "fabric_config": "FABRIC_1D", "fabric_reliability_mode": "RELAXED_INIT", "env_passthrough":["VLLM_*", "MESH_DEVICE"]}'
+MESH_DEVICE=(8,8) python -u plugins/vllm-tt-plugin/examples/offline_inference_tt.py --model <MODEL_NAME> --data_parallel_size 2 --async_engine --plugin-config '{"tt": {"rank_binding": "<PATH_TO_TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml", "extra_ttrun_args": "--tcp-interface cnx1", "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile", "config_pkl_dir": "<PATH_TO_SHARED_TMP_DIR>", "fabric_config": "FABRIC_1D", "fabric_reliability_mode": "RELAXED_INIT", "env_passthrough":["VLLM_*", "MESH_DEVICE"]}}'
 ```
 
 > **Notes:**
@@ -339,7 +346,7 @@ MESH_DEVICE=(8,8) python -u examples/offline_inference_tt.py --model <MODEL_NAME
 > - The `rank_binding` YAML needs to contain an absolute path for `mesh_graph_desc_path` so the file can be located (the default tt-metal rank binding files contain paths relative to tt-metal).
 > - To check which host has MPI rank 0, examine the rankfile (commonly /etc/mpirun/rankfile). If you launch from another host, vLLM will raise an error and indicate which host to run from.
 > - `config_pkl_dir` needs to be set to a directory that is shared by all hosts (used during initialization to write a temporary config file that is read by other hosts).
-> - If you need to set environment variables that should be propagated to all hosts, you can either 1) specify them as part of `env_passthrough` in `--override_tt_config` or 2) add them as a `global_env` in the rank_binding file.
+> - If you need to set environment variables that should be propagated to all hosts, you can either 1) specify them as part of `env_passthrough` in `--plugin-config` or 2) add them as a `global_env` in the rank_binding file.
 > - `extra_ttrun_args` can be used to pass additional flags directly to `tt-run` as a raw string (e.g. `"--tcp-interface cnx1"`, `"--bare"`, `"--debug-gdbserver"`).
 
 ## Hybrid Attention Models

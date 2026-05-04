@@ -6,7 +6,7 @@ from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
@@ -102,23 +102,7 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
-        if not scheduler_output.pending_structured_output_tokens:
-            self.get_grammar_bitmask(scheduler_output)
         return scheduler_output
-
-    def get_grammar_bitmask(
-        self, scheduler_output: SchedulerOutput
-    ) -> GrammarOutput | None:
-        grammar_output = super().get_grammar_bitmask(scheduler_output)
-        if grammar_output is not None:
-            scheduler_output.structured_output_request_ids = (
-                grammar_output.structured_output_request_ids
-            )
-            scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
-        else:
-            scheduler_output.structured_output_request_ids = None
-            scheduler_output.grammar_bitmask = None
-        return grammar_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule only waiting (prefill) requests.

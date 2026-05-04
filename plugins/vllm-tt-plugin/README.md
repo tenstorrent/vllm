@@ -12,8 +12,13 @@ behavior should live here instead of in shared core.
 Install from the repository root:
 
 ```bash
-pip install -e plugins/vllm-tt-plugin
+uv pip install -e "plugins/vllm-tt-plugin[runtime]" \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  --index-strategy unsafe-best-match
 ```
+
+Use `uv pip install -e plugins/vllm-tt-plugin --no-deps` only when the TT
+runtime dependencies are already managed by the active tt-metal environment.
 
 ## Entry Points
 
@@ -42,7 +47,7 @@ gather execution path, and mixed local/MPI launch path.
 
 ## Configuration
 
-Prefer the generic plugin namespace:
+Use the generic plugin namespace:
 
 ```bash
 --plugin-config '{"tt": {"sample_on_device_mode": "all"}}'
@@ -51,22 +56,13 @@ Prefer the generic plugin namespace:
 TT code reads this through `vllm_tt_plugin.config.get_tt_config()`, which returns
 `vllm_config.plugin_config["tt"]`.
 
-The fork still accepts the compatibility flag:
-
-```bash
---override-tt-config '{"trace_mode": "decode_only"}'
-```
-
-During the current transition, shared argparse maps `--override-tt-config` into
-`plugin_config["tt"]`. New TT options should be handled through the `tt` plugin
-config namespace.
-
 Common TT config keys include:
 
 - `register_test_models`
 - `sample_on_device_mode`
 - `trace_mode`
 - `enable_model_warmup`
+- `input_queue_batching_delay`
 - `optimizations`
 - `rank_binding`
 - `mpi_args`

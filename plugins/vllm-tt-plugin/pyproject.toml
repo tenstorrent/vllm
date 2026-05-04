@@ -11,6 +11,17 @@ requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 dependencies = ["vllm"]
 
+[project.optional-dependencies]
+runtime = [
+    "torch==2.10.0+cpu",
+    "torchvision==0.25.0",
+    "torchaudio==2.10.0",
+    "numpy==1.26.4",
+    "transformers<=4.57.1",
+    "qwen-vl-utils",
+    "tblib==3.1.0",
+]
+
 [project.entry-points."vllm.general_plugins"]
 tt_model_registry = "vllm_tt_plugin.entrypoints:register"
 

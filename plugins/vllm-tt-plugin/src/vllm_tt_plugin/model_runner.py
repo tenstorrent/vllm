@@ -45,7 +45,7 @@ from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.platform import TTPlatform
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 import numpy as np
 
@@ -827,7 +827,11 @@ class TTModelRunner:
 
         return multi_modal_kwargs
 
-    def _prepare_model_inputs(self, scheduler_output: SchedulerOutput) -> TTModelInput:
+    def _prepare_model_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
+    ) -> TTModelInput:
         # In DP, called on each rank
         # In non-DP, this is the only input preparation function
 
@@ -982,8 +986,8 @@ class TTModelRunner:
         else:
             multi_modal_kwargs = {}
 
-        # If we're not using structured outputs, grammar_bitmask is None
-        bitmask = scheduler_output.grammar_bitmask
+        # If we're not using structured outputs, grammar_bitmask is None.
+        bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
         scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         scheduled_structured_req_ids = [
             req_id
@@ -1009,12 +1013,14 @@ class TTModelRunner:
                 (batch_length, grammar_bitmask_length), dtype=torch.int32
             )
             reordered_bitmask = torch.bitwise_not(reordered_bitmask)
-            # `structured_output_request_ids` is produced by the scheduler as a
-            # list of request IDs (bitmask rows are in this order). TT does not
-            # support speculative decoding in this path, so we assume a single
-            # bitmask row per request.
+            # `structured_output_request_ids` comes from GrammarOutput as a list
+            # of request IDs (bitmask rows are in this order). TT does not support
+            # speculative decoding in this path, so we assume a single bitmask row
+            # per request.
             structured_output_request_ids = (
-                scheduler_output.structured_output_request_ids or []
+                grammar_output.structured_output_request_ids
+                if grammar_output is not None
+                else []
             )
             req_id_to_bitmask_row: dict[str, int] = {
                 req_id: i for i, req_id in enumerate(structured_output_request_ids)
@@ -1119,6 +1125,7 @@ class TTModelRunner:
     def build_model_input(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
     ) -> TTModelInput | None:
         """
         Update internal state with the scheduler output and build
@@ -1134,21 +1141,23 @@ class TTModelRunner:
             return None
 
         # Prepare model inputs only
-        model_input = self._prepare_model_inputs(scheduler_output)
+        model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         return model_input
 
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
     ) -> bool:
         """Return whether a scheduled non-DP step can overlap steady decode."""
         return self.async_decode.can_attempt_steady_decode_from_scheduler(
-            scheduler_output
+            scheduler_output, grammar_output
         )
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
+        grammar_output: GrammarOutput | None,
     ) -> bool:
         """Check whether one DP rank can participate in steady gathered decode.
 
@@ -1158,7 +1167,7 @@ class TTModelRunner:
         work while the global gathered step still overlaps safely.
         """
         return self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
-            scheduler_output
+            scheduler_output, grammar_output
         )
 
     def build_dp_decode_gather_input(
@@ -1781,6 +1790,7 @@ class TTModelRunner:
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         """Public non-DP runner entrypoint used by the TT worker.
@@ -1800,13 +1810,15 @@ class TTModelRunner:
         # completed work pile up unbounded.
         self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
-            self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
+            self.async_decode.can_attempt_steady_decode_from_scheduler(
+                scheduler_output, grammar_output
+            )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
             self.async_decode.wait_for_all_pending_async_steps()
 
         # Update cached state and prepare model inputs
-        model_input = self.build_model_input(scheduler_output)
+        model_input = self.build_model_input(scheduler_output, grammar_output)
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -2049,7 +2061,9 @@ class TTModelRunner:
         )
 
     def prepare_dp_model_input(
-        self, scheduler_output: SchedulerOutput | None
+        self,
+        scheduler_output: SchedulerOutput | None,
+        grammar_output: GrammarOutput | None,
     ) -> tuple[
         TTModelInput | None,
         int,
@@ -2074,7 +2088,7 @@ class TTModelRunner:
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         if scheduler_output is not None:
-            model_input = self.build_model_input(scheduler_output)
+            model_input = self.build_model_input(scheduler_output, grammar_output)
             if model_input is not None:
                 has_penalties = int(not self.input_batch.no_penalties)
                 reset_batch = int(model_input.reset_batch)
