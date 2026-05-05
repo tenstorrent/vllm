@@ -204,7 +204,7 @@ MESH_DEVICE=N300 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py 
 To start up the server:
 
 ```sh
-VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K python examples/server_example_tt.py
+VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K python plugins/vllm-tt-plugin/examples/server_example_tt.py
 ```
 
 > **Notes:**
