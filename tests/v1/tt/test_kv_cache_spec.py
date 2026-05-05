@@ -27,7 +27,7 @@ def worker():
     The hook resolution path only reads config attributes, so we can build
     a synthetic instance and set just those attributes directly.
     """
-    from vllm.v1.worker.tt_worker import TTWorker
+    from vllm_tt_plugin.worker import TTWorker
 
     w = TTWorker.__new__(TTWorker)
     w.vllm_config = MagicMock()

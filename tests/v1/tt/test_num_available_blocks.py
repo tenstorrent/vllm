@@ -33,10 +33,10 @@ def cfg():
 
 
 def test_default_branch_no_sliding(cfg):
-    from vllm.v1.worker.tt_worker import get_num_available_blocks_tt
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     with patch(
-        "vllm.v1.worker.tt_worker.ttnn.get_arch_name", return_value="wormhole_b0"
+        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
     ):
         n = get_num_available_blocks_tt(cfg)
 
@@ -50,12 +50,12 @@ def test_sliding_window_adds_headroom(cfg):
     additional headroom proportional to sliding_window × max_batch ×
     a per-buffer group multiplier, otherwise hybrid prefill would run
     out of blocks at full batch."""
-    from vllm.v1.worker.tt_worker import get_num_available_blocks_tt
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.model_config.get_sliding_window.return_value = 1024
 
     with patch(
-        "vllm.v1.worker.tt_worker.ttnn.get_arch_name", return_value="wormhole_b0"
+        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
     ):
         n = get_num_available_blocks_tt(cfg)
 
@@ -68,13 +68,13 @@ def test_sliding_window_adds_headroom(cfg):
 def test_n150_branch_unchanged_for_uniform_model(cfg):
     """N150 Llama-3.1-8B (uniform attention) keeps its existing budget;
     sliding_window is None so no headroom is added."""
-    from vllm.v1.worker.tt_worker import get_num_available_blocks_tt
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.model_config.model = "/path/to/Llama-3.1-8B-Instruct"
     cfg.device_config.num_devices = 1
 
     with patch(
-        "vllm.v1.worker.tt_worker.ttnn.get_arch_name", return_value="wormhole_b0"
+        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
     ):
         n = get_num_available_blocks_tt(cfg)
 
@@ -85,14 +85,14 @@ def test_n150_branch_unchanged_for_uniform_model(cfg):
 def test_per_model_branch_with_sliding_window(cfg):
     """Per-model SKU branches (e.g. gemma-3-4b on N300) still get sliding
     headroom on top of the per-SKU base."""
-    from vllm.v1.worker.tt_worker import get_num_available_blocks_tt
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.model_config.model = "/path/to/gemma-3-4b-it"
     cfg.model_config.get_sliding_window.return_value = 1024
     cfg.device_config.num_devices = 2
 
     with patch(
-        "vllm.v1.worker.tt_worker.ttnn.get_arch_name", return_value="wormhole_b0"
+        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
     ):
         n = get_num_available_blocks_tt(cfg)
 

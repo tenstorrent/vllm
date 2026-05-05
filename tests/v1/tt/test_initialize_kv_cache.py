@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for ``TTModelRunner.initialize_kv_cache`` and helpers.
 
-Phase 2 of kv-cache-groups: the runner now refactors group handling into
-helpers, validates AttentionSpec on every group, stores ``kv_cache_config``
-for downstream phases, and explicitly errors on multi-group configs (the
-end-to-end hybrid path lands in Phase 3 + 7).
+The runner refactors group handling into focused helpers, validates
+that every group carries an ``AttentionSpec``, stores ``kv_cache_config``
+for downstream consumers, and supports both single-group (uniform) and
+multi-group (hybrid attention) configurations.
 """
 
 from unittest.mock import MagicMock
@@ -59,7 +59,7 @@ def _config(groups, num_blocks=2048, tensors=None):
 @pytest.fixture
 def runner():
     """Synthetic TTModelRunner skipping the real ``__init__``."""
-    from vllm.v1.worker.tt_model_runner import TTModelRunner
+    from vllm_tt_plugin.model_runner import TTModelRunner
 
     r = TTModelRunner.__new__(TTModelRunner)
     r.model_config = MagicMock()
@@ -266,7 +266,7 @@ def test_initialize_creates_one_block_table_per_group(runner, monkeypatch):
     """For hybrid models, InputBatch must receive block_sizes with one
     entry per kv_cache_group so its MultiGroupBlockTable produces the
     matching number of per-group block tables."""
-    from vllm.v1.worker import tt_model_runner as runner_module
+    import vllm_tt_plugin.model_runner as runner_module
 
     captured = {}
 
@@ -303,9 +303,9 @@ def test_initialize_creates_one_block_table_per_group(runner, monkeypatch):
 
 def test_initialize_single_group_keeps_one_block_table(runner, monkeypatch):
     """Single-group (uniform attention) is the legacy contract: exactly
-    one block table in the input batch — confirms Phase 4 didn't change
-    the wire shape for uniform models."""
-    from vllm.v1.worker import tt_model_runner as runner_module
+    one block table in the input batch — confirms the multi-group
+    plumbing didn't change the wire shape for uniform models."""
+    import vllm_tt_plugin.model_runner as runner_module
 
     captured = {}
 

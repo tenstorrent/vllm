@@ -348,10 +348,10 @@ Hybrid attention models — those with mixed sliding-window and full-attention l
 
 To enable hybrid kv cache support for a TT model:
 
-1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM` instead of `Generator`. The base class provides a default `get_kv_cache_spec` classmethod that builds per-layer specs from `hf_config.text_config.layer_types` (the standard HF convention used by all target hybrid models).
+1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM` instead of `Generator`. The base class provides a default `get_kv_cache_spec` classmethod that builds per-layer specs from `hf_config.text_config.layer_types` (the standard HF convention used by all target hybrid models). The plugin uses the presence of `get_kv_cache_spec` on the model class as the hybrid opt-in marker.
 2. Implement `prefill_forward` and `decode_forward` to consume the new `page_tables_per_group` kwarg (a list of per-group block tables in upstream's group order) and route per layer to the right group's page table. The underlying TT model needs to accept this routing.
 3. Implement `allocate_kv_cache_per_layer(per_layer_specs)` (the base class default delegates to `allocate_vllm_kv_cache_per_layer` for you).
 
-Models that **don't** opt in stay on the legacy `Generator` path and continue to behave exactly as before — uniform single-group KV cache, single page table, no behavioural change. The legacy `prefill_forward` / `decode_forward` wrappers strip `page_tables_per_group` defensively and raise a clear `NotImplementedError` if a multi-group input ever reaches a non-hybrid model.
+Models that **don't** opt in stay on the legacy `Generator` path and continue to behave exactly as before — uniform single-group KV cache, single page table, no behavioural change. The plugin only sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`, and falls back to the legacy `allocate_kv_cache(shape, dtype, num_layers)` entry point when `allocate_kv_cache_per_layer` is not implemented; legacy wrappers therefore don't need any defensive stripping.
 
 > **Note:** Hybrid models are not yet supported with `data_parallel_size > 1` — the DP merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models until per-group DP gather lands.

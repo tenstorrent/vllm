@@ -20,7 +20,7 @@ import pytest
     ],
 )
 def test_parse_layer_index_valid(name, expected):
-    from vllm.v1.worker.tt_model_runner import _parse_layer_index
+    from vllm_tt_plugin.model_runner import _parse_layer_index
 
     assert _parse_layer_index(name) == expected
 
@@ -37,7 +37,7 @@ def test_parse_layer_index_valid(name, expected):
     ],
 )
 def test_parse_layer_index_invalid(name):
-    from vllm.v1.worker.tt_model_runner import _parse_layer_index
+    from vllm_tt_plugin.model_runner import _parse_layer_index
 
     with pytest.raises(ValueError, match="parse a layer index"):
         _parse_layer_index(name)

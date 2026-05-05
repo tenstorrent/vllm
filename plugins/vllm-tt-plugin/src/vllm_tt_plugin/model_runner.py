@@ -169,8 +169,8 @@ class TTModelInput:
     # Per-group block tables in upstream's KVCacheConfig group order; one
     # entry for uniform models, ``len(kv_cache_groups)`` entries for
     # hybrid attention. Group g's tensor maps the model's layer-→group
-    # routing onto the right paged pool. Phase 5 wires this through to
-    # the model's prefill/decode forward; Phase 4 just plumbs it.
+    # routing onto the right paged pool, consumed by hybrid models'
+    # prefill/decode forward via the ``page_tables_per_group`` kwarg.
     block_tables_per_group: list[torch.Tensor]
     unpadded_batch_size: int | list[int]  # List is used for DP
     tt_sampling_params: TTSamplingParams
@@ -361,9 +361,9 @@ class TTModelRunner:
         # manager enforces a uniform page_size across groups, and to keep
         # the existing block-table plumbing intact we additionally require
         # a single block_size across groups for now. Different block_sizes
-        # per group can be enabled when the input batch + block table
-        # consumers learn to address per-group block tables with mixed
-        # block sizes (Phase 8+).
+        # per group will require the input batch + block table consumers
+        # to learn to address per-group block tables with mixed block
+        # sizes.
         block_size = kv_cache_groups[0].kv_cache_spec.block_size
         assert all(g.kv_cache_spec.block_size == block_size for g in kv_cache_groups), (
             "Mixed block sizes across kv_cache_groups not yet supported"
@@ -1597,8 +1597,9 @@ class TTModelRunner:
             prompt_lens=prompt_lens,
             block_tables=block_tables,
             # DP merged path collapses to group-0 only for now; full
-            # per-group DP gather lands in Phase 8. Hybrid models on DP > 1
-            # are gated by tt_worker.get_kv_cache_spec until then.
+            # per-group DP gather is not yet implemented. Hybrid models on
+            # DP > 1 are gated by ``TTWorker.get_kv_cache_spec`` until
+            # then.
             block_tables_per_group=[block_tables],
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=tt_sampling_params,

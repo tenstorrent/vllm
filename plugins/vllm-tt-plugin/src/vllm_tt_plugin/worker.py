@@ -160,17 +160,16 @@ class TTWorker(WorkerBase):
         a single group-0 block table when concatenating per-rank inputs, so
         running a hybrid model under DP would silently send only group 0
         to the device and corrupt KV state for the sliding-window groups.
-        Per-group DP gather is the Phase 8 follow-up of the kv-cache-groups
-        effort; until then, fail fast at config time.
+        Per-group DP gather isn't implemented yet; fail fast at config
+        time until it is.
         """
         spec_types = {type(s) for s in spec.values()}
         if len(spec_types) > 1 and self.parallel_config.data_parallel_size > 1:
             raise NotImplementedError(
                 "Hybrid attention models with mixed kv cache types are not "
                 "yet supported with data_parallel_size > 1 on the TT backend. "
-                "Per-group DP gather is the Phase 8 follow-up of the "
-                "kv-cache-groups effort. Run with data_parallel_size=1 for "
-                "now, or use a uniform-attention model under DP."
+                "Run with data_parallel_size=1, or use a uniform-attention "
+                "model under DP."
             )
 
     def _try_get_spec_from_model_hook(self) -> dict[str, KVCacheSpec] | None:
