@@ -72,6 +72,9 @@ The `plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh` script installs th
 source plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh
 ```
 
+The script installs the base vLLM package with `VLLM_TARGET_DEVICE=empty` because
+`tt` is provided by the plugin at runtime, not by the base vLLM build.
+
 To install or refresh only the plugin package and its runtime dependencies, run:
 
 ```sh
