@@ -13,7 +13,7 @@ import weakref
 import cloudpickle
 import yaml
 
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_ip
@@ -34,6 +34,15 @@ class TTCoreEngineLauncher(CoreEngineLauncher):
         rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
         if rank_binding_file is None:
             return EngineLaunchPlan()
+
+        parallel_config = vllm_config.parallel_config
+        if (
+            parallel_config.data_parallel_master_ip
+            == ParallelConfig.data_parallel_master_ip
+        ):
+            host_ip = get_ip()
+            logger.info("Using host IP %s as TT data parallel address", host_ip)
+            parallel_config.data_parallel_master_ip = host_ip
 
         vllm_config.parallel_config.data_parallel_size_local = len(non_device_dp_ranks)
         plan = TTLaunchPlan(
