@@ -314,7 +314,8 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         ]
         dist.all_gather(gathered_local_ranks, local_dp_rank_tensor, group=self.dp_group)
         self.dp_device_ranks = [
-            i for i, rank_tensor in enumerate(gathered_local_ranks)
+            i
+            for i, rank_tensor in enumerate(gathered_local_ranks)
             if rank_tensor.item() == 0
         ]
         logger.info("DP device ranks: %s", self.dp_device_ranks)
