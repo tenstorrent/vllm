@@ -3,7 +3,7 @@
 import random
 
 import pytest
-from tests.tt.utils import (
+from utils import (
     RequestConfig,
     assert_deterministic,
     assert_pairwise_varied,

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import random
 
-from tests.tt.utils import RequestConfig, run_concurrent_batch
+from utils import RequestConfig, run_concurrent_batch
 
 
 class TestBatchIsolation:

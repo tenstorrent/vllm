@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import openai
 import pytest
-from tests.tt.utils import RequestConfig, run_concurrent_batch
+from utils import RequestConfig, run_concurrent_batch
 
 
 # 0 means just the sampled token's logprob
