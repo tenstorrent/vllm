@@ -174,13 +174,13 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         "TT does not support ray-based data parallel backend"
     )
     dp_size = parallel_config.data_parallel_size
-    override_tt_config = get_tt_config(vllm_config)
-    rank_binding_file = override_tt_config.get("rank_binding")
+    tt_config = get_tt_config(vllm_config)
+    rank_binding_file = tt_config.get("rank_binding")
     non_device_dp_ranks: set[int] = set()
     if rank_binding_file:
         if not isinstance(rank_binding_file, str):
             raise RuntimeError(
-                "override_tt_config['rank_binding'] must be a non-empty string"
+                "TT plugin config key 'rank_binding' must be a non-empty string"
             )
         try:
             with open(rank_binding_file) as f:
@@ -211,17 +211,17 @@ def tt_run_launch(
     if not rank_binding_file:
         raise RuntimeError("rank_binding_file must be a non-empty string")
 
-    override_tt_config = get_tt_config(vllm_config)
-    mpi_args = override_tt_config.get("mpi_args", "")
-    extra_ttrun_args = override_tt_config.get("extra_ttrun_args")
-    cfg_dir = override_tt_config.get("config_pkl_dir")
+    tt_config = get_tt_config(vllm_config)
+    mpi_args = tt_config.get("mpi_args", "")
+    extra_ttrun_args = tt_config.get("extra_ttrun_args")
+    cfg_dir = tt_config.get("config_pkl_dir")
 
     if not cfg_dir:
         raise RuntimeError(
-            "override_tt_config['config_pkl_dir'] is required for TT MPI launch"
+            "TT plugin config key 'config_pkl_dir' is required for TT MPI launch"
         )
     if not os.path.isdir(cfg_dir):
-        raise RuntimeError("override_tt_config['config_pkl_dir'] must be a directory")
+        raise RuntimeError("TT plugin config key 'config_pkl_dir' must be a directory")
 
     host_ip = get_ip()
     parallel_config = vllm_config.parallel_config
@@ -239,7 +239,7 @@ def tt_run_launch(
         rb = yaml.safe_load(f)
     rb.setdefault("global_env", {})
     default_env_patterns = ["VLLM_*", "MESH_DEVICE"]
-    env_passthrough = override_tt_config.get("env_passthrough", default_env_patterns)
+    env_passthrough = tt_config.get("env_passthrough", default_env_patterns)
     if isinstance(env_passthrough, (list, tuple)):
         to_inject = {}
         for key, val in os.environ.items():
@@ -258,7 +258,7 @@ def tt_run_launch(
     if extra_ttrun_args:
         if not isinstance(extra_ttrun_args, str):
             raise RuntimeError(
-                "override_tt_config['extra_ttrun_args'] must be a string"
+                "TT plugin config key 'extra_ttrun_args' must be a string"
             )
         normalized_extra_ttrun_args = shlex.split(extra_ttrun_args)
         reserved_flags = {"--rank-binding", "--mpi-args"}
@@ -268,7 +268,7 @@ def tt_run_launch(
             for tok in normalized_extra_ttrun_args
         ):
             raise RuntimeError(
-                "override_tt_config['extra_ttrun_args'] must not include "
+                "TT plugin config key 'extra_ttrun_args' must not include "
                 "--rank-binding or --mpi-args"
             )
 

@@ -61,24 +61,24 @@ class TTWorker(WorkerBase):
         self.mesh_device = None
 
         # Whether to use ttnn tracing for model execution
-        override_tt_config = get_tt_config(self.vllm_config)
+        tt_config = get_tt_config(self.vllm_config)
         trace_key = "trace_mode"
         self.trace_mode = "all"
-        if override_tt_config and trace_key in override_tt_config:
-            assert override_tt_config[trace_key] in ["decode_only", "all", "none"], (
-                f"Invalid {trace_key}: {override_tt_config[trace_key]}"
+        if tt_config and trace_key in tt_config:
+            assert tt_config[trace_key] in ["decode_only", "all", "none"], (
+                f"Invalid {trace_key}: {tt_config[trace_key]}"
             )
-            self.trace_mode = override_tt_config[trace_key]
+            self.trace_mode = tt_config[trace_key]
 
         enable_model_warmup_key = "enable_model_warmup"
         self.enable_model_warmup = True
-        if override_tt_config and enable_model_warmup_key in override_tt_config:
-            assert override_tt_config[enable_model_warmup_key] in [True, False], (
+        if tt_config and enable_model_warmup_key in tt_config:
+            assert tt_config[enable_model_warmup_key] in [True, False], (
                 f"Invalid {enable_model_warmup_key}: \
-                {override_tt_config[enable_model_warmup_key]}"
+                {tt_config[enable_model_warmup_key]}"
             )
 
-            self.enable_model_warmup = override_tt_config[enable_model_warmup_key]
+            self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
         # Validate/apply TT config in this worker process (multiprocessing
@@ -514,24 +514,24 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 # TT-NN utilities
 
 
-def get_dispatch_core_config(override_tt_config):
+def get_dispatch_core_config(tt_config):
     dispatch_core_axis: ttnn.DispatchCoreAxis = None
-    if override_tt_config is not None and "dispatch_core_axis" in override_tt_config:
-        assert override_tt_config["dispatch_core_axis"] in ["row", "col"], (
+    if tt_config is not None and "dispatch_core_axis" in tt_config:
+        assert tt_config["dispatch_core_axis"] in ["row", "col"], (
             "Invalid dispatch_core_axis:"
-            f"{override_tt_config['dispatch_core_axis']}. "
+            f"{tt_config['dispatch_core_axis']}. "
             "Expected: row, col."
         )
         dispatch_core_axis = (
             ttnn.DispatchCoreAxis.COL
-            if override_tt_config["dispatch_core_axis"] == "col"
+            if tt_config["dispatch_core_axis"] == "col"
             else ttnn.DispatchCoreAxis.ROW
         )
 
     return ttnn.DispatchCoreConfig(axis=dispatch_core_axis)
 
 
-def get_fabric_config(override_tt_config, num_devices):
+def get_fabric_config(tt_config, num_devices):
     if num_devices == 1:
         # No fabric config for single device
         fabric_config = None
@@ -542,9 +542,9 @@ def get_fabric_config(override_tt_config, num_devices):
             ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
         )
 
-    # Override fabric_config if specified in override_tt_config
-    if override_tt_config is not None and "fabric_config" in override_tt_config:
-        fabric_config_str = override_tt_config["fabric_config"]
+    # Override fabric_config if specified in TT plugin config.
+    if tt_config is not None and "fabric_config" in tt_config:
+        fabric_config_str = tt_config["fabric_config"]
         fabric_config_map = {
             "DISABLED": ttnn.FabricConfig.DISABLED,
             "FABRIC_1D": ttnn.FabricConfig.FABRIC_1D,
@@ -560,14 +560,11 @@ def get_fabric_config(override_tt_config, num_devices):
     return fabric_config
 
 
-def get_reliability_mode(override_tt_config):
-    # Default to strict init and override if specified in override_tt_config.
+def get_reliability_mode(tt_config):
+    # Default to strict init and override if specified in TT plugin config.
     reliability_mode = ttnn.FabricReliabilityMode.STRICT_INIT
-    if (
-        override_tt_config is not None
-        and "fabric_reliability_mode" in override_tt_config
-    ):
-        reliability_mode_str = override_tt_config["fabric_reliability_mode"]
+    if tt_config is not None and "fabric_reliability_mode" in tt_config:
+        reliability_mode_str = tt_config["fabric_reliability_mode"]
         reliability_mode_map = {
             "STRICT_INIT": ttnn.FabricReliabilityMode.STRICT_INIT,
             "RELAXED_INIT": ttnn.FabricReliabilityMode.RELAXED_INIT,
@@ -584,10 +581,10 @@ def get_reliability_mode(override_tt_config):
 # Set fabric config to passed in value
 # Do nothing if not set
 # Must be called before creating the mesh device
-def set_fabric(override_tt_config, num_devices):
-    fabric_config = get_fabric_config(override_tt_config, num_devices)
+def set_fabric(tt_config, num_devices):
+    fabric_config = get_fabric_config(tt_config, num_devices)
     if fabric_config:
-        reliability_mode = get_reliability_mode(override_tt_config)
+        reliability_mode = get_reliability_mode(tt_config)
         logger.info(
             "Setting fabric config: %s, reliability mode: %s",
             fabric_config,
@@ -602,26 +599,26 @@ def set_fabric(override_tt_config, num_devices):
 # in as even setting it to DISABLED might be unstable
 # This is to ensure that we don't propagate
 # the instability to the rest of CI
-def reset_fabric(override_tt_config, num_devices):
-    fabric_config = get_fabric_config(override_tt_config, num_devices)
+def reset_fabric(tt_config, num_devices):
+    fabric_config = get_fabric_config(tt_config, num_devices)
     if fabric_config:
         ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
 
-def device_params_from_override_tt_config(override_tt_config, trace_mode):
+def device_params_from_tt_config(tt_config, trace_mode):
     device_params = {}
 
     if trace_mode in ["all", "decode_only"]:
         # Set the most common value as default, override later
         device_params["trace_region_size"] = 50000000
-        if override_tt_config and "trace_region_size" in override_tt_config:
-            device_params["trace_region_size"] = override_tt_config["trace_region_size"]
+        if tt_config and "trace_region_size" in tt_config:
+            device_params["trace_region_size"] = tt_config["trace_region_size"]
 
-    if override_tt_config and "worker_l1_size" in override_tt_config:
-        device_params["worker_l1_size"] = override_tt_config["worker_l1_size"]
+    if tt_config and "worker_l1_size" in tt_config:
+        device_params["worker_l1_size"] = tt_config["worker_l1_size"]
 
-    if override_tt_config and "l1_small_size" in override_tt_config:
-        device_params["l1_small_size"] = override_tt_config["l1_small_size"]
+    if tt_config and "l1_small_size" in tt_config:
+        device_params["l1_small_size"] = tt_config["l1_small_size"]
 
     return device_params
 
@@ -677,22 +674,20 @@ def get_mesh_grid(local_dp_rank=0):
     return mesh_grid
 
 
-def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
+def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
     assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
     mesh_grid = get_mesh_grid(local_dp_rank)
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
-    device_params = device_params_from_override_tt_config(
-        override_tt_config, trace_mode
-    )
+    device_params = device_params_from_tt_config(tt_config, trace_mode)
 
     # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(override_tt_config, num_devices_requested)
+    set_fabric(tt_config, num_devices_requested)
 
     mesh_device = ttnn.open_mesh_device(
         ttnn.MeshShape(*mesh_grid),
-        dispatch_core_config=get_dispatch_core_config(override_tt_config),
+        dispatch_core_config=get_dispatch_core_config(tt_config),
         **device_params,
     )
     logger.info(
@@ -703,7 +698,7 @@ def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
     return mesh_device
 
 
-def close_mesh_device(mesh_device, override_tt_config):
+def close_mesh_device(mesh_device, tt_config):
     # Read device profiler (no-op if not profiling with tracy)
     ttnn.ReadDeviceProfiler(mesh_device)
 
@@ -714,4 +709,4 @@ def close_mesh_device(mesh_device, override_tt_config):
     ttnn.close_mesh_device(mesh_device)
 
     # Reset fabric
-    reset_fabric(override_tt_config, num_devices)
+    reset_fabric(tt_config, num_devices)

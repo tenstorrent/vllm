@@ -291,9 +291,7 @@ class TTPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
         if vllm_config.scheduler_config.enable_chunked_prefill:
-            logger.info(
-                "Chunked prefill is not yet supported for TT backend"
-            )
+            logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
@@ -324,10 +322,10 @@ class TTPlatform(Platform):
         # engine/worker subprocess startup ordering where model architectures
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
-        override_tt_config = get_tt_config(vllm_config)
+        tt_config = get_tt_config(vllm_config)
         register_test_models = False
-        if override_tt_config and "register_test_models" in override_tt_config:
-            register_test_models = override_tt_config["register_test_models"]
+        if tt_config and "register_test_models" in tt_config:
+            register_test_models = tt_config["register_test_models"]
             assert register_test_models in [True, False], (
                 f"Invalid option register_test_models: {register_test_models}"
             )
@@ -373,11 +371,8 @@ class TTPlatform(Platform):
         # TODO move this to tt_model_runner when request validation
         # stops depending on vllm_config
 
-        if (
-            override_tt_config is not None
-            and "sample_on_device_mode" in override_tt_config
-        ):
-            sample_on_device_mode = override_tt_config["sample_on_device_mode"]
+        if tt_config is not None and "sample_on_device_mode" in tt_config:
+            sample_on_device_mode = tt_config["sample_on_device_mode"]
             assert sample_on_device_mode in [
                 "all",
                 "decode_only",
@@ -392,11 +387,8 @@ class TTPlatform(Platform):
         # or if always_compat_sampling is enabled.
 
         always_compat_sampling = False
-        if (
-            override_tt_config is not None
-            and "always_compat_sampling" in override_tt_config
-        ):
-            always_compat_sampling = override_tt_config["always_compat_sampling"]
+        if tt_config is not None and "always_compat_sampling" in tt_config:
+            always_compat_sampling = tt_config["always_compat_sampling"]
             assert always_compat_sampling in [True, False], (
                 "always_compat_sampling must be a boolean"
             )
