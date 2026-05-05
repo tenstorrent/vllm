@@ -46,7 +46,7 @@ from vllm.entrypoints.openai.engine.serving import (
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_developer_message,
-    get_stop_tokens_for_assistant_actions,
+    get_harmony_request_default_sampling_params,
     get_system_message,
     get_user_message,
     has_custom_tools,
@@ -217,13 +217,6 @@ class OpenAIServingResponses(OpenAIServing):
             logger.warning(
                 "For gpt-oss, we ignore --enable-auto-tool-choice "
                 "and always enable tool use."
-            )
-            # OpenAI models have two EOS-like tokens: <|return|> and <|call|>.
-            # We need to add them to the stop token ids.
-            if "stop_token_ids" not in self.default_sampling_params:
-                self.default_sampling_params["stop_token_ids"] = []
-            self.default_sampling_params["stop_token_ids"].extend(
-                get_stop_tokens_for_assistant_actions()
             )
 
         self.tool_call_id_type = get_tool_call_id_type(self.model_config)
@@ -410,16 +403,22 @@ class OpenAIServingResponses(OpenAIServing):
             if maybe_error is not None:
                 return maybe_error
 
+            default_sampling_params = self.default_sampling_params
+            if self.use_harmony:
+                default_sampling_params = get_harmony_request_default_sampling_params(
+                    self.default_sampling_params, request.ignore_eos
+                )
+
             default_max_tokens = get_max_tokens(
                 max_model_len,
                 request.max_output_tokens,
                 self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
+                default_sampling_params,
                 self.override_max_tokens,
             )
 
             sampling_params = request.to_sampling_params(
-                default_max_tokens, self.default_sampling_params
+                default_max_tokens, default_sampling_params
             )
 
             trace_headers = (
