@@ -414,14 +414,15 @@ class TTAsyncDecodeController:
         kwargs: dict[str, Any] = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
-            # Hybrid attention models route per-layer to per-group block
-            # tables; uniform models receive a one-element list and the
-            # generator_vllm wrappers drop it before delegating to the
-            # legacy text forward path.
-            "page_tables_per_group": model_input.block_tables_per_group,
             "kv_cache": runner.kv_caches,
             "start_pos": model_input.input_positions,
         }
+        # Hybrid attention models route per-layer to per-group block tables;
+        # they opt in by exposing ``get_kv_cache_spec`` (same marker the
+        # worker uses to pick the hybrid kv cache spec path). Legacy models
+        # never see the kwarg and don't need to strip it.
+        if hasattr(type(runner.model), "get_kv_cache_spec"):
+            kwargs["page_tables_per_group"] = model_input.block_tables_per_group
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (

@@ -430,24 +430,33 @@ class TTModelRunner:
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
     def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> Any:
-        """Allocate KV cache tensors via the TT model's per-layer entry point.
+        """Allocate KV cache tensors, falling back to legacy uniform API.
 
         Builds a ``per_layer_specs`` list of ``(shape, dtype)`` tuples — one
-        entry per attention layer in model layer-index order — and hands it
-        to ``model.allocate_kv_cache_per_layer``. Hybrid attention models
-        thus get sliding-window layers backed by a smaller paged pool than
-        full-attention layers; uniform-attention models pass an
-        all-identical list and see byte-equivalent allocation.
-
-        The TT model is expected to expose ``allocate_kv_cache_per_layer``;
-        the legacy ``allocate_kv_cache(shape, dtype, num_layers)`` entry
-        point on the model side is kept as a thin compatibility shim.
+        entry per attention layer in model layer-index order. Hybrid models
+        opt in to per-layer allocation by exposing
+        ``allocate_kv_cache_per_layer(per_layer_specs)``; legacy models keep
+        the older ``allocate_kv_cache(shape, dtype, num_layers)`` signature
+        and we adapt to it here, asserting the per-layer specs are uniform.
         """
         num_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
-        return self.model.allocate_kv_cache_per_layer(per_layer_specs)
+
+        if hasattr(self.model, "allocate_kv_cache_per_layer"):
+            return self.model.allocate_kv_cache_per_layer(per_layer_specs)
+
+        first = per_layer_specs[0]
+        for entry in per_layer_specs[1:]:
+            if entry != first:
+                raise NotImplementedError(
+                    f"{type(self.model).__name__} only implements legacy "
+                    "allocate_kv_cache; hybrid attention models must "
+                    "override allocate_kv_cache_per_layer."
+                )
+        shape, dtype = first
+        return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
@@ -1774,16 +1783,17 @@ class TTModelRunner:
         kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
-            # Hybrid attention models route per-layer to per-group block
-            # tables; uniform models receive a one-element list and the
-            # generator_vllm wrappers drop it before delegating to the
-            # legacy text forward path.
-            "page_tables_per_group": model_input.block_tables_per_group,
             "kv_cache": self.kv_caches,
             "enable_trace": self.trace_mode in ["all"],
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        # Hybrid attention models route per-layer to per-group block tables;
+        # they opt in by exposing ``get_kv_cache_spec`` (same marker the
+        # worker uses to pick the hybrid kv cache spec path). Legacy models
+        # never see the kwarg and don't need to strip it.
+        if hasattr(type(self.model), "get_kv_cache_spec"):
+            kwargs["page_tables_per_group"] = model_input.block_tables_per_group
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
