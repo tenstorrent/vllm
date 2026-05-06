@@ -507,7 +507,34 @@ class TTModelRunner:
         """
         if self._layer_to_group_idx is None:
             return None
-        return [block_tables_per_group[g] for g in self._layer_to_group_idx]
+        result = [block_tables_per_group[g] for g in self._layer_to_group_idx]
+        # Pad to the warmup shape ``[max_batch, max_num_blocks_per_req]``.
+        # The model side (``Transformer._page_tables_to_ttnn``) allocates
+        # *persistent* ttnn device tensors at this shape during warmup so
+        # captured traces can be replayed against stable device addresses;
+        # ``ttnn.copy_host_to_device_tensor`` then asserts
+        # ``host_shape == device_shape`` when the runtime per-layer block
+        # tables push their content into those buffers. Padding rows with
+        # zeros is harmless — the kernel only reads up to each layer's
+        # active block count.
+        max_batch = int(self.scheduler_config.max_num_seqs) * int(
+            self.parallel_config.data_parallel_size
+        )
+        target_shape = (max_batch, self.max_num_blocks_per_req)
+        padded = []
+        for bt in result:
+            if bt is None:
+                padded.append(None)
+                continue
+            if bt.shape == target_shape:
+                padded.append(bt)
+                continue
+            full = torch.zeros(target_shape, dtype=bt.dtype)
+            rows = min(bt.shape[0], target_shape[0])
+            cols = min(bt.shape[1], target_shape[1])
+            full[:rows, :cols] = bt[:rows, :cols]
+            padded.append(full)
+        return padded
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
