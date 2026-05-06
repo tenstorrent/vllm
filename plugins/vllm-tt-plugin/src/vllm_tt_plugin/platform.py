@@ -121,6 +121,19 @@ def register_tt_models(register_test_models=False) -> None:
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
+    # Qwen3.5 - Hybrid (DeltaNet + Full-Attention) - Blackhole P150
+    # Override upstream `Qwen3_5ForConditionalGeneration` (a vision model) so
+    # `ModelConfig.__post_init__` resolves to our text-only class up front and
+    # never enters vLLM's multimodal pipeline. Also register the TT-prefixed
+    # name produced by `check_and_update_config` below.
+    qwen35_path = "models.demos.blackhole.qwen3_5_9b.tt.qwen35_vllm:TTQwen35ForCausalLM"
+    ModelRegistry.register_model("Qwen3_5ForConditionalGeneration", qwen35_path)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3_5ForConditionalGeneration",
+        qwen35_path,
+    )
+
     # Qwen2.5 - Vision
     _register_model_if_missing(
         ModelRegistry,
