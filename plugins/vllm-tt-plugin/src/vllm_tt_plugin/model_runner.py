@@ -478,15 +478,18 @@ class TTModelRunner:
         if hasattr(self.model, "allocate_kv_cache_per_layer"):
             return self.model.allocate_kv_cache_per_layer(per_layer_specs)
 
-        first = per_layer_specs[0]
-        for entry in per_layer_specs[1:]:
-            if entry != first:
+        # Legacy ``allocate_kv_cache(shape, dtype, num_layers)`` API: every
+        # layer must have the same shape/dtype. The third tuple element is
+        # the tensor index, which is irrelevant for the legacy uniform
+        # path (each layer gets its own buffer there).
+        shape, dtype, _ = per_layer_specs[0]
+        for entry_shape, entry_dtype, _ in per_layer_specs[1:]:
+            if (entry_shape, entry_dtype) != (shape, dtype):
                 raise NotImplementedError(
                     f"{type(self.model).__name__} only implements legacy "
                     "allocate_kv_cache; hybrid attention models must "
                     "override allocate_kv_cache_per_layer."
                 )
-        shape, dtype = first
         return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
 
     def _block_tables_per_layer(
@@ -508,17 +511,23 @@ class TTModelRunner:
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
-    ) -> list[tuple[tuple[int, int, int, int], Any]]:
-        """Resolve ``KVCacheConfig`` → list of ``(shape, dtype)`` per layer.
+    ) -> list[tuple[tuple[int, int, int, int], Any, int]]:
+        """Resolve ``KVCacheConfig`` → list of ``(shape, dtype, tensor_idx)``
+        per layer in model layer-index order.
 
-        Single-group: every layer gets the same shape/dtype.
+        ``tensor_idx`` identifies the unique DRAM buffer that each layer's
+        KV cache lives in. Multiple layers from different
+        ``KVCacheGroupSpec``\\ s can carry the same ``tensor_idx`` — this
+        is upstream's tensor-sharing model: with a 5:1 sliding/full split,
+        a full-attention layer and several sliding-window layers all share
+        one buffer, and they index disjoint slots within it via per-group
+        block tables (vLLM's ``BlockPool`` allocates disjoint block IDs
+        across groups, so the shared tensor is sized for the worst-case
+        full-attention demand and the sliding-window layers fit within
+        their window's worth of slots).
 
-        Multi-group: each layer's spec comes from its containing
-        ``KVCacheGroupSpec`` and shape is derived per group (sliding-window
-        layers can therefore receive a smaller paged pool than full
-        attention). Layer index is parsed from the layer name; the hook
-        author is expected to follow the ``...layers.<idx>...`` convention
-        used by upstream attention layer naming.
+        Single-group (uniform-attention) models keep the previous behavior:
+        every layer gets a unique buffer and ``tensor_idx == layer_idx``.
         """
         kv_cache_groups = kv_cache_config.kv_cache_groups
 
@@ -528,19 +537,28 @@ class TTModelRunner:
             # top of ``initialize_kv_cache``; assert for mypy.
             assert isinstance(spec, AttentionSpec)
             shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
-            return [(shape, spec.dtype)] * num_layers
+            return [(shape, spec.dtype, i) for i in range(num_layers)]
 
-        # Multi-group: walk groups, parse layer index from each layer name,
-        # and slot each layer's (shape, dtype) into the per-layer list.
-        per_layer: list[tuple[tuple[int, int, int, int], Any] | None] = [
+        # Multi-group: walk ``kv_cache_tensors`` (one entry per unique DRAM
+        # buffer) and assign every layer in ``shared_by`` the same
+        # ``tensor_idx``. Shape/dtype come from the layer's own group spec.
+        spec_by_layer_name: dict[str, AttentionSpec] = {}
+        for group in kv_cache_groups:
+            assert isinstance(group.kv_cache_spec, AttentionSpec)
+            for layer_name in group.layer_names:
+                spec_by_layer_name[layer_name] = group.kv_cache_spec
+
+        per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
             None
         ] * num_layers
-        for group in kv_cache_groups:
-            spec = group.kv_cache_spec
-            assert isinstance(spec, AttentionSpec)
-            shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
-            entry = (shape, spec.dtype)
-            for layer_name in group.layer_names:
+        for tensor_idx, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            for layer_name in kv_cache_tensor.shared_by:
+                spec = spec_by_layer_name.get(layer_name)
+                if spec is None:
+                    raise ValueError(
+                        f"KVCacheTensor.shared_by names layer '{layer_name}' "
+                        "but it doesn't appear in any kv_cache_group"
+                    )
                 idx = _parse_layer_index(layer_name)
                 if not 0 <= idx < num_layers:
                     raise ValueError(
@@ -549,17 +567,19 @@ class TTModelRunner:
                     )
                 if per_layer[idx] is not None:
                     raise ValueError(
-                        f"Layer index {idx} (from '{layer_name}') already "
-                        "assigned to another group; layer names must be unique"
+                        f"Layer index {idx} (from '{layer_name}') is named "
+                        "by more than one KVCacheTensor.shared_by; each "
+                        "layer must map to exactly one DRAM buffer"
                     )
-                per_layer[idx] = entry
+                shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+                per_layer[idx] = (shape, spec.dtype, tensor_idx)
 
         missing = [i for i, e in enumerate(per_layer) if e is None]
         if missing:
             raise ValueError(
-                f"No KVCacheGroupSpec covers layer indices {missing}; "
-                "the model's get_kv_cache_spec hook must return a spec "
-                f"for every attention layer (expected {num_layers})"
+                f"No KVCacheTensor covers layer indices {missing}; "
+                "every attention layer must appear in some "
+                "kv_cache_tensors[i].shared_by"
             )
         return per_layer  # type: ignore[return-value]
 
