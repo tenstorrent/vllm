@@ -35,9 +35,7 @@ def cfg():
 def test_default_branch_no_sliding(cfg):
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ):
+    with patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"):
         n = get_num_available_blocks_tt(cfg)
 
     # Default branch: max_tokens_all_users = 131072, plus block_size*batch
@@ -54,9 +52,7 @@ def test_sliding_window_adds_headroom(cfg):
 
     cfg.model_config.get_sliding_window.return_value = 1024
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ):
+    with patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"):
         n = get_num_available_blocks_tt(cfg)
 
     # Default tokens (131072) + batch padding (64*32=2048) +
@@ -73,9 +69,7 @@ def test_n150_branch_unchanged_for_uniform_model(cfg):
     cfg.model_config.model = "/path/to/Llama-3.1-8B-Instruct"
     cfg.device_config.num_devices = 1
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ):
+    with patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"):
         n = get_num_available_blocks_tt(cfg)
 
     # Llama8B-N150 branch: 32768 + 64*32 padding = 34816 → ceil/64 = 544.
@@ -91,9 +85,7 @@ def test_per_model_branch_with_sliding_window(cfg):
     cfg.model_config.get_sliding_window.return_value = 1024
     cfg.device_config.num_devices = 2
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ):
+    with patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"):
         n = get_num_available_blocks_tt(cfg)
 
     # gemma-3-4b N300 branch: 65536 base + 64*32 padding + 1024*32*8 sliding
