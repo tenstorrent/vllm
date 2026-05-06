@@ -169,9 +169,17 @@ class TTModelInput:
     # Per-group block tables in upstream's KVCacheConfig group order; one
     # entry for uniform models, ``len(kv_cache_groups)`` entries for
     # hybrid attention. Group g's tensor maps the model's layer-→group
-    # routing onto the right paged pool, consumed by hybrid models'
-    # prefill/decode forward via the ``page_tables_per_group`` kwarg.
+    # routing onto the right paged pool. We expand this into
+    # ``block_tables_per_layer`` (one entry per decoder layer) before
+    # handing it to hybrid models so they don't have to re-derive vLLM's
+    # group construction order.
     block_tables_per_group: list[torch.Tensor]
+    # Per-layer block tables, one entry per decoder layer in model
+    # layer-index order. ``None`` for non-hybrid models (the runner only
+    # populates this when ``self._layer_to_group_idx`` was set at
+    # ``initialize_kv_cache`` time, which itself only fires when the
+    # model class exposes ``get_kv_cache_spec``).
+    block_tables_per_layer: list[torch.Tensor] | None
     unpadded_batch_size: int | list[int]  # List is used for DP
     tt_sampling_params: TTSamplingParams
     multi_modal_kwargs: dict[str, Any]
@@ -396,6 +404,29 @@ class TTModelRunner:
             kv_cache_config.num_blocks,
         )
 
+        # Cache layer→group index mapping for hybrid models so submit_*
+        # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
+        # without re-deriving vLLM's group construction order. Non-hybrid
+        # models skip the expansion entirely (mapping stays None).
+        self._layer_to_group_idx: list[int] | None = None
+        if hasattr(type(self.model), "get_kv_cache_spec"):
+            num_layers = self.model_config.get_num_layers_by_block_type(
+                self.parallel_config, "attention"
+            )
+            mapping: list[int | None] = [None] * num_layers
+            for g_idx, group in enumerate(kv_cache_groups):
+                for layer_name in group.layer_names:
+                    idx = _parse_layer_index(layer_name)
+                    mapping[idx] = g_idx
+            missing = [i for i, g in enumerate(mapping) if g is None]
+            if missing:
+                raise ValueError(
+                    f"No KVCacheGroupSpec covers layer indices {missing} "
+                    f"on hybrid model {type(self.model).__name__}; every "
+                    "attention layer must appear in some group's layer_names."
+                )
+            self._layer_to_group_idx = mapping  # type: ignore[assignment]
+
         # Only DP rank 0 allocates KV cache.
         if self.parallel_config.data_parallel_rank_local != 0:
             return
@@ -457,6 +488,23 @@ class TTModelRunner:
                 )
         shape, dtype = first
         return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
+
+    def _block_tables_per_layer(
+        self, block_tables_per_group: list[torch.Tensor]
+    ) -> list[torch.Tensor] | None:
+        """Expand per-group block tables to per-layer using the cached mapping.
+
+        Returns None for non-hybrid models (the mapping is only populated
+        when the model class exposes ``get_kv_cache_spec``). The output is
+        a list of ``num_layers`` tensors, where entry ``i`` is the block
+        table for layer ``i``'s containing kv_cache_group — what hybrid
+        bridges hand to the underlying TT model so attention layer ``i``
+        can index its own paged pool (full vs. sliding-window) without
+        knowing how vLLM ordered the groups.
+        """
+        if self._layer_to_group_idx is None:
+            return None
+        return [block_tables_per_group[g] for g in self._layer_to_group_idx]
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
@@ -992,6 +1040,7 @@ class TTModelRunner:
             prompt_lens=prompt_lens,
             block_tables=block_tables,
             block_tables_per_group=block_tables_per_group,
+            block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
@@ -1599,8 +1648,11 @@ class TTModelRunner:
             # DP merged path collapses to group-0 only for now; full
             # per-group DP gather is not yet implemented. Hybrid models on
             # DP > 1 are gated by ``TTWorker.get_kv_cache_spec`` until
-            # then.
+            # then. ``block_tables_per_layer`` stays None on this path —
+            # if a hybrid model ever runs DP > 1 the gate above will fire
+            # before we get here.
             block_tables_per_group=[block_tables],
+            block_tables_per_layer=None,
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
@@ -1789,12 +1841,16 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
-        # Hybrid attention models route per-layer to per-group block tables;
-        # they opt in by exposing ``get_kv_cache_spec`` (same marker the
-        # worker uses to pick the hybrid kv cache spec path). Legacy models
-        # never see the kwarg and don't need to strip it.
+        # Hybrid attention models route per-layer block tables; they opt
+        # in by exposing ``get_kv_cache_spec`` (same marker the worker
+        # uses to pick the hybrid kv cache spec path). The runner cached
+        # the layer→group index mapping at ``initialize_kv_cache`` and
+        # ``_block_tables_per_layer`` already expanded the per-group list
+        # into a per-layer list aligned with the model's ``self.layers``
+        # — bridges just pass it straight through. Legacy models never
+        # see the kwarg.
         if hasattr(type(self.model), "get_kv_cache_spec"):
-            kwargs["page_tables_per_group"] = model_input.block_tables_per_group
+            kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params

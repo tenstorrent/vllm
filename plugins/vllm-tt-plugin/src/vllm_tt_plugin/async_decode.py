@@ -417,12 +417,14 @@ class TTAsyncDecodeController:
             "kv_cache": runner.kv_caches,
             "start_pos": model_input.input_positions,
         }
-        # Hybrid attention models route per-layer to per-group block tables;
-        # they opt in by exposing ``get_kv_cache_spec`` (same marker the
-        # worker uses to pick the hybrid kv cache spec path). Legacy models
-        # never see the kwarg and don't need to strip it.
+        # Hybrid attention models route per-layer block tables; they opt
+        # in by exposing ``get_kv_cache_spec`` (same marker the worker
+        # uses to pick the hybrid kv cache spec path). The runner cached
+        # the layer→group index mapping at ``initialize_kv_cache`` and
+        # populated ``block_tables_per_layer`` per submission so bridges
+        # don't have to re-derive vLLM's group construction order.
         if hasattr(type(runner.model), "get_kv_cache_spec"):
-            kwargs["page_tables_per_group"] = model_input.block_tables_per_group
+            kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
