@@ -180,8 +180,25 @@ class TTWorker(WorkerBase):
         """
         from vllm.model_executor.models.registry import ModelRegistry
 
+        # ``ModelConfig.architecture`` (singular) is computed in
+        # ``ModelConfig.__post_init__`` from ``hf_config.architectures``
+        # *before* :meth:`TTPlatform.check_and_update_config` prepends ``"TT"``
+        # to the architectures list. As a result the cached property still
+        # holds the upstream (e.g. CUDA) name, and resolving it would find
+        # upstream's vLLM model class — which doesn't have our
+        # ``get_kv_cache_spec`` hook. Prefer the prefixed entry from the
+        # ``architectures`` list (which the platform modifies in-place) and
+        # fall back to prepending ``"TT"`` when neither is available.
+        arch = next(
+            (a for a in self.model_config.architectures if a.startswith("TT")),
+            None,
+        )
+        if arch is None:
+            arch = self.model_config.architecture
+            if not arch.startswith("TT"):
+                arch = "TT" + arch
         model_cls, _ = ModelRegistry.resolve_model_cls(
-            self.model_config.architecture, model_config=self.model_config
+            arch, model_config=self.model_config
         )
         hook = getattr(model_cls, "get_kv_cache_spec", None)
         if hook is None:
