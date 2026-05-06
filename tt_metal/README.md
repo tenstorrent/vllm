@@ -13,6 +13,7 @@
 - [Benchmarking](#benchmarking)
 - [Testing Sampling Parameters](#testing-sampling-parameters)
 - [Running on Multi-Host Systems (V1 only)](#running-on-multi-host-systems-v1-only)
+- [Hybrid Attention Models](#hybrid-attention-models)
 
 ## vLLM and TT-Metal Branches
 
@@ -340,3 +341,17 @@ MESH_DEVICE=(8,8) python -u examples/offline_inference_tt.py --model <MODEL_NAME
 > - `config_pkl_dir` needs to be set to a directory that is shared by all hosts (used during initialization to write a temporary config file that is read by other hosts).
 > - If you need to set environment variables that should be propagated to all hosts, you can either 1) specify them as part of `env_passthrough` in `--override_tt_config` or 2) add them as a `global_env` in the rank_binding file.
 > - `extra_ttrun_args` can be used to pass additional flags directly to `tt-run` as a raw string (e.g. `"--tcp-interface cnx1"`, `"--bare"`, `"--debug-gdbserver"`).
+
+## Hybrid Attention Models
+
+Hybrid attention models — those with mixed sliding-window and full-attention layers (e.g. Gemma3, Gemma4, GPT-OSS) — opt in to upstream vLLM's hybrid kv cache manager via a per-model spec hook on the registered TT model class. The hybrid manager packs sliding and full layers into separate `KVCacheGroupSpec`s, sized by upstream's [Hybrid KV Cache Manager design](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/), so sliding-window layers occupy only `sliding_window` worth of KV state per request instead of `max_seq_len`. On Gemma4-31B at 256k context this is roughly a 6× reduction in KV cache memory.
+
+To enable hybrid kv cache support for a TT model:
+
+1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM` instead of `Generator`. The base class provides a default `get_kv_cache_spec` classmethod that builds per-layer specs from `hf_config.text_config.layer_types` (the standard HF convention used by all target hybrid models). The plugin uses the presence of `get_kv_cache_spec` on the model class as the hybrid opt-in marker.
+2. Implement `prefill_forward` and `decode_forward` to consume the new `page_tables_per_group` kwarg (a list of per-group block tables in upstream's group order) and route per layer to the right group's page table. The underlying TT model needs to accept this routing.
+3. Implement `allocate_kv_cache_per_layer(per_layer_specs)` (the base class default delegates to `allocate_vllm_kv_cache_per_layer` for you).
+
+Models that **don't** opt in stay on the legacy `Generator` path and continue to behave exactly as before — uniform single-group KV cache, single page table, no behavioural change. The plugin only sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`, and falls back to the legacy `allocate_kv_cache(shape, dtype, num_layers)` entry point when `allocate_kv_cache_per_layer` is not implemented; legacy wrappers therefore don't need any defensive stripping.
+
+> **Note:** Hybrid models are not yet supported with `data_parallel_size > 1` — the DP merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models until per-group DP gather lands.
