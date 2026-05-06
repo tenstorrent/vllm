@@ -346,10 +346,10 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
 
-            # Keep all ranks aligned for TT's finish all-reduce.
-            if not executed:
-                pass
-
+            # TT does not call execute_dummy_batch() on idle steps because
+            # _dp_any_rank_has_scheduler_requests() already synchronises all
+            # ranks before any execution is attempted.  Rank alignment for the
+            # wave-finish all-reduce happens inside _has_global_unfinished_reqs.
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )

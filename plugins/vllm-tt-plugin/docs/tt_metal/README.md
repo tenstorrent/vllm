@@ -44,11 +44,13 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 
 **To activate the vLLM+tt-metal environment (after the first time):**
 
-1. Set `VLLM_TARGET_DEVICE` and activate virtual environment if using one (where `PYTHON_ENV_DIR` is set to the path of the python virtual environment):
+1. Activate the virtual environment (where `PYTHON_ENV_DIR` is set to the path of the python virtual environment):
 
     ```sh
-    export VLLM_TARGET_DEVICE="tt" && source $PYTHON_ENV_DIR/bin/activate
+    source $PYTHON_ENV_DIR/bin/activate
     ```
+
+    > **Note**: `VLLM_TARGET_DEVICE` is a build-time variable only (used during `pip install`) and does not need to be set at runtime. The TT platform is detected automatically when `ttnn` is importable, via the `vllm.platform_plugins` entry point registered by the TT plugin.
 
 2. Ensure that the `PYTHONPATH` environment variable contains the path to tt-metal (should already have been set when installing tt-metal).
 
@@ -60,7 +62,7 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 
 ## TT Plugin Package
 
-The TT backend is in a Phase 1 out-of-tree plugin package located at:
+The TT backend is in a Phase 2 out-of-tree plugin package located at:
 
 ```text
 plugins/vllm-tt-plugin
@@ -88,7 +90,7 @@ The editable install registers two vLLM entry points:
 - `vllm.general_plugins`: registers TT model architectures.
 - `vllm.platform_plugins`: activates `vllm_tt_plugin.platform.TTPlatform` when `ttnn` is available.
 
-The plugin currently owns TT model registration, platform/config logic, worker, model runner, input batch, async decode helpers, scheduler, and model loader. The vLLM fork still contains TT compatibility files and fork-only execution paths, including gathered-DP execution and TT launcher support. Those pieces remain in the fork until the execution and launcher abstractions are generalized in a later phase.
+The plugin owns TT model registration, platform/config logic, worker, model runner, input batch, async decode helpers, scheduler, model loader, engine-core subclasses (`TTEngineCore`, `TTEngineCoreProc`, `TTDPEngineCoreProc`), and the multi-host launcher (`TTCoreEngineLauncher`). The vLLM fork adds only generic, TT-agnostic extension points (`engine_core_cls`, `engine_core_proc_cls`, `dp_engine_core_proc_cls`, `engine_core_launcher_cls` in `ParallelConfig`, and `plugin_config` in `VllmConfig`) that any backend plugin can use.
 
 Because the plugin is installed in editable mode, normal Python changes under `plugins/vllm-tt-plugin/src/vllm_tt_plugin/` take effect after restarting the Python or vLLM process. Reinstall the plugin only when package metadata or entry points change, such as changes to `plugins/vllm-tt-plugin/pyproject.toml`.
 
