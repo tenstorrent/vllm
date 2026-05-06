@@ -341,7 +341,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
     def run_busy_loop(self) -> None:
         while True:
             self._process_input_queue()
-            executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
