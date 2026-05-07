@@ -1546,15 +1546,27 @@ class DPEngineCoreProc(EngineCoreProc):
                 stateless_destroy_torch_distributed_process_group(dp_group)
 
     def add_request(self, request: Request, request_wave: int = 0):
+        start_wave = False
         if self.has_coordinator and request_wave != self.current_wave:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
             elif not self.engines_running:
                 # Request received for an already-completed wave, notify
                 # front-end that we need to start the next one.
-                self.output_queue.put_nowait(
-                    (-1, EngineCoreOutputs(start_wave=self.current_wave))
-                )
+                start_wave = True
+
+        if self.has_coordinator and not self.engines_running:
+            # The front-end normally notifies the coordinator before sending
+            # the first request in a new wave. If that notification races with
+            # wave completion state, the engine receiving the request must still
+            # wake its peers before entering gathered-DP collectives.
+            self.engines_running = True
+            start_wave = True
+
+        if start_wave:
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(start_wave=self.current_wave))
+            )
 
         super().add_request(request, request_wave)
 
