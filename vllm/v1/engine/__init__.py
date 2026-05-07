@@ -195,8 +195,8 @@ class EngineCoreOutputs(
     # In DP case, used to signal that the current wave of requests
     # has finished and the engines are paused.
     wave_complete: int | None = None
-    # In DP case, used to signal that a request was received for an
-    # "old" wave, so the next wave needs to be started in other engines.
+    # In DP case, used to signal that a request was received while engines
+    # were paused, so the wave needs to be started in other engines.
     start_wave: int | None = None
 
     def __post_init__(self):
