@@ -928,14 +928,19 @@ class TTModelRunner:
                 input_positions = torch.cat(
                     [input_positions, torch.ones(batch_pad, dtype=torch.int32) * -1]
                 )
-                block_tables = torch.cat(
-                    [
-                        block_tables,
-                        torch.zeros(
-                            batch_pad, block_tables.shape[1], dtype=torch.int32
-                        ),
-                    ]
-                )
+                # Pad each per-group block table to max_num_reqs so DP
+                # gather produces a fixed-shape payload regardless of how
+                # many users are active on this rank. Keep ``block_tables``
+                # aliased to the (now padded) group-0 view, matching the
+                # alias set up where ``block_tables_per_group`` is built.
+                block_tables_per_group = [
+                    torch.cat(
+                        [bt, torch.zeros(batch_pad, bt.shape[1], dtype=bt.dtype)],
+                        dim=0,
+                    )
+                    for bt in block_tables_per_group
+                ]
+                block_tables = block_tables_per_group[0]
                 # Pad sampling parameters with default values
                 sample_params.pad_with_defaults(num_reqs)
 
