@@ -133,7 +133,9 @@ def test_initialize_single_group_calls_model_allocate(runner):
     assert len(per_layer_specs) == 32
     # Each layer gets a unique ``tensor_idx`` in the single-group path so
     # legacy (uniform) callers retain one buffer per layer.
-    assert all(s == (expected_shape, torch.bfloat16, i) for i, s in enumerate(per_layer_specs))
+    assert all(
+        s == (expected_shape, torch.bfloat16, i) for i, s in enumerate(per_layer_specs)
+    )
     assert runner.kv_caches == "kv-caches-sentinel"
     assert runner.kv_cache_config is config
 

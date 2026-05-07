@@ -1192,7 +1192,6 @@ class TTModelRunner:
                 torch.zeros((max_batch, max_blocks_decode_batch), dtype=torch.int32)
                 for _ in range(num_groups)
             ]
-            block_tables = block_tables_per_group[0]
             unpadded_batch_size = torch.tensor([0], dtype=torch.int32)
             # Create default sampling parameter tensors (max_batch sized)
             sampling_default_tensors = (
@@ -1231,7 +1230,6 @@ class TTModelRunner:
                 f"build_dp_decode_gather_input: expected {num_groups} "
                 f"per-group block tables, got {len(block_tables_per_group)}"
             )
-            block_tables = block_tables_per_group[0]
             unpadded_batch_size = torch.tensor(
                 [cast(int, model_input.unpadded_batch_size)], dtype=torch.int32
             )
@@ -1598,8 +1596,7 @@ class TTModelRunner:
                     prompt_lens_list.append(mi.prompt_lens)
                     block_tables_list.append(pad_block_tables(mi.block_tables))
                     assert (
-                        len(mi.block_tables_per_group)
-                        == self._num_kv_cache_groups
+                        len(mi.block_tables_per_group) == self._num_kv_cache_groups
                     ), (
                         f"DP merge: rank input has "
                         f"{len(mi.block_tables_per_group)} block_tables_per_group "
@@ -1652,8 +1649,7 @@ class TTModelRunner:
             # Build the per-group merged view here so the prefill branch
             # exits with the same shape contract as the decode branch.
             block_tables_per_group = [
-                torch.cat(per_rank, dim=0)
-                for per_rank in block_tables_per_group_list
+                torch.cat(per_rank, dim=0) for per_rank in block_tables_per_group_list
             ]
 
             # Concatenate sampling parameter tensors across DP ranks
@@ -1762,9 +1758,7 @@ class TTModelRunner:
             # ``_block_tables_per_layer`` then expands the per-group view
             # into the per-layer list the hybrid bridge consumes.
             block_tables_per_group=block_tables_per_group,
-            block_tables_per_layer=self._block_tables_per_layer(
-                block_tables_per_group
-            ),
+            block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
