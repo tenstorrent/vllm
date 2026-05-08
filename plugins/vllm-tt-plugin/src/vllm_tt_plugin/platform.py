@@ -211,6 +211,16 @@ class TTPlatform(Platform):
     simple_compile_backend: str = "eager"
 
     @classmethod
+    def support_hybrid_kv_cache(cls) -> bool:
+        # Hybrid models (Gemma3/4, GPT-OSS) opt in to upstream's HMA via
+        # ``HybridAttentionForCausalLM.get_kv_cache_spec`` so layers from
+        # different attention groups can share DRAM tensors. Without this
+        # override the base ``Platform`` returns ``False`` and HMA collapses
+        # every ``SlidingWindowSpec`` back to ``FullAttentionSpec`` in
+        # ``unify_hybrid_kv_cache_specs`` — defeating the entire point.
+        return True
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: FlexibleArgumentParser | None = None
     ) -> None:

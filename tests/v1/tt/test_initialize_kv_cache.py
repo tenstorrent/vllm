@@ -131,7 +131,11 @@ def test_initialize_single_group_calls_model_allocate(runner):
     (per_layer_specs,), _ = runner.model.allocate_kv_cache_per_layer.call_args
     expected_shape = (2048, 8 // min(2, 8), 64, 128)
     assert len(per_layer_specs) == 32
-    assert all(s == (expected_shape, torch.bfloat16) for s in per_layer_specs)
+    # Each layer gets a unique ``tensor_idx`` in the single-group path so
+    # legacy (uniform) callers retain one buffer per layer.
+    assert all(
+        s == (expected_shape, torch.bfloat16, i) for i, s in enumerate(per_layer_specs)
+    )
     assert runner.kv_caches == "kv-caches-sentinel"
     assert runner.kv_cache_config is config
 
@@ -139,7 +143,8 @@ def test_initialize_single_group_calls_model_allocate(runner):
 def test_initialize_multi_group_assigns_specs_per_layer(runner):
     """Hybrid configuration: 2 full-attention layers + 4 sliding-window
     layers should produce a per-layer spec list where each layer's shape
-    matches its group's spec.
+    matches its group's spec, and ``tensor_idx`` matches the
+    ``kv_cache_tensors`` sharing layout (one tensor per unique buffer).
     """
     runner.model_config.get_num_layers_by_block_type.return_value = 6
     runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
@@ -147,6 +152,27 @@ def test_initialize_multi_group_assigns_specs_per_layer(runner):
     sliding = _sliding_spec(
         num_kv_heads=4, head_size=128, block_size=64, sliding_window=1024
     )
+    # Two unique DRAM buffers, each shared by one full + two sliding
+    # layers — mirrors upstream's HMA tensor-sharing layout for n:1
+    # patterns.
+    tensors = [
+        KVCacheTensor(
+            size=1,
+            shared_by=[
+                "model.layers.0.self_attn",
+                "model.layers.1.self_attn",
+                "model.layers.2.self_attn",
+            ],
+        ),
+        KVCacheTensor(
+            size=1,
+            shared_by=[
+                "model.layers.5.self_attn",
+                "model.layers.3.self_attn",
+                "model.layers.4.self_attn",
+            ],
+        ),
+    ]
     config = _config(
         [
             KVCacheGroupSpec(
@@ -164,6 +190,7 @@ def test_initialize_multi_group_assigns_specs_per_layer(runner):
             ),
         ],
         num_blocks=512,
+        tensors=tensors,
     )
 
     runner.initialize_kv_cache(config)
@@ -173,13 +200,17 @@ def test_initialize_multi_group_assigns_specs_per_layer(runner):
     full_shape = (512, 4 // min(2, 4), 64, 128)
     sliding_shape = (512, 4 // min(2, 4), 64, 128)
     # Layer indices 0 and 5 are full attention; 1-4 are sliding window.
-    # (Shapes happen to match since both groups share kv-heads/head-size in
-    # this fixture; the spec types differ, which is the structural change
-    # that propagates downstream once forward routing lands.)
     assert per_layer_specs[0][0] == full_shape
     assert per_layer_specs[5][0] == full_shape
     assert per_layer_specs[1][0] == sliding_shape
     assert per_layer_specs[4][0] == sliding_shape
+    # Tensor index reflects sharing: layers 0, 1, 2 → buffer 0; 5, 3, 4 → buffer 1.
+    assert per_layer_specs[0][2] == 0
+    assert per_layer_specs[1][2] == 0
+    assert per_layer_specs[2][2] == 0
+    assert per_layer_specs[5][2] == 1
+    assert per_layer_specs[3][2] == 1
+    assert per_layer_specs[4][2] == 1
 
 
 def test_initialize_stores_config_even_when_not_dp_rank_zero(runner):
@@ -211,9 +242,8 @@ def test_build_per_layer_specs_rejects_unparseable_layer_name(runner):
 
 
 def test_build_per_layer_specs_rejects_missing_layers(runner):
-    """If the spec hook didn't return a spec for every attention layer,
-    we should fail loudly in the multi-group path rather than silently
-    allocating None for the missing layers."""
+    """If kv_cache_tensors doesn't cover every attention layer, fail
+    loudly rather than silently leaving holes in the per-layer list."""
     runner.model_config.get_num_layers_by_block_type.return_value = 4
     config = _config(
         [
@@ -230,17 +260,26 @@ def test_build_per_layer_specs_rejects_missing_layers(runner):
 
 
 def test_build_per_layer_specs_rejects_duplicate_layer(runner):
+    """A layer named in two different KVCacheTensors must error — every
+    layer must map to exactly one DRAM buffer."""
+    full = _full_spec()
+    sliding = _sliding_spec()
+    tensors = [
+        KVCacheTensor(size=1, shared_by=["model.layers.0.self_attn"]),
+        KVCacheTensor(size=1, shared_by=["model.layers.0.self_attn"]),
+    ]
     config = _config(
         [
             KVCacheGroupSpec(
-                layer_names=["model.layers.0.self_attn"], kv_cache_spec=_full_spec()
+                layer_names=["model.layers.0.self_attn"], kv_cache_spec=full
             ),
             KVCacheGroupSpec(
-                layer_names=["model.layers.0.self_attn"], kv_cache_spec=_sliding_spec()
+                layer_names=["model.layers.1.self_attn"], kv_cache_spec=sliding
             ),
-        ]
+        ],
+        tensors=tensors,
     )
-    with pytest.raises(ValueError, match="already.*assigned"):
+    with pytest.raises(ValueError, match="more than one KVCacheTensor"):
         runner._build_per_layer_specs(config, num_layers=2)
 
 

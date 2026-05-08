@@ -141,16 +141,17 @@ def test_default_spec_passes_sliding_window(resolve, worker):
 
 
 @patch("vllm.model_executor.models.registry.ModelRegistry.resolve_model_cls")
-def test_hybrid_under_dp_rejected(resolve, worker):
-    """Hybrid spec (mixed FullAttention + SlidingWindow) under DP > 1 is
-    rejected at spec-resolution time. The DP merged path doesn't yet
-    gather per-group block tables, so silent group-0 collapse would
-    corrupt KV state for the sliding-window groups."""
+def test_hybrid_under_dp_returns_full_spec(resolve, worker):
+    """Hybrid spec (mixed FullAttention + SlidingWindow) under DP > 1
+    flows through unchanged: the DP gather/merge path now packs every
+    kv_cache_group's block table into the gather payload and rebuilds
+    them on the driver, so per-rank routing survives the merge."""
     resolve.return_value = (_ModelHookReturningSpecs, "TestArch")
     worker.parallel_config.data_parallel_size = 2
 
-    with pytest.raises(NotImplementedError, match="data_parallel_size"):
-        worker.get_kv_cache_spec()
+    spec = worker.get_kv_cache_spec()
+
+    assert {type(s) for s in spec.values()} == {FullAttentionSpec, SlidingWindowSpec}
 
 
 @patch("vllm.model_executor.models.registry.ModelRegistry.resolve_model_cls")

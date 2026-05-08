@@ -147,30 +147,9 @@ class TTWorker(WorkerBase):
         """
         spec_from_hook = self._try_get_spec_from_model_hook()
         if spec_from_hook is not None:
-            self._guard_hybrid_under_dp(spec_from_hook)
             return spec_from_hook
 
         return self._build_default_kv_cache_spec()
-
-    def _guard_hybrid_under_dp(self, spec: dict[str, KVCacheSpec]) -> None:
-        """Reject hybrid (multi-spec) configurations when running with
-        ``data_parallel_size > 1``.
-
-        The DP merge path in :class:`TTModelRunner` currently collapses to
-        a single group-0 block table when concatenating per-rank inputs, so
-        running a hybrid model under DP would silently send only group 0
-        to the device and corrupt KV state for the sliding-window groups.
-        Per-group DP gather isn't implemented yet; fail fast at config
-        time until it is.
-        """
-        spec_types = {type(s) for s in spec.values()}
-        if len(spec_types) > 1 and self.parallel_config.data_parallel_size > 1:
-            raise NotImplementedError(
-                "Hybrid attention models with mixed kv cache types are not "
-                "yet supported with data_parallel_size > 1 on the TT backend. "
-                "Run with data_parallel_size=1, or use a uniform-attention "
-                "model under DP."
-            )
 
     def _try_get_spec_from_model_hook(self) -> dict[str, KVCacheSpec] | None:
         """If the resolved TT model class implements ``get_kv_cache_spec``,
@@ -180,8 +159,25 @@ class TTWorker(WorkerBase):
         """
         from vllm.model_executor.models.registry import ModelRegistry
 
+        # ``ModelConfig.architecture`` (singular) is computed in
+        # ``ModelConfig.__post_init__`` from ``hf_config.architectures``
+        # *before* :meth:`TTPlatform.check_and_update_config` prepends ``"TT"``
+        # to the architectures list. As a result the cached property still
+        # holds the upstream (e.g. CUDA) name, and resolving it would find
+        # upstream's vLLM model class — which doesn't have our
+        # ``get_kv_cache_spec`` hook. Prefer the prefixed entry from the
+        # ``architectures`` list (which the platform modifies in-place) and
+        # fall back to prepending ``"TT"`` when neither is available.
+        arch = next(
+            (a for a in self.model_config.architectures if a.startswith("TT")),
+            None,
+        )
+        if arch is None:
+            arch = self.model_config.architecture
+            if not arch.startswith("TT"):
+                arch = "TT" + arch
         model_cls, _ = ModelRegistry.resolve_model_cls(
-            self.model_config.architecture, model_config=self.model_config
+            arch, model_config=self.model_config
         )
         hook = getattr(model_cls, "get_kv_cache_spec", None)
         if hook is None:
