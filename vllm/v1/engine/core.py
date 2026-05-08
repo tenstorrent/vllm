@@ -1603,6 +1603,18 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            # Rendezvous all DP ranks at iteration start to prevent
+            # FIFO-collective skew accumulation across iterations.
+            # gloo collectives are matched in call order per group, so
+            # once ranks drift apart in iteration count every subsequent
+            # collective deadlocks. See tenstorrent/vllm#387.
+            if self.requires_gather:
+                try:
+                    dist.barrier(group=self.dp_group)
+                except RuntimeError as e:
+                    if "Connection closed by peer" in str(e):
+                        raise SystemExit() from e
+                    raise
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
