@@ -8,6 +8,7 @@ from typing import Literal
 from openai.types.responses.tool import Tool
 from openai_harmony import (
     Author,
+    ChannelConfig,
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
@@ -100,6 +101,17 @@ def get_system_message(
         sys_msg_content = sys_msg_content.with_tools(python_description)
     if container_description is not None:
         sys_msg_content = sys_msg_content.with_tools(container_description)
+    if not with_custom_tools:
+        # Restrict valid channels to {analysis, final} when there are no
+        # custom tools so the model does not emit commentary-channel
+        # transitions whose boundary tokens the parser is not robust to.
+        # See tenstorrent/vllm#386.
+        channel_config = sys_msg_content.channel_config
+        invalid_channel = "commentary"
+        new_config = ChannelConfig.require_channels(
+            [c for c in channel_config.valid_channels if c != invalid_channel]
+        )
+        sys_msg_content = sys_msg_content.with_channel_config(new_config)
     sys_msg = Message.from_role_and_content(Role.SYSTEM, sys_msg_content)
     return sys_msg
 
@@ -334,8 +346,25 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
 
 def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
     parser = get_streamable_parser_for_assistant()
+    stop_tokens = set(get_stop_tokens_for_assistant_actions())
     for token_id in token_ids:
-        parser.process(token_id)
+        try:
+            parser.process(token_id)
+        except Exception as e:
+            # Tolerate mid-stream harmony parse errors caused by stray
+            # tokens between messages. The model can occasionally emit
+            # corrupt control-token sequences at message boundaries
+            # (e.g. doubled <|start|>, content tokens before <|start|>);
+            # return whatever was successfully parsed before the bad token
+            # rather than letting the openai_harmony Rust binding raise out
+            # to the route handler. See tenstorrent/vllm#386.
+            logger.warning(
+                "Harmony parser error at token %d, returning partial "
+                "parse: %r", token_id, e,
+            )
+            break
+        if token_id in stop_tokens:
+            break
     return parser
 
 
