@@ -3,9 +3,13 @@
 
 """Molmo2 multimodal processor for the reference vllm fork.
 
-Calls the HF Molmo2VideoProcessor to produce pre-processed patches
-[n_frames, 729, 588] and video_token_pooling [N_pooled, 9], matching the
-input format expected by TtMolmo2Model.forward_prefill().
+Supports both image and video modalities:
+  - Video: calls HF Molmo2VideoProcessor → pixel_values_videos [n_frames, 729, 588]
+           + video_token_pooling [N_pooled, 9] (k_pool=9, pooling=[3,3])
+  - Image: calls HF Molmo2ImageProcessor → pixel_values [n_crops, 729, 588]
+           + image_token_pooling [N_pooled, 4] (k_pool=4, pooling=[2,2])
+
+Both paths produce tensors that TtMolmo2Model.forward_prefill() already handles.
 """
 
 from collections.abc import Mapping, Sequence
@@ -34,10 +38,12 @@ except ImportError:
     from vllm.inputs import MultiModalDataDict
 
 # Molmo2 token IDs (from allenai/Molmo2-8B config)
-_IMAGE_PATCH_ID = 151938   # image_patch_id — replaces <|video|> placeholder
+_IMAGE_PATCH_ID = 151938        # image_patch_id — replaces both <|video|> and <|image|>
 _VIDEO_PLACEHOLDER_ID = 151945  # <|video|> token in the prompt
+_IMAGE_PLACEHOLDER_ID = 151941  # <|image|> token in the prompt
 
-_DEFAULT_N_OUT_PER_FRAME = 81   # typical for standard Molmo2 video resolution
+_DEFAULT_N_OUT_PER_FRAME = 81   # video: 9×9 pool = 81 tokens per frame (pooling=[3,3])
+_DEFAULT_N_OUT_PER_IMAGE_CROP = 196  # image: 14×14 pool = 196 tokens per crop (pooling=[2,2])
 _DEFAULT_IMAGE_SIZE = 378
 _DEFAULT_PATCH_SIZE = 14
 
@@ -46,9 +52,9 @@ class Molmo2ProcessingInfo(BaseProcessingInfo):
     """ProcessingInfo for Molmo2: supports image and video."""
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
-        # Only expose video modality — our _get_mm_fields_config only handles video.
-        # Images are not needed for the TT model (video subsumes single-frame image use).
-        return {"video": 1}
+        # Both video and image supported.
+        # TT override (_TT_Molmo2ProcessingInfo) raises image limit to 23.
+        return {"video": 1, "image": 1}
 
     def get_data_parser(self):
         """Use video_needs_metadata=True so vLLM preserves fps/duration metadata.
@@ -131,6 +137,31 @@ class Molmo2MultiModalProcessor(BaseMultiModalProcessor[Molmo2ProcessingInfo]):
         """
         mm_data = dict(mm_data)
         hf_processor = self.info.get_hf_processor(**mm_kwargs)
+
+        # ---- Image path (ImageProcessorItems.get_processor_data() → {"images": [...]}) ----
+        images = mm_data.pop("images", [])
+        if images:
+            # Only pass text + images — NOT remaining mm_data which may contain "videos"
+            # (HF Molmo2Processor cannot process images and videos simultaneously).
+            combined_out = self.info.ctx.call_hf_processor(
+                hf_processor,
+                {"text": prompt, "images": images},
+                {},
+            )
+            result = dict(combined_out)
+            # HF image processor already provides image_num_crops as a per-image tensor
+            # (e.g. tensor([2, 3]) for 2 images with 2 and 3 crops respectively).
+            # DO NOT overwrite it — the per-image counts are needed for flat_from_sizes batching.
+            img_num_crops = result.get("image_num_crops")
+            if img_num_crops is not None:
+                crops_t = (
+                    img_num_crops
+                    if isinstance(img_num_crops, torch.Tensor)
+                    else torch.tensor(img_num_crops)
+                )
+                # Pooled patches per image = crops_per_image * pooled_per_crop (196 for [2,2] pool)
+                result["image_num_pooled_patches"] = crops_t.long() * _DEFAULT_N_OUT_PER_IMAGE_CROP
+            return BatchFeature(result)
 
         try:
             from transformers.video_utils import VideoMetadata as _VideoMetadata
@@ -233,6 +264,34 @@ class Molmo2MultiModalProcessor(BaseMultiModalProcessor[Molmo2ProcessingInfo]):
                 "video", video_num_tokens
             )
             config["video_num_input_tokens"] = MultiModalFieldConfig.batched("video")
+
+        # ---- Image fields (from native image path) ----
+        # image_num_crops is a per-image tensor from the HF image processor (e.g. [2, 3] for
+        # 2 images with 2 and 3 crops). flat_from_sizes batches pixel_values accordingly.
+        img_num_crops_raw = hf_inputs.get("image_num_crops")
+        img_num_pooled_raw = hf_inputs.get("image_num_pooled_patches")
+        if img_num_crops_raw is not None:
+            img_num_crops = (
+                img_num_crops_raw
+                if isinstance(img_num_crops_raw, torch.Tensor)
+                else torch.tensor(img_num_crops_raw)
+            )
+            if img_num_crops.numel() > 0:
+                config["pixel_values"] = MultiModalFieldConfig.flat_from_sizes(
+                    "image", img_num_crops
+                )
+                config["image_num_crops"] = MultiModalFieldConfig.batched("image")
+        if img_num_pooled_raw is not None:
+            img_num_pooled = (
+                img_num_pooled_raw
+                if isinstance(img_num_pooled_raw, torch.Tensor)
+                else torch.tensor(img_num_pooled_raw)
+            )
+            if img_num_pooled.numel() > 0:
+                config["image_token_pooling"] = MultiModalFieldConfig.flat_from_sizes(
+                    "image", img_num_pooled
+                )
+                config["image_num_pooled_patches"] = MultiModalFieldConfig.batched("image")
         return config
 
     def _get_prompt_updates(
@@ -291,12 +350,32 @@ class Molmo2MultiModalProcessor(BaseMultiModalProcessor[Molmo2ProcessingInfo]):
                 embed_token_id=_IMAGE_PATCH_ID,
             )
 
+        def get_image_replacement(item_idx: int) -> PromptUpdateDetails:
+            image_items = out_mm_kwargs.get("image", [])
+            n_pooled = _DEFAULT_N_OUT_PER_IMAGE_CROP  # 196 per crop fallback
+            if item_idx < len(image_items):
+                item_data = image_items[item_idx].data
+                np_elem = item_data.get("image_num_pooled_patches")
+                if np_elem is not None:
+                    np_tensor = np_elem.data if hasattr(np_elem, "data") else np_elem
+                    if isinstance(np_tensor, torch.Tensor) and np_tensor.numel() > 0:
+                        n_pooled = int(np_tensor.item())
+            return PromptUpdateDetails.select_token_id(
+                [_IMAGE_PATCH_ID] * n_pooled,
+                embed_token_id=_IMAGE_PATCH_ID,
+            )
+
         return [
             PromptReplacement(
                 modality="video",
                 target=[_VIDEO_PLACEHOLDER_ID],
                 replacement=get_replacement,
-            )
+            ),
+            PromptReplacement(
+                modality="image",
+                target=[_IMAGE_PLACEHOLDER_ID],
+                replacement=get_image_replacement,
+            ),
         ]
 
 
