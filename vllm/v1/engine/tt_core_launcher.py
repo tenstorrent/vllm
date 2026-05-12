@@ -91,6 +91,23 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
         # If resolution failed and rank0_host is not an IP, we can't validate
         if not resolved_ips:
             return
+    # When rank0_host resolves only to loopback (e.g. Ubuntu's default
+    # `/etc/hosts` maps the local hostname to 127.0.1.1), getaddrinfo cannot
+    # produce the externally-routable IP. Accept as rank-0 host if the local
+    # hostname matches rank0_host.
+    if resolved_ips and all(ip.startswith("127.") for ip in resolved_ips):
+        try:
+            local_hostname = socket.gethostname()
+        except Exception:
+            local_hostname = ""
+        if rank0_host in {local_hostname, local_hostname.split(".", 1)[0]}:
+            logger.info(
+                "Rank 0 host %s resolves only to loopback %s; accepting based on "
+                "matching local hostname.",
+                rank0_host,
+                sorted(resolved_ips),
+            )
+            return
     assert host_ip in resolved_ips, (
         f"MPI rank 0 host {rank0_host} from rankfile {mapby_path} "
         f"(resolves to {sorted(resolved_ips)}) does not match "
