@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     VLLM_HOST_IP: str = ""
+    VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
@@ -458,6 +459,9 @@ def get_env_or_set_default(
 logger = logging.getLogger(__name__)
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Optional ISO date used by the GPT-OSS harmony chat template to pin
+    # the conversation start date and remove time-based non-determinism.
+    "VLLM_SYSTEM_START_DATE": lambda: os.getenv("VLLM_SYSTEM_START_DATE", None),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

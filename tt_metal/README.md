@@ -5,6 +5,7 @@
 - [vLLM and TT-Metal Branches](#vllm-and-tt-metal-branches)
 - [System Requirements](#system-requirements)
 - [Environment Creation](#environment-creation)
+- [TT Plugin Package](#tt-plugin-package)
 - [Accessing the Meta-Llama Hugging Face Models](#accessing-the-meta-llama-hugging-face-models)
 - [Preparing the TT-Metal Models](#preparing-the-tt-metal-models)
 - [Running the Offline Inference Example](#running-the-offline-inference-example)
@@ -12,6 +13,7 @@
 - [Benchmarking](#benchmarking)
 - [Testing Sampling Parameters](#testing-sampling-parameters)
 - [Running on Multi-Host Systems (V1 only)](#running-on-multi-host-systems-v1-only)
+- [Hybrid Attention Models](#hybrid-attention-models)
 
 ## vLLM and TT-Metal Branches
 
@@ -32,7 +34,7 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 **To create the vLLM+tt-metal environment (first time):**
 
 1. Install tt-metal following the instructions in [INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) (build and create the virtual environment if [installing tt-metal from source](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md#source)). Ensure that the necessary environment variables for running tt-metal tests were set.
-2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM (Note: `dev` is the main vLLM branch):
+2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM and the TT backend plugin (Note: `dev` is the main vLLM branch):
 
     ```sh
     source tt_metal/install-vllm-tt.sh
@@ -49,6 +51,43 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
     ```
 
 2. Ensure that the `PYTHONPATH` environment variable contains the path to tt-metal (should already have been set when installing tt-metal).
+
+3. Ensure the TT backend plugin is installed in the active environment:
+
+    ```sh
+    python -c "import vllm_tt_plugin; print(vllm_tt_plugin.__file__)"
+    ```
+
+## TT Plugin Package
+
+The TT backend is in a Phase 1 out-of-tree plugin package located at:
+
+```text
+plugins/vllm-tt-plugin
+```
+
+The `tt_metal/install-vllm-tt.sh` script installs this package after installing vLLM:
+
+```sh
+source tt_metal/install-vllm-tt.sh
+```
+
+To install or refresh only the plugin package, run `uv pip install --no-deps -e plugins/vllm-tt-plugin`.
+
+The editable install registers two vLLM entry points:
+
+- `vllm.general_plugins`: registers TT model architectures.
+- `vllm.platform_plugins`: activates `vllm_tt_plugin.platform.TTPlatform` when `ttnn` is available.
+
+The plugin currently owns TT model registration, platform/config logic, worker, model runner, input batch, async decode helpers, scheduler, and model loader. The vLLM fork still contains TT compatibility files and fork-only execution paths, including gathered-DP execution and TT launcher support. Those pieces remain in the fork until the execution and launcher abstractions are generalized in a later phase.
+
+Because the plugin is installed in editable mode, normal Python changes under `plugins/vllm-tt-plugin/src/vllm_tt_plugin/` take effect after restarting the Python or vLLM process. Reinstall the plugin only when package metadata or entry points change, such as changes to `plugins/vllm-tt-plugin/pyproject.toml`.
+
+If `VLLM_PLUGINS` is set, it must allow both TT plugin entry point names:
+
+```sh
+export VLLM_PLUGINS=tt,tt_model_registry
+```
 
 ## Accessing the Meta-Llama Hugging Face Models
 
@@ -302,3 +341,17 @@ MESH_DEVICE=(8,8) python -u examples/offline_inference_tt.py --model <MODEL_NAME
 > - `config_pkl_dir` needs to be set to a directory that is shared by all hosts (used during initialization to write a temporary config file that is read by other hosts).
 > - If you need to set environment variables that should be propagated to all hosts, you can either 1) specify them as part of `env_passthrough` in `--override_tt_config` or 2) add them as a `global_env` in the rank_binding file.
 > - `extra_ttrun_args` can be used to pass additional flags directly to `tt-run` as a raw string (e.g. `"--tcp-interface cnx1"`, `"--bare"`, `"--debug-gdbserver"`).
+
+## Hybrid Attention Models
+
+Hybrid attention models — those with mixed sliding-window and full-attention layers (e.g. Gemma3, Gemma4, GPT-OSS) — opt in to upstream vLLM's hybrid kv cache manager via a per-model spec hook on the registered TT model class. The hybrid manager packs sliding and full layers into separate `KVCacheGroupSpec`s, sized by upstream's [Hybrid KV Cache Manager design](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/), so sliding-window layers occupy only `sliding_window` worth of KV state per request instead of `max_seq_len`. On Gemma4-31B at 256k context this is roughly a 6× reduction in KV cache memory.
+
+To enable hybrid kv cache support for a TT model:
+
+1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM` instead of `Generator`. The base class provides a default `get_kv_cache_spec` classmethod that builds per-layer specs from `hf_config.text_config.layer_types` (the standard HF convention used by all target hybrid models). The plugin uses the presence of `get_kv_cache_spec` on the model class as the hybrid opt-in marker.
+2. Implement `prefill_forward` and `decode_forward` to consume the new `page_tables_per_group` kwarg (a list of per-group block tables in upstream's group order) and route per layer to the right group's page table. The underlying TT model needs to accept this routing.
+3. Implement `allocate_kv_cache_per_layer(per_layer_specs)` (the base class default delegates to `allocate_vllm_kv_cache_per_layer` for you).
+
+Models that **don't** opt in stay on the legacy `Generator` path and continue to behave exactly as before — uniform single-group KV cache, single page table, no behavioural change. The plugin only sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`, and falls back to the legacy `allocate_kv_cache(shape, dtype, num_layers)` entry point when `allocate_kv_cache_per_layer` is not implemented; legacy wrappers therefore don't need any defensive stripping.
+
+> **Note:** Hybrid models are not yet supported with `data_parallel_size > 1` — the DP merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models until per-group DP gather lands.

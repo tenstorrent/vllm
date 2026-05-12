@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77.0.3,<81.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-tt-plugin"
+version = "0.0.0"
+description = "Tenstorrent backend plugin for vLLM"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "Apache-2.0"
+dependencies = ["vllm"]
+
+[project.entry-points."vllm.general_plugins"]
+tt_model_registry = "vllm_tt_plugin.entrypoints:register"
+
+[project.entry-points."vllm.platform_plugins"]
+tt = "vllm_tt_plugin.entrypoints:platform_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vllm_tt_plugin*"]

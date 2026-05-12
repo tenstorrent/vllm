@@ -12,12 +12,12 @@ import torch
 import ttnn
 
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
-from vllm.v1.worker.tt_input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.worker.tt_input_batch import CachedRequestState
-    from vllm.v1.worker.tt_model_runner import TTModelInput, TTModelRunner
+    from vllm_tt_plugin.input_batch import CachedRequestState
+    from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 
 
 @dataclass(frozen=True)
@@ -417,6 +417,13 @@ class TTAsyncDecodeController:
             "kv_cache": runner.kv_caches,
             "start_pos": model_input.input_positions,
         }
+        # Hybrid attention models route per-layer block tables; the
+        # runner already populated ``block_tables_per_layer`` at
+        # submission time when the kv_cache_config has multiple groups.
+        # Legacy/uniform models leave it as ``None`` and never see the
+        # kwarg.
+        if model_input.block_tables_per_layer is not None:
+            kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (

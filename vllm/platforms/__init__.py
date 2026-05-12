@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import traceback
+from importlib.util import find_spec
 from itertools import chain
 from typing import TYPE_CHECKING
 
@@ -186,7 +187,13 @@ def tt_platform_plugin() -> str | None:
     except Exception as e:
         logger.debug("TT platform is not available because: %s", str(e))
 
-    return "vllm.platforms.tt.TTPlatform" if is_tt else None
+    if not is_tt:
+        return None
+
+    if find_spec("vllm_tt_plugin") is not None:
+        return "vllm_tt_plugin.platform.TTPlatform"
+
+    return "vllm.platforms.tt.TTPlatform"
 
 
 builtin_platform_plugins = {

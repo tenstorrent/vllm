@@ -9,14 +9,13 @@ from collections import deque
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
+import regex as re
 import torch
 import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.tt_loader import TTModelLoader
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.platforms.tt import TTPlatform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -31,17 +30,19 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.tt_async_decode import (
+from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     TTAsyncDecodeController,
 )
-from vllm.v1.worker.tt_input_batch import (
+from vllm_tt_plugin.input_batch import (
     LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
     CachedRequestState,
     InputBatch,
 )
+from vllm_tt_plugin.loader import TTModelLoader
+from vllm_tt_plugin.platform import TTPlatform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -52,6 +53,30 @@ logger = init_logger(__name__)
 
 # Maximum top_k value for on-device sampling
 MAX_K = 32
+
+
+# Matches the upstream attention-layer naming convention used by registered
+# vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
+# bare "layers.5" forms used in TT spec hooks. The first capture group is
+# the integer layer index.
+_LAYER_NAME_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _parse_layer_index(layer_name: str) -> int:
+    """Extract the integer layer index from a layer name.
+
+    Used to map ``KVCacheGroupSpec.layer_names`` back to model-side layer
+    indices when distributing per-group KV cache shapes across the
+    layer-indexed allocator. The hook author is expected to follow the
+    ``...layers.<idx>...`` convention.
+    """
+    match = _LAYER_NAME_RE.search(layer_name)
+    if match is None:
+        raise ValueError(
+            f"Could not parse a layer index from layer name '{layer_name}'. "
+            "TT spec hooks must use the '...layers.<idx>...' naming convention."
+        )
+    return int(match.group(1))
 
 
 def _build_logprobs_from_topk(
@@ -136,7 +161,25 @@ class TTModelInput:
     input_tokens: torch.Tensor
     input_positions: torch.Tensor
     prompt_lens: list[int] | None
+    # Group-0 block table, retained as a tensor for back-compat with the
+    # many DP padding/gather/pack paths that read it as ``block_tables``.
+    # Hybrid models must additionally consult ``block_tables_per_group``
+    # below; legacy single-group models can continue to use this field.
     block_tables: torch.Tensor
+    # Per-group block tables in upstream's KVCacheConfig group order; one
+    # entry for uniform models, ``len(kv_cache_groups)`` entries for
+    # hybrid attention. Group g's tensor maps the model's layer-→group
+    # routing onto the right paged pool. We expand this into
+    # ``block_tables_per_layer`` (one entry per decoder layer) before
+    # handing it to hybrid models so they don't have to re-derive vLLM's
+    # group construction order.
+    block_tables_per_group: list[torch.Tensor]
+    # Per-layer block tables, one entry per decoder layer in model
+    # layer-index order. ``None`` for non-hybrid models (the runner only
+    # populates this when ``self._layer_to_group_idx`` was set at
+    # ``initialize_kv_cache`` time, which itself only fires when the
+    # model class exposes ``get_kv_cache_spec``).
+    block_tables_per_layer: list[torch.Tensor] | None
     unpadded_batch_size: int | list[int]  # List is used for DP
     tt_sampling_params: TTSamplingParams
     multi_modal_kwargs: dict[str, Any]
@@ -307,30 +350,38 @@ class TTModelRunner:
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
-        Initialize KV cache based on `kv_cache_config`.
+        Initialize KV cache based on ``kv_cache_config``.
+
         Args:
-            kv_cache_config: Configuration for the KV cache, including the KV
-            cache size of each layer
+            kv_cache_config: Configuration for the KV cache. May contain one
+                group (uniform attention) or multiple groups (hybrid models
+                like Gemma3/4 / GPT-OSS that mix sliding-window and full
+                attention layers).
         """
-
         kv_cache_groups = kv_cache_config.kv_cache_groups
-        if len(kv_cache_groups) > 1:
-            raise NotImplementedError(
-                "Hybrid models with more than one KV cache type are not supported yet."
-            )
-        if isinstance(kv_cache_groups[0].kv_cache_spec, AttentionSpec):
-            kv_cache_spec = kv_cache_groups[0].kv_cache_spec
-        else:
-            raise TypeError("Expected AttentionSpec")
+        self._validate_kv_cache_groups(kv_cache_groups)
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            assert len(kv_cache_tensor.shared_by) == 1, (
-                "KV cache shared by multiple layers is not supported for TT"
-            )
+        # Stash on the runner for downstream phases that need to walk the
+        # group structure during input prep / forward.
+        self.kv_cache_config = kv_cache_config
 
-        # Initialize persistent input batch with block size from kv_cache_spec.
-        # The persistent batch optimization reduces overhead between steps
-        # when consecutive batches contain mostly the same requests.
+        # Build the persistent input batch. Upstream's hybrid kv cache
+        # manager enforces a uniform page_size across groups, and to keep
+        # the existing block-table plumbing intact we additionally require
+        # a single block_size across groups for now. Different block_sizes
+        # per group will require the input batch + block table consumers
+        # to learn to address per-group block tables with mixed block
+        # sizes.
+        block_size = kv_cache_groups[0].kv_cache_spec.block_size
+        assert all(g.kv_cache_spec.block_size == block_size for g in kv_cache_groups), (
+            "Mixed block sizes across kv_cache_groups not yet supported"
+        )
+
+        # One block table per group, all with the same block_size. The
+        # MultiGroupBlockTable then has ``len(kv_cache_groups)`` entries
+        # — single-group models keep the previous shape (length 1).
+        per_group_block_sizes = [block_size] * len(kv_cache_groups)
+
         max_num_reqs = self.scheduler_config.max_num_seqs
         max_model_len = self.model_config.max_model_len
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -339,47 +390,231 @@ class TTModelRunner:
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             vocab_size=self.vocab_size,
-            block_sizes=[kv_cache_spec.block_size],
-            kernel_block_sizes=[kv_cache_spec.block_size],
+            block_sizes=per_group_block_sizes,
+            kernel_block_sizes=per_group_block_sizes,
             logitsprocs=self._host_logitsprocs,
         )
 
         # The block tables in the persistent input batch have
         # max_num_blocks_per_req = cdiv(max_model_len, block_size) but this
-        # does not take into account num blocks in KV cache. Actual max is min
-        # of these two. Used to slice block tables during input prep.
+        # does not take into account num blocks in KV cache. Actual max is
+        # min of these two. Used to slice block tables during input prep.
         self.max_num_blocks_per_req = min(
-            cdiv(self.model_config.max_model_len, self.cache_config.block_size),
+            cdiv(max_model_len, self.cache_config.block_size),
             kv_cache_config.num_blocks,
         )
 
-        # Only DP rank 0 allocates KV cache
+        # Number of kv_cache_groups; needed by DP gather/merge to pack
+        # per-group block tables into the gather payload.
+        self._num_kv_cache_groups = len(kv_cache_groups)
+        # Cache layer→group index mapping for hybrid models so submit_*
+        # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
+        # without re-deriving vLLM's group construction order. Non-hybrid
+        # configurations (single group) skip the expansion entirely. The
+        # check is on ``len(kv_cache_groups)`` rather than the model class
+        # so it works on every DP rank — only ``data_parallel_rank_local
+        # == 0`` actually loads ``self.model``.
+        self._layer_to_group_idx: list[int] | None = None
+        if len(kv_cache_groups) > 1:
+            num_layers = self.model_config.get_num_layers_by_block_type(
+                self.parallel_config, "attention"
+            )
+            mapping: list[int | None] = [None] * num_layers
+            for g_idx, group in enumerate(kv_cache_groups):
+                for layer_name in group.layer_names:
+                    idx = _parse_layer_index(layer_name)
+                    mapping[idx] = g_idx
+            missing = [i for i, g in enumerate(mapping) if g is None]
+            if missing:
+                raise ValueError(
+                    f"No KVCacheGroupSpec covers layer indices {missing} "
+                    f"on hybrid model; every attention layer must appear "
+                    "in some group's layer_names."
+                )
+            self._layer_to_group_idx = mapping  # type: ignore[assignment]
+
+        # Only DP rank 0 allocates KV cache.
         if self.parallel_config.data_parallel_rank_local != 0:
             return
 
-        # Make the assumption that we are tensor parallel by
-        # min(number of devices, number of KV heads).
-        # TODO: move this into model.allocate_kv_cache.
-        model_config = self.model_config
+        self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+
+    @staticmethod
+    def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
+        if not kv_cache_groups:
+            raise ValueError("kv_cache_config has no groups")
+        for group in kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                raise TypeError(
+                    f"Expected AttentionSpec for group {group.layer_names}, "
+                    f"got {type(group.kv_cache_spec).__name__}"
+                )
+
+    def _kv_cache_shape(
+        self, spec: AttentionSpec, num_blocks: int
+    ) -> tuple[int, int, int, int]:
+        """Per-buffer shape ``(num_blocks, num_kv_heads, block_size,
+        head_size)`` from a group's attention spec.
+
+        TP factor is folded in here because it is handled on the model
+        side for TT (caches are replicated per submesh and each device
+        carries ``num_kv_heads // tp`` heads internally).
+        """
         data_parallel = self.parallel_config.data_parallel_size
         assert self.device_config.num_devices is not None
         num_devices = self.device_config.num_devices // data_parallel
-        total_kv_heads = kv_cache_spec.num_kv_heads
-        num_kv_heads = total_kv_heads // min(num_devices, total_kv_heads)
+        num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
+        return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
-        kv_cache_shape = (
-            kv_cache_config.num_blocks,
-            num_kv_heads,
-            kv_cache_spec.block_size,
-            kv_cache_spec.head_size,
-        )
-        dtype = kv_cache_spec.dtype
-        num_layers = model_config.get_num_layers_by_block_type(
+    def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> Any:
+        """Allocate KV cache tensors, falling back to legacy uniform API.
+
+        Builds a ``per_layer_specs`` list of ``(shape, dtype)`` tuples — one
+        entry per attention layer in model layer-index order. Hybrid models
+        opt in to per-layer allocation by exposing
+        ``allocate_kv_cache_per_layer(per_layer_specs)``; legacy models keep
+        the older ``allocate_kv_cache(shape, dtype, num_layers)`` signature
+        and we adapt to it here, asserting the per-layer specs are uniform.
+        """
+        num_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
+        per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
 
-        # Allocate KV cache tensors.
-        self.kv_caches = self.model.allocate_kv_cache(kv_cache_shape, dtype, num_layers)
+        if hasattr(self.model, "allocate_kv_cache_per_layer"):
+            return self.model.allocate_kv_cache_per_layer(per_layer_specs)
+
+        # Legacy ``allocate_kv_cache(shape, dtype, num_layers)`` API: every
+        # layer must have the same shape/dtype. The third tuple element is
+        # the tensor index, which is irrelevant for the legacy uniform
+        # path (each layer gets its own buffer there).
+        shape, dtype, _ = per_layer_specs[0]
+        for entry_shape, entry_dtype, _ in per_layer_specs[1:]:
+            if (entry_shape, entry_dtype) != (shape, dtype):
+                raise NotImplementedError(
+                    f"{type(self.model).__name__} only implements legacy "
+                    "allocate_kv_cache; hybrid attention models must "
+                    "override allocate_kv_cache_per_layer."
+                )
+        return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
+
+    def _block_tables_per_layer(
+        self, block_tables_per_group: list[torch.Tensor]
+    ) -> list[torch.Tensor] | None:
+        """Expand per-group block tables to per-layer using the cached mapping.
+
+        Returns None for non-hybrid models (the mapping is only populated
+        when the model class exposes ``get_kv_cache_spec``). The output is
+        a list of ``num_layers`` tensors, where entry ``i`` is the block
+        table for layer ``i``'s containing kv_cache_group — what hybrid
+        bridges hand to the underlying TT model so attention layer ``i``
+        can index its own paged pool (full vs. sliding-window) without
+        knowing how vLLM ordered the groups.
+        """
+        if self._layer_to_group_idx is None:
+            return None
+        result = [block_tables_per_group[g] for g in self._layer_to_group_idx]
+        # Pad to the warmup shape ``[max_batch, max_num_blocks_per_req]``.
+        # The model side (``Transformer._page_tables_to_ttnn``) allocates
+        # *persistent* ttnn device tensors at this shape during warmup so
+        # captured traces can be replayed against stable device addresses;
+        # ``ttnn.copy_host_to_device_tensor`` then asserts
+        # ``host_shape == device_shape`` when the runtime per-layer block
+        # tables push their content into those buffers. Padding rows with
+        # zeros is harmless — the kernel only reads up to each layer's
+        # active block count.
+        max_batch = int(self.scheduler_config.max_num_seqs) * int(
+            self.parallel_config.data_parallel_size
+        )
+        target_shape = (max_batch, self.max_num_blocks_per_req)
+        padded = []
+        for bt in result:
+            if bt is None:
+                padded.append(None)
+                continue
+            if bt.shape == target_shape:
+                padded.append(bt)
+                continue
+            full = torch.zeros(target_shape, dtype=bt.dtype)
+            rows = min(bt.shape[0], target_shape[0])
+            cols = min(bt.shape[1], target_shape[1])
+            full[:rows, :cols] = bt[:rows, :cols]
+            padded.append(full)
+        return padded
+
+    def _build_per_layer_specs(
+        self, kv_cache_config: KVCacheConfig, num_layers: int
+    ) -> list[tuple[tuple[int, int, int, int], Any, int]]:
+        """Resolve ``KVCacheConfig`` → list of ``(shape, dtype, tensor_idx)``
+        per layer in model layer-index order.
+
+        ``tensor_idx`` identifies the unique DRAM buffer that each layer's
+        KV cache lives in. Multiple layers from different
+        ``KVCacheGroupSpec``\\ s can carry the same ``tensor_idx`` — this
+        is upstream's tensor-sharing model: with a 5:1 sliding/full split,
+        a full-attention layer and several sliding-window layers all share
+        one buffer, and they index disjoint slots within it via per-group
+        block tables (vLLM's ``BlockPool`` allocates disjoint block IDs
+        across groups, so the shared tensor is sized for the worst-case
+        full-attention demand and the sliding-window layers fit within
+        their window's worth of slots).
+
+        Single-group (uniform-attention) models keep the previous behavior:
+        every layer gets a unique buffer and ``tensor_idx == layer_idx``.
+        """
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+
+        if len(kv_cache_groups) == 1:
+            spec = kv_cache_groups[0].kv_cache_spec
+            # Already enforced by ``_validate_kv_cache_groups`` at the
+            # top of ``initialize_kv_cache``; assert for mypy.
+            assert isinstance(spec, AttentionSpec)
+            shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+            return [(shape, spec.dtype, i) for i in range(num_layers)]
+
+        # Multi-group: walk ``kv_cache_tensors`` (one entry per unique DRAM
+        # buffer) and assign every layer in ``shared_by`` the same
+        # ``tensor_idx``. Shape/dtype come from the layer's own group spec.
+        spec_by_layer_name: dict[str, AttentionSpec] = {}
+        for group in kv_cache_groups:
+            assert isinstance(group.kv_cache_spec, AttentionSpec)
+            for layer_name in group.layer_names:
+                spec_by_layer_name[layer_name] = group.kv_cache_spec
+
+        per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
+            None
+        ] * num_layers
+        for tensor_idx, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            for layer_name in kv_cache_tensor.shared_by:
+                spec = spec_by_layer_name.get(layer_name)
+                if spec is None:
+                    raise ValueError(
+                        f"KVCacheTensor.shared_by names layer '{layer_name}' "
+                        "but it doesn't appear in any kv_cache_group"
+                    )
+                idx = _parse_layer_index(layer_name)
+                if not 0 <= idx < num_layers:
+                    raise ValueError(
+                        f"Layer index {idx} parsed from '{layer_name}' is "
+                        f"out of range for {num_layers} attention layers"
+                    )
+                if per_layer[idx] is not None:
+                    raise ValueError(
+                        f"Layer index {idx} (from '{layer_name}') is named "
+                        "by more than one KVCacheTensor.shared_by; each "
+                        "layer must map to exactly one DRAM buffer"
+                    )
+                shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+                per_layer[idx] = (shape, spec.dtype, tensor_idx)
+
+        missing = [i for i, e in enumerate(per_layer) if e is None]
+        if missing:
+            raise ValueError(
+                f"No KVCacheTensor covers layer indices {missing}; "
+                "every attention layer must appear in some "
+                "kv_cache_tensors[i].shared_by"
+            )
+        return per_layer  # type: ignore[return-value]
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
@@ -600,16 +835,14 @@ class TTModelRunner:
         input_batch = self.input_batch
         num_reqs = input_batch.num_reqs
         assert num_reqs > 0
-        assert len(input_batch.block_table.block_tables) == 1, (
-            "Currently only supporting 1 KV cache group"
-        )
 
-        # Second dim of block table is (ceil(max_model_len / block_size)).
+        # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice to self.max_num_blocks_per_req which also takes into
         # account max num blocks in KV cache in case max KV blocks is smaller.
         # Constant shape is required for ttnn tracing to work.
-        block_tables = input_batch.block_table[0].get_cpu_tensor()[
-            :num_reqs, : self.max_num_blocks_per_req
+        block_tables_per_group = [
+            bt.get_cpu_tensor()[:num_reqs, : self.max_num_blocks_per_req]
+            for bt in input_batch.block_table.block_tables
         ]
 
         # DP optimization: don't send padding blocks if possible to reduce
@@ -620,7 +853,18 @@ class TTModelRunner:
             max_blocks_in_batch = cdiv(
                 max_tokens_in_batch, self.cache_config.block_size
             )
-            block_tables = block_tables[:, :max_blocks_in_batch]
+            block_tables_per_group = [
+                bt[:, :max_blocks_in_batch] for bt in block_tables_per_group
+            ]
+
+        # Group-0 view kept on TTModelInput.block_tables for back-compat with
+        # the existing single-tensor consumers (DP pack/gather, decode_forward
+        # page_table arg). Hybrid models additionally consume
+        # ``block_tables_per_group`` via the ``page_tables_per_group`` kwarg
+        # in submit_prefill / submit_decode; the legacy generator_vllm
+        # wrappers strip it on the way through and raise loudly if the list
+        # has more than one entry.
+        block_tables = block_tables_per_group[0]
 
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
@@ -684,14 +928,19 @@ class TTModelRunner:
                 input_positions = torch.cat(
                     [input_positions, torch.ones(batch_pad, dtype=torch.int32) * -1]
                 )
-                block_tables = torch.cat(
-                    [
-                        block_tables,
-                        torch.zeros(
-                            batch_pad, block_tables.shape[1], dtype=torch.int32
-                        ),
-                    ]
-                )
+                # Pad each per-group block table to max_num_reqs so DP
+                # gather produces a fixed-shape payload regardless of how
+                # many users are active on this rank. Keep ``block_tables``
+                # aliased to the (now padded) group-0 view, matching the
+                # alias set up where ``block_tables_per_group`` is built.
+                block_tables_per_group = [
+                    torch.cat(
+                        [bt, torch.zeros(batch_pad, bt.shape[1], dtype=bt.dtype)],
+                        dim=0,
+                    )
+                    for bt in block_tables_per_group
+                ]
+                block_tables = block_tables_per_group[0]
                 # Pad sampling parameters with default values
                 sample_params.pad_with_defaults(num_reqs)
 
@@ -848,6 +1097,8 @@ class TTModelRunner:
             input_positions=input_positions,
             prompt_lens=prompt_lens,
             block_tables=block_tables,
+            block_tables_per_group=block_tables_per_group,
+            block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
@@ -930,12 +1181,17 @@ class TTModelRunner:
         """
 
         max_batch = int(self.scheduler_config.max_num_seqs)
+        num_groups = self._num_kv_cache_groups
         if model_input is None:
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
             positions = torch.full((max_batch,), -1, dtype=torch.int32)
-            block_tables = torch.zeros(
-                (max_batch, max_blocks_decode_batch), dtype=torch.int32
-            )
+            # One zero-filled block table per kv_cache_group so the gather
+            # payload always carries G * B * W block_table ints regardless
+            # of whether this rank has local work.
+            block_tables_per_group = [
+                torch.zeros((max_batch, max_blocks_decode_batch), dtype=torch.int32)
+                for _ in range(num_groups)
+            ]
             unpadded_batch_size = torch.tensor([0], dtype=torch.int32)
             # Create default sampling parameter tensors (max_batch sized)
             sampling_default_tensors = (
@@ -955,19 +1211,25 @@ class TTModelRunner:
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
-            block_tables = model_input.block_tables
-            # Pad block tables to max_blocks_decode_batch
-            if block_tables.shape[1] < max_blocks_decode_batch:
-                pad_w = max_blocks_decode_batch - block_tables.shape[1]
-                block_tables = torch.cat(
-                    [
-                        block_tables,
-                        torch.zeros(
-                            (block_tables.shape[0], pad_w), dtype=block_tables.dtype
-                        ),
-                    ],
-                    dim=1,
-                )
+            # Pad each group's block_table out to ``max_blocks_decode_batch``
+            # so the gather payload has a fixed shape regardless of which
+            # group carries the most blocks for this rank.
+            block_tables_per_group = []
+            for bt in model_input.block_tables_per_group:
+                if bt.shape[1] < max_blocks_decode_batch:
+                    pad_w = max_blocks_decode_batch - bt.shape[1]
+                    bt = torch.cat(
+                        [
+                            bt,
+                            torch.zeros((bt.shape[0], pad_w), dtype=bt.dtype),
+                        ],
+                        dim=1,
+                    )
+                block_tables_per_group.append(bt)
+            assert len(block_tables_per_group) == num_groups, (
+                f"build_dp_decode_gather_input: expected {num_groups} "
+                f"per-group block tables, got {len(block_tables_per_group)}"
+            )
             unpadded_batch_size = torch.tensor(
                 [cast(int, model_input.unpadded_batch_size)], dtype=torch.int32
             )
@@ -993,12 +1255,20 @@ class TTModelRunner:
             else torch.arange(max_batch, dtype=torch.int32)
         )
         # Pack into flattened tensors to reduce number of collectives.
-        # B = max batch size, W = max_num_blocks_per_req.
+        # B = max batch size, W = max_num_blocks_per_req, G = num kv_cache_groups.
+        # Layout includes one block_table block per group (G*B*W ints) so
+        # hybrid models can carry per-group routing through DP gather; for
+        # the legacy single-group case G == 1 and the layout is byte-
+        # identical to the pre-hybrid format.
+        block_tables_packed = torch.cat(
+            [bt.contiguous().view(-1) for bt in block_tables_per_group],
+            dim=0,
+        )
         int_inputs = torch.cat(
             [
                 tokens.contiguous().view(-1),  # B
                 positions.contiguous().view(-1),  # B
-                block_tables.contiguous().view(-1),  # B*W
+                block_tables_packed,  # G*B*W
                 unpadded_batch_size.contiguous().view(-1),  # 1
                 top_k.contiguous().view(-1),  # B
                 seed.contiguous().view(-1),  # B
@@ -1151,15 +1421,24 @@ class TTModelRunner:
                     f"max_blocks_decode_batch={W} exceeds "
                     f"max_num_blocks_per_req={max_bt_width}"
                 )
-            block_tables_raw = stacked_int[:, off : off + B * W].reshape(total_B, W)
-            off += B * W
-            if max_bt_width == W:
-                block_tables = block_tables_raw
-            else:
-                # Pad to constant width expected by TT backend.
-                # Use new_zeros to match dtype/device of gathered tensors.
-                block_tables = block_tables_raw.new_zeros((total_B, max_bt_width))
-                block_tables[:, :W] = block_tables_raw
+            num_groups = self._num_kv_cache_groups
+            # Layout: ``[world, G, B, W]`` because every rank packs its
+            # block tables in kv_cache_group order and the gather stacks
+            # ranks. Reshape per-group and reassemble each group's table
+            # as ``[total_B, W]`` then pad to the kernel-expected width.
+            block_tables_raw_per_group = stacked_int[
+                :, off : off + num_groups * B * W
+            ].reshape(world, num_groups, B, W)
+            off += num_groups * B * W
+            block_tables_per_group: list[torch.Tensor] = []
+            for g in range(num_groups):
+                bt_g = block_tables_raw_per_group[:, g, :, :].reshape(total_B, W)
+                if max_bt_width != W:
+                    padded = bt_g.new_zeros((total_B, max_bt_width))
+                    padded[:, :W] = bt_g
+                    bt_g = padded
+                block_tables_per_group.append(bt_g)
+            block_tables = block_tables_per_group[0]
 
             bs_tensor = stacked_int[:, off]
             off += 1
@@ -1255,6 +1534,13 @@ class TTModelRunner:
         else:
             input_tokens_list: list[torch.Tensor] = []
             block_tables_list: list[torch.Tensor] = []
+            # ``block_tables_per_group_list[g]`` holds one entry per active
+            # rank (the rank's group-``g`` block table padded to a common
+            # width). Concatenated across ranks at the end so hybrid
+            # prefill carries per-group routing through the merged input.
+            block_tables_per_group_list: list[list[torch.Tensor]] = [
+                [] for _ in range(self._num_kv_cache_groups)
+            ]
             input_positions_list: list[
                 torch.Tensor
             ] = []  # (prefix cache positions for prefill)
@@ -1309,6 +1595,15 @@ class TTModelRunner:
                     assert mi.prompt_lens is not None
                     prompt_lens_list.append(mi.prompt_lens)
                     block_tables_list.append(pad_block_tables(mi.block_tables))
+                    assert (
+                        len(mi.block_tables_per_group) == self._num_kv_cache_groups
+                    ), (
+                        f"DP merge: rank input has "
+                        f"{len(mi.block_tables_per_group)} block_tables_per_group "
+                        f"entries, expected {self._num_kv_cache_groups}"
+                    )
+                    for g, bt_g in enumerate(mi.block_tables_per_group):
+                        block_tables_per_group_list[g].append(pad_block_tables(bt_g))
                     input_positions_list.append(mi.input_positions)
 
                     # Extract sampling parameter tensors from TTSamplingParams
@@ -1351,6 +1646,11 @@ class TTModelRunner:
             input_positions = np.concatenate(input_positions_list, axis=0)
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
             block_tables = torch.cat(block_tables_list, dim=0)
+            # Build the per-group merged view here so the prefill branch
+            # exits with the same shape contract as the decode branch.
+            block_tables_per_group = [
+                torch.cat(per_rank, dim=0) for per_rank in block_tables_per_group_list
+            ]
 
             # Concatenate sampling parameter tensors across DP ranks
             temperature = torch.cat(temperature_list, dim=0)
@@ -1452,6 +1752,13 @@ class TTModelRunner:
             input_positions=input_positions,
             prompt_lens=prompt_lens,
             block_tables=block_tables,
+            # ``block_tables_per_group`` carries each kv_cache_group's
+            # block table merged across DP ranks (decode unpacks them
+            # from ``int_inputs``; prefill concatenates rank-by-rank).
+            # ``_block_tables_per_layer`` then expands the per-group view
+            # into the per-layer list the hybrid bridge consumes.
+            block_tables_per_group=block_tables_per_group,
+            block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=batch_size_per_dp,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
@@ -1640,6 +1947,13 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        # Hybrid attention models route per-layer block tables; the
+        # runner already expanded ``block_tables_per_group`` into a
+        # per-layer list at submission time when the kv_cache_config has
+        # multiple groups. Legacy/uniform models leave it as ``None``
+        # and never see the kwarg.
+        if model_input.block_tables_per_layer is not None:
+            kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params

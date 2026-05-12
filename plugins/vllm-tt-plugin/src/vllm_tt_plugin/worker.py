@@ -13,11 +13,6 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_architecture
-from vllm.platforms.tt import (
-    TTPlatform,
-    _should_pre_register_tt_test_models_from_cli,
-    register_tt_models,
-)
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.kv_cache_interface import (
@@ -27,8 +22,13 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.tt_model_runner import TTModelInput, TTModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _should_pre_register_tt_test_models_from_cli,
+    register_tt_models,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -124,19 +124,81 @@ class TTWorker(WorkerBase):
         memory info from a profiling run to determine num blocks.
 
         For the TT backend, the static forward context is not populated since
-        the modelling code is independent so we currently skip creating a
-        kv cache spec for each layer, similar to the Spyre/Neuron backends.
-        Currently we also don't run profiling to determine available memory.
+        the modelling code is independent. Two paths are supported:
 
-        Return a dummy single layer KVCacheSpec and in the
-        determine_available_memory function override num blocks using
-        self.cache_config.num_gpu_blocks_override.
+        1. Hybrid models (mixed sliding-window + full-attention layers, e.g.
+           Gemma3/4 / GPT-OSS) opt in by defining a ``get_kv_cache_spec``
+           classmethod on the registered TT model class:
+
+               @classmethod
+               def get_kv_cache_spec(
+                   cls, vllm_config
+               ) -> dict[str, KVCacheSpec] | None:
+                   ...
+
+           The returned dict maps a layer name to its per-layer spec. This
+           lets upstream's hybrid kv cache manager pack each attention type
+           into its own group with its own per-request block budget.
+
+        2. Models without the hook (and models that return ``None``) fall
+           back to a single homogeneous spec under the dummy ``"foo"`` layer
+           name, the same behaviour the TT backend has always had. As before
+           we don't run profiling for available memory and instead override
+           num blocks via ``self.cache_config.num_gpu_blocks_override``.
         """
+        spec_from_hook = self._try_get_spec_from_model_hook()
+        if spec_from_hook is not None:
+            return spec_from_hook
 
-        # TODO: Once we're able to populate a static forward context,
-        # generate separate specs per layer (e.g. also sliding window, local
-        # attention).
+        return self._build_default_kv_cache_spec()
 
+    def _try_get_spec_from_model_hook(self) -> dict[str, KVCacheSpec] | None:
+        """If the resolved TT model class implements ``get_kv_cache_spec``,
+        invoke it and return the result. Returns ``None`` when the hook is
+        absent or explicitly returns ``None`` (signalling fallback to the
+        single-spec default).
+        """
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        # ``ModelConfig.architecture`` (singular) is computed in
+        # ``ModelConfig.__post_init__`` from ``hf_config.architectures``
+        # *before* :meth:`TTPlatform.check_and_update_config` prepends ``"TT"``
+        # to the architectures list. As a result the cached property still
+        # holds the upstream (e.g. CUDA) name, and resolving it would find
+        # upstream's vLLM model class — which doesn't have our
+        # ``get_kv_cache_spec`` hook. Prefer the prefixed entry from the
+        # ``architectures`` list (which the platform modifies in-place) and
+        # fall back to prepending ``"TT"`` when neither is available.
+        arch = next(
+            (a for a in self.model_config.architectures if a.startswith("TT")),
+            None,
+        )
+        if arch is None:
+            arch = self.model_config.architecture
+            if not arch.startswith("TT"):
+                arch = "TT" + arch
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            arch, model_config=self.model_config
+        )
+        hook = getattr(model_cls, "get_kv_cache_spec", None)
+        if hook is None:
+            return None
+        spec = hook(self.vllm_config)
+        if spec is None:
+            return None
+        if not isinstance(spec, dict) or not all(
+            isinstance(k, str) and isinstance(v, KVCacheSpec) for k, v in spec.items()
+        ):
+            raise TypeError(
+                f"{model_cls.__name__}.get_kv_cache_spec() must return "
+                f"dict[str, KVCacheSpec] or None, got {type(spec).__name__}"
+            )
+        return spec
+
+    def _build_default_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Single-layer spec used by the legacy non-hybrid path. Downstream
+        sizing is overridden via ``cache_config.num_gpu_blocks_override``.
+        """
         model_config = self.model_config
         parallel_config = self.parallel_config
         cache_config = self.cache_config
@@ -169,8 +231,7 @@ class TTWorker(WorkerBase):
                 dtype=dtype,
                 sliding_window=sliding_window,
             )
-        kv_cache_spec: dict[str, KVCacheSpec] = {"foo": attn_spec}
-        return kv_cache_spec
+        return {"foo": attn_spec}
 
     def determine_available_memory(self) -> int:
         """
@@ -407,6 +468,28 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
     max_batch = scheduler_config.max_num_seqs
     max_tokens_all_users += cache_config.block_size * max_batch
+
+    # Hybrid attention models (Gemma3/4, GPT-OSS, ...) split layers into
+    # multiple kv_cache_groups: a full-attention group plus several
+    # sliding-window groups. Upstream's hybrid manager packs these into
+    # ``group_size = min(layer_counts_per_type)`` buffers and indexes them
+    # via per-group block tables, so each request consumes
+    # ``full_blocks_per_request + Σ sliding_blocks_per_request`` block IDs
+    # from the pool. Our heuristic above sizes ``num_tt_blocks`` for the
+    # full-attention demand only; add headroom for the sliding overhead so
+    # hybrid models don't run out of blocks at scheduled batch.
+    sliding_window = model_config.get_sliding_window()
+    if sliding_window is not None:
+        # Conservative cap: assume up to a few sliding groups per buffer
+        # (typical for Gemma3 5:1 / GPT-OSS 1:1 hybrid patterns) and add
+        # ``sliding_window * max_batch`` worth of tokens per group as
+        # padding. The exact number of sliding groups isn't known here
+        # (the spec hook hasn't run yet); bound it with a small constant
+        # rather than walking the model layer types from raw HF config.
+        _MAX_SLIDING_GROUPS_HEURISTIC = 8
+        max_tokens_all_users += (
+            sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC
+        )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
 
