@@ -567,7 +567,7 @@ class Platform:
         return False
 
     @classmethod
-    def uses_cpu_device(cls) -> bool:
+    def uses_host_device_handling(cls) -> bool:
         """Whether vLLM should leave DeviceConfig.device unset."""
         return cls.device_type == "tpu"
 

@@ -71,7 +71,7 @@ class DeviceConfig:
         # Some device types require processing inputs on CPU
         from vllm.platforms import current_platform
 
-        if current_platform.uses_cpu_device():
+        if current_platform.uses_host_device_handling():
             self.device = None
         else:
             # Set device with device type

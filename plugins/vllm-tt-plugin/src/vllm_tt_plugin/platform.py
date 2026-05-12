@@ -489,7 +489,7 @@ class TTPlatform(Platform):
         return False
 
     @classmethod
-    def uses_cpu_device(cls) -> bool:
+    def uses_host_device_handling(cls) -> bool:
         return True
 
     @classmethod
