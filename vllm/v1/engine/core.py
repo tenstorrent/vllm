@@ -1546,15 +1546,27 @@ class DPEngineCoreProc(EngineCoreProc):
                 stateless_destroy_torch_distributed_process_group(dp_group)
 
     def add_request(self, request: Request, request_wave: int = 0):
+        start_wave = False
         if self.has_coordinator and request_wave != self.current_wave:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
             elif not self.engines_running:
                 # Request received for an already-completed wave, notify
                 # front-end that we need to start the next one.
-                self.output_queue.put_nowait(
-                    (-1, EngineCoreOutputs(start_wave=self.current_wave))
-                )
+                start_wave = True
+
+        if self.has_coordinator and not self.engines_running:
+            # The front-end normally notifies the coordinator before sending
+            # the first request in a new wave. If that notification races with
+            # wave completion state, the engine receiving the request must still
+            # wake its peers before entering gathered-DP collectives.
+            self.engines_running = True
+            start_wave = True
+
+        if start_wave:
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(start_wave=self.current_wave))
+            )
 
         super().add_request(request, request_wave)
 
@@ -1591,6 +1603,18 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            # Rendezvous all DP ranks at iteration start to prevent
+            # FIFO-collective skew accumulation across iterations.
+            # gloo collectives are matched in call order per group, so
+            # once ranks drift apart in iteration count every subsequent
+            # collective deadlocks. See tenstorrent/vllm#387.
+            if self.requires_gather:
+                try:
+                    dist.barrier(group=self.dp_group)
+                except RuntimeError as e:
+                    if "Connection closed by peer" in str(e):
+                        raise SystemExit() from e
+                    raise
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
