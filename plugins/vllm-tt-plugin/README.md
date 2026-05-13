@@ -11,7 +11,7 @@ validation, scheduling, worker execution, model loading, async decode, gathered
 data-parallel execution, and `tt-run` / MPI launch orchestration all live here.
 Nothing TT-specific needs to touch vLLM core.
 
-## Package layout
+## Package Layout
 
 ```text
 plugins/vllm-tt-plugin/
@@ -28,21 +28,39 @@ plugins/vllm-tt-plugin/
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
 |   +-- config.py            # TT plugin config access
-+-- docs/tt_metal/           # TT runtime setup and operator notes
++-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
 +-- tests/tt/                # Server-facing TT plugin tests
 ```
 
-## Install
+## Requirements
 
-The normal developer path is to create or activate a tt-metal environment, then
-install vLLM and this plugin from the repository root:
+If testing a specific model, check the
+[TT-Metal LLMs table](https://github.com/tenstorrent/tt-metal?tab=readme-ov-file#llms)
+for the appropriate tt-metal and vLLM commits.
+
+vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
+Ubuntu 22.04.
+
+## Environment Setup
+
+Install tt-metal first by following
+[INSTALLING.md](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md).
+If installing tt-metal from source, build it, create the virtual environment,
+and set the environment variables needed for tt-metal tests.
+
+Activate the environment where tt-metal is installed, then install vLLM and the
+TT plugin from the vLLM repository root:
 
 ```bash
 source plugins/vllm-tt-plugin/docs/install-vllm-tt.sh
 ```
 
-To install or refresh only the plugin package with its runtime dependencies:
+The script installs base vLLM with `VLLM_TARGET_DEVICE=empty` because `tt` is
+provided by this plugin at runtime, not by the base vLLM build. It then installs
+the plugin with its runtime dependencies.
+
+To install or refresh only the plugin package with runtime dependencies:
 
 ```bash
 uv pip install -e "plugins/vllm-tt-plugin[runtime]" \
@@ -57,11 +75,22 @@ no-dependency editable install:
 uv pip install -e plugins/vllm-tt-plugin --no-deps
 ```
 
-The plugin requires Python `>=3.10,<3.14` and depends on `vllm`. The `runtime`
-extra pins the CPU PyTorch stack and TT-side Python dependencies used by the
-current integration.
+After the first setup, activate the same environment before running vLLM:
 
-## Verify plugin discovery
+```bash
+source "$PYTHON_ENV_DIR/bin/activate"
+```
+
+`VLLM_TARGET_DEVICE` is a build-time variable only and does not need to be set at
+runtime. The TT platform is detected automatically when `ttnn` is importable.
+
+Optionally install pre-commit hooks for local development:
+
+```bash
+pre-commit install
+```
+
+## Verify Plugin Discovery
 
 The editable install registers two vLLM entry points:
 
@@ -81,28 +110,117 @@ python -c "import vllm_tt_plugin; print(vllm_tt_plugin.__file__)"
 python -c "import ttnn; print('ttnn available')"
 ```
 
-If `VLLM_PLUGINS` is set, it must allow both TT entry points:
+If `VLLM_PLUGINS` is set, it must allow both TT entry point names:
 
 ```bash
 export VLLM_PLUGINS=tt,tt_model_registry
 ```
 
-## Quick start
+## Hugging Face Access
 
-Run offline generation:
+To run Meta Llama 3.1 or 3.2 models, request access on Hugging Face:
+
+- [Llama 3.1](https://huggingface.co/meta-llama/Llama-3.1-70B)
+- [Llama 3.2](https://huggingface.co/meta-llama/Llama-3.2-1B)
+- [Llama 3.2 Vision](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
+
+After access is approved, create an access token in Hugging Face settings and
+log in from Python:
+
+```python
+from huggingface_hub import login
+
+login()
+```
+
+## Preparing TT-Metal Models
+
+For the target model, follow any setup instructions in the corresponding
+tt-metal demo. For Llama 3.1, Llama 3.2, and Qwen 2.5 models, follow the
+[tt-transformers demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
+for weights and environment variables.
+
+## Running The Offline Inference Example
+
+Run offline generation with the default Llama 3.1 70B model:
+
+```bash
+MESH_DEVICE=T3K python plugins/vllm-tt-plugin/examples/offline_inference_tt.py
+```
+
+Measure offline performance for one batch of prompts:
 
 ```bash
 MESH_DEVICE=T3K \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
-  --model meta-llama/Llama-3.1-70B-Instruct
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --measure_perf
 ```
 
-Run the OpenAI-compatible server:
+To run a different text model, set `MESH_DEVICE` to `N150`, `N300`, `T3K`, `TG`,
+or a mesh shape such as `"(4,8)"`, then pass `--model`:
+
+- Llama 3.1 8B: `--model "meta-llama/Llama-3.1-8B"`
+- Llama 3.2 1B: `--model "meta-llama/Llama-3.2-1B"`
+- Llama 3.2 3B: `--model "meta-llama/Llama-3.2-3B"`
+- Qwen 2.5 7B: `--model "Qwen/Qwen2.5-7B"`
+- Qwen 2.5 72B: `--model "Qwen/Qwen2.5-72B"`
+- DeepSeek R1 Distill Llama 70B: `--model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"`
+- GPT-OSS 20B: `--model "openai/gpt-oss-20b"`
+- GPT-OSS 120B: `--model "openai/gpt-oss-120b"`
+
+For Llama 3.1 8B on N150, set `--max_model_len 32768`; see the tt-metal model
+demo for context-length details.
+
+To run Llama 70B on Galaxy:
+
+```bash
+MESH_DEVICE=TG \
+LLAMA_DIR=<path-to-weights> \
+TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --model "meta-llama/Llama-3.1-70B-Instruct" \
+  --plugin-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
+```
+
+To run GPT-OSS 20B on Galaxy:
+
+```bash
+MESH_DEVICE="(4,8)" \
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --model "openai/gpt-oss-20b" \
+  --max_seqs_in_batch 1 \
+  --plugin-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'
+```
+
+Run Llama 3.2 Vision on N300:
+
+```bash
+MESH_DEVICE=N300 \
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --model "meta-llama/Llama-3.2-11B-Vision-Instruct" \
+  --multi_modal \
+  --max_seqs_in_batch 16 \
+  --num_repeat_prompts 8
+```
+
+Useful vision-model variants:
+
+- Llama 3.2 11B Vision on QuietBox: set `MESH_DEVICE=T3K` and `--max_seqs_in_batch 32`.
+- Llama 3.2 90B Vision: set `MESH_DEVICE=T3K`, `--model "meta-llama/Llama-3.2-90B-Vision-Instruct"`, and `--max_seqs_in_batch 4`.
+- Qwen 2.5-VL 32B: set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-32B"`, and `--max_seqs_in_batch 32`.
+- Qwen 2.5-VL 72B: set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, `--max_model_len 2048`, and `--plugin-config '{"tt": {"trace_region_size": 28467200}}'`.
+- Gemma 3 27B: set `MESH_DEVICE=T3K`, `--model "google/gemma-3-27b-it"`, `--max_seqs_in_batch 32`, `--plugin-config '{"tt": {"l1_small_size": 768, "fabric_config": "FABRIC_1D"}}'`, `--multi_modal`, `--multi_image`, and `--mm_processor_kwargs '{"use_fast": true, "do_convert_rgb": true}'`.
+
+For debugging V1, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to disable
+multiprocessing. This is useful for stepping through code or making scheduling
+deterministic, but it is not compatible with DP models.
+
+## Running The Server Example
+
+Start the OpenAI-compatible server:
 
 ```bash
 VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K \
-python plugins/vllm-tt-plugin/examples/server_example_tt.py \
-  --model meta-llama/Llama-3.1-70B-Instruct
+python plugins/vllm-tt-plugin/examples/server_example_tt.py
 ```
 
 Send a completion request:
@@ -120,15 +238,55 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-See `docs/tt_metal/README.md` for full model-specific setup, Hugging Face
-access notes, multimodal examples, benchmarking commands, and multi-host launch
-examples.
+Sampling parameters beyond `temperature`, `top_k`, and `top_p` require
+compatibility sampling mode. The compatibility sampling pathway is selected per
+batch when any request in the batch requires it.
 
-## Runtime architecture
+For vision models, start the server with the correct `--model`, then send a chat
+completion request with image content. Qwen 2.5-VL models can use either a
+base64 `data:image/...` URL or a real URL such as
+`https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg`.
+
+## Configuration
+
+TT options are passed through vLLM's generic plugin namespace:
+
+```bash
+--plugin-config '{"tt": {"sample_on_device_mode": "all"}}'
+```
+
+Plugin code reads this through `vllm_tt_plugin.config.get_tt_config()`, which
+returns `vllm_config.plugin_config["tt"]`. Do not add TT-specific options to the
+core vLLM CLI namespace.
+
+Common options:
+
+| Key | Purpose |
+| --- | --- |
+| `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
+| `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
+| `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
+| `trace_region_size` | Trace region size for TT runtime tracing. |
+| `worker_l1_size` | Worker L1 size override. |
+| `l1_small_size` | Small L1 size override. |
+| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, or `CUSTOM`. |
+| `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
+| `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
+| `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
+| `input_queue_batching_delay` | Short idle delay in seconds to allow more requests to coalesce before TT execution. Default: `0.002`. |
+| `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
+| `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
+| `rank_binding` | Rank-binding YAML used for `tt-run` / MPI launches. |
+| `mpi_args` | MPI launch arguments, for example host and rankfile settings. |
+| `extra_ttrun_args` | Additional raw arguments passed to `tt-run`. |
+| `config_pkl_dir` | Shared directory used to pass launch config to remote hosts. |
+| `env_passthrough` | Environment variable names or glob patterns propagated to remote hosts. |
+
+## Runtime Architecture
 
 `TTPlatform.check_and_update_config()` is the main handoff from vLLM into the TT
 runtime. It validates configuration, registers TT model architectures, and
-selects the TT-owned runtime classes through vLLM's existing extension points:
+selects the TT-owned runtime classes through vLLM's extension points:
 
 | vLLM config field | TT implementation |
 | --- | --- |
@@ -151,58 +309,9 @@ The execution model matches TT hardware characteristics:
   engine-client handshake.
 
 For a deeper walk-through of the scheduling and execution model, read
-`docs/tt_metal/SCHEDULING.md`.
+`docs/SCHEDULING.md`.
 
-## Configuration
-
-TT options are passed through vLLM's generic plugin namespace, keeping them
-cleanly separated from the core vLLM CLI:
-
-```bash
---plugin-config '{"tt": {"sample_on_device_mode": "all"}}'
-```
-
-Plugin code reads this through `vllm_tt_plugin.config.get_tt_config()`, which
-returns `vllm_config.plugin_config["tt"]`.
-
-Common options:
-
-| Key | Purpose |
-| --- | --- |
-| `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
-| `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
-| `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
-| `input_queue_batching_delay` | Short idle delay in seconds to allow more requests to coalesce before TT execution. Default: `0.002`. |
-| `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
-| `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
-| `rank_binding` | Rank-binding YAML used for `tt-run` / MPI launches. |
-| `mpi_args` | MPI launch arguments, for example host and rankfile settings. |
-| `extra_ttrun_args` | Additional raw arguments passed to `tt-run`. |
-| `config_pkl_dir` | Shared directory used to pass launch config to remote hosts. |
-| `env_passthrough` | Environment variable names or glob patterns propagated to remote hosts. |
-
-Example multi-host launch across two Galaxy systems with DP=2:
-
-```bash
-MESH_DEVICE="(8,8)" \
-python -u plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
-  --model <MODEL_NAME> \
-  --data_parallel_size 2 \
-  --async_engine \
-  --plugin-config '{
-    "tt": {
-      "rank_binding": "<TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml",
-      "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile",
-      "extra_ttrun_args": "--tcp-interface cnx1",
-      "config_pkl_dir": "<SHARED_TMP_DIR>",
-      "fabric_config": "FABRIC_1D",
-      "fabric_reliability_mode": "RELAXED_INIT",
-      "env_passthrough": ["VLLM_*", "MESH_DEVICE"]
-    }
-  }'
-```
-
-## Supported model families
+## Supported Model Families
 
 The plugin registers TT-prefixed model architectures backed by tt-metal model
 implementations. Current families:
@@ -217,10 +326,9 @@ implementations. Current families:
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 
 Model availability, supported device shapes, max sequence limits, and required
-environment variables are documented per model in `docs/tt_metal/README.md` and
-in the corresponding tt-metal model demos.
+environment variables are documented in the corresponding tt-metal model demos.
 
-## Operational constraints
+## Operational Constraints
 
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a
 clear error before anything reaches the device:
@@ -234,6 +342,40 @@ clear error before anything reaches the device:
 - Async decode overlap is enabled only for models that declare the capability.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
+
+## Benchmarking
+
+Offline benchmarking is done by passing `--measure_perf` to
+`offline_inference_tt.py`:
+
+```bash
+MESH_DEVICE=T3K \
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --measure_perf
+```
+
+Client-server benchmarking can be done with `vllm bench serve` after starting
+the server:
+
+```bash
+vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct \
+  --dataset-name random \
+  --random-input-len 128 \
+  --random-output-len 128 \
+  --num-prompts 32 \
+  --ignore-eos \
+  --percentile-metrics ttft,tpot,itl,e2el
+```
+
+For prefix-cache experiments, use prompts with shared prefixes:
+
+```bash
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --prompts_json plugins/vllm-tt-plugin/examples/prompts_overlapping.json
+```
+
+You can also pass `--random-prefix-len <N>` to `vllm bench serve`.
 
 ## Testing
 
@@ -249,32 +391,74 @@ pytest plugins/vllm-tt-plugin/tests/tt -v \
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
-## Benchmarking
+## Running On Multi-Host Systems
 
-Offline benchmarking via the example script:
+For multi-host offline inference or serving, launch vLLM from the host that has
+MPI rank 0, as determined from the rankfile. Under the hood, the plugin uses
+`tt-run` from tt-metal to spawn MPI processes on each host.
 
-```bash
-MESH_DEVICE=T3K \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
-  --model meta-llama/Llama-3.1-70B-Instruct \
-  --measure_perf
-```
-
-Client-server benchmarking with `vllm bench serve`:
+Example offline inference on two Wormhole Galaxy hosts with DP=2:
 
 ```bash
-vllm bench serve \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --dataset-name random \
-  --random-input-len 128 \
-  --random-output-len 128 \
-  --num-prompts 32 \
-  --ignore-eos \
-  --percentile-metrics ttft,tpot,itl,e2el
+MESH_DEVICE="(8,8)" \
+python -u plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --model <MODEL_NAME> \
+  --data_parallel_size 2 \
+  --async_engine \
+  --plugin-config '{
+    "tt": {
+      "rank_binding": "<TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml",
+      "extra_ttrun_args": "--tcp-interface cnx1",
+      "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile",
+      "config_pkl_dir": "<SHARED_TMP_DIR>",
+      "fabric_config": "FABRIC_1D",
+      "fabric_reliability_mode": "RELAXED_INIT",
+      "env_passthrough": ["VLLM_*", "MESH_DEVICE"]
+    }
+  }'
 ```
 
-For prefix-cache experiments, use prompts with shared prefixes or pass
-`--random-prefix-len` to `vllm bench serve`.
+Notes:
+
+- The `rank_binding` YAML needs an absolute path for `mesh_graph_desc_path`.
+- `config_pkl_dir` must be shared by all hosts.
+- Environment variables can be propagated through `env_passthrough` in
+  `--plugin-config` or through `global_env` in the rank-binding file.
+- `extra_ttrun_args` passes raw flags to `tt-run`, such as
+  `"--tcp-interface cnx1"`, `"--bare"`, or `"--debug-gdbserver"`.
+
+## Hybrid Attention Models
+
+Hybrid attention models have mixed sliding-window and full-attention layers
+such as Gemma 3, Gemma 4, and GPT-OSS. They opt in to upstream vLLM's hybrid KV
+cache manager through a per-model spec hook on the registered TT model class.
+
+The hybrid manager packs sliding and full layers into separate
+`KVCacheGroupSpec`s, sized by upstream's
+[Hybrid KV Cache Manager design](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/).
+Sliding-window layers then occupy only `sliding_window` worth of KV state per
+request instead of `max_seq_len`. On Gemma 4 31B at 256k context this is roughly
+a 6x reduction in KV cache memory.
+
+To enable hybrid KV cache support for a TT model:
+
+1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`
+   instead of `Generator`. The base class provides a default
+   `get_kv_cache_spec` classmethod that builds per-layer specs from
+   `hf_config.text_config.layer_types`.
+2. Implement `prefill_forward` and `decode_forward` to consume the
+   `page_tables_per_group` kwarg and route each layer to the right group's page
+   table.
+3. Implement `allocate_kv_cache_per_layer(per_layer_specs)`. The base class
+   default delegates to `allocate_vllm_kv_cache_per_layer`.
+
+Models that do not opt in stay on the legacy `Generator` path: uniform
+single-group KV cache, one page table, and no behavioral change. The plugin only
+sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
+
+Hybrid models are not yet supported with `data_parallel_size > 1`; the DP
+merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models
+until per-group DP gather lands.
 
 ## Status
 
@@ -285,25 +469,23 @@ will work against stock vLLM without any fork.
 
 The extensions needed are:
 
-- `VllmConfig.plugin_config` — a namespaced dict that lets any plugin pass
+- `VllmConfig.plugin_config`: a namespaced dict that lets any plugin pass
   backend-specific configuration without touching the core CLI.
-- `ParallelConfig.engine_core_cls` — lets a platform plugin select an
+- `ParallelConfig.engine_core_cls`: lets a platform plugin select an
   alternative `EngineCore` implementation.
-- `ParallelConfig.engine_core_proc_cls` — lets a platform plugin select an
+- `ParallelConfig.engine_core_proc_cls`: lets a platform plugin select an
   alternative `EngineCoreProc` implementation.
-- `ParallelConfig.dp_engine_core_proc_cls` — lets a platform plugin select an
+- `ParallelConfig.dp_engine_core_proc_cls`: lets a platform plugin select an
   alternative data-parallel engine process implementation.
-- `ParallelConfig.engine_core_launcher_cls` — lets a platform plugin own the
+- `ParallelConfig.engine_core_launcher_cls`: lets a platform plugin own the
   engine launch and handshake topology.
 
-## Development notes
+## Development Notes
 
-- Normal Python changes under `src/vllm_tt_plugin/` take effect after
-  restarting the Python or vLLM process.
+- Normal Python changes under `src/vllm_tt_plugin/` take effect after restarting
+  the Python or vLLM process.
 - Reinstall the plugin when package metadata or entry points change, such as
   edits to `pyproject.toml`.
-- TT-specific options belong under the `tt` key in `--plugin-config`, not in
-  the vLLM CLI namespace.
 - Model capability declarations (`model_capabilities` dict on the model class)
   are the preferred way to gate features like async decode and prefix caching,
   rather than hard-coded model-name checks.
