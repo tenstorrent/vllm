@@ -118,6 +118,7 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     except Exception:
         argv = []
     mapby_path = None
+    # Parse --map-by to locate rankfile and ensure rank 0 host matches host_ip.
     for i, tok in enumerate(argv):
         if tok.startswith("--map-by"):
             if "=" in tok:
@@ -134,6 +135,7 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     if not (mapby_path and os.path.isfile(mapby_path)):
         return
 
+    # Open MPI rankfiles use entries like `rank 0=<host> ...`.
     rank0_host = None
     try:
         with open(mapby_path) as f:
@@ -156,6 +158,7 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     if not rank0_host:
         return
 
+    # Accept either direct IP rankfiles or hostnames that resolve to host_ip.
     resolved_ips: set[str] = set()
     if all(c.isdigit() or c == "." for c in rank0_host):
         resolved_ips.add(rank0_host)
@@ -204,6 +207,8 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
                 f"data_parallel_size ({dp_size}) must be divisible by number "
                 f"of device MPI ranks ({mpi_world})"
             )
+        # Only the first DP rank in each MPI segment owns a TT device process.
+        # The other DP ranks stay local and participate as non-device ranks.
         dp_size_per_mpi_rank = dp_size // mpi_world
         device_dp_ranks = {i * dp_size_per_mpi_rank for i in range(mpi_world)}
         non_device_dp_ranks = {i for i in range(dp_size) if i not in device_dp_ranks}
@@ -240,10 +245,13 @@ def tt_run_launch(
     )
     _validate_launch_from_rank0_host(mpi_args, host_ip)
 
+    # Remote ranks read the pickled config from a shared directory.
     serialized_config_path = os.path.join(cfg_dir, "tmp_vllm_tt_cfg.pkl")
     with open(serialized_config_path, "wb") as tf:
         cloudpickle.dump(vllm_config, tf)
 
+    # Create a temporary rank binding so vLLM-specific env vars can be injected
+    # without mutating the user's source rank-binding file.
     with open(rank_binding_file) as f:
         rb = yaml.safe_load(f)
     rb.setdefault("global_env", {})
@@ -270,6 +278,8 @@ def tt_run_launch(
                 "TT plugin config key 'extra_ttrun_args' must be a string"
             )
         normalized_extra_ttrun_args = shlex.split(extra_ttrun_args)
+        # These flags are owned by this launcher so it can control config
+        # staging and avoid conflicting rank-binding or MPI argument sources.
         reserved_flags = {"--rank-binding", "--mpi-args"}
         if any(
             (tok in reserved_flags)
@@ -281,6 +291,7 @@ def tt_run_launch(
                 "--rank-binding or --mpi-args"
             )
 
+    # tt-run launches one Python engine entrypoint per MPI rank.
     cmd = ["tt-run"]
     cmd.extend(normalized_extra_ttrun_args)
     cmd.extend(["--rank-binding", tmp_rb_path])
