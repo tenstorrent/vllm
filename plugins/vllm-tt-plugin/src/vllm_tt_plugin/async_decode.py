@@ -15,7 +15,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm_tt_plugin.input_batch import CachedRequestState
     from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 
@@ -165,6 +165,7 @@ class TTAsyncDecodeController:
     def steady_decode_scheduler_invariants_met(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
     ) -> bool:
         runner = self.runner
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -175,7 +176,7 @@ class TTAsyncDecodeController:
             return False
         if (
             scheduler_output.pending_structured_output_tokens
-            or scheduler_output.grammar_bitmask is not None
+            or grammar_output is not None
         ):
             return False
         input_batch = runner.input_batch
@@ -202,20 +203,26 @@ class TTAsyncDecodeController:
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=False):
             return False
-        return self.steady_decode_scheduler_invariants_met(scheduler_output)
+        return self.steady_decode_scheduler_invariants_met(
+            scheduler_output, grammar_output
+        )
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
+        grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=True):
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
-        return self.steady_decode_scheduler_invariants_met(scheduler_output)
+        return self.steady_decode_scheduler_invariants_met(
+            scheduler_output, grammar_output
+        )
 
     def can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=False):

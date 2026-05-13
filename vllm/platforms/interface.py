@@ -43,7 +43,6 @@ class PlatformEnum(enum.Enum):
     XPU = enum.auto()
     CPU = enum.auto()
     OOT = enum.auto()
-    TT = enum.auto()
     UNSPECIFIED = enum.auto()
 
 
@@ -168,9 +167,6 @@ class Platform:
 
     def is_cpu(self) -> bool:
         return self._enum == PlatformEnum.CPU
-
-    def is_tt(self) -> bool:
-        return self._enum == PlatformEnum.TT
 
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT
@@ -571,12 +567,9 @@ class Platform:
         return False
 
     @classmethod
-    def requires_gathered_batch_dp(cls) -> bool:
-        """
-        Whether DP ranks must gather batches to a single driver
-        before executing. Defaults to False; platforms can override.
-        """
-        return False
+    def uses_host_device_handling(cls) -> bool:
+        """Whether vLLM should leave DeviceConfig.device unset."""
+        return cls.device_type == "tpu"
 
     @classmethod
     def validate_request(

@@ -13,6 +13,7 @@ class ForbiddenImport:
     tip: str
     allowed_pattern: re.Pattern = re.compile(r"^$")  # matches nothing by default
     allowed_files: set[str] = field(default_factory=set)
+    allowed_prefixes: set[str] = field(default_factory=set)
 
 
 CHECK_IMPORTS = {
@@ -48,16 +49,15 @@ CHECK_IMPORTS = {
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
             "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
-            "vllm/v1/engine/tt_engine_step.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",
             "vllm/entrypoints/llm.py",
             "tests/utils.py",
-            "vllm/v1/engine/tt_core_launcher.py",
             # pickle and cloudpickle
             "vllm/v1/serial_utils.py",
         },
+        allowed_prefixes={"plugins/"},
     ),
     "re": ForbiddenImport(
         pattern=r"^\s*(?:import\s+re(?:$|\s|,)|from\s+re\s+import)",
@@ -84,6 +84,8 @@ def check_file(path: str) -> int:
     for import_name, forbidden_import in CHECK_IMPORTS.items():
         # Skip files that are allowed for this import
         if path in forbidden_import.allowed_files:
+            continue
+        if any(path.startswith(prefix) for prefix in forbidden_import.allowed_prefixes):
             continue
         # Search for forbidden imports
         for match in re.finditer(forbidden_import.pattern, content, re.MULTILINE):

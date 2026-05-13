@@ -28,7 +28,7 @@ class DeviceConfig:
     `__post_init__`."""
     num_devices: int | None = field(default=None, init=False)
     """Runtime-only device count for backends that manage multiple devices
-    inside a single worker, such as TT."""
+    inside a single worker."""
 
     def compute_hash(self) -> str:
         """
@@ -69,7 +69,9 @@ class DeviceConfig:
                 self.device_type = self.device.type
 
         # Some device types require processing inputs on CPU
-        if self.device_type in ["tpu"] or self.device_type in ["tt"]:
+        from vllm.platforms import current_platform
+
+        if current_platform.uses_host_device_handling():
             self.device = None
         else:
             # Set device with device type

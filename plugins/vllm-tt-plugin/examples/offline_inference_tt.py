@@ -247,7 +247,7 @@ def run_inference(
     multi_image=False,
     mm_processor_kwargs=None,
     test_increasing_seq_lens=False,
-    override_tt_config=None,
+    plugin_config=None,
     max_model_len=None,
     max_num_batched_tokens=None,
     data_parallel_size=1,
@@ -300,10 +300,13 @@ def run_inference(
     }
 
     try:
-        if override_tt_config:
-            engine_kw_args["override_tt_config"] = json.loads(override_tt_config)
+        if plugin_config:
+            parsed_plugin_config = json.loads(plugin_config)
+            if not isinstance(parsed_plugin_config, dict):
+                raise ValueError("plugin_config must be a JSON object")
+            engine_kw_args["plugin_config"] = parsed_plugin_config
     except json.JSONDecodeError as err:
-        raise ValueError(f"Invalid JSON string for override_tt_config: {err}") from err
+        raise ValueError(f"Invalid JSON string for plugin_config: {err}") from err
 
     try:
         if mm_processor_kwargs:
@@ -615,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompts_json",
         type=str,
-        default="tt_metal/prompts.json",
+        default="plugins/vllm-tt-plugin/examples/prompts.json",
         help="Path to JSON file containing prompts",
     )
     parser.add_argument(
@@ -660,10 +663,11 @@ if __name__ == "__main__":
         help="Test generations of small to large sequences",
     )
     parser.add_argument(
-        "--override_tt_config",
+        "--plugin-config",
+        dest="plugin_config",
         type=str,
         default=None,
-        help="Custom TT options as Json string",
+        help="Plugin options as JSON, for example '{\"tt\": {...}}'",
     )
     parser.add_argument("--max_model_len", type=int, default=None, help="Max model len")
     parser.add_argument(
@@ -723,7 +727,7 @@ if __name__ == "__main__":
         multi_image=args.multi_image,
         mm_processor_kwargs=args.mm_processor_kwargs,
         test_increasing_seq_lens=args.test_increasing_seq_lens,
-        override_tt_config=args.override_tt_config,
+        plugin_config=args.plugin_config,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         data_parallel_size=args.data_parallel_size,

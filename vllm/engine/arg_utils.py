@@ -495,8 +495,6 @@ class EngineArgs:
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
 
-    input_queue_batching_delay: float = SchedulerConfig.input_queue_batching_delay
-
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
@@ -535,8 +533,6 @@ class EngineArgs:
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
-    override_tt_config: dict[str, Any] = get_field(ModelConfig, "override_tt_config")
-
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
@@ -570,6 +566,7 @@ class EngineArgs:
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
+    plugin_config: dict[str, dict[str, Any]] = get_field(VllmConfig, "plugin_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -613,6 +610,11 @@ class EngineArgs:
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
             )
+        if not isinstance(self.plugin_config, dict) or any(
+            not isinstance(key, str) or not isinstance(value, dict)
+            for key, value in self.plugin_config.items()
+        ):
+            raise ValueError("plugin_config must map plugin names to object values")
         # Setup plugins
         from vllm.plugins import load_general_plugins
 
@@ -711,9 +713,6 @@ class EngineArgs:
             help=model_kwargs["hf_token"]["help"],
         )
         model_group.add_argument("--hf-overrides", **model_kwargs["hf_overrides"])
-        model_group.add_argument(
-            "--override-tt-config", **model_kwargs["override_tt_config"]
-        )
         model_group.add_argument("--pooler-config", **model_kwargs["pooler_config"])
         model_group.add_argument(
             "--generation-config", **model_kwargs["generation_config"]
@@ -1163,11 +1162,6 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
-        scheduler_group.add_argument(
-            "--input-queue-batching-delay",
-            **scheduler_kwargs["input_queue_batching_delay"],
-        )
-
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
         compilation_group = parser.add_argument_group(
@@ -1223,6 +1217,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
+        vllm_group.add_argument("--plugin-config", **vllm_kwargs["plugin_config"])
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
@@ -1334,7 +1329,6 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
-            override_tt_config=self.override_tt_config,
         )
 
     def validate_tensorizer_args(self):
@@ -1607,11 +1601,7 @@ class EngineArgs:
         # DP address, used in multi-node case for torch distributed group
         # and ZMQ sockets.
         if self.data_parallel_address is None:
-            if current_platform.is_tt():
-                host_ip = get_ip()
-                logger.info("Using host IP %s as TT data parallel address", host_ip)
-                data_parallel_address = host_ip
-            elif self.data_parallel_backend == "ray":
+            if self.data_parallel_backend == "ray":
                 host_ip = get_ip()
                 logger.info(
                     "Using host IP %s as ray-based data parallel address", host_ip
@@ -1704,7 +1694,6 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
-            input_queue_batching_delay=self.input_queue_batching_delay,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
@@ -1836,6 +1825,7 @@ class EngineArgs:
             ec_transfer_config=self.ec_transfer_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
+            plugin_config=self.plugin_config,
             optimization_level=self.optimization_level,
             weight_transfer_config=self.weight_transfer_config,
         )
@@ -2007,14 +1997,6 @@ class EngineArgs:
                 "or produce incorrect outputs.",
                 scope="local",
             )
-
-        # Disable chunked prefill for TT devices in V1
-        if current_platform.is_tt():
-            logger.info(
-                "Chunked prefill is not yet supported for TT devices; "
-                "disabling it for V1 backend."
-            )
-            self.enable_chunked_prefill = False
 
         # Disable chunked prefill and prefix caching for:
         # POWER (ppc64le)/s390x/RISCV CPUs in V1

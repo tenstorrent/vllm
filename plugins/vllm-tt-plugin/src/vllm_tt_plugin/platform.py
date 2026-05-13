@@ -10,6 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
+from vllm_tt_plugin.config import get_tt_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -37,38 +38,78 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
 
 
 def _should_pre_register_tt_test_models_from_cli() -> bool:
-    """Return True iff `--override-tt-config` enables test models.
+    """Return True iff `--plugin-config` enables TT test models.
 
-    `TTPlatform.pre_register_and_update()` runs before `VllmConfig` (and thus
-    `ModelConfig.override_tt_config`) is constructed, but ModelConfig may
-    inspect architectures early.
+    `TTPlatform.pre_register_and_update()` runs before `VllmConfig` is
+    constructed, but ModelConfig may inspect architectures early.
     """
     argv = list(sys.argv[1:])
 
-    def _parse_override_tt_config(raw: str) -> dict | None:
+    def _parse_plugin_config(raw: str) -> dict | None:
         try:
             parsed = json.loads(raw)
         except Exception:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    # Users may pass either `--override-tt-config` or `--override_tt_config`.
-    # Arg name normalization happens later during argparse processing, but this
-    # function runs before parsing, so we normalize locally and compare against
-    # the canonical `--override-tt-config`.
-    canonical_flag = "--override-tt-config"
+    canonical_flag = "--plugin-config"
     for i, arg in enumerate(argv):
         if "=" in arg:
             flag, value = arg.split("=", 1)
             if flag.replace("_", "-") == canonical_flag:
-                cfg = _parse_override_tt_config(value)
-                return bool(cfg and cfg.get("register_test_models") is True)
+                cfg = _parse_plugin_config(value)
+                tt_config = cfg.get("tt", {}) if cfg else {}
+                return bool(
+                    isinstance(tt_config, dict)
+                    and tt_config.get("register_test_models") is True
+                )
         else:
             if arg.replace("_", "-") == canonical_flag and i + 1 < len(argv):
-                cfg = _parse_override_tt_config(argv[i + 1])
-                return bool(cfg and cfg.get("register_test_models") is True)
+                cfg = _parse_plugin_config(argv[i + 1])
+                tt_config = cfg.get("tt", {}) if cfg else {}
+                return bool(
+                    isinstance(tt_config, dict)
+                    and tt_config.get("register_test_models") is True
+                )
 
     return False
+
+
+def _install_tt_harmony_truncation_patch() -> None:
+    """Use right truncation for TT GPT-OSS tokenizers.
+
+    GPT-OSS harmony prompts have important template/control tokens at the
+    beginning. Left truncation can remove those tokens when prompt truncation is
+    requested, so TT keeps the prefix and truncates from the right for these
+    models.
+
+    TODO: remove this once fixed in vLLM core.
+    """
+    import vllm.tokenizers.registry as tokenizer_registry
+
+    if hasattr(tokenizer_registry, "_tt_original_tokenizer_args_from_config"):
+        return
+
+    original = tokenizer_registry.tokenizer_args_from_config
+    tokenizer_registry._tt_original_tokenizer_args_from_config = original
+
+    def tokenizer_args_from_config_tt(config, **kwargs):
+        tokenizer_mode, tokenizer_name, args, tokenizer_kwargs = original(
+            config, **kwargs
+        )
+        if (
+            "truncation_side" not in tokenizer_kwargs
+            and config.runner_type in ("generate", "draft")
+            and "gpt-oss" in str(tokenizer_name or "").lower()
+        ):
+            tokenizer_kwargs["truncation_side"] = "right"
+        return tokenizer_mode, tokenizer_name, args, tokenizer_kwargs
+
+    tokenizer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
+
+    renderer_registry = sys.modules.get("vllm.renderers.registry")
+    if renderer_registry is not None:
+        renderer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
 
 
 def register_tt_models(register_test_models=False) -> None:
@@ -202,7 +243,7 @@ def register_tt_test_models():
 
 
 class TTPlatform(Platform):
-    _enum = PlatformEnum.TT
+    _enum = PlatformEnum.OOT
     device_name: str = "tt"
     device_type: str = "tt"
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
@@ -229,6 +270,7 @@ class TTPlatform(Platform):
         # this process, so we must ensure TT test models are registered early
         # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
+        _install_tt_harmony_truncation_patch()
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
 
@@ -247,9 +289,10 @@ class TTPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        assert not vllm_config.scheduler_config.enable_chunked_prefill, (
-            "Chunked prefill is not yet supported for TT backend"
-        )
+        _install_tt_harmony_truncation_patch()
+        if vllm_config.scheduler_config.enable_chunked_prefill:
+            logger.info("Chunked prefill is not yet supported for TT backend")
+            vllm_config.scheduler_config.enable_chunked_prefill = False
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
@@ -274,15 +317,15 @@ class TTPlatform(Platform):
 
         # Import and register models from tt-metal.
         #
-        # NOTE: We also register TT models early in `vllm/v1/worker/tt_worker.py`
+        # NOTE: We also register TT models early in `vllm_tt_plugin.worker`
         # (at module import time). That registration is required to handle
         # engine/worker subprocess startup ordering where model architectures
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
-        override_tt_config = vllm_config.model_config.override_tt_config
+        tt_config = get_tt_config(vllm_config)
         register_test_models = False
-        if override_tt_config and "register_test_models" in override_tt_config:
-            register_test_models = override_tt_config["register_test_models"]
+        if tt_config and "register_test_models" in tt_config:
+            register_test_models = tt_config["register_test_models"]
             assert register_test_models in [True, False], (
                 f"Invalid option register_test_models: {register_test_models}"
             )
@@ -291,6 +334,14 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+        parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
+        parallel_config.engine_core_proc_cls = "vllm_tt_plugin.engine.TTEngineCoreProc"
+        parallel_config.dp_engine_core_proc_cls = (
+            "vllm_tt_plugin.engine.TTDPEngineCoreProc"
+        )
+        parallel_config.engine_core_launcher_cls = (
+            "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
+        )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -320,11 +371,8 @@ class TTPlatform(Platform):
         # TODO move this to tt_model_runner when request validation
         # stops depending on vllm_config
 
-        if (
-            override_tt_config is not None
-            and "sample_on_device_mode" in override_tt_config
-        ):
-            sample_on_device_mode = override_tt_config["sample_on_device_mode"]
+        if tt_config is not None and "sample_on_device_mode" in tt_config:
+            sample_on_device_mode = tt_config["sample_on_device_mode"]
             assert sample_on_device_mode in [
                 "all",
                 "decode_only",
@@ -339,11 +387,8 @@ class TTPlatform(Platform):
         # or if always_compat_sampling is enabled.
 
         always_compat_sampling = False
-        if (
-            override_tt_config is not None
-            and "always_compat_sampling" in override_tt_config
-        ):
-            always_compat_sampling = override_tt_config["always_compat_sampling"]
+        if tt_config is not None and "always_compat_sampling" in tt_config:
+            always_compat_sampling = tt_config["always_compat_sampling"]
             assert always_compat_sampling in [True, False], (
                 "always_compat_sampling must be a boolean"
             )
@@ -443,10 +488,8 @@ class TTPlatform(Platform):
         # to use pinned memory in case we're using GPUs.
         return False
 
-    # Require DP ranks to gather batches to a single driver
-    # before executing (used by core.py to gate DP-gather behavior).
     @classmethod
-    def requires_gathered_batch_dp(cls) -> bool:
+    def uses_host_device_handling(cls) -> bool:
         return True
 
     @classmethod

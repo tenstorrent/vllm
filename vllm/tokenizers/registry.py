@@ -130,17 +130,7 @@ def resolve_tokenizer_args(
 
     if "truncation_side" not in kwargs:
         if runner_type == "generate" or runner_type == "draft":
-            # Use right truncation for harmony models (GPT-OSS) to preserve
-            # the <|start|> template prefix when truncate_prompt_tokens is used.
-            from vllm.platforms import current_platform
-
-            if (
-                current_platform.is_tt()
-                and "gpt-oss" in str(tokenizer_name or "").lower()
-            ):
-                kwargs["truncation_side"] = "right"
-            else:
-                kwargs["truncation_side"] = "left"
+            kwargs["truncation_side"] = "left"
         elif runner_type == "pooling":
             kwargs["truncation_side"] = "right"
         else:

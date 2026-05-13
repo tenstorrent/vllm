@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import traceback
-from importlib.util import find_spec
 from itertools import chain
 from typing import TYPE_CHECKING
 
@@ -175,34 +174,12 @@ def cpu_platform_plugin() -> str | None:
     return "vllm.platforms.cpu.CpuPlatform" if is_cpu else None
 
 
-def tt_platform_plugin() -> str | None:
-    is_tt = False
-    logger.debug("Checking if TT platform is available.")
-    try:
-        # assume ttnn is installed if and only if machine has TT devices
-        import ttnn  # noqa: F401
-
-        is_tt = True
-        logger.debug("Confirmed TT platform is available because ttnn is found.")
-    except Exception as e:
-        logger.debug("TT platform is not available because: %s", str(e))
-
-    if not is_tt:
-        return None
-
-    if find_spec("vllm_tt_plugin") is not None:
-        return "vllm_tt_plugin.platform.TTPlatform"
-
-    return "vllm.platforms.tt.TTPlatform"
-
-
 builtin_platform_plugins = {
     "tpu": tpu_platform_plugin,
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
     "xpu": xpu_platform_plugin,
     "cpu": cpu_platform_plugin,
-    "tt": tt_platform_plugin,
 }
 
 

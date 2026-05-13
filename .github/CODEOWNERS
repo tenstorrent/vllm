@@ -8,7 +8,7 @@
 /vllm/model_executor/layers/quantization @mgoin @robertgshaw2-redhat @tlrmchlsmth @yewentao256 @pavanimajety
 /vllm/model_executor/layers/mamba @tdoublep
 /vllm/model_executor/model_loader @22quinn
-/vllm/model_executor/layers/batch_invariant.py @yewentao256 
+/vllm/model_executor/layers/batch_invariant.py @yewentao256
 /vllm/multimodal @DarkLight1337 @ywang96 @NickLucche @tjtanaa
 /vllm/vllm_flash_attn @LucasWilkinson
 /vllm/lora @jeejeelee
@@ -63,7 +63,7 @@ CMakeLists.txt @tlrmchlsmth @LucasWilkinson
 /tests/v1/kv_connector/nixl_integration @NickLucche
 /tests/v1/kv_connector @ApostaC @orozery
 /tests/v1/kv_offload @ApostaC @orozery
-/tests/v1/determinism @yewentao256 
+/tests/v1/determinism @yewentao256
 
 # Transformers modeling backend
 /vllm/model_executor/models/transformers @hmellor
@@ -167,24 +167,4 @@ mkdocs.yaml @hmellor
 
 # Generic
 * @viktorpusTT
-/examples/offline_inference_tt.py @skhorasganiTT @ppetrovicTT @viktorpusTT
-/examples/server_example_tt.py @skhorasganiTT @ppetrovicTT @viktorpusTT
-/requirements/tt* @skhorasganiTT @ppetrovicTT @viktorpusTT
-/tt_metal @skhorasganiTT @viktorpusTT
-/vllm/platforms/tt.py @skhorasganiTT @tchedaTT @viktorpusTT
-/vllm/model_executor/model_loader/tt_loader.py @skhorasganiTT @viktorpusTT
-
-# V1
-/vllm/v1/worker/tt_worker.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
-/vllm/v1/worker/tt_model_runner.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
-/vllm/v1/worker/tt_input_batch.py @skhorasganiTT @tchedaTT @ppetrovicTT @viktorpusTT
-/vllm/v1/core/sched/tt_scheduler.py @viktorpusTT
-/vllm/v1/engine/core.py @skhorasganiTT @tchedaTT @viktorpusTT
-/vllm/v1/engine/utils.py @skhorasganiTT @viktorpusTT
-/vllm/v1/engine/tt_core_launcher.py @skhorasganiTT @viktorpusTT
-/vllm/v1/engine/tt_dp_gather.py @viktorpusTT @tchedaTT
-/vllm/v1/engine/tt_engine_step.py @viktorpusTT @tchedaTT
-/vllm/v1/worker/tt_async_decode.py @viktorpusTT
-
-# Tests
-/tests/tt @tchedaTT @skhorasganiTT @viktorpusTT
+/plugins/vllm-tt-plugin @tchedaTT @ppetrovicTT @viktorpusTT

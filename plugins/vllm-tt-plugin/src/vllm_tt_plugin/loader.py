@@ -7,6 +7,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
+from vllm_tt_plugin.config import get_tt_config
 
 logger = init_logger(__name__)
 
@@ -21,7 +22,7 @@ class TTModelLoader(BaseModelLoader):
         scheduler_config = vllm_config.scheduler_config
 
         model_class, _ = get_model_architecture(model_config)
-        optimizations = model_config.override_tt_config.get("optimizations", None)
+        optimizations = get_tt_config(vllm_config).get("optimizations", None)
         if optimizations is not None:
             assert optimizations in [
                 "performance",
@@ -32,7 +33,7 @@ class TTModelLoader(BaseModelLoader):
         # TT model init expects the global DP-sized batch contract:
         # batch_size_per_dp * total_dp.
         parallel_config = vllm_config.parallel_config
-        data_parallel = parallel_config.data_parallel_size_original
+        data_parallel = parallel_config.data_parallel_size
         max_batch_size = scheduler_config.max_num_seqs * data_parallel
 
         model = model_class.initialize_vllm_model(

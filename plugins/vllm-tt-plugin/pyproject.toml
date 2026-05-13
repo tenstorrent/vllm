@@ -11,6 +11,19 @@ requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 dependencies = ["vllm"]
 
+[project.optional-dependencies]
+runtime = [
+    # TT-NN works with older torch versions, but vLLM requires torch >= 2.7.0.
+    "torch==2.10.0+cpu",
+    "torchvision==0.25.0",
+    "torchaudio==2.10.0",
+    # Pinned to exact version to match tt-metal's pyproject.toml and prevent numpy 2.x upgrades.
+    "numpy==1.26.4",
+    "transformers<=4.57.1",
+    "qwen-vl-utils",
+    "tblib==3.1.0",
+]
+
 [project.entry-points."vllm.general_plugins"]
 tt_model_registry = "vllm_tt_plugin.entrypoints:register"
 

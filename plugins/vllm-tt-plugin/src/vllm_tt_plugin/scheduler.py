@@ -1,16 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from enum import Enum
 from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.core.sched.tt_scheduler import TTSchedulingMode
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class TTSchedulingMode(Enum):
+    DEFAULT = "default"
+    DECODE_ONLY = "decode_only"
+    PREFILL_ONLY = "prefill_only"
+
+    @classmethod
+    def from_prefill_intent(cls, prefill_intent: int) -> "TTSchedulingMode":
+        if prefill_intent == 0:
+            return cls.DECODE_ONLY
+        if prefill_intent == 1:
+            return cls.PREFILL_ONLY
+        raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
 
 
 class TTScheduler(AsyncScheduler):
@@ -88,23 +102,7 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
-        if not scheduler_output.pending_structured_output_tokens:
-            self.get_grammar_bitmask(scheduler_output)
         return scheduler_output
-
-    def get_grammar_bitmask(
-        self, scheduler_output: SchedulerOutput
-    ) -> GrammarOutput | None:
-        grammar_output = super().get_grammar_bitmask(scheduler_output)
-        if grammar_output is not None:
-            scheduler_output.structured_output_request_ids = (
-                grammar_output.structured_output_request_ids
-            )
-            scheduler_output.grammar_bitmask = grammar_output.grammar_bitmask
-        else:
-            scheduler_output.structured_output_request_ids = None
-            scheduler_output.grammar_bitmask = None
-        return grammar_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule only waiting (prefill) requests.
