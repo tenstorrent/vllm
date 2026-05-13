@@ -124,6 +124,7 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
             batch_size_per_dp=self._submission.batch_size_per_dp,
             perform_device_sampling=self._submission.perform_device_sampling,
             is_decode=True,
+            grammar_outputs=None,
         )
         return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
 
@@ -165,7 +166,6 @@ class TTAsyncDecodeController:
     def steady_decode_scheduler_invariants_met(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         runner = self.runner
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -174,10 +174,9 @@ class TTAsyncDecodeController:
         )
         if is_prompt or runner._decode_layout_changed_since_last_decode:
             return False
-        if (
-            scheduler_output.pending_structured_output_tokens
-            or grammar_output is not None
-        ):
+        if scheduler_output.pending_structured_output_tokens:
+            return False
+        if runner._scheduler_output_has_structured_outputs(scheduler_output):
             return False
         input_batch = runner.input_batch
         if not input_batch.no_penalties:
@@ -203,26 +202,20 @@ class TTAsyncDecodeController:
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=False):
             return False
-        return self.steady_decode_scheduler_invariants_met(
-            scheduler_output, grammar_output
-        )
+        return self.steady_decode_scheduler_invariants_met(scheduler_output)
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=True):
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
-        return self.steady_decode_scheduler_invariants_met(
-            scheduler_output, grammar_output
-        )
+        return self.steady_decode_scheduler_invariants_met(scheduler_output)
 
     def can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=False):
@@ -233,7 +226,7 @@ class TTAsyncDecodeController:
             return False
         if model_input.reset_batch:
             return False
-        if model_input.grammar_bitmask[0] is not None:
+        if model_input.has_structured_outputs:
             return False
         if (
             model_input.prompt_tokens is not None
@@ -323,6 +316,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=submission.batch_size_per_dp,
                 perform_device_sampling=submission.perform_device_sampling,
                 is_decode=True,
+                grammar_outputs=None,
             )
             sampled_token_ids = sampled_token_ids_per_dp[0]
             logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
