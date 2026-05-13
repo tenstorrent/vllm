@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import openai
 import pytest
+
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
