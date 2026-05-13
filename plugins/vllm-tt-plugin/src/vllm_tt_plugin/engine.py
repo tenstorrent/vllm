@@ -23,6 +23,7 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.request import Request
 from vllm_tt_plugin.config import get_tt_config
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 
@@ -338,9 +339,47 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         if dp_group := getattr(self, "dp_group", None):
             dist.destroy_process_group(dp_group)
 
+    def add_request(self, request: Request, request_wave: int = 0) -> None:
+        start_wave = False
+        if self.has_coordinator and request_wave != self.current_wave:
+            if request_wave > self.current_wave:
+                self.current_wave = request_wave
+            elif not self.engines_running:
+                # Request received for an already-completed wave, notify
+                # front-end that we need to start the next one.
+                start_wave = True
+
+        if self.has_coordinator and not self.engines_running:
+            # The front-end normally notifies the coordinator before sending
+            # the first request in a new wave. If that notification races with
+            # wave completion state, this rank must still wake its peers before
+            # entering TT gathered-DP collectives.
+            self.engines_running = True
+            start_wave = True
+
+        if start_wave:
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(start_wave=self.current_wave))
+            )
+
+        super().add_request(request, request_wave)
+
     def run_busy_loop(self) -> None:
         while True:
+            # Rendezvous all DP ranks at iteration start to prevent
+            # FIFO-collective skew accumulation across iterations.
+            # gloo collectives are matched in call order per group, so once
+            # ranks drift by one iteration, every subsequent collective can
+            # deadlock waiting for a future peer call.
+            try:
+                dist.barrier(group=self.dp_group)
+            except RuntimeError as e:
+                if "Connection closed by peer" in str(e):
+                    raise SystemExit() from e
+                raise
+
             self._process_input_queue()
+            self._process_engine_step()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
