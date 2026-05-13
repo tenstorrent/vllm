@@ -618,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompts_json",
         type=str,
-        default="plugins/vllm-tt-plugin/docs/tt_metal/prompts.json",
+        default="plugins/vllm-tt-plugin/examples/prompts.json",
         help="Path to JSON file containing prompts",
     )
     parser.add_argument(
