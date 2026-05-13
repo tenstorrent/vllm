@@ -90,6 +90,9 @@ class TTCoreEngineLauncher(CoreEngineLauncher):
     ) -> None:
         assert isinstance(plan, TTLaunchPlan)
         assert plan.rank_binding_file is not None
+        # Launch must be done on the host with MPI rank 0 since we set that
+        # process's DP rank to 0, and torch distributed uses DP rank 0 to bind
+        # the TCP rendezvous endpoint.
         assert vllm_config.parallel_config.data_parallel_rank == 0, (
             "TT MPI must be launched from rank 0"
         )
