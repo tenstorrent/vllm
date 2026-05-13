@@ -6,7 +6,7 @@ Tests for sampling parameters which require host ("compat") sampling.
 
 import string
 
-from utils import RequestConfig, run_concurrent_batch
+from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
 class TestHostOnlyParameters:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from utils import (
+from tests.tt.utils import (
     RequestConfig,
     assert_deterministic,
     assert_varied,
