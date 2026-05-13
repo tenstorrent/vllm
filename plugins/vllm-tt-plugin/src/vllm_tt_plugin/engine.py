@@ -69,7 +69,7 @@ def _normal_init_dp_group(parallel_config: ParallelConfig) -> dist.ProcessGroup:
 
 @dataclass
 class DPGatherHandle:
-    future: Future[tuple[torch.Tensor, list]]
+    future: Future[Any]
     scheduler_output: SchedulerOutput | None
     local_has_requests: bool
     is_decode: bool
@@ -79,158 +79,11 @@ class DPGatherHandle:
     req_id_to_index: dict[str, int]
 
 
-class TTExecutionMixin:
-    """TT non-DP execution policy for plugin-selected engine cores."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)  # type: ignore[misc]
-        if (
-            self.batch_queue is not None
-            and self.vllm_config.scheduler_config.async_scheduling
-            and self.vllm_config.parallel_config.data_parallel_size == 1
-        ):
-            self.step_fn = self.step_with_batch_queue_tt
-
-    def _get_grammar_output(
-        self,
-        scheduler_output: SchedulerOutput,
-        *,
-        require_ready: bool = True,
-    ) -> GrammarOutput | None:
-        if require_ready and scheduler_output.pending_structured_output_tokens:
-            return None
-        return self.scheduler.get_grammar_bitmask(scheduler_output)
-
-    def _execute_model_with_grammar(
-        self,
-        scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
-        *,
-        non_block: bool = False,
-    ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
-        result = self.model_executor.collective_rpc(
-            "execute_model_with_grammar",
-            args=(scheduler_output, grammar_output),
-            non_block=non_block,
-        )
-        if non_block:
-            return _unwrap_single_worker_future(
-                cast(Future[list[ModelRunnerOutput]], result)
-            )
-        return result[0]
-
-    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-        """TT regular execution path.
-
-        TT sampling runs inside ``execute_model``, so grammar state is passed
-        through plugin-owned worker calls instead of shared scheduler output.
-        """
-        if self._scheduler_paused:
-            return {}, False
-
-        if not self.scheduler.has_requests():
-            return {}, False
-
-        scheduler_output = self.scheduler.schedule()
-        grammar_output = self._get_grammar_output(scheduler_output)
-        future = cast(
-            Future[ModelRunnerOutput],
-            self._execute_model_with_grammar(
-                scheduler_output, grammar_output, non_block=True
-            ),
-        )
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(None)
-
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
-
-    def step_with_batch_queue_tt(
-        self,
-    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        """TT-specific async batch-queue path for non-DP execution."""
-        batch_queue = self.batch_queue
-        assert batch_queue is not None
-
-        # Match the shared queue behavior: prefer keeping the queue filled before
-        # blocking on the oldest in-flight result.
-        assert len(batch_queue) < self.batch_queue_size
-
-        model_executed = False
-        deferred_scheduler_output: SchedulerOutput | None = None
-        if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
-            if not self.is_ec_producer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                future = cast(
-                    Future[ModelRunnerOutput],
-                    self._execute_model_with_grammar(
-                        scheduler_output, None, non_block=True
-                    ),
-                )
-            elif scheduler_output.pending_structured_output_tokens:
-                # TT consumes structured-output state inside execute_model(), so
-                # the grammar bitmask must be populated before submission.
-                deferred_scheduler_output = scheduler_output
-            else:
-                grammar_output = self._get_grammar_output(scheduler_output)
-                future = cast(
-                    Future[ModelRunnerOutput],
-                    self._execute_model_with_grammar(
-                        scheduler_output, grammar_output, non_block=True
-                    ),
-                )
-
-            if deferred_scheduler_output is None:
-                batch_queue.appendleft((future, scheduler_output, future))
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    return None, True
-
-        elif not batch_queue:
-            return None, False
-
-        future, scheduler_output, _ = batch_queue.pop()
-        with self.log_error_detail(scheduler_output):
-            model_output = future.result()
-
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-
-        if deferred_scheduler_output is not None:
-            grammar_output = self._get_grammar_output(
-                deferred_scheduler_output, require_ready=False
-            )
-            future = cast(
-                Future[ModelRunnerOutput],
-                self._execute_model_with_grammar(
-                    deferred_scheduler_output, grammar_output, non_block=True
-                ),
-            )
-            batch_queue.appendleft((future, deferred_scheduler_output, future))
-
-        return engine_core_outputs, model_executed
-
-
-class TTEngineCore(TTExecutionMixin, EngineCore):
+class TTEngineCore(EngineCore):
     """In-process TT engine core."""
 
 
-class TTEngineCoreProc(TTExecutionMixin, EngineCoreProc):
+class TTEngineCoreProc(EngineCoreProc):
     """Multiprocessing TT engine core."""
 
 
@@ -506,15 +359,16 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         forced_mode = self._dp_negotiate_forced_mode()
         if not self.scheduler.has_requests():
-            _ = self._execute_model_dp_gather(None, None)
+            _ = self._execute_model_dp_gather(None)
             return {}, False
 
         self._dp_apply_forced_mode(forced_mode)
         scheduler_output = self.scheduler.schedule()
         self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
 
+        handle = self.dp_gather_submit(scheduler_output, overlap_ok=False)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        model_output = self._execute_model_dp_gather(scheduler_output, grammar_output)
+        model_output = self.dp_gather_finalize(handle, grammar_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -533,7 +387,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         forced_mode = TTSchedulingMode.DEFAULT
         scheduler_output: SchedulerOutput | None = None
-        grammar_output: GrammarOutput | None = None
         model_executed = False
         current_overlap_ok = False
         if global_has_requests:
@@ -544,19 +397,20 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
                 if not self.is_ec_producer:
                     model_executed = scheduler_output.total_num_scheduled_tokens > 0
-                if not scheduler_output.pending_structured_output_tokens:
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
             if forced_mode == TTSchedulingMode.DECODE_ONLY:
                 current_overlap_ok = self._dp_can_attempt_steady_decode_from_scheduler(
-                    scheduler_output, grammar_output
+                    scheduler_output
                 )
 
         def _finalize_previous(
             handle: DPGatherHandle,
         ) -> dict[int, EngineCoreOutputs]:
-            model_output = self.dp_gather_finalize(handle)
+            grammar_output = None
+            if handle.scheduler_output is not None:
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    handle.scheduler_output
+                )
+            model_output = self.dp_gather_finalize(handle, grammar_output)
             if handle.scheduler_output is None:
                 return {}
             return self.scheduler.update_from_output(
@@ -575,18 +429,10 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             engine_core_outputs = _finalize_previous(prev_handle)
             prev_handle = None
 
-        if (
-            scheduler_output is not None
-            and grammar_output is None
-            and scheduler_output.pending_structured_output_tokens
-        ):
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-
         next_handle: DPGatherHandle | None = None
         if global_has_requests:
             next_handle = self.dp_gather_submit(
                 scheduler_output,
-                grammar_output,
                 overlap_ok=current_overlap_ok,
             )
 
@@ -603,12 +449,11 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
     def _dp_can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         local_overlap_ok = int(
             self.model_executor.collective_rpc(
                 "can_attempt_steady_dp_decode_from_scheduler",
-                args=(scheduler_output, grammar_output),
+                args=(scheduler_output,),
             )[0]
         )
         overlap_ok_t = torch.tensor([local_overlap_ok], dtype=torch.int32)
@@ -620,7 +465,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
     def dp_gather_submit(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
         *,
         overlap_ok: bool = False,
     ) -> DPGatherHandle:
@@ -641,7 +485,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         is_decode = self._dp_gather_forced_mode == TTSchedulingMode.DECODE_ONLY
 
         all_local_inputs = self.model_executor.collective_rpc(
-            "build_dp_model_input", args=(scheduler_output, grammar_output)
+            "build_dp_model_input", args=(scheduler_output,)
         )[0]
         (
             local_input,
@@ -838,7 +682,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         )
         if should_submit:
             collective_future = cast(
-                Future[list[tuple[torch.Tensor, list]]],
+                Future[list[Any]],
                 self.model_executor.collective_rpc(
                     "concat_and_execute_dp",
                     args=(
@@ -866,16 +710,28 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             req_id_to_index=req_id_to_index,
         )
 
-    def dp_gather_finalize(self, handle: DPGatherHandle) -> ModelRunnerOutput:
+    def dp_gather_finalize(
+        self,
+        handle: DPGatherHandle,
+        grammar_output: GrammarOutput | None = None,
+    ) -> ModelRunnerOutput:
         parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
         world = parallel_config.data_parallel_size
-        logprobs_per_dp: list = [None] * world
-
         result = handle.future.result()
-        assert isinstance(result, tuple) and len(result) == 2
-        send_tensor, logprobs_per_dp = result
+        if isinstance(result, tuple) and len(result) == 2:
+            send_tensor, logprobs_per_dp = result
+        else:
+            gathered_grammar_outputs = self._gather_grammar_outputs(
+                grammar_output, handle.req_id_to_index
+            )
+            sampled_result = self.model_executor.collective_rpc(
+                "sample_dp_forward_output",
+                args=(gathered_grammar_outputs,),
+            )[0]
+            assert isinstance(sampled_result, tuple) and len(sampled_result) == 2
+            send_tensor, logprobs_per_dp = sampled_result
         assert isinstance(send_tensor, torch.Tensor)
 
         my_ids = torch.empty_like(send_tensor[0])
@@ -907,15 +763,51 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             return output
         return EMPTY_MODEL_RUNNER_OUTPUT
 
+    def _gather_grammar_outputs(
+        self,
+        grammar_output: GrammarOutput | None,
+        req_id_to_index: dict[str, int],
+    ) -> list[tuple[GrammarOutput | None, dict[str, int]] | None] | None:
+        parallel_config = self.vllm_config.parallel_config
+        group = self.dp_group
+        rank = self.dp_rank
+        local_rank = parallel_config.data_parallel_rank_local
+        world = parallel_config.data_parallel_size
+
+        local_payload = (grammar_output, req_id_to_index)
+        gathered: list[tuple[GrammarOutput | None, dict[str, int]] | None] | None = None
+        if rank == 0:
+            gathered = [None for _ in range(world)]
+        dist.gather_object(local_payload, gathered, dst=0, group=group)
+
+        if len(self.dp_device_ranks) > 1:
+            if rank == 0:
+                pickled = pickle.dumps(gathered)
+                obj_tensor = torch.frombuffer(pickled, dtype=torch.uint8)
+                size_tensor = torch.tensor([obj_tensor.numel()], dtype=torch.long)
+                for dst in self.dp_device_ranks[1:]:
+                    dist.send(size_tensor, dst=dst, group=group)
+                    dist.send(obj_tensor, dst=dst, group=group)
+            elif local_rank == 0:
+                size_tensor = torch.zeros(1, dtype=torch.long)
+                dist.recv(size_tensor, src=0, group=group)
+                obj_tensor = torch.empty(size_tensor.item(), dtype=torch.uint8)
+                dist.recv(obj_tensor, src=0, group=group)
+                gathered = pickle.loads(obj_tensor.numpy().tobytes())
+
+        return gathered if local_rank == 0 else None
+
     def _execute_model_dp_gather(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> ModelRunnerOutput:
         handle = self.dp_gather_submit(
-            scheduler_output, grammar_output, overlap_ok=False
+            scheduler_output, overlap_ok=False
         )
-        return self.dp_gather_finalize(handle)
+        grammar_output = None
+        if scheduler_output is not None:
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        return self.dp_gather_finalize(handle, grammar_output)
 
     def _completed_dp_gather_future(self) -> Future[tuple[torch.Tensor, list]]:
         parallel_config = self.vllm_config.parallel_config
