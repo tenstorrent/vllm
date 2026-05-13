@@ -37,7 +37,7 @@ vLLM requires Python 3.9+ (Python 3.10.12 is the default `python3` on Ubuntu 22.
 2. Enter the environment which has tt-metal installed (e.g. `source $PYTHON_ENV_DIR/bin/activate` if using python virtual environment), and then from the root vLLM directory install vLLM and the TT backend plugin with its runtime extra (Note: `dev` is the main vLLM branch):
 
     ```sh
-    source plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh
+    source plugins/vllm-tt-plugin/docs/install-vllm-tt.sh
     ```
 
 > **Note for developers**: Optionally install pre-commit hooks for linting, formatting, and static type checking on commits by running `pre-commit install`.
@@ -68,10 +68,10 @@ The TT backend is in a Phase 2 out-of-tree plugin package located at:
 plugins/vllm-tt-plugin
 ```
 
-The `plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh` script installs this package after installing vLLM:
+The `plugins/vllm-tt-plugin/docs/install-vllm-tt.sh` script installs this package after installing vLLM:
 
 ```sh
-source plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh
+source plugins/vllm-tt-plugin/docs/install-vllm-tt.sh
 ```
 
 The script installs the base vLLM package with `VLLM_TARGET_DEVICE=empty` because

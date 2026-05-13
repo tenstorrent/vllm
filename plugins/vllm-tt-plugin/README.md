@@ -39,7 +39,7 @@ The normal developer path is to create or activate a tt-metal environment, then
 install vLLM and this plugin from the repository root:
 
 ```bash
-source plugins/vllm-tt-plugin/docs/tt_metal/install-vllm-tt.sh
+source plugins/vllm-tt-plugin/docs/install-vllm-tt.sh
 ```
 
 To install or refresh only the plugin package with its runtime dependencies:
