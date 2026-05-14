@@ -130,6 +130,16 @@ class TTExecutionMixin:
             scheduler_output = self.scheduler.schedule()  # type: ignore[attr-defined]
             if not self.is_ec_producer:  # type: ignore[attr-defined]
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            overlap_eligible = (
+                bool(
+                    self.model_executor.collective_rpc(  # type: ignore[attr-defined]
+                        "can_attempt_steady_decode_from_scheduler",
+                        args=(scheduler_output,),
+                    )[0]
+                )
+                if model_executed
+                else False
+            )
 
             exec_future = cast(
                 "Future[ModelRunnerOutput | None]",
@@ -142,7 +152,7 @@ class TTExecutionMixin:
             if (
                 model_executed
                 and len(batch_queue) < self.batch_queue_size  # type: ignore[attr-defined]
-                and not batch_queue[-1][0].done()
+                and overlap_eligible
             ):
                 return None, True
 
@@ -893,9 +903,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         self,
         scheduler_output: SchedulerOutput | None,
     ) -> ModelRunnerOutput:
-        handle = self.dp_gather_submit(
-            scheduler_output, overlap_ok=False
-        )
+        handle = self.dp_gather_submit(scheduler_output, overlap_ok=False)
         grammar_output = None
         if scheduler_output is not None:
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)

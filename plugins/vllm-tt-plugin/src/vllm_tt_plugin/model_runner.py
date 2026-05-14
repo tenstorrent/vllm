@@ -32,6 +32,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
     CompletedDecodeStep,
+    SubmittedStepContext,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.input_batch import (
@@ -250,6 +251,7 @@ class TTPendingDecodeState:
     submission: Any  # TTDecodeSubmission
     model_input: TTModelInput
     completion_event: threading.Event
+    context: SubmittedStepContext
 
 
 class TTModelRunner:
@@ -342,9 +344,9 @@ class TTModelRunner:
         # pops.  A deque (instead of a single slot) is required when the
         # TTExecutionMixin interleaves two execute_model calls before the
         # first sample_tokens call to achieve decode-pipeline overlap.
-        self._forward_state_queue: deque[
-            TTPendingDecodeState | TTForwardOutput
-        ] = deque()
+        self._forward_state_queue: deque[TTPendingDecodeState | TTForwardOutput] = (
+            deque()
+        )
         self._dp_forward_state_queue: deque[TTForwardOutput] = deque()
 
         # Sampler for sampling on host when device sampling is not supported.
@@ -1785,9 +1787,7 @@ class TTModelRunner:
         # completed work pile up unbounded.
         self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
-            self.async_decode.can_attempt_steady_decode_from_scheduler(
-                scheduler_output
-            )
+            self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
             self.async_decode.wait_for_all_pending_async_steps()
@@ -1808,9 +1808,7 @@ class TTModelRunner:
         return None
 
     @torch.no_grad()
-    def sample_tokens(
-        self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput:
+    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
         """Sample tokens from the oldest non-DP TT forward result.
 
         Pops the front of ``_forward_state_queue``.  If the entry is a
@@ -1823,7 +1821,9 @@ class TTModelRunner:
         )
         pending = self._forward_state_queue.popleft()
 
+        context = None
         if isinstance(pending, TTPendingDecodeState):
+            context = pending.context
             finalized = self.async_decode.finalize_decode(pending.submission)
             pending.completion_event.set()
             if finalized is None:
@@ -1848,7 +1848,14 @@ class TTModelRunner:
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
-        output = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        output = self.apply_and_build_runner_output(
+            sampled_token_ids,
+            logprobs,
+            req_ids=context.req_ids if context is not None else None,
+            req_id_to_index=context.req_id_to_index if context is not None else None,
+            request_states=context.request_states if context is not None else None,
+            row_indices=context.row_indices if context is not None else None,
+        )
         return output
 
     def pack_dp_results(
@@ -2104,6 +2111,7 @@ class TTModelRunner:
         steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
             model_input
         )
+        context = self.async_decode.capture_submitted_step_context()
         event = threading.Event()
         submission = self.async_decode.submit_decode(
             model_input,
@@ -2125,6 +2133,7 @@ class TTModelRunner:
                 submission=submission,
                 model_input=model_input,
                 completion_event=event,
+                context=context,
             )
         )
 
@@ -2665,6 +2674,8 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        request_states: tuple[CachedRequestState, ...] | None = None,
+        row_indices: tuple[int, ...] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -2674,6 +2685,8 @@ class TTModelRunner:
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
+            request_states=request_states,
+            row_indices=row_indices,
         )
         return self._build_runner_output(
             sampled_token_ids=sampled_token_ids,
