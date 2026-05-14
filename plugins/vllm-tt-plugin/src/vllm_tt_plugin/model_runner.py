@@ -236,6 +236,22 @@ class TTForwardOutput:
     is_decode: bool
 
 
+@dataclass
+class TTPendingDecodeState:
+    """Async decode submission in-flight (DMA not yet waited on).
+
+    Pushed to ``_forward_state_queue`` by ``execute_model`` so that the DMA
+    wait is deferred to ``sample_tokens``.  This lets a second
+    ``execute_model`` call (for the next step) start the device decode for
+    step K+1 *before* the host waits for step K's DMA transfer to finish,
+    reproducing the original steady-decode pipeline overlap.
+    """
+
+    submission: Any  # TTDecodeSubmission
+    model_input: TTModelInput
+    completion_event: threading.Event
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -322,8 +338,14 @@ class TTModelRunner:
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
-        self._forward_state: TTForwardOutput | None = None
-        self._dp_forward_state: TTForwardOutput | None = None
+        # FIFO queues for forward state: execute_model pushes, sample_tokens
+        # pops.  A deque (instead of a single slot) is required when the
+        # TTExecutionMixin interleaves two execute_model calls before the
+        # first sample_tokens call to achieve decode-pipeline overlap.
+        self._forward_state_queue: deque[
+            TTPendingDecodeState | TTForwardOutput
+        ] = deque()
+        self._dp_forward_state_queue: deque[TTForwardOutput] = deque()
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -1777,22 +1799,48 @@ class TTModelRunner:
 
         is_decode = model_input.prompt_lens is None
         if self.non_dp_async_scheduling and is_decode:
-            self._forward_state = self._submit_async_forward_with_model_input(
-                model_input
-            )
+            self._submit_async_forward_with_model_input(model_input)
             return None
 
-        self._forward_state = self.execute_forward_with_model_input(model_input)
+        self._forward_state_queue.append(
+            self.execute_forward_with_model_input(model_input)
+        )
         return None
 
     @torch.no_grad()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput:
-        """Sample tokens from the most recent non-DP TT forward result."""
-        assert self._forward_state is not None
-        forward_output = self._forward_state
-        self._forward_state = None
+        """Sample tokens from the oldest non-DP TT forward result.
+
+        Pops the front of ``_forward_state_queue``.  If the entry is a
+        ``TTPendingDecodeState`` (async path), the DMA wait happens here so
+        a concurrent ``execute_model`` call for the next step can start the
+        device decode while this DMA is in flight.
+        """
+        assert self._forward_state_queue, (
+            "sample_tokens called with no pending forward state"
+        )
+        pending = self._forward_state_queue.popleft()
+
+        if isinstance(pending, TTPendingDecodeState):
+            finalized = self.async_decode.finalize_decode(pending.submission)
+            pending.completion_event.set()
+            if finalized is None:
+                forward_output = self._empty_forward_output(pending.model_input)
+            else:
+                sub = pending.submission
+                forward_output = TTForwardOutput(
+                    tt_out=finalized.tt_out,
+                    tt_log_probs=finalized.tt_log_probs,
+                    sampling_params=sub.sampling_params,
+                    model_input=pending.model_input,
+                    batch_size_per_dp=sub.batch_size_per_dp,
+                    perform_device_sampling=sub.perform_device_sampling,
+                    is_decode=True,
+                )
+        else:
+            forward_output = pending
 
         sampled_token_ids_per_dp, logprobs_per_dp = self.sample_forward_output(
             forward_output, [grammar_output]
@@ -2044,8 +2092,15 @@ class TTModelRunner:
     def _submit_async_forward_with_model_input(
         self,
         model_input: TTModelInput,
-    ) -> TTForwardOutput:
-        """Submit async decode and keep its raw output for sample_tokens()."""
+    ) -> None:
+        """Submit async decode and push a pending state for sample_tokens().
+
+        The DMA is intentionally NOT waited on here.  ``sample_tokens`` pops
+        the ``TTPendingDecodeState`` and finalises the DMA there, so a second
+        ``execute_model`` call (for step K+1) can start the device decode
+        while step K's DMA is still in flight — reproducing the original
+        steady-decode pipeline.
+        """
         steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
             model_input
         )
@@ -2060,20 +2115,17 @@ class TTModelRunner:
             overlap_ok=steady_decode_fast_path,
         )
         if submission.tt_out is None:
+            # Nothing to read — treat as an empty forward step.
             event.set()
-            return self._empty_forward_output(model_input)
-        finalized = self.async_decode.finalize_decode(submission)
-        event.set()
-        if finalized is None:
-            return self._empty_forward_output(model_input)
-        return TTForwardOutput(
-            tt_out=finalized.tt_out,
-            tt_log_probs=finalized.tt_log_probs,
-            sampling_params=submission.sampling_params,
-            model_input=model_input,
-            batch_size_per_dp=submission.batch_size_per_dp,
-            perform_device_sampling=submission.perform_device_sampling,
-            is_decode=True,
+            self._forward_state_queue.append(self._empty_forward_output(model_input))
+            return
+        # Push the in-flight submission; sample_tokens will finalize it.
+        self._forward_state_queue.append(
+            TTPendingDecodeState(
+                submission=submission,
+                model_input=model_input,
+                completion_event=event,
+            )
         )
 
     def sample_forward_output(
@@ -2154,25 +2206,33 @@ class TTModelRunner:
         any_structured_inputs: bool,
         non_block: bool = False,
     ) -> Any:
-        """Execute one merged DP forward and store its sampling payload.
+        """Execute one merged DP forward and enqueue its sampling payload.
 
-        Sampling is intentionally separated so gathered grammar constraints can
-        be supplied after the forward pass, matching the non-DP vLLM flow.
+        Pushes the ``TTForwardOutput`` onto ``_dp_forward_state_queue`` rather
+        than storing it in a single mutable slot.  This is what makes the DP
+        overlap path safe: when ``concat_and_execute_dp(K+1)`` is sent to the
+        worker *before* ``sample_dp_forward_output(K)`` (as happens in
+        ``step_dp_with_batch_queue`` with ``finalize_before_submit=False``),
+        both forwards are queued in FIFO order and each ``sample`` call pops
+        the correct entry regardless of RPC ordering.
         """
         merged = self.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
         )
-        self._dp_forward_state = self.execute_forward_with_model_input(merged)
+        self._dp_forward_state_queue.append(
+            self.execute_forward_with_model_input(merged)
+        )
         return True
 
     def sample_dp_forward_output(
         self,
         grammar_outputs: list[Any] | None,
     ) -> tuple[torch.Tensor, list]:
-        """Sample the stored gathered-DP forward output and pack results."""
-        assert self._dp_forward_state is not None
-        forward_output = self._dp_forward_state
-        self._dp_forward_state = None
+        """Sample the oldest gathered-DP forward output and pack results."""
+        assert self._dp_forward_state_queue, (
+            "sample_dp_forward_output called with no pending DP forward state"
+        )
+        forward_output = self._dp_forward_state_queue.popleft()
         if grammar_outputs is None:
             grammar_outputs = [None] * len(forward_output.batch_size_per_dp)
         sampled_token_ids_per_dp, logprobs_per_dp = self.sample_forward_output(
