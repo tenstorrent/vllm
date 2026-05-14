@@ -254,6 +254,20 @@ class TTPendingDecodeState:
     context: SubmittedStepContext
 
 
+@dataclass
+class TTPendingDPDecodeState:
+    """Async gathered-DP decode submission in-flight.
+
+    DP sampling is driven by ``sample_dp_forward_output`` after grammar outputs
+    are gathered on the engine side.  Keeping the raw submission here lets the
+    next gathered decode be submitted before the previous decode's async read is
+    finalized, matching the pre-split DP overlap behavior.
+    """
+
+    submission: Any  # TTDecodeSubmission
+    model_input: TTModelInput
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -347,7 +361,9 @@ class TTModelRunner:
         self._forward_state_queue: deque[TTPendingDecodeState | TTForwardOutput] = (
             deque()
         )
-        self._dp_forward_state_queue: deque[TTForwardOutput] = deque()
+        self._dp_forward_state_queue: deque[
+            TTForwardOutput | TTPendingDPDecodeState
+        ] = deque()
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -2137,6 +2153,40 @@ class TTModelRunner:
             )
         )
 
+    def _forward_output_from_finalized_decode(
+        self,
+        model_input: TTModelInput,
+        submission: Any,
+        finalized: Any | None,
+    ) -> TTForwardOutput:
+        if finalized is None:
+            return self._empty_forward_output(model_input)
+        return TTForwardOutput(
+            tt_out=finalized.tt_out,
+            tt_log_probs=finalized.tt_log_probs,
+            sampling_params=submission.sampling_params,
+            model_input=model_input,
+            batch_size_per_dp=submission.batch_size_per_dp,
+            perform_device_sampling=submission.perform_device_sampling,
+            is_decode=True,
+        )
+
+    def _submit_async_dp_forward_with_model_input(
+        self,
+        model_input: TTModelInput,
+    ) -> None:
+        submission = self.async_decode.submit_decode(
+            model_input,
+            read_from_device=False,
+            async_read=True,
+        )
+        if submission.tt_out is None:
+            self._dp_forward_state_queue.append(self._empty_forward_output(model_input))
+            return
+        self._dp_forward_state_queue.append(
+            TTPendingDPDecodeState(submission=submission, model_input=model_input)
+        )
+
     def sample_forward_output(
         self,
         forward_output: TTForwardOutput,
@@ -2228,6 +2278,10 @@ class TTModelRunner:
         merged = self.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
         )
+        if non_block and is_decode:
+            self._submit_async_dp_forward_with_model_input(merged)
+            return True
+
         self._dp_forward_state_queue.append(
             self.execute_forward_with_model_input(merged)
         )
@@ -2241,7 +2295,14 @@ class TTModelRunner:
         assert self._dp_forward_state_queue, (
             "sample_dp_forward_output called with no pending DP forward state"
         )
-        forward_output = self._dp_forward_state_queue.popleft()
+        pending = self._dp_forward_state_queue.popleft()
+        if isinstance(pending, TTPendingDPDecodeState):
+            finalized = self.async_decode.finalize_decode(pending.submission)
+            forward_output = self._forward_output_from_finalized_decode(
+                pending.model_input, pending.submission, finalized
+            )
+        else:
+            forward_output = pending
         if grammar_outputs is None:
             grammar_outputs = [None] * len(forward_output.batch_size_per_dp)
         sampled_token_ids_per_dp, logprobs_per_dp = self.sample_forward_output(
