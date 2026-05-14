@@ -375,7 +375,10 @@ class TTWorker(WorkerBase):
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         if local_dp_rank != 0:
-            return self._empty_dp_execute_result()
+            # This worker does not execute the merged TT batch, but the engine
+            # still needs every DP rank to take the forward-only finalize path
+            # so grammar/output collectives stay aligned.
+            return True
 
         return self.model_runner.submit_dp_execution(
             inputs,

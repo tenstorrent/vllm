@@ -778,10 +778,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     gathered_inputs = pickle.loads(object_tensor.numpy().tobytes())
         self.dlog("after_inputs_gather")
 
-        should_submit = is_decode or (
-            isinstance(gathered_inputs, list)
-            and any(x is not None for x in gathered_inputs)
-        )
+        should_submit_t = torch.tensor([int(is_decode)], dtype=torch.int32)
+        if not is_decode and rank == 0:
+            should_submit_t[0] = int(
+                isinstance(gathered_inputs, list)
+                and any(x is not None for x in gathered_inputs)
+            )
+        dist.broadcast(should_submit_t, src=0, group=group)
+        should_submit = bool(should_submit_t.item())
         if should_submit:
             collective_future = cast(
                 Future[list[Any]],
