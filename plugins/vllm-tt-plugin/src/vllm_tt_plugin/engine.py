@@ -24,7 +24,6 @@ from vllm.v1.engine import (
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
-    AsyncModelRunnerOutput,
     ModelRunnerOutput,
 )
 from vllm.v1.request import Request
@@ -83,109 +82,11 @@ class DPGatherHandle:
     req_id_to_index: dict[str, int]
 
 
-class TTExecutionMixin:
-    """Non-DP async execution policy for TT engine cores.
-
-    Replaces the standard ``step_with_batch_queue`` with a TT-specific version
-    that interleaves two consecutive ``execute_model`` calls before the first
-    ``sample_tokens`` call.  This reproduces the original steady-decode
-    pipeline overlap: step K+1's device decode is submitted (and its async DMA
-    started) while the host is still waiting for step K's DMA to finish inside
-    ``sample_tokens(K)``.
-
-    Only activated when ``async_scheduling=True`` and ``data_parallel_size==1``
-    (DP>1 has its own overlap path in ``TTDPEngineCoreProc``).
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)  # type: ignore[misc]
-        if (
-            self.batch_queue is not None  # type: ignore[attr-defined]
-            and self.vllm_config.scheduler_config.async_scheduling  # type: ignore[attr-defined]
-            and self.vllm_config.parallel_config.data_parallel_size == 1  # type: ignore[attr-defined]
-        ):
-            self.step_fn = self.step_with_batch_queue_tt  # type: ignore[attr-defined]
-
-    def step_with_batch_queue_tt(
-        self,
-    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        """TT-specific async batch-queue path for non-DP execution.
-
-        Ordering per engine iteration (batch_queue_size=2 example):
-          Iteration 1: execute_model(K)  → queue=[K]           → return early
-          Iteration 2: execute_model(K+1)→ queue=[K+1,K]       → pop K
-                       sample_tokens(K) (DMA wait + sample K)  → emit K output
-          Iteration 3: execute_model(K+2)→ queue=[K+2,K+1]     → pop K+1
-                       sample_tokens(K+1) ...
-
-        While sample_tokens(K) is waiting for K's DMA, execute_model(K+1) has
-        already submitted K+1's device decode and started its DMA, giving true
-        decode-pipeline overlap.
-        """
-        batch_queue = self.batch_queue  # type: ignore[attr-defined]
-        assert batch_queue is not None
-
-        model_executed = False
-        if self.scheduler.has_requests():  # type: ignore[attr-defined]
-            scheduler_output = self.scheduler.schedule()  # type: ignore[attr-defined]
-            if not self.is_ec_producer:  # type: ignore[attr-defined]
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-            overlap_eligible = (
-                bool(
-                    self.model_executor.collective_rpc(  # type: ignore[attr-defined]
-                        "can_attempt_steady_decode_from_scheduler",
-                        args=(scheduler_output,),
-                    )[0]
-                )
-                if model_executed
-                else False
-            )
-
-            exec_future = cast(
-                "Future[ModelRunnerOutput | None]",
-                self.model_executor.execute_model(  # type: ignore[attr-defined]
-                    scheduler_output, non_block=True
-                ),
-            )
-            batch_queue.appendleft((exec_future, scheduler_output))
-
-            if (
-                model_executed
-                and len(batch_queue) < self.batch_queue_size  # type: ignore[attr-defined]
-                and overlap_eligible
-            ):
-                return None, True
-
-        elif not batch_queue:
-            return None, False
-
-        exec_future, popped_sched_out = batch_queue.pop()
-        with self.log_error_detail(popped_sched_out):  # type: ignore[attr-defined]
-            exec_result = exec_future.result()
-
-        if exec_result is None:
-            # execute_model stored forward state in the runner queue; retrieve
-            # the result by calling sample_tokens now (DMA wait happens here).
-            grammar_output = self.scheduler.get_grammar_bitmask(  # type: ignore[attr-defined]
-                popped_sched_out
-            )
-            model_output = self.model_executor.sample_tokens(grammar_output)  # type: ignore[attr-defined]
-        else:
-            if isinstance(exec_result, AsyncModelRunnerOutput):
-                exec_result = exec_result.get_output()
-            model_output = exec_result
-
-        engine_core_outputs = self.scheduler.update_from_output(  # type: ignore[attr-defined]
-            popped_sched_out, model_output
-        )
-        return engine_core_outputs, model_executed
-
-
-class TTEngineCore(TTExecutionMixin, EngineCore):
+class TTEngineCore(EngineCore):
     """In-process TT engine core."""
 
 
-class TTEngineCoreProc(TTExecutionMixin, EngineCoreProc):
+class TTEngineCoreProc(EngineCoreProc):
     """Multiprocessing TT engine core."""
 
 

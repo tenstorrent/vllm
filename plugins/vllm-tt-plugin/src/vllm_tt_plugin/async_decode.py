@@ -61,19 +61,21 @@ class CompletedDecodeStep:
 
 
 class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
-    """Wrap a non-blocking TT decode submission plus async read submit."""
+    """Finish TT non-DP sampling on vLLM's async output thread."""
 
     def __init__(
         self,
         controller: TTAsyncDecodeController,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
         completion_event: threading.Event,
         context: SubmittedStepContext,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
+        self._grammar_output = grammar_output
         self._completion_event = completion_event
         self._context = context
 
@@ -87,6 +89,7 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         completed = self._controller.complete_non_dp_decode_step(
             submission=self._submission,
             model_input=self._model_input,
+            grammar_output=self._grammar_output,
             context=self._context,
         )
         self._controller.enqueue_completed_decode_step(completed)
@@ -301,6 +304,7 @@ class TTAsyncDecodeController:
         self,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
         context: SubmittedStepContext,
     ) -> CompletedDecodeStep:
         finalized = self.finalize_decode(submission)
@@ -316,7 +320,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=submission.batch_size_per_dp,
                 perform_device_sampling=submission.perform_device_sampling,
                 is_decode=True,
-                grammar_outputs=None,
+                grammar_outputs=[grammar_output],
             )
             sampled_token_ids = sampled_token_ids_per_dp[0]
             logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
@@ -370,6 +374,7 @@ class TTAsyncDecodeController:
             controller=self,
             submission=submission,
             model_input=model_input,
+            grammar_output=None,
             completion_event=event,
             context=context,
         )

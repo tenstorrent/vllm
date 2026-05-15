@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm_tt_plugin.config import get_tt_config
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
@@ -282,7 +282,7 @@ class TTWorker(WorkerBase):
     def sample_tokens(
         self,
         grammar_output: "GrammarOutput | None",
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         assert self.is_driver_worker, "There should only be one Worker for TT"
         return self.model_runner.sample_tokens(grammar_output)
 

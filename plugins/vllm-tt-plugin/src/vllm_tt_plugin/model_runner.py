@@ -23,6 +23,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -31,6 +32,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
+    AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     SubmittedStepContext,
     TTAsyncDecodeController,
@@ -355,9 +357,9 @@ class TTModelRunner:
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
         # FIFO queues for forward state: execute_model pushes, sample_tokens
-        # pops.  A deque (instead of a single slot) is required when the
-        # TTExecutionMixin interleaves two execute_model calls before the
-        # first sample_tokens call to achieve decode-pipeline overlap.
+        # pops. A deque (instead of a single slot) keeps non-DP and DP forward
+        # state ordered while vLLM's async scheduling overlaps output
+        # finalization with later worker calls.
         self._forward_state_queue: deque[TTPendingDecodeState | TTForwardOutput] = (
             deque()
         )
@@ -1824,37 +1826,29 @@ class TTModelRunner:
         return None
 
     @torch.no_grad()
-    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         """Sample tokens from the oldest non-DP TT forward result.
 
         Pops the front of ``_forward_state_queue``.  If the entry is a
-        ``TTPendingDecodeState`` (async path), the DMA wait happens here so
-        a concurrent ``execute_model`` call for the next step can start the
-        device decode while this DMA is in flight.
+        ``TTPendingDecodeState`` (async path), return an async output wrapper
+        so vLLM's output thread does the DMA wait and final sampling.
         """
         assert self._forward_state_queue, (
             "sample_tokens called with no pending forward state"
         )
         pending = self._forward_state_queue.popleft()
 
-        context = None
         if isinstance(pending, TTPendingDecodeState):
-            context = pending.context
-            finalized = self.async_decode.finalize_decode(pending.submission)
-            pending.completion_event.set()
-            if finalized is None:
-                forward_output = self._empty_forward_output(pending.model_input)
-            else:
-                sub = pending.submission
-                forward_output = TTForwardOutput(
-                    tt_out=finalized.tt_out,
-                    tt_log_probs=finalized.tt_log_probs,
-                    sampling_params=sub.sampling_params,
-                    model_input=pending.model_input,
-                    batch_size_per_dp=sub.batch_size_per_dp,
-                    perform_device_sampling=sub.perform_device_sampling,
-                    is_decode=True,
-                )
+            return AsyncTTModelRunnerOutput(
+                controller=self.async_decode,
+                submission=pending.submission,
+                model_input=pending.model_input,
+                grammar_output=grammar_output,
+                completion_event=pending.completion_event,
+                context=pending.context,
+            )
         else:
             forward_output = pending
 
@@ -1867,10 +1861,6 @@ class TTModelRunner:
         output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
-            req_ids=context.req_ids if context is not None else None,
-            req_id_to_index=context.req_id_to_index if context is not None else None,
-            request_states=context.request_states if context is not None else None,
-            row_indices=context.row_indices if context is not None else None,
         )
         return output
 
