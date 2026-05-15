@@ -150,17 +150,39 @@ class Molmo2MultiModalProcessor(BaseMultiModalProcessor[Molmo2ProcessingInfo]):
             )
             result = dict(combined_out)
             # HF image processor already provides image_num_crops as a per-image tensor
-            # (e.g. tensor([2, 3]) for 2 images with 2 and 3 crops respectively).
+            # (e.g. tensor([9, 9]) for 2 images with 9 crops each).
             # DO NOT overwrite it — the per-image counts are needed for flat_from_sizes batching.
-            img_num_crops = result.get("image_num_crops")
-            if img_num_crops is not None:
-                crops_t = (
-                    img_num_crops
-                    if isinstance(img_num_crops, torch.Tensor)
-                    else torch.tensor(img_num_crops)
+            #
+            # Compute per-image pooled-patch counts by processing each image individually.
+            # We cannot split the combined image_token_pooling by index because the HF processor
+            # uses per-image-relative (not global) pooling indices, making them identical across
+            # images. Processing per-image is the only reliable way to get accurate counts.
+            if len(images) > 1:
+                per_image_pooled_counts = []
+                for single_img in images:
+                    single_out = self.info.ctx.call_hf_processor(
+                        hf_processor,
+                        {"text": "<|image|>", "images": [single_img]},
+                        {},
+                    )
+                    single_pool = single_out.get("image_token_pooling")
+                    if single_pool is not None:
+                        per_image_pooled_counts.append(single_pool.shape[0])
+                    else:
+                        # Fallback: crops_i × 196 (may over-count if some patches invalid)
+                        img_nc = single_out.get("image_num_crops")
+                        nc = int(img_nc.sum().item()) if img_nc is not None else 1
+                        per_image_pooled_counts.append(nc * _DEFAULT_N_OUT_PER_IMAGE_CROP)
+                result["image_num_pooled_patches"] = torch.tensor(
+                    per_image_pooled_counts, dtype=torch.long
                 )
-                # Pooled patches per image = crops_per_image * pooled_per_crop (196 for [2,2] pool)
-                result["image_num_pooled_patches"] = crops_t.long() * _DEFAULT_N_OUT_PER_IMAGE_CROP
+            else:
+                # Single image: use actual pool shape directly
+                pool = result.get("image_token_pooling")
+                if pool is not None:
+                    result["image_num_pooled_patches"] = torch.tensor(
+                        [pool.shape[0]], dtype=torch.long
+                    )
             return BatchFeature(result)
 
         try:
