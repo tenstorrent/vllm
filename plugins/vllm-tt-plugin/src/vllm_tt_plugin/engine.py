@@ -497,6 +497,46 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         if callable(set_mode):
             set_mode(forced_mode)
 
+    def _dp_schedule_with_prefill_fallback(
+        self,
+        forced_mode: TTSchedulingMode,
+    ) -> tuple[SchedulerOutput | None, TTSchedulingMode]:
+        scheduler_output: SchedulerOutput | None = None
+        if self.scheduler.has_requests():
+            self._dp_apply_forced_mode(forced_mode)
+            scheduler_output = self.scheduler.schedule()
+            self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
+
+        local_scheduled_tokens = (
+            scheduler_output.total_num_scheduled_tokens
+            if scheduler_output is not None
+            else 0
+        )
+        scheduled_tokens_t = torch.tensor([local_scheduled_tokens], dtype=torch.int64)
+        dist.all_reduce(scheduled_tokens_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+
+        if (
+            forced_mode != TTSchedulingMode.PREFILL_ONLY
+            or int(scheduled_tokens_t.item()) > 0
+        ):
+            return scheduler_output, forced_mode
+
+        # A global zero-token PREFILL_ONLY step means at least one rank wanted
+        # prefill, but no rank could admit one. Fall back to decode in the same
+        # DP iteration so running requests can free KV cache and all ranks stay
+        # in the same collective phase.
+        finished_req_ids = (
+            set(scheduler_output.finished_req_ids)
+            if scheduler_output is not None
+            else set()
+        )
+        if self.scheduler.has_requests():
+            self._dp_apply_forced_mode(TTSchedulingMode.DECODE_ONLY)
+            scheduler_output = self.scheduler.schedule()
+            self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
+            scheduler_output.finished_req_ids.update(finished_req_ids)
+        return scheduler_output, TTSchedulingMode.DECODE_ONLY
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         if self._scheduler_paused:
             return {}, False
@@ -505,17 +545,20 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             return {}, False
 
         forced_mode = self._dp_negotiate_forced_mode()
-        if not self.scheduler.has_requests():
-            _ = self._execute_model_dp_gather(None, None)
-            return {}, False
+        scheduler_output, forced_mode = self._dp_schedule_with_prefill_fallback(
+            forced_mode
+        )
+        self._dp_gather_forced_mode = forced_mode
 
-        self._dp_apply_forced_mode(forced_mode)
-        scheduler_output = self.scheduler.schedule()
-        self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
-
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        grammar_output = (
+            self.scheduler.get_grammar_bitmask(scheduler_output)
+            if scheduler_output is not None
+            else None
+        )
         model_output = self._execute_model_dp_gather(scheduler_output, grammar_output)
         self._process_aborts_queue()
+        if scheduler_output is None:
+            return {}, False
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -538,10 +581,11 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         current_overlap_ok = False
         if global_has_requests:
             forced_mode = self._dp_negotiate_forced_mode()
-            if self.scheduler.has_requests():
-                self._dp_apply_forced_mode(forced_mode)
-                scheduler_output = self.scheduler.schedule()
-                self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
+            scheduler_output, forced_mode = self._dp_schedule_with_prefill_fallback(
+                forced_mode
+            )
+            self._dp_gather_forced_mode = forced_mode
+            if scheduler_output is not None:
                 if not self.is_ec_producer:
                     model_executed = scheduler_output.total_num_scheduled_tokens > 0
                 if not scheduler_output.pending_structured_output_tokens:
