@@ -817,6 +817,10 @@ def _is_xpu() -> bool:
     return VLLM_TARGET_DEVICE == "xpu"
 
 
+def _is_tt() -> bool:
+    return VLLM_TARGET_DEVICE == "tt"
+
+
 def _build_custom_ops() -> bool:
     return _is_cuda() or _is_hip() or _is_cpu()
 
@@ -906,6 +910,8 @@ def get_vllm_version() -> str:
             version += f"{sep}cpu"
     elif _is_xpu():
         version += f"{sep}xpu"
+    elif _is_tt():
+        version += f"{sep}tt"
     else:
         raise RuntimeError("Unknown runtime environment")
 
@@ -952,6 +958,8 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("cpu.txt")
     elif _is_xpu():
         requirements = _read_requirements("xpu.txt")
+    elif _is_tt():
+        requirements = _read_requirements("common.txt")
     else:
         raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
     return requirements
@@ -959,7 +967,9 @@ def get_requirements() -> list[str]:
 
 ext_modules = []
 
-if _is_cuda() or _is_hip():
+if _is_tt():
+    ext_modules = []
+elif _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
     # Optional since this doesn't get built (produce an .so file). This is just
