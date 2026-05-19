@@ -218,9 +218,7 @@ def step_dp_with_batch_queue(
             return {}
         return core.scheduler.update_from_output(handle.scheduler_output, model_output)
 
-    finalize_before_submit = prev_handle is not None and (
-        not global_has_requests or not prev_handle.overlap_ok or not current_overlap_ok
-    )
+    finalize_before_submit = prev_handle is not None
 
     engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
     if finalize_before_submit:
