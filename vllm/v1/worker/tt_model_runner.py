@@ -1956,7 +1956,12 @@ class TTModelRunner:
         )
 
     def warmup_model(self) -> None:
-        # Two-phase warmup: compile first, then capture traces.
+        # Two-phase warmup: compile first, then capture traces..
+        #
+        # Each model warmup_* method now supports warmup_only=True, which runs
+        # the same enable_trace=True execution path but skips begin/end_trace_capture.
+        # This ensures trace-only op variants are compiled before the first trace
+        # is captured on device.
         #
         # Phase 1 compiles all op variants (prefill + decode) into the
         # program cache WITHOUT capturing any traces.  Phase 2 then
@@ -1964,19 +1969,11 @@ class TTModelRunner:
         # kernel-cache allocations occur that could corrupt trace memory.
         #
         # Assumptions / limitations:
-        #   1. Traced and non-traced code paths must use the same ops.
-        #      If a model uses different operators when enable_trace=False
-        #      vs True, Phase 1 will not compile the ops that Phase 2
-        #      traces, and new compilations during trace capture will
-        #      allocate corruptible buffers.
-        #   2. Prefill warmup must cover all supported sequence lengths.
+        #   1. Prefill warmup must cover all supported sequence lengths.
         #      If a new sequence length appears during inference, its
         #      first compilation will allocate new kernel cache entries
-        #      (including reshape caches) that can corrupt active traces.
-        #
-        # Phase 1 uses read_from_device=False because some generators
-        # (e.g. llama3_70b_galaxy) only handle the traced return format
-        # in read_decode_output.
+        #      (including reshape caches) that can be corrupted
+        #      by previously captured traces executing.
         #
         # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
         trace_prefill_mode = self.trace_mode in ["all"]
@@ -1995,18 +1992,33 @@ class TTModelRunner:
             non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
         )
 
-        # Phase 1: compile all code paths (no trace capture)
-        self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
-        self.model.warmup_model_decode(
-            enable_trace=False, read_from_device=False, **decode_kwargs
-        )
+        # Phase 1: trace-path warmup without capture (compile only)
+        if trace_prefill_mode:
+            self.model.warmup_model_prefill(enable_trace=True, warmup_only=True, **prefill_kwargs)
+        else:
+            self.model.warmup_model_prefill(enable_trace=False, warmup_only=False, **prefill_kwargs)
 
-        # Reset prefill warmup flag so Phase 2 re-runs with tracing
+        if trace_decode_mode:
+            self.model.warmup_model_decode(
+                enable_trace=True,
+                warmup_only=True,
+                read_from_device=False,
+                **decode_kwargs,
+            )
+        else:
+            self.model.warmup_model_decode(
+                enable_trace=False,
+                warmup_only=False,
+                read_from_device=False,
+                **decode_kwargs,
+            )
+
+        # Reset prefill warmup flag so phase 2 can capture traces.
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled)
+        # Phase 2: actual trace capture
         if trace_prefill_mode:
-            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+            self.model.warmup_model_prefill(enable_trace=True, warmup_only=False, **prefill_kwargs)
         if trace_decode_mode:
-            self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+            self.model.warmup_model_decode(enable_trace=True, warmup_only=False, **decode_kwargs)
