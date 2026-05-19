@@ -243,11 +243,9 @@ class TTForwardOutput:
 class TTPendingDecodeState:
     """Async decode submission in-flight (DMA not yet waited on).
 
-    Pushed to ``_forward_state_queue`` by ``execute_model`` so that the DMA
-    wait is deferred to ``sample_tokens``.  This lets a second
-    ``execute_model`` call (for the next step) start the device decode for
-    step K+1 *before* the host waits for step K's DMA transfer to finish,
-    reproducing the original steady-decode pipeline overlap.
+    Pushed to ``_forward_state_queue`` by ``execute_model`` and consumed by
+    ``sample_tokens``. The async output wrapper then performs the DMA wait and
+    sampling off the main worker loop.
     """
 
     submission: Any  # TTDecodeSubmission
@@ -2659,7 +2657,6 @@ class TTModelRunner:
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
-        row_indices: tuple[int, ...] | None = None,
     ) -> None:
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
@@ -2703,6 +2700,8 @@ class TTModelRunner:
             if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
+            # Resolve the live batch row at apply time; async scheduling may have
+            # moved requests since the submit-time snapshot was captured.
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
@@ -2726,7 +2725,6 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
-        row_indices: tuple[int, ...] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -2737,7 +2735,6 @@ class TTModelRunner:
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
             request_states=request_states,
-            row_indices=row_indices,
         )
         return self._build_runner_output(
             sampled_token_ids=sampled_token_ids,

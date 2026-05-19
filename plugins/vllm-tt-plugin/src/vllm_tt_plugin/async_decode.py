@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
@@ -46,8 +45,6 @@ class SubmittedStepContext:
     req_ids: list[str]
     req_id_to_index: dict[str, int]
     request_states: tuple[CachedRequestState, ...]
-    row_indices: tuple[int, ...]
-    submit_time_ns: int
 
 
 @dataclass(frozen=True)
@@ -57,7 +54,6 @@ class CompletedDecodeStep:
     sampled_token_ids: torch.Tensor
     logprobs: LogprobsLists | None
     context: SubmittedStepContext
-    completion_time_ns: int
 
 
 class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
@@ -96,42 +92,6 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         return self._controller.build_runner_output_from_completed_step(completed)
 
 
-class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
-    """Wrap a non-blocking DP decode submission plus async read submit."""
-
-    def __init__(
-        self,
-        controller: TTAsyncDecodeController,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-    ):
-        self._controller = controller
-        self._submission = submission
-        self._model_input = model_input
-
-    def get_output(self) -> tuple[torch.Tensor, list]:  # type: ignore[override]
-        finalized = self._controller.finalize_decode(self._submission)
-        runner = self._controller.runner
-        if finalized is None:
-            return runner.pack_dp_results(
-                [torch.tensor([], dtype=torch.int32)]
-                * len(self._submission.batch_size_per_dp),
-                [None] * len(self._submission.batch_size_per_dp),
-            )
-
-        sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
-            tt_out=finalized.tt_out,
-            tt_log_probs=finalized.tt_log_probs,
-            sampling_params=self._submission.sampling_params,
-            model_input=self._model_input,
-            batch_size_per_dp=self._submission.batch_size_per_dp,
-            perform_device_sampling=self._submission.perform_device_sampling,
-            is_decode=True,
-            grammar_outputs=None,
-        )
-        return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
-
-
 class TTAsyncDecodeController:
     """Own the TT async decode lifecycle for a `TTModelRunner`."""
 
@@ -146,10 +106,6 @@ class TTAsyncDecodeController:
             req_ids=req_ids,
             req_id_to_index=dict(runner.input_batch.req_id_to_index),
             request_states=tuple(runner.requests[req_id] for req_id in req_ids),
-            row_indices=tuple(
-                runner.input_batch.req_id_to_index[req_id] for req_id in req_ids
-            ),
-            submit_time_ns=time.perf_counter_ns(),
         )
 
     def steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
@@ -312,6 +268,11 @@ class TTAsyncDecodeController:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
         else:
+            grammar_payload = (
+                (grammar_output, context.req_id_to_index)
+                if grammar_output is not None
+                else None
+            )
             sampled_token_ids_per_dp, logprobs_per_dp = self.runner._get_output_tokens(
                 tt_out=finalized.tt_out,
                 tt_log_probs=finalized.tt_log_probs,
@@ -320,7 +281,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=submission.batch_size_per_dp,
                 perform_device_sampling=submission.perform_device_sampling,
                 is_decode=True,
-                grammar_outputs=[grammar_output],
+                grammar_outputs=[grammar_payload],
             )
             sampled_token_ids = sampled_token_ids_per_dp[0]
             logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
@@ -329,7 +290,6 @@ class TTAsyncDecodeController:
             sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
             context=context,
-            completion_time_ns=time.perf_counter_ns(),
         )
 
     def build_runner_output_from_completed_step(
@@ -348,50 +308,6 @@ class TTAsyncDecodeController:
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             request_states=completed.context.request_states,
-            row_indices=completed.context.row_indices,
-        )
-
-    def submit_async_non_dp_decode(
-        self,
-        model_input: TTModelInput,
-        *,
-        steady_decode_fast_path: bool,
-    ) -> AsyncTTModelRunnerOutput:
-        event = threading.Event()
-        context = self.capture_submitted_step_context()
-        submission = self.submit_decode(
-            model_input,
-            read_from_device=False,
-            async_read=True,
-        )
-        self.register_pending_async_event(
-            event,
-            overlap_ok=steady_decode_fast_path,
-        )
-        if submission.tt_out is None:
-            event.set()
-        return AsyncTTModelRunnerOutput(
-            controller=self,
-            submission=submission,
-            model_input=model_input,
-            grammar_output=None,
-            completion_event=event,
-            context=context,
-        )
-
-    def submit_async_dp_decode(
-        self,
-        model_input: TTModelInput,
-    ) -> AsyncTTDPGatherOutput:
-        submission = self.submit_decode(
-            model_input,
-            read_from_device=False,
-            async_read=True,
-        )
-        return AsyncTTDPGatherOutput(
-            controller=self,
-            submission=submission,
-            model_input=model_input,
         )
 
     def submit_decode(
