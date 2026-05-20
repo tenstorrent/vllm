@@ -405,15 +405,19 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     scheduler_output
                 )
 
+        def _grammar_output_for_handle(
+            handle: DPGatherHandle,
+        ) -> GrammarOutput | None:
+            if handle.scheduler_output is None:
+                return None
+            return self.scheduler.get_grammar_bitmask(handle.scheduler_output)
+
         def _finalize_previous(
             handle: DPGatherHandle,
         ) -> dict[int, EngineCoreOutputs]:
-            grammar_output = None
-            if handle.scheduler_output is not None:
-                grammar_output = self.scheduler.get_grammar_bitmask(
-                    handle.scheduler_output
-                )
-            model_output = self.dp_gather_finalize(handle, grammar_output)
+            model_output = self.dp_gather_apply_runner_state(
+                handle, _grammar_output_for_handle(handle)
+            )
             if handle.scheduler_output is None:
                 return {}
             return self.scheduler.update_from_output(
@@ -427,10 +431,21 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         )
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
+        overlap_pending_output: ModelRunnerOutput | None = None
         if finalize_before_submit:
             assert prev_handle is not None
             engine_core_outputs = _finalize_previous(prev_handle)
             prev_handle = None
+        elif prev_handle is not None:
+            # Steady overlap path: apply the previous step's sampled tokens to
+            # runner state before build_dp_model_input() runs inside submit.
+            # Scheduler update for that step is deferred until after submit so
+            # the next device decode can start while the engine finishes the
+            # previous step's bookkeeping.
+            overlap_pending_output = self.dp_gather_apply_runner_state(
+                prev_handle,
+                _grammar_output_for_handle(prev_handle),
+            )
 
         next_handle: DPGatherHandle | None = None
         if global_has_requests:
@@ -439,8 +454,15 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 overlap_ok=current_overlap_ok,
             )
 
-        if not finalize_before_submit and prev_handle is not None:
-            engine_core_outputs = _finalize_previous(prev_handle)
+        if overlap_pending_output is not None:
+            assert prev_handle is not None
+            if prev_handle.scheduler_output is None:
+                engine_core_outputs = {}
+            else:
+                engine_core_outputs = self.scheduler.update_from_output(
+                    prev_handle.scheduler_output,
+                    overlap_pending_output,
+                )
 
         self._dp_in_flight = next_handle
 
@@ -717,11 +739,12 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             req_id_to_index=req_id_to_index,
         )
 
-    def dp_gather_finalize(
+    def dp_gather_apply_runner_state(
         self,
         handle: DPGatherHandle,
         grammar_output: GrammarOutput | None = None,
     ) -> ModelRunnerOutput:
+        """Wait for a gathered DP forward, sample, and update runner token state."""
         parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
@@ -769,6 +792,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             )[0]
             return output
         return EMPTY_MODEL_RUNNER_OUTPUT
+
+    def dp_gather_finalize(
+        self,
+        handle: DPGatherHandle,
+        grammar_output: GrammarOutput | None = None,
+    ) -> ModelRunnerOutput:
+        """Backward-compatible alias for ``dp_gather_apply_runner_state``."""
+        return self.dp_gather_apply_runner_state(handle, grammar_output)
 
     def _gather_grammar_outputs(
         self,
