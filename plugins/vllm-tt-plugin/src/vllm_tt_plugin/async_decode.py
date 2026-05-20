@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, fields
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import ttnn
 
+from vllm.logger import init_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 
@@ -18,6 +20,9 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm_tt_plugin.input_batch import CachedRequestState
     from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -101,12 +106,20 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
         controller: TTAsyncDecodeController,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
+        completion_event: threading.Event,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
+        self._completion_event = completion_event
 
     def get_output(self) -> tuple[torch.Tensor, list]:  # type: ignore[override]
+        try:
+            return self._get_output_impl()
+        finally:
+            self._completion_event.set()
+
+    def _get_output_impl(self) -> tuple[torch.Tensor, list]:
         finalized = self._controller.finalize_decode(self._submission)
         runner = self._controller.runner
         if finalized is None:
@@ -133,6 +146,10 @@ class TTAsyncDecodeController:
 
     def __init__(self, runner: TTModelRunner):
         self.runner = runner
+
+    @staticmethod
+    def _lane_debug_enabled() -> bool:
+        return os.environ.get("TT_LANE_DEBUG") == "1"
 
     def capture_submitted_step_context(self) -> SubmittedStepContext:
         runner = self.runner
@@ -383,16 +400,36 @@ class TTAsyncDecodeController:
     def submit_async_dp_decode(
         self,
         model_input: TTModelInput,
+        *,
+        allow_decode_overlap: bool = True,
     ) -> AsyncTTDPGatherOutput:
+        overlap_ok = allow_decode_overlap and self.can_use_steady_decode_fast_path(
+            model_input
+        )
+        if self._lane_debug_enabled():
+            logger.info(
+                "lane-async submit decode batch_size_per_dp=%s overlap_ok=%s reset_batch=%s",
+                model_input.unpadded_batch_size,
+                overlap_ok,
+                model_input.reset_batch,
+            )
+        completion_event = threading.Event()
         submission = self.submit_decode(
             model_input,
             read_from_device=False,
             async_read=True,
         )
+        self.register_pending_async_event(
+            completion_event,
+            overlap_ok=overlap_ok,
+        )
+        if submission.tt_out is None:
+            completion_event.set()
         return AsyncTTDPGatherOutput(
             controller=self,
             submission=submission,
             model_input=model_input,
+            completion_event=completion_event,
         )
 
     def submit_decode(
@@ -510,6 +547,12 @@ class TTAsyncDecodeController:
         if submission.tt_out is None:
             return None
 
+        if self._lane_debug_enabled():
+            logger.info(
+                "lane-async finalize start batch_size_per_dp=%s read_events=%s",
+                submission.batch_size_per_dp,
+                0 if submission.read_events is None else len(submission.read_events),
+            )
         if submission.read_events is not None:
             for read_event in submission.read_events:
                 ttnn.event_synchronize(read_event)
@@ -544,4 +587,6 @@ class TTAsyncDecodeController:
         elif isinstance(tt_out, tuple):
             tt_out, _ = tt_out
 
+        if self._lane_debug_enabled():
+            logger.info("lane-async finalize done")
         return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=tt_log_probs)
