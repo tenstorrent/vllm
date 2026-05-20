@@ -22,7 +22,7 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=13.0.0
+ARG CUDA_VERSION=13.0.2
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 
@@ -188,7 +188,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Explicitly set the list to avoid issues with torch 2.2
 # See https://github.com/pytorch/pytorch/pull/123243
 # From versions.json: .torch.cuda_arch_list
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.9 9.0 10.0 12.0'
+ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
 
@@ -490,41 +490,46 @@ WORKDIR /vllm-workspace
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
-# Install Python and system dependencies
+# Install Python from source and system dependencies
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        software-properties-common \
         curl \
         sudo \
         ffmpeg \
         libsm6 \
         libxext6 \
         libgl1 \
-    && if [ ! -z ${DEADSNAKES_MIRROR_URL} ] ; then \
-        if [ ! -z "${DEADSNAKES_GPGKEY_URL}" ] ; then \
-            mkdir -p -m 0755 /etc/apt/keyrings ; \
-            curl -L ${DEADSNAKES_GPGKEY_URL} | gpg --dearmor > /etc/apt/keyrings/deadsnakes.gpg ; \
-            sudo chmod 644 /etc/apt/keyrings/deadsnakes.gpg ; \
-            echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list ; \
-        fi ; \
-    else \
-        for i in 1 2 3; do \
-            add-apt-repository -y ppa:deadsnakes/ppa && break || \
-            { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
-        done ; \
-    fi \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv \
         libibverbs-dev \
+        build-essential \
+        libssl-dev \
+        libffi-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        libncurses-dev \
+        liblzma-dev \
+        libgdbm-dev \
+        uuid-dev \
+        tk-dev \
+    && PYTHON_MAJOR_MINOR=${PYTHON_VERSION} \
+    && PYTHON_FULL_VERSION=$(curl -s https://www.python.org/ftp/python/ \
+        | grep -oE "${PYTHON_MAJOR_MINOR}\.[0-9]+" \
+        | sort -t. -k3 -n | uniq \
+        | tail -1) \
+    && echo "Building Python ${PYTHON_FULL_VERSION} from source..." \
+    && curl -fSL https://www.python.org/ftp/python/${PYTHON_FULL_VERSION}/Python-${PYTHON_FULL_VERSION}.tgz -o /tmp/python.tgz \
+    && tar -xzf /tmp/python.tgz -C /tmp \
+    && cd /tmp/Python-${PYTHON_FULL_VERSION} \
+    && ./configure --enable-optimizations --with-ensurepip=install --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && cd / \
+    && rm -rf /tmp/python.tgz /tmp/Python-${PYTHON_FULL_VERSION} \
+    && ln -sf /usr/local/bin/python${PYTHON_MAJOR_MINOR} /usr/bin/python3 \
+    && ln -sf /usr/local/bin/python${PYTHON_MAJOR_MINOR}-config /usr/bin/python3-config \
+    && ln -sf /usr/local/bin/pip${PYTHON_MAJOR_MINOR} /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
-    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
-    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
-    && rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED \
-    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
 
 # Install CUDA development tools for runtime JIT compilation
@@ -540,7 +545,9 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         libcurand-dev-${CUDA_VERSION_DASH} \
         libcublas-${CUDA_VERSION_DASH} \
         # Required by fastsafetensors (fixes #20384)
-        libnuma-dev && \
+        libnuma-dev \
+        # numactl CLI for NUMA binding at runtime
+        numactl && \
     # Fixes nccl_allocator requiring nccl.h at runtime
     # https://github.com/vllm-project/vllm/blob/1336a1ea244fa8bfd7e72751cabbdb5b68a0c11a/vllm/distributed/device_communicators/pynccl_allocator.py#L22
     # NCCL packages don't use the cuda-MAJOR-MINOR naming convention,
@@ -580,33 +587,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
-# 0.6.7: CUTLASS 4.4.2 bump, fixes TMA grouped GEMM on SM12x (flashinfer#2798)
-# TODO: bump to 0.6.8 when released for NVFP4/MXFP4 group GEMMs on
-#   SM120/SM121 (RTX 50 / DGX Spark) via flashinfer#2738
-ARG FLASHINFER_VERSION=0.6.7
+ARG FLASHINFER_VERSION=0.6.8.post1
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
         --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-    && flashinfer show-config
-
-# Pre-download FlashInfer TRTLLM BMM headers for air-gapped environments.
-# At runtime, MoE JIT compilation downloads these from edge.urm.nvidia.com
-# which fails without internet. This step caches them at build time.
-RUN python3 <<'PYEOF'
-from flashinfer.jit import env as jit_env
-from flashinfer.jit.cubin_loader import download_trtllm_headers, get_cubin
-from flashinfer.artifacts import ArtifactPath, CheckSumHash
-
-download_trtllm_headers(
-    'bmm',
-    jit_env.FLASHINFER_CUBIN_DIR / 'flashinfer' / 'trtllm' / 'batched_gemm' / 'trtllmGen_bmm_export',
-    f'{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export',
-    ArtifactPath.TRTLLM_GEN_BMM,
-    get_cubin(f'{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt', CheckSumHash.TRTLLM_GEN_BMM),
-)
-
-print('FlashInfer TRTLLM BMM headers downloaded successfully')
-PYEOF
+    && flashinfer show-config \
+    && flashinfer download-cubin
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -786,7 +772,7 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ENV UV_HTTP_TIMEOUT=500
 
 # install kv_connectors if requested
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.9 9.0 10.0 12.0'
+ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \

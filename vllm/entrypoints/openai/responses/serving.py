@@ -267,6 +267,14 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.tool_server = tool_server
 
+    def _effective_chat_template_kwargs(
+        self, request: ResponsesRequest
+    ) -> dict[str, Any]:
+        return request.build_chat_params(
+            self.chat_template,
+            self.chat_template_content_format,
+        ).chat_template_kwargs
+
     def _validate_generator_input(
         self,
         engine_input: EngineInput,
@@ -464,7 +472,14 @@ class OpenAIServingResponses(OpenAIServing):
                     context = SimpleContext()
 
             if self.parser and self.parser.reasoning_parser_cls is not None:
-                reasoning_parser = self.parser.reasoning_parser_cls(tokenizer)
+                chat_template_kwargs = self._effective_chat_template_kwargs(request)
+                reasoning_parser_kwargs = {
+                    "chat_template_kwargs": chat_template_kwargs,
+                }
+                reasoning_parser = self.parser.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
                 if (
                     isinstance(
                         struct_out := sampling_params.structured_outputs,
@@ -486,6 +501,9 @@ class OpenAIServingResponses(OpenAIServing):
                 lora_request=lora_request,
                 priority=request.priority,
                 trace_headers=trace_headers,
+                reasoning_parser_kwargs=reasoning_parser_kwargs
+                if self.parser and self.parser.reasoning_parser_cls is not None
+                else None,
             )
             generators.append(generator)
 
@@ -632,6 +650,7 @@ class OpenAIServingResponses(OpenAIServing):
         lora_request: LoRARequest | None = None,
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
+        reasoning_parser_kwargs: dict[str, Any] | None = None,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -655,6 +674,7 @@ class OpenAIServingResponses(OpenAIServing):
                 lora_request=lora_request,
                 trace_headers=trace_headers,
                 priority=priority,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
 
             async for res in generator:
@@ -707,9 +727,10 @@ class OpenAIServingResponses(OpenAIServing):
         request: ResponsesRequest,
         prev_response: ResponsesResponse | None,
     ):
-        if request.tool_choice != "auto":
+        if request.tool_choice not in ("auto", "none"):
             raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in response API with Harmony"
+                "Only 'auto' or 'none' tool_choice is supported "
+                "in response API with Harmony"
             )
 
         arrival_time = time.time()
@@ -835,7 +856,10 @@ class OpenAIServingResponses(OpenAIServing):
             and self.parser.reasoning_parser_cls is not None
             and isinstance(context, (SimpleContext, ParsableContext))
         ):
-            reasoning_parser = self.parser.reasoning_parser_cls(tokenizer)
+            reasoning_parser = self.parser.reasoning_parser_cls(
+                tokenizer,
+                chat_template_kwargs=self._effective_chat_template_kwargs(request),
+            )
             accumulated = getattr(context, "_accumulated_token_ids", []) or []
             num_reasoning_tokens = reasoning_parser.count_reasoning_tokens(accumulated)
 

@@ -338,7 +338,7 @@ def get_graph_partition_signature_patched(
 # The bug occurs when `use_inductor_graph_partition` is turned on and there
 # exists operators inside of `splitting_ops` that have an in-place mutation. In
 # vllm, this specifically occurs on the operator
-# vllm.unified_attention_with_output. In this case, inductor does not populate
+# vllm.unified_attention. In this case, inductor does not populate
 # the inductor IR's `origin_node` field, causing an assertion error when trying
 # to access the node's `origin_node` field.
 #
@@ -553,7 +553,7 @@ def _apply_constrain_to_fx_strides_patch():
     _lowering.constrain_to_fx_strides = _patched
 
 
-if is_torch_equal_or_newer("2.10.0") and not is_torch_equal_or_newer("2.12.0"):
+if is_torch_equal_or_newer("2.10.0") and not is_torch_equal_or_newer("2.12.0.dev"):
     import builtins as _builtins
     import pickle
 
