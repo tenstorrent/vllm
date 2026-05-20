@@ -23,7 +23,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    uses_tt_lane_coordinator,
+)
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
@@ -288,6 +292,10 @@ class TTWorker(WorkerBase):
     ) -> ModelRunnerOutput | None:
         """Execute a non-DP TT step with plugin-owned structured-output data."""
         assert self.is_driver_worker, "There should only be one Worker for TT"
+        if uses_tt_lane_coordinator(self.vllm_config):
+            return self.model_runner.execute_model_lanes(
+                scheduler_output, grammar_output
+            )
         output = self.model_runner.execute_model(scheduler_output, grammar_output)
         return output
 
@@ -453,12 +461,12 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     # region Get default or model- and device-specific `max_tokens_all_users`
     try:
-        data_parallel = vllm_config.parallel_config.data_parallel_size
+        tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         model_class, _ = get_model_architecture(model_config)
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
             num_devices=device_config.num_devices,
-            tt_data_parallel=data_parallel,
+            tt_data_parallel=tt_data_parallel,
         )
 
         logger.info(

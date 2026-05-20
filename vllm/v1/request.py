@@ -126,6 +126,11 @@ class Request:
             else [0] * self.num_prompt_tokens
         )
 
+        # TT single-process lanes: sticky lane index in [0, N), or -1 if unset.
+        self.tt_lane: int = -1
+        # Optional routing hint from EngineCoreRequest.data_parallel_rank.
+        self.preferred_data_parallel_rank: int | None = None
+
         # Used in async scheduling.
         self.num_output_placeholders = 0
         # Used in forced preemption (reset_prefix_cache) with async scheduling.
@@ -200,6 +205,7 @@ class Request:
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
         )
+        req.preferred_data_parallel_rank = request.data_parallel_rank
 
     def append_output_token_ids(
         self,
