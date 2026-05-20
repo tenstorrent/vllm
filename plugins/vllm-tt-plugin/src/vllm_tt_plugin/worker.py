@@ -489,7 +489,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-    max_batch = scheduler_config.max_num_seqs
+    max_batch = scheduler_config.max_num_seqs * get_tt_data_parallel_size(vllm_config)
     max_tokens_all_users += cache_config.block_size * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) split layers into

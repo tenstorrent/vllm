@@ -43,6 +43,22 @@ def test_default_branch_no_sliding(cfg):
     assert n == 2080
 
 
+def test_lane_mode_uses_global_batch_padding(cfg):
+    """Single-process lane mode must size KV padding for all concurrent
+    requests, not just one lane's local ``max_num_seqs``."""
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.plugin_config = {"tt": {"tt_data_parallel_size": 4}}
+
+    with patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"):
+        n = get_num_available_blocks_tt(cfg)
+
+    # Default tokens (131072) + global batch padding (64 * (8 * 4) = 2048)
+    # = 133120 tokens -> ceil/64 = 2080.
+    assert n == 2080
+
+
 def test_sliding_window_adds_headroom(cfg):
     """Hybrid models declare a sliding_window; the heuristic should add
     additional headroom proportional to sliding_window × max_batch ×

@@ -128,6 +128,14 @@ class TTExecutionMixin:
             )
         return result[0]
 
+    def preprocess_add_request(self, request: Any) -> tuple[Request, int]:
+        req, request_wave = super().preprocess_add_request(request)
+        # Keep TT-only routing hints plugin-local rather than extending the
+        # shared vLLM Request model.
+        req.tt_lane = -1
+        req.preferred_data_parallel_rank = request.data_parallel_rank
+        return req, request_wave
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """TT regular execution path.
 

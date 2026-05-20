@@ -132,7 +132,7 @@ def filter_scheduler_output_for_lane(
 
     def _lane_req(req_id: str) -> bool:
         req = requests.get(req_id)
-        return req is not None and req.tt_lane == lane
+        return req is not None and getattr(req, "tt_lane", -1) == lane
 
     scheduled_new_reqs = [
         nr for nr in scheduler_output.scheduled_new_reqs if _lane_req(nr.req_id)
@@ -202,11 +202,13 @@ class TTLaneCoordinator(TTScheduler):
         waiting_counts = [0] * self.num_lanes
         running_counts = [0] * self.num_lanes
         for req in self.waiting:
-            if 0 <= req.tt_lane < self.num_lanes:
-                waiting_counts[req.tt_lane] += 1
+            req_lane = getattr(req, "tt_lane", -1)
+            if 0 <= req_lane < self.num_lanes:
+                waiting_counts[req_lane] += 1
         for req in self.running:
-            if 0 <= req.tt_lane < self.num_lanes:
-                running_counts[req.tt_lane] += 1
+            req_lane = getattr(req, "tt_lane", -1)
+            if 0 <= req_lane < self.num_lanes:
+                running_counts[req_lane] += 1
         self._lane_waiting_counts = waiting_counts
         self._lane_running_counts = running_counts
 
@@ -224,9 +226,11 @@ class TTLaneCoordinator(TTScheduler):
         return best_lane
 
     def add_request(self, request: Request) -> None:
-        if request.preferred_data_parallel_rank is not None:
-            request.tt_lane = request.preferred_data_parallel_rank % self.num_lanes
-        elif request.tt_lane < 0:
+        preferred_dp_rank = getattr(request, "preferred_data_parallel_rank", None)
+        request_lane = getattr(request, "tt_lane", -1)
+        if preferred_dp_rank is not None:
+            request.tt_lane = preferred_dp_rank % self.num_lanes
+        elif request_lane < 0:
             request.tt_lane = self._pick_lane()
         super().add_request(request)
 
@@ -249,13 +253,15 @@ class TTLaneCoordinator(TTScheduler):
     def _visible_lane_only(self, lane: int) -> Iterator[None]:
         stashed_waiting = create_request_queue(self.policy)
         for req in list(self.waiting):
-            if req.tt_lane != lane:
+            if getattr(req, "tt_lane", -1) != lane:
                 self.waiting.remove_request(req)
                 stashed_waiting.add_request(req)
 
         saved_running = self.running
-        self.running = [r for r in saved_running if r.tt_lane == lane]
-        stashed_running = [r for r in saved_running if r.tt_lane != lane]
+        self.running = [r for r in saved_running if getattr(r, "tt_lane", -1) == lane]
+        stashed_running = [
+            r for r in saved_running if getattr(r, "tt_lane", -1) != lane
+        ]
 
         saved_max = self.max_num_running_reqs
         self.max_num_running_reqs = self._per_lane_max
