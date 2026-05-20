@@ -7,9 +7,10 @@ plugin mechanism. Install it alongside vLLM and, when `ttnn` is importable,
 TT hardware is automatically available as a vLLM platform.
 
 The plugin is self-contained: model registration, platform detection, request
-validation, scheduling, worker execution, model loading, async decode, gathered
-data-parallel execution, and `tt-run` / MPI launch orchestration all live here.
-Nothing TT-specific needs to touch vLLM core.
+validation, scheduling, worker execution, model loading, async decode, single-
+process multi-lane execution, and `tt-run` / MPI
+launch orchestration all live here. Nothing TT-specific needs to touch vLLM
+core.
 
 ## Package Layout
 
@@ -264,6 +265,7 @@ Common options:
 | Key | Purpose |
 | --- | --- |
 | `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
+| `tt_data_parallel_size` | Enable single-process TT lanes when `data_parallel_size == 1`. For Galaxy 70B this is the preferred replacement for gathered multi-process DP. |
 | `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
 | `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
 | `trace_region_size` | Trace region size for TT runtime tracing. |
@@ -295,7 +297,7 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | `parallel_config.engine_core_proc_cls` | `vllm_tt_plugin.engine.TTEngineCoreProc` |
 | `parallel_config.dp_engine_core_proc_cls` | `vllm_tt_plugin.engine.TTDPEngineCoreProc` |
 | `parallel_config.engine_core_launcher_cls` | `vllm_tt_plugin.launcher.TTCoreEngineLauncher` |
-| `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` |
+| `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
 
 The execution model matches TT hardware characteristics:
 
@@ -303,6 +305,8 @@ The execution model matches TT hardware characteristics:
 - Chunked prefill is not used.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
+- When `tt.tt_data_parallel_size > 1` and vLLM `data_parallel_size == 1`,
+  `TTLaneCoordinator` schedules one engine across multiple in-process TT lanes.
 - Gathered DP collects local rank inputs, executes across the TT mesh, and
   scatters outputs back to the participating ranks.
 - Multi-host execution uses `tt-run` / MPI while vLLM sees a normal
@@ -310,6 +314,28 @@ The execution model matches TT hardware characteristics:
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.
+
+## Llama3 70B Galaxy Serving
+
+For Llama 3.3 70B on Galaxy, the preferred serving path is one vLLM engine
+process with internal TT lanes:
+
+```bash
+MESH_DEVICE=TG \
+TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
+VLLM_RPC_TIMEOUT=900000 \
+python plugins/vllm-tt-plugin/examples/server_example_tt.py \
+  --model "meta-llama/Llama-3.3-70B-Instruct" \
+  --max_num_seqs 8 \
+  --async-scheduling \
+  --plugin-config '{"tt": {"tt_data_parallel_size": 4, "dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
+```
+
+Notes:
+
+- `max_num_seqs` is per lane in this mode. With `tt_data_parallel_size=4` and
+  `max_num_seqs=8`, the server admits up to `32` concurrent running requests.
+- Leave vLLM `--data_parallel_size` at `1` when using `tt_data_parallel_size`.
 
 ## Supported Model Families
 
@@ -390,6 +416,13 @@ pytest plugins/vllm-tt-plugin/tests/tt -v \
 
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
+
+Plugin-local unit tests that do not require a running server live directly
+under `plugins/vllm-tt-plugin/tests/`, for example:
+
+```bash
+pytest plugins/vllm-tt-plugin/tests/test_lane_scheduler.py
+```
 
 ## Running On Multi-Host Systems
 

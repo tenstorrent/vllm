@@ -91,6 +91,15 @@ class TTExecutionMixin:
         ):
             self.step_fn = self.step_with_batch_queue_tt
 
+    @staticmethod
+    def _lane_debug_enabled() -> bool:
+        return os.environ.get("TT_LANE_DEBUG", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+
     def _get_grammar_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -118,6 +127,14 @@ class TTExecutionMixin:
                 cast(Future[list[ModelRunnerOutput]], result)
             )
         return result[0]
+
+    def preprocess_add_request(self, request: Any) -> tuple[Request, int]:
+        req, request_wave = super().preprocess_add_request(request)
+        # Keep TT-only routing hints plugin-local rather than extending the
+        # shared vLLM Request model.
+        req.tt_lane = -1
+        req.preferred_data_parallel_rank = request.data_parallel_rank
+        return req, request_wave
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """TT regular execution path.
@@ -207,9 +224,42 @@ class TTExecutionMixin:
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
 
+        if self._lane_debug_enabled():
+            logger.info(
+                "lane-engine future resolved scheduled_reqs=%s output_reqs=%s "
+                "sample_counts=%s queue_depth_after_pop=%d",
+                list(scheduler_output.num_scheduled_tokens.keys()),
+                list(model_output.req_ids),
+                [len(tokens) for tokens in model_output.sampled_token_ids],
+                len(batch_queue),
+            )
+
+        self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        if self._lane_debug_enabled():
+            output_summaries = []
+            finished_requests = {}
+            for client_idx, client_output in engine_core_outputs.items():
+                if client_output.finished_requests:
+                    finished_requests[client_idx] = sorted(
+                        client_output.finished_requests
+                    )
+                for output in client_output.outputs:
+                    output_summaries.append(
+                        (
+                            output.request_id,
+                            len(output.new_token_ids),
+                            output.finish_reason,
+                        )
+                    )
+            logger.info(
+                "lane-engine scheduler updated outputs=%s finished_requests=%s",
+                output_summaries,
+                finished_requests,
+            )
 
         if deferred_scheduler_output is not None:
             grammar_output = self._get_grammar_output(

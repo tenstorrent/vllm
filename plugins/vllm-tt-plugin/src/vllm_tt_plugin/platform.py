@@ -10,7 +10,11 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    uses_tt_lane_coordinator,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -25,6 +29,7 @@ else:
 logger = init_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
+TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -448,7 +453,25 @@ class TTPlatform(Platform):
 
         # TT uses a single scheduler implementation for both sync and async
         # execution modes; async_scheduling only controls execution overlap.
-        vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+        configured_lanes = tt_config.get("tt_data_parallel_size")
+        if (
+            configured_lanes is not None
+            and vllm_config.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "tt_data_parallel_size cannot be used with "
+                f"data_parallel_size="
+                f"{vllm_config.parallel_config.data_parallel_size}. "
+                "Use one of gathered multi-process DP or single-process lanes."
+            )
+        if uses_tt_lane_coordinator(vllm_config):
+            vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
+            logger.info(
+                "Using TTLaneCoordinator with tt_data_parallel_size=%d",
+                get_tt_data_parallel_size(vllm_config),
+            )
+        else:
+            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
