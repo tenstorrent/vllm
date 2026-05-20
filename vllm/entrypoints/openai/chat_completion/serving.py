@@ -424,7 +424,7 @@ class OpenAIServingChat(OpenAIServing):
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
             ]
-            harmony_parser_failed = [False] * num_choices
+            harmony_parser_errors: list[Exception | None] = [None] * num_choices
             harmony_tools_streamed = [False] * num_choices
         tools_streamed = [False] * num_choices
 
@@ -497,7 +497,32 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        def maybe_stop_harmony_stream() -> bool:
+            if not self.use_harmony:
+                return False
+
+            if not all(
+                finish_reason_sent[idx] or harmony_parser_errors[idx] is not None
+                for idx in range(num_choices)
+            ):
+                return False
+
+            if any(finish_reason_sent):
+                return True
+
+            failure_summary = ", ".join(
+                f"choice {idx}: {type(error).__name__}: {error}"
+                for idx, error in enumerate(harmony_parser_errors)
+                if error is not None
+            )
+            logger.warning(
+                "All Harmony parser choices failed during streaming: %s",
+                failure_summary,
+            )
+            raise GenerationError("All Harmony parser choices failed during streaming")
+
         try:
+            stop_streaming = False
             async for res in result_generator:
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
@@ -628,13 +653,14 @@ class OpenAIServingChat(OpenAIServing):
 
                         # Track accumulated content per token with their state
                         token_states: list[TokenState] = []
-                        if not harmony_parser_failed[i]:
+                        if harmony_parser_errors[i] is None:
                             (
                                 token_states,
-                                harmony_parser_failed[i],
+                                harmony_parser_errors[i],
                             ) = process_harmony_stream_tokens(
                                 harmony_parser, output.token_ids
                             )
+                        harmony_choice_failed = harmony_parser_errors[i] is not None
                         delta_text = "".join(delta for _, _, delta in token_states)
                         cur_channel = harmony_parser.current_channel
 
@@ -645,6 +671,7 @@ class OpenAIServingChat(OpenAIServing):
                             cur_channel = "final"
                     else:
                         delta_text = output.text
+                        harmony_choice_failed = False
 
                     if (
                         not delta_text
@@ -758,9 +785,11 @@ class OpenAIServingChat(OpenAIServing):
                         # send a chunk with token_ids even if delta_message is None
                         # to ensure all tokens are included in the response
                         if (
-                            output.finish_reason is None
-                            and not request.return_token_ids
-                        ):
+                            output.finish_reason is None or harmony_choice_failed
+                        ) and not request.return_token_ids:
+                            if maybe_stop_harmony_stream():
+                                stop_streaming = True
+                                break
                             continue
                         delta_message = DeltaMessage()
 
@@ -792,7 +821,10 @@ class OpenAIServingChat(OpenAIServing):
                                 delta=True,
                             )
 
-                    if output.finish_reason is None:
+                    if output.finish_reason == "error":
+                        self._raise_if_error(output.finish_reason, request_id)
+
+                    if output.finish_reason is None or harmony_choice_failed:
                         # Send token-by-token response for each request.n
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -808,10 +840,6 @@ class OpenAIServingChat(OpenAIServing):
 
                     # if the model is finished generating
                     else:
-                        # check for error finish reason and abort streaming
-                        # finish_reason='error' indicates a retryable error
-                        self._raise_if_error(output.finish_reason, request_id)
-
                         # check to make sure we haven't "forgotten" to stream
                         #   any tokens that were generated but previously
                         #   matched by partial json parsing
@@ -938,6 +966,13 @@ class OpenAIServingChat(OpenAIServing):
 
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
+
+                    if maybe_stop_harmony_stream():
+                        stop_streaming = True
+                        break
+
+                if stop_streaming:
+                    break
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
