@@ -77,6 +77,40 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def format_scheduled_request_details(
+    scheduler_output: SchedulerOutput,
+    requests: dict[str, Request],
+) -> str:
+    if not scheduler_output.num_scheduled_tokens:
+        return "scheduled requests: []"
+
+    new_req_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+    scheduled_requests: list[str] = []
+    for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+        request = requests.get(req_id)
+        external_req_id = (
+            request.external_req_id if request and request.external_req_id else req_id
+        )
+        phase = (
+            "context"
+            if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+            or req_id in new_req_ids
+            else "generation"
+        )
+        scheduled_requests.append(
+            " ".join(
+                [
+                    f"external={external_req_id}",
+                    f"internal={req_id}",
+                    f"phase={phase}",
+                    f"tokens={num_tokens}",
+                ]
+            )
+        )
+
+    return f"scheduled requests: [{'; '.join(scheduled_requests)}]"
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -371,6 +405,9 @@ class EngineCore:
             return
         self._iteration_index = getattr(self, "_iteration_index", 0)
         iteration_details = compute_iteration_details(scheduler_output)
+        scheduled_request_details = format_scheduled_request_details(
+            scheduler_output, self.scheduler.requests
+        )
         before = time.monotonic()
         yield
         logger.info(
@@ -386,7 +423,9 @@ class EngineCore:
                     str(iteration_details.num_generation_requests),
                     " generation requests, ",
                     str(iteration_details.num_generation_tokens),
-                    " generation tokens, iteration elapsed time: ",
+                    " generation tokens, ",
+                    scheduled_request_details,
+                    ", iteration elapsed time: ",
                     format((time.monotonic() - before) * 1000, ".2f"),
                     " ms",
                 ]

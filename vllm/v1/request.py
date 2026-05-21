@@ -63,6 +63,7 @@ class Request:
         sampling_params: SamplingParams | None,
         pooling_params: PoolingParams | None,
         eos_token_id: int | None,
+        external_req_id: str | None = None,
         client_index: int = 0,
         arrival_time: float | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -76,6 +77,7 @@ class Request:
         reasoning_ended: bool | None = None,
     ) -> None:
         self.request_id = request_id
+        self.external_req_id = external_req_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -184,6 +186,7 @@ class Request:
     ) -> "Request":
         return cls(
             request_id=request.request_id,
+            external_req_id=request.external_req_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,

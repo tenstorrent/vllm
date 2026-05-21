@@ -204,7 +204,10 @@ class TTExecutionMixin:
             return None, False
 
         future, scheduler_output, _ = batch_queue.pop()
-        with self.log_error_detail(scheduler_output):
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
             model_output = future.result()
 
         engine_core_outputs = self.scheduler.update_from_output(
@@ -514,7 +517,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
 
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        model_output = self._execute_model_dp_gather(scheduler_output, grammar_output)
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
+            model_output = self._execute_model_dp_gather(
+                scheduler_output, grammar_output
+            )
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -556,9 +565,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         def _finalize_previous(
             handle: DPGatherHandle,
         ) -> dict[int, EngineCoreOutputs]:
-            model_output = self.dp_gather_finalize(handle)
             if handle.scheduler_output is None:
                 return {}
+            with (
+                self.log_error_detail(handle.scheduler_output),
+                self.log_iteration_details(handle.scheduler_output),
+            ):
+                model_output = self.dp_gather_finalize(handle)
             return self.scheduler.update_from_output(
                 handle.scheduler_output, model_output
             )
