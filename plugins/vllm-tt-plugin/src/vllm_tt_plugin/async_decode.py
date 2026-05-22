@@ -444,7 +444,8 @@ class TTAsyncDecodeController:
                 None if s == SEED_NONE_SENTINEL else s
                 for s in sampling_param_dict["seed"]
             ]
-            kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+            converted_sampling_params = type(sampling_params)(**sampling_param_dict)
+            kwargs["sampling_params"] = converted_sampling_params
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
@@ -470,12 +471,35 @@ class TTAsyncDecodeController:
             runner.previous_req_ids = set(runner.input_batch.req_ids)
 
         enable_trace = runner.trace_mode in ["all", "decode_only"]
-        tt_out = runner.model.decode_forward(
-            **kwargs,
+        split_decode_sampling = (
+            perform_device_sampling and hasattr(runner.model, "sample_decode_on_device")
+        )
+        if split_decode_sampling:
+            kwargs.pop("sampling_params", None)
+            kwargs.pop("prompt_tokens", None)
+            kwargs.pop("output_tokens", None)
+            kwargs.pop("slot_remap", None)
+        decode_forward_kwargs: dict[str, Any] = dict(
+            kwargs,
             **enc_dec_kwargs,
             enable_trace=enable_trace,
-            read_from_device=read_from_device,
+            read_from_device=(False if split_decode_sampling else read_from_device),
         )
+        if split_decode_sampling:
+            decode_forward_kwargs["defer_device_sampling"] = True
+        tt_out = runner.model.decode_forward(
+            **decode_forward_kwargs,
+        )
+        if split_decode_sampling:
+            tt_out = runner.model.sample_decode_on_device(
+                tt_out,
+                sampling_params=converted_sampling_params,
+                reset_batch=model_input.reset_batch,
+                prompt_tokens=model_input.prompt_tokens,
+                output_tokens=model_input.output_tokens,
+                slot_remap=model_input.slot_remap,
+                enable_trace=False,
+            )
         read_events = None
         if async_read:
             if hasattr(runner.model, "read_decode_output"):

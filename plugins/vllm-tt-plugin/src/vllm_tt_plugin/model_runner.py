@@ -1963,6 +1963,10 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        split_prefill_sampling = (
+            model_input.perform_device_sampling
+            and hasattr(self.model, "sample_prefill_on_device")
+        )
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
@@ -1977,7 +1981,11 @@ class TTModelRunner:
                 None if s == SEED_NONE_SENTINEL else s
                 for s in sampling_param_dict["seed"]
             ]
-            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+            converted_sampling_params = TTSamplingParams(**sampling_param_dict)
+            if not split_prefill_sampling:
+                kwargs["sampling_params"] = converted_sampling_params
+            if split_prefill_sampling:
+                kwargs["defer_device_sampling"] = True
         if len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
             # "global" user ids instead for backwards compatibility.
@@ -1993,8 +2001,15 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
-            return tt_out
-        return self.model.prefill_forward(**kwargs)
+        else:
+            tt_out = self.model.prefill_forward(**kwargs)
+        if split_prefill_sampling:
+            if isinstance(tt_out, dict):
+                return self.model.sample_prefill_on_device(
+                    **tt_out,
+                    sampling_params=converted_sampling_params,
+                )
+        return tt_out
 
     def execute_sync_with_model_input(
         self,
