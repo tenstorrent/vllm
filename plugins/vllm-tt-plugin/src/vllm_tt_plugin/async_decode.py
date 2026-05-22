@@ -498,7 +498,7 @@ class TTAsyncDecodeController:
                 prompt_tokens=model_input.prompt_tokens,
                 output_tokens=model_input.output_tokens,
                 slot_remap=model_input.slot_remap,
-                enable_trace=False,
+                enable_trace=enable_trace,
             )
         read_events = None
         if async_read:

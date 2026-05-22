@@ -1967,6 +1967,7 @@ class TTModelRunner:
             model_input.perform_device_sampling
             and hasattr(self.model, "sample_prefill_on_device")
         )
+        converted_sampling_params = None
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
@@ -1996,15 +1997,19 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
             kwargs["empty_slots"] = empty_slots
 
+        tt_out = self.model.prefill_forward(**kwargs)
         if self.request_specific_rope:
-            tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
+            assert isinstance(tt_out, tuple) and len(tt_out) == 2, (
+                "request_specific_rope expects prefill_forward() to return "
+                "(tt_out_or_deferred_payload, rope_deltas)"
+            )
+            tt_out, rope_deltas = tt_out
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
-        else:
-            tt_out = self.model.prefill_forward(**kwargs)
         if split_prefill_sampling:
             if isinstance(tt_out, dict):
+                assert converted_sampling_params is not None
                 return self.model.sample_prefill_on_device(
                     **tt_out,
                     sampling_params=converted_sampling_params,
