@@ -2008,12 +2008,18 @@ class TTModelRunner:
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
         if split_prefill_sampling:
-            if isinstance(tt_out, dict):
-                assert converted_sampling_params is not None
-                return self.model.sample_prefill_on_device(
-                    **tt_out,
-                    sampling_params=converted_sampling_params,
-                )
+            assert isinstance(tt_out, dict), (
+                "split prefill sampling requires prefill_forward() to return "
+                "a deferred payload dict."
+            )
+            assert converted_sampling_params is not None
+            deferred_payload = dict(tt_out)
+            deferred_bitmask = deferred_payload.pop("bitmask", None)
+            return self.model.sample_prefill_on_device(
+                **deferred_payload,
+                sampling_params=converted_sampling_params,
+                bitmask=prefill_bitmask if prefill_bitmask is not None else deferred_bitmask,
+            )
         return tt_out
 
     def execute_sync_with_model_input(
