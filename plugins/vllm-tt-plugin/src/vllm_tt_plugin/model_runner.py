@@ -230,12 +230,14 @@ class TTModelInput:
 class TTForwardOutput:
     """Forward-only TT payload consumed by the sampling phase."""
 
-    tt_out: torch.Tensor
+    tt_out: Any
     tt_log_probs: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None
     sampling_params: TTSamplingParams
+    model_sampling_params: Any | None
     model_input: TTModelInput
     batch_size_per_dp: list[int]
     perform_device_sampling: bool
+    device_sampling_deferred: bool
     is_decode: bool
 
 
@@ -1908,6 +1910,12 @@ class TTModelRunner:
         )
         if not want_device_sampling:
             return False
+        if not is_decode:
+            # TT-metal deferred prefill sampling currently trips paged prefill
+            # constraints in vLLM batches. Keep prefill on host and use the
+            # split device path for decode, where grammar bitmasks are needed
+            # after the first sampled token.
+            return False
 
         # Calculate number of devices per DP rank
         assert self.device_config.num_devices is not None
@@ -1928,9 +1936,10 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # Structured outputs are not supported on device yet
-        # https://github.com/tenstorrent/vllm/issues/277
-        if has_structured_outputs:
+        # Structured outputs can only use device sampling when the model exposes
+        # a split forward/sampling API so the grammar bitmask can be applied
+        # after vLLM produces it.
+        if has_structured_outputs and not self._can_defer_device_sampling(is_decode):
             return False
 
         # Logprobs on device require multi-device setups (num_devices in {8,32}).
@@ -1961,6 +1970,29 @@ class TTModelRunner:
         )
         return params_device_supported
 
+    def _can_defer_device_sampling(self, is_decode: bool) -> bool:
+        if not is_decode and self.request_specific_rope:
+            return False
+        method_name = (
+            "sample_decode_on_device" if is_decode else "sample_prefill_on_device"
+        )
+        return hasattr(self.model, method_name)
+
+    @staticmethod
+    def _to_model_sampling_params(sampling_params: TTSamplingParams) -> Any:
+        sampling_param_dict = {
+            field.name: (
+                getattr(sampling_params, field.name).tolist()
+                if getattr(sampling_params, field.name) is not None
+                else None
+            )
+            for field in fields(sampling_params)
+        }
+        sampling_param_dict["seed"] = [
+            None if s == SEED_NONE_SENTINEL else s for s in sampling_param_dict["seed"]
+        ]
+        return TTSamplingParams(**sampling_param_dict)
+
     def submit_prefill(
         self,
         model_input: TTModelInput,
@@ -1987,21 +2019,19 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        device_sampling_deferred = (
+            model_input.perform_device_sampling
+            and self._can_defer_device_sampling(is_decode=False)
+            and not self.request_specific_rope
+        )
+        model_sampling_params = None
         if model_input.perform_device_sampling:
-            sampling_params = model_input.tt_sampling_params
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+            model_sampling_params = self._to_model_sampling_params(
+                model_input.tt_sampling_params
+            )
+            kwargs["sampling_params"] = model_sampling_params
+            if device_sampling_deferred:
+                kwargs["defer_device_sampling"] = True
         if len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
             # "global" user ids instead for backwards compatibility.
@@ -2017,8 +2047,12 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
-            return tt_out
-        return self.model.prefill_forward(**kwargs)
+            return tt_out, model_sampling_params, device_sampling_deferred
+        return (
+            self.model.prefill_forward(**kwargs),
+            model_sampling_params,
+            device_sampling_deferred,
+        )
 
     def execute_sync_with_model_input(
         self,
@@ -2048,9 +2082,11 @@ class TTModelRunner:
             tt_out=torch.empty((0, 1, self.vocab_size), dtype=torch.float32),
             tt_log_probs=None,
             sampling_params=model_input.tt_sampling_params,
+            model_sampling_params=None,
             model_input=model_input,
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=model_input.perform_device_sampling,
+            device_sampling_deferred=False,
             is_decode=model_input.prompt_lens is None,
         )
 
@@ -2068,9 +2104,15 @@ class TTModelRunner:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        model_sampling_params = None
+        device_sampling_deferred = False
         tt_log_probs = None
         if not is_decode:
-            tt_out = self.submit_prefill(model_input, batch_size_per_dp)
+            (
+                tt_out,
+                model_sampling_params,
+                device_sampling_deferred,
+            ) = self.submit_prefill(model_input, batch_size_per_dp)
         else:
             submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
@@ -2082,21 +2124,29 @@ class TTModelRunner:
             batch_size_per_dp = submission.batch_size_per_dp
             sampling_params = submission.sampling_params
             perform_device_sampling = submission.perform_device_sampling
+            model_sampling_params = submission.model_sampling_params
+            device_sampling_deferred = submission.device_sampling_deferred
 
         assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
-        if perform_device_sampling and sampling_params.enable_log_probs.any():
+        if (
+            perform_device_sampling
+            and not device_sampling_deferred
+            and sampling_params.enable_log_probs.any()
+        ):
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
-        elif isinstance(tt_out, tuple):
+        elif not device_sampling_deferred and isinstance(tt_out, tuple):
             tt_out, _ = tt_out
 
         return TTForwardOutput(
             tt_out=tt_out,
             tt_log_probs=tt_log_probs,
             sampling_params=sampling_params,
+            model_sampling_params=model_sampling_params,
             model_input=model_input,
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=perform_device_sampling,
+            device_sampling_deferred=device_sampling_deferred,
             is_decode=is_decode,
         )
 
@@ -2153,9 +2203,11 @@ class TTModelRunner:
             tt_out=finalized.tt_out,
             tt_log_probs=finalized.tt_log_probs,
             sampling_params=submission.sampling_params,
+            model_sampling_params=submission.model_sampling_params,
             model_input=model_input,
             batch_size_per_dp=submission.batch_size_per_dp,
             perform_device_sampling=submission.perform_device_sampling,
+            device_sampling_deferred=submission.device_sampling_deferred,
             is_decode=True,
         )
 
@@ -2184,9 +2236,11 @@ class TTModelRunner:
             tt_out=forward_output.tt_out,
             tt_log_probs=forward_output.tt_log_probs,
             sampling_params=forward_output.sampling_params,
+            model_sampling_params=forward_output.model_sampling_params,
             model_input=forward_output.model_input,
             batch_size_per_dp=forward_output.batch_size_per_dp,
             perform_device_sampling=forward_output.perform_device_sampling,
+            device_sampling_deferred=forward_output.device_sampling_deferred,
             is_decode=forward_output.is_decode,
             grammar_outputs=grammar_outputs,
         )
@@ -2319,14 +2373,116 @@ class TTModelRunner:
             req_id_to_index=req_id_to_index,
         )
 
+    def _device_sampling_bitmask(
+        self,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+        is_decode: bool,
+        grammar_outputs: list[GrammarOutput | None] | None,
+    ) -> torch.Tensor | None:
+        if grammar_outputs is None:
+            return None
+        bitmasks: list[torch.Tensor] = []
+        for dp_rank, sz in enumerate(batch_size_per_dp):
+            grammar_payload = (
+                grammar_outputs[dp_rank] if dp_rank < len(grammar_outputs) else None
+            )
+            batch_length = (
+                model_input.input_tokens.shape[0]
+                if len(batch_size_per_dp) == 1
+                else self.scheduler_config.max_num_seqs
+            )
+            grammar_bitmask = self._reorder_grammar_bitmask(
+                grammar_payload,
+                batch_length=batch_length,
+            )
+            if grammar_bitmask is None:
+                continue
+            bitmasks.append(grammar_bitmask if is_decode else grammar_bitmask[:sz])
+        if not bitmasks:
+            return None
+        return torch.cat(bitmasks, dim=0)
+
+    def _sample_deferred_device_output(
+        self,
+        tt_out: Any,
+        model_sampling_params: Any,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+        is_decode: bool,
+        grammar_outputs: list[GrammarOutput | None] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
+        assert model_sampling_params is not None
+        bitmask = self._device_sampling_bitmask(
+            model_input=model_input,
+            batch_size_per_dp=batch_size_per_dp,
+            is_decode=is_decode,
+            grammar_outputs=grammar_outputs,
+        )
+        if is_decode:
+            sampled = self.model.sample_decode_on_device(
+                tt_out,
+                model_sampling_params,
+                reset_batch=model_input.reset_batch,
+                prompt_tokens=model_input.prompt_tokens,
+                output_tokens=model_input.output_tokens,
+                slot_remap=model_input.slot_remap,
+                # Grammar bitmasks change the logits tensor, so the sampling
+                # trace captured for the unmasked logits cannot be reused.
+                enable_trace=(
+                    bitmask is None and self.trace_mode in ["all", "decode_only"]
+                ),
+                bitmask=bitmask,
+            )
+            if hasattr(self.model, "process_decode_output_host"):
+                processed = self.model.process_decode_output_host(
+                    sampled,
+                    is_tokens=True,
+                )
+            else:
+                processed = sampled
+            if isinstance(processed, tuple):
+                tt_tokens, tt_log_probs = processed
+            else:
+                tt_tokens, tt_log_probs = processed, None
+            return tt_tokens, tt_log_probs
+
+        if isinstance(tt_out, dict) and "deferred_sampling_tasks" in tt_out:
+            sampled = self.model.sample_prefill_on_device(
+                tt_out["deferred_sampling_tasks"],
+                tt_out["batch_size"],
+                model_sampling_params,
+                bitmask=bitmask,
+            )
+        elif isinstance(tt_out, dict) and "tt_logits_batch" in tt_out:
+            sampled = self.model.sample_prefill_on_device(
+                tt_logits_batch=tt_out["tt_logits_batch"],
+                sampling_params=model_sampling_params,
+                empty_slots=tt_out["empty_slots"],
+                prefill_ids=tt_out.get("prefill_ids"),
+                bitmask=bitmask,
+            )
+        else:
+            raise TypeError(
+                "Deferred prefill device sampling returned an unsupported "
+                f"payload type: {type(tt_out)}"
+            )
+        if isinstance(sampled, tuple):
+            tt_tokens, tt_log_probs = sampled
+        else:
+            tt_tokens, tt_log_probs = sampled, None
+        return tt_tokens, tt_log_probs
+
     def _get_output_tokens(
         self,
-        tt_out: torch.Tensor,
+        tt_out: Any,
         tt_log_probs: torch.Tensor | None,
         sampling_params: TTSamplingParams,
+        model_sampling_params: Any | None,
         model_input: TTModelInput,
         batch_size_per_dp: list[int],
         perform_device_sampling: bool,
+        device_sampling_deferred: bool,
         is_decode: bool,
         grammar_outputs: list[GrammarOutput | None] | None = None,
     ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
@@ -2345,6 +2501,16 @@ class TTModelRunner:
             Each element in logprobs_per_dp is None if logprobs were not
             requested for that DP rank.
         """
+        if perform_device_sampling and device_sampling_deferred:
+            tt_out, tt_log_probs = self._sample_deferred_device_output(
+                tt_out=tt_out,
+                model_sampling_params=model_sampling_params,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                is_decode=is_decode,
+                grammar_outputs=grammar_outputs,
+            )
+
         sampled_token_ids_per_dp: list[torch.Tensor] = []
         logprobs_per_dp: list[LogprobsTensors | None] = []
 
