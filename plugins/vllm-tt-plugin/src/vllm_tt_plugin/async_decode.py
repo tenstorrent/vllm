@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import ttnn
 
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
-from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -27,15 +26,17 @@ class TTDecodeSubmission:
     read_events: list[Any] | None
     batch_size_per_dp: list[int]
     sampling_params: Any
+    model_sampling_params: Any | None
     perform_device_sampling: bool
+    device_sampling_deferred: bool
 
 
 @dataclass(frozen=True)
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor
-    tt_log_probs: torch.Tensor | None
+    tt_out: Any
+    tt_log_probs: Any | None
 
 
 @dataclass(frozen=True)
@@ -277,9 +278,11 @@ class TTAsyncDecodeController:
                 tt_out=finalized.tt_out,
                 tt_log_probs=finalized.tt_log_probs,
                 sampling_params=submission.sampling_params,
+                model_sampling_params=submission.model_sampling_params,
                 model_input=model_input,
                 batch_size_per_dp=submission.batch_size_per_dp,
                 perform_device_sampling=submission.perform_device_sampling,
+                device_sampling_deferred=submission.device_sampling_deferred,
                 is_decode=True,
                 grammar_outputs=[grammar_payload],
             )
@@ -330,7 +333,9 @@ class TTAsyncDecodeController:
                 read_events=None,
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
+                model_sampling_params=None,
                 perform_device_sampling=perform_device_sampling,
+                device_sampling_deferred=False,
             )
 
         kwargs: dict[str, Any] = {
@@ -346,20 +351,17 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        device_sampling_deferred = (
+            perform_device_sampling
+            and model_input.has_structured_outputs
+            and runner._can_defer_device_sampling(is_decode=True)
+        )
+        model_sampling_params = None
         if perform_device_sampling:
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+            model_sampling_params = runner._to_model_sampling_params(sampling_params)
+            kwargs["sampling_params"] = model_sampling_params
+            if device_sampling_deferred:
+                kwargs["defer_device_sampling"] = True
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
@@ -392,7 +394,7 @@ class TTAsyncDecodeController:
             read_from_device=read_from_device,
         )
         read_events = None
-        if async_read:
+        if async_read and not device_sampling_deferred:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
@@ -414,7 +416,9 @@ class TTAsyncDecodeController:
             read_events=read_events,
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
+            model_sampling_params=model_sampling_params,
             perform_device_sampling=perform_device_sampling,
+            device_sampling_deferred=device_sampling_deferred,
         )
 
     def finalize_decode(
@@ -431,6 +435,9 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
         else:
             tt_out = submission.tt_out
+
+        if submission.device_sampling_deferred:
+            return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=None)
 
         if hasattr(runner.model, "process_decode_output_host"):
             tt_out = runner.model.process_decode_output_host(
