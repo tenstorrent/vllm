@@ -43,15 +43,15 @@ def pytest_addoption(parser):
         "--tt-structured-churn-short-max-tokens",
         action="store",
         type=int,
-        default=8,
-        help="Short structured request max_tokens for churn test (default: 8)",
+        default=16,
+        help="Short structured request max_tokens for churn test (default: 16)",
     )
     parser.addoption(
         "--tt-structured-churn-long-max-tokens",
         action="store",
         type=int,
-        default=128,
-        help="Long structured request max_tokens for churn test (default: 128)",
+        default=512,
+        help="Long structured request max_tokens for churn test (default: 512)",
     )
     parser.addoption(
         "--tt-structured-churn-plain-max-tokens",
