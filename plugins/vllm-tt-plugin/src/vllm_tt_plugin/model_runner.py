@@ -1482,12 +1482,12 @@ class TTModelRunner:
             ]
             off += 1
 
-            # Slot remap for seed manager: per-rank values are in [0,B), but
-            # the row-sharded SeedManager uses global indices [0, total_B).
-            # Offset each rank's remap values by rank * B.
+            # Slot remap for seed manager. Keep values local to each DP rank:
+            # remap[i] = j means local slot i now contains the request that was
+            # previously in local slot j. The tt-metal side pads each rank's
+            # compact [B] remap to the sampling module's physical slot count.
             raw_remap = stacked_int[:, off : off + B]  # [world, B]
-            offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * B
-            slot_remap = (raw_remap + offsets).reshape(total_B)
+            slot_remap = raw_remap.reshape(total_B)
             off += B
 
             grammar_bitmask_list = [None] * world
