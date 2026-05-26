@@ -425,26 +425,53 @@ class TTAsyncDecodeController:
         self,
         submission: TTDecodeSubmission,
     ) -> TTFinalizedDecode | None:
+        """Turn a submitted decode into the payload consumed by sampling.
+
+        This method finalizes the TT decode submission. It is intentionally not
+        synonymous with "sample": depending on the mode, the returned ``tt_out``
+        may be host logits, already sampled token IDs, or still-device logits
+        that deferred sampling will consume later.
+        """
         runner = self.runner
         if submission.tt_out is None:
+            # No active users produced device work for this decode step.
             return None
 
         if submission.read_events is not None:
+            # Async decode readback path. The forward already submitted an
+            # asynchronous device-to-host read; wait here before exposing the
+            # payload to sampling/output construction.
             for read_event in submission.read_events:
                 ttnn.event_synchronize(read_event)
             tt_out = submission.tt_out
         else:
+            # No async readback event was registered. This covers synchronous
+            # decode finalization, deferred device sampling (device logits stay
+            # on device for sample_decode_on_device), and model paths that
+            # already returned host tensors.
             tt_out = submission.tt_out
 
         if submission.device_sampling_deferred:
+            # Structured-output device sampling needs the grammar bitmask,
+            # which vLLM prepares after forward submission. Keep the device
+            # logits/payload untouched; _get_output_tokens() will later call
+            # sample_decode_on_device(..., bitmask=...).
             return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=None)
 
         if hasattr(runner.model, "process_decode_output_host"):
+            # Normalize the model-specific decode result into host-visible
+            # tensors. For host sampling this means logits; for immediate
+            # device sampling this means sampled token IDs, and possibly
+            # logprobs. The is_tokens flag tells the model which shape/type to
+            # interpret.
             tt_out = runner.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
         else:
+            # Some tests or model paths may already return torch tensors. In
+            # that case there is no model-specific host processing to do, but
+            # device tensors would be unsafe to pass upward from this point.
             is_host_tensor = isinstance(tt_out, torch.Tensor)
             is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
                 tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
@@ -461,9 +488,13 @@ class TTAsyncDecodeController:
             submission.perform_device_sampling
             and submission.sampling_params.enable_log_probs.any()
         ):
+            # Immediate device sampling with logprobs returns a pair:
+            # (sampled_tokens, sampled_token_logprobs).
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
         elif isinstance(tt_out, tuple):
+            # Host-sampling decode commonly returns (logits, None). Keep only
+            # logits here; host logprobs are computed later by the host sampler.
             tt_out, _ = tt_out
 
         return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=tt_log_probs)

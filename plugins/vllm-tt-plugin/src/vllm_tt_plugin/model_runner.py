@@ -1817,9 +1817,21 @@ class TTModelRunner:
 
         is_decode = model_input.prompt_lens is None
         if self.non_dp_async_scheduling and is_decode:
+            # Async decode keeps the TT readback/sampling work out of the
+            # engine thread. We submit the device forward and queue a
+            # TTPendingDecodeState; sample_tokens() will return an
+            # AsyncModelRunnerOutput that finalizes and samples on vLLM's async
+            # output thread.
             self._submit_async_forward_with_model_input(model_input)
             return None
 
+        # Sync path: prefill always uses this path, and decode uses it when
+        # non-DP async scheduling is disabled. The queue item is a
+        # TTForwardOutput, meaning the TT forward submission has already been
+        # finalized enough that sample_tokens() can consume logits/tokens
+        # directly on the engine thread. Sampling still happens later in
+        # sample_tokens(), after vLLM has had a chance to prepare grammar
+        # bitmasks for structured outputs.
         self._forward_state_queue.append(
             self.execute_forward_with_model_input(model_input)
         )
@@ -1831,9 +1843,16 @@ class TTModelRunner:
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         """Sample tokens from the oldest non-DP TT forward result.
 
-        Pops the front of ``_forward_state_queue``.  If the entry is a
-        ``TTPendingDecodeState`` (async path), return an async output wrapper
-        so vLLM's output thread does the DMA wait and final sampling.
+        Pops the front of ``_forward_state_queue``.
+
+        Queue entries have two shapes:
+
+        * ``TTForwardOutput``: sync path.  Forward/finalization already ran far
+          enough for this method to sample immediately on the engine thread.
+        * ``TTPendingDecodeState``: non-DP async decode path.  Decode forward
+          was submitted with async readback, so this method must return an
+          ``AsyncModelRunnerOutput`` wrapper instead of blocking the engine
+          thread here.
         """
         assert self._forward_state_queue, (
             "sample_tokens called with no pending forward state"
@@ -1841,6 +1860,12 @@ class TTModelRunner:
         pending = self._forward_state_queue.popleft()
 
         if isinstance(pending, TTPendingDecodeState):
+            # Async path: the queue item is not logits/tokens yet. It is an
+            # in-flight decode submission plus the runner state captured at
+            # submit time. Do not wait or sample on the engine thread here;
+            # vLLM will call get_output() on the returned wrapper from its
+            # async output thread, where we wait/finalize, apply any grammar
+            # bitmask, sample, and build the ModelRunnerOutput.
             return AsyncTTModelRunnerOutput(
                 controller=self.async_decode,
                 submission=pending.submission,
@@ -1850,6 +1875,10 @@ class TTModelRunner:
                 context=pending.context,
             )
         else:
+            # Sync path: the queue item is a TTForwardOutput. It may contain
+            # host logits (host sampling), already sampled tokens (immediate
+            # device sampling), or a deferred device-sampling payload. In all
+            # cases the vLLM sampling phase can run now using grammar_output.
             forward_output = pending
 
         sampled_token_ids_per_dp, logprobs_per_dp = self.sample_forward_output(
@@ -2159,7 +2188,7 @@ class TTModelRunner:
         The DMA is intentionally NOT waited on here.  ``sample_tokens`` pops
         the ``TTPendingDecodeState`` and finalises the DMA there, so a second
         ``execute_model`` call (for step K+1) can start the device decode
-        while step K's DMA is still in flight — reproducing the original
+        while step K's DMA is still in flight — realizing the
         steady-decode pipeline.
         """
         steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
@@ -2177,7 +2206,11 @@ class TTModelRunner:
             overlap_ok=steady_decode_fast_path,
         )
         if submission.tt_out is None:
-            # Nothing to read — treat as an empty forward step.
+            # This is a no-op decode submission: no active users produced a TT
+            # output tensor, so there is no readback event to wait on. We still
+            # enqueue an empty forward output because EngineCore will call
+            # sample_tokens() for this scheduled step and pending-event drains
+            # must not block on a submission with no device work.
             event.set()
             self._forward_state_queue.append(self._empty_forward_output(model_input))
             return
