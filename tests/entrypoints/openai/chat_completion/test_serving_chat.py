@@ -1367,6 +1367,7 @@ class TestServingChatWithHarmony:
 
         content_by_choice: dict[int, str] = {0: "", 1: ""}
         finish_reason_by_choice: dict[int, str] = {}
+        stop_reason_by_choice: dict[int, str] = {}
         for chunk in chunks:
             if not chunk.startswith("data: {"):
                 continue
@@ -1377,10 +1378,13 @@ class TestServingChatWithHarmony:
                 content_by_choice[idx] += delta.get("content") or ""
                 if choice.get("finish_reason") is not None:
                     finish_reason_by_choice[idx] = choice["finish_reason"]
+                if choice.get("stop_reason") is not None:
+                    stop_reason_by_choice[idx] = choice["stop_reason"]
 
         assert content_by_choice[0] == "A"
         assert content_by_choice[1] == ""
-        assert finish_reason_by_choice == {0: "stop"}
+        assert finish_reason_by_choice == {0: "stop", 1: "error"}
+        assert stop_reason_by_choice[1] == "error"
 
     @pytest.mark.asyncio
     @pytest.mark.skip_global_cleanup
@@ -1456,11 +1460,22 @@ class TestServingChatWithHarmony:
                 chunks.append(chunk)
 
         assert consumed_outputs == 1
-        assert any(
-            "All Harmony parser choices failed during streaming" in chunk
-            for chunk in chunks
-        )
         assert chunks[-1] == "data: [DONE]\n\n"
+
+        finish_reason_by_choice: dict[int, str] = {}
+        stop_reason_by_choice: dict[int, str] = {}
+        for chunk in chunks:
+            if not chunk.startswith("data: {"):
+                continue
+            data = json.loads(chunk[6:].strip())
+            for choice in data.get("choices", []):
+                if choice.get("finish_reason") is not None:
+                    finish_reason_by_choice[choice["index"]] = choice["finish_reason"]
+                if choice.get("stop_reason") is not None:
+                    stop_reason_by_choice[choice["index"]] = choice["stop_reason"]
+
+        assert finish_reason_by_choice == {0: "error", 1: "error"}
+        assert stop_reason_by_choice == {0: "error", 1: "error"}
 
     @pytest.mark.asyncio
     async def test_simple_chat(self, serving_chat, stream):
