@@ -319,14 +319,10 @@ def run_inference(
             if not isinstance(parsed_plugin_config, dict):
                 raise ValueError("plugin_config must be a JSON object")
 
-        if (
-            parsed_additional_config is not None
-            and parsed_plugin_config is not None
-            and parsed_additional_config != parsed_plugin_config
-        ):
+        if parsed_additional_config is not None and parsed_plugin_config is not None:
             raise ValueError(
-                "additional_config and plugin_config must contain identical "
-                "{'tt': {...}} content when both are provided"
+                "Only one of additional_config or plugin_config may be provided. "
+                "Prefer additional_config."
             )
         if parsed_additional_config is not None or parsed_plugin_config is not None:
             engine_kw_args["additional_config"] = (
@@ -704,7 +700,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help=(
-            "Deprecated alias for --additional-config. "
+            "Deprecated alias; prefer --additional-config. "
             "Value must use the same '{\"tt\": {...}}' JSON shape."
         ),
     )

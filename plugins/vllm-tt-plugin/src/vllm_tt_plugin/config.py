@@ -49,14 +49,10 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     if has_plugin_config:
         _warn_plugin_config()
 
-    if (
-        has_additional_config
-        and has_plugin_config
-        and additional_config != plugin_config
-    ):
+    if has_additional_config and has_plugin_config:
         raise ValueError(
-            "TT config in additional_config and plugin_config differs. "
-            "Pass only additional_config. plugin_config is deprecated."
+            "Only one of additional_config or plugin_config may contain TT config. "
+            "Prefer additional_config. plugin_config is deprecated."
         )
 
     return dict(additional_config if has_additional_config else plugin_config)
