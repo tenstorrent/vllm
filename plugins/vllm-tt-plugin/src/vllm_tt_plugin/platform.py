@@ -246,6 +246,7 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
     device_type: str = "tt"
+    full_dp_mode: ClassVar[bool] = False
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
@@ -336,9 +337,20 @@ class TTPlatform(Platform):
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
         parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
         parallel_config.engine_core_proc_cls = "vllm_tt_plugin.engine.TTEngineCoreProc"
-        parallel_config.dp_engine_core_proc_cls = (
-            "vllm_tt_plugin.engine.TTDPEngineCoreProc"
-        )
+
+        full_dp_mode = False
+        if tt_config is not None and "full_dp_mode" in tt_config:
+            full_dp_mode = tt_config["full_dp_mode"]
+        if full_dp_mode:
+            # Use vLLM's standard DP core path for full-DP TT models.
+            parallel_config.dp_engine_core_proc_cls = (
+                "vllm.v1.engine.core.DPEngineCoreProc"
+            )
+        else:
+            parallel_config.dp_engine_core_proc_cls = (
+                "vllm_tt_plugin.engine.TTDPEngineCoreProc"
+            )
+
         parallel_config.engine_core_launcher_cls = (
             "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
         )
@@ -380,6 +392,8 @@ class TTPlatform(Platform):
         else:
             sample_on_device_mode = None
         cls.sample_on_device_mode = sample_on_device_mode  # type: ignore[attr-defined]
+
+        cls.full_dp_mode = full_dp_mode  # type: ignore[attr-defined]
 
         # Compat sampling uses the full vLLM sampling pipeline,
         # with logit processors and sampler, instead of our custom sampling.

@@ -27,13 +27,22 @@ logger = init_logger(__name__)
 
 class TTLaunchPlan(EngineLaunchPlan):
     rank_binding_file: str | None = None
+    full_dp_mode: bool = False
 
 
 class TTCoreEngineLauncher(CoreEngineLauncher):
     def prepare_launch(self, vllm_config: VllmConfig) -> EngineLaunchPlan:
         rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+
+        tt_config = get_tt_config(vllm_config)
+        full_dp_mode = False
+        if tt_config and "full_dp_mode" in tt_config:
+            full_dp_mode = tt_config["full_dp_mode"]
+
         if rank_binding_file is None:
-            return EngineLaunchPlan()
+            plan = TTLaunchPlan()
+            plan.full_dp_mode = full_dp_mode
+            return plan
 
         parallel_config = vllm_config.parallel_config
         if (
@@ -50,6 +59,7 @@ class TTCoreEngineLauncher(CoreEngineLauncher):
             non_device_dp_ranks=non_device_dp_ranks,
         )
         plan.rank_binding_file = rank_binding_file
+        plan.full_dp_mode = full_dp_mode
         return plan
 
     def get_engines_to_handshake(
