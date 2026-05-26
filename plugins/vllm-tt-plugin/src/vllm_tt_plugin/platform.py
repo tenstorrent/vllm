@@ -25,6 +25,18 @@ else:
 logger = init_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
+_warned_cli_plugin_config = False
+
+
+def _warn_cli_plugin_config() -> None:
+    global _warned_cli_plugin_config
+    if _warned_cli_plugin_config:
+        return
+    logger.warning(
+        "TT config passed through --plugin-config is deprecated. "
+        "Use --additional-config '{\"tt\": {...}}' instead."
+    )
+    _warned_cli_plugin_config = True
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -38,41 +50,48 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
 
 
 def _should_pre_register_tt_test_models_from_cli() -> bool:
-    """Return True iff `--plugin-config` enables TT test models.
+    """Return True iff CLI TT config enables TT test models.
 
     `TTPlatform.pre_register_and_update()` runs before `VllmConfig` is
     constructed, but ModelConfig may inspect architectures early.
     """
     argv = list(sys.argv[1:])
 
-    def _parse_plugin_config(raw: str) -> dict | None:
+    def _parse_namespaced_config(raw: str) -> dict | None:
         try:
             parsed = json.loads(raw)
         except Exception:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    canonical_flag = "--plugin-config"
+    canonical_flags = {"--additional-config", "--plugin-config"}
+    parsed_configs: dict[str, dict] = {}
     for i, arg in enumerate(argv):
         if "=" in arg:
             flag, value = arg.split("=", 1)
-            if flag.replace("_", "-") == canonical_flag:
-                cfg = _parse_plugin_config(value)
-                tt_config = cfg.get("tt", {}) if cfg else {}
-                return bool(
-                    isinstance(tt_config, dict)
-                    and tt_config.get("register_test_models") is True
-                )
+            normalized_flag = flag.replace("_", "-")
+            if normalized_flag in canonical_flags:
+                if normalized_flag == "--plugin-config":
+                    _warn_cli_plugin_config()
+                cfg = _parse_namespaced_config(value)
+                if cfg:
+                    parsed_configs[normalized_flag] = cfg
         else:
-            if arg.replace("_", "-") == canonical_flag and i + 1 < len(argv):
-                cfg = _parse_plugin_config(argv[i + 1])
-                tt_config = cfg.get("tt", {}) if cfg else {}
-                return bool(
-                    isinstance(tt_config, dict)
-                    and tt_config.get("register_test_models") is True
-                )
+            normalized_arg = arg.replace("_", "-")
+            if normalized_arg in canonical_flags and i + 1 < len(argv):
+                if normalized_arg == "--plugin-config":
+                    _warn_cli_plugin_config()
+                cfg = _parse_namespaced_config(argv[i + 1])
+                if cfg:
+                    parsed_configs[normalized_arg] = cfg
 
-    return False
+    cfg = parsed_configs.get("--additional-config") or parsed_configs.get(
+        "--plugin-config"
+    )
+    tt_config = cfg.get("tt", {}) if cfg else {}
+    return bool(
+        isinstance(tt_config, dict) and tt_config.get("register_test_models") is True
+    )
 
 
 def _install_tt_harmony_truncation_patch() -> None:
