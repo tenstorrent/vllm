@@ -499,7 +499,6 @@ class TTAsyncDecodeController:
                 output_tokens=model_input.output_tokens,
                 slot_remap=model_input.slot_remap,
                 enable_trace=enable_trace,
-                bitmask=decode_bitmask,
             )
         read_events = None
         if async_read:

@@ -2013,12 +2013,9 @@ class TTModelRunner:
                 "a deferred payload dict."
             )
             assert converted_sampling_params is not None
-            deferred_payload = dict(tt_out)
-            deferred_bitmask = deferred_payload.pop("bitmask", None)
             return self.model.sample_prefill_on_device(
-                **deferred_payload,
+                **tt_out,
                 sampling_params=converted_sampling_params,
-                bitmask=prefill_bitmask if prefill_bitmask is not None else deferred_bitmask,
             )
         return tt_out
 
