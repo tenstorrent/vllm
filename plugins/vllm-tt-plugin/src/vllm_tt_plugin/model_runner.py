@@ -15,6 +15,7 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -316,6 +317,16 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        # DP gather builds local model inputs on every DP rank, but only local
+        # DP rank 0 loads ``self.model``. Capability checks used during input
+        # construction therefore must not depend on the instance being present.
+        model_class, _ = get_model_architecture(self.model_config)
+        self._supports_deferred_decode_sampling = hasattr(
+            model_class, "sample_decode_on_device"
+        )
+        self._supports_deferred_prefill_sampling = hasattr(
+            model_class, "sample_prefill_on_device"
+        )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -387,6 +398,15 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        # On the device-owning rank, prefer the loaded instance as the
+        # authority. Non-device DP ranks keep using the class-level values from
+        # ``__init__`` because they never instantiate ``self.model``.
+        self._supports_deferred_decode_sampling = hasattr(
+            self.model, "sample_decode_on_device"
+        )
+        self._supports_deferred_prefill_sampling = hasattr(
+            self.model, "sample_prefill_on_device"
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -2002,10 +2022,11 @@ class TTModelRunner:
     def _can_defer_device_sampling(self, is_decode: bool) -> bool:
         if not is_decode and self.request_specific_rope:
             return False
-        method_name = (
-            "sample_decode_on_device" if is_decode else "sample_prefill_on_device"
+        return (
+            self._supports_deferred_decode_sampling
+            if is_decode
+            else self._supports_deferred_prefill_sampling
         )
-        return hasattr(self.model, method_name)
 
     @staticmethod
     def _to_model_sampling_params(sampling_params: TTSamplingParams) -> Any:
