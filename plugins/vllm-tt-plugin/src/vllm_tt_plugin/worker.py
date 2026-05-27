@@ -459,6 +459,8 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
             model_name=model_config.model,
             num_devices=device_config.num_devices,
             tt_data_parallel=data_parallel,
+            max_model_len=model_config.max_model_len,
+            max_num_seqs=scheduler_config.max_num_seqs,
         )
 
         logger.info(
