@@ -2064,6 +2064,7 @@ class TTModelRunner:
         kwargs.update(model_input.multi_modal_kwargs)
         device_sampling_deferred = (
             model_input.perform_device_sampling
+            and model_input.has_structured_outputs
             and self._can_defer_device_sampling(is_decode=False)
             and not self.request_specific_rope
         )
