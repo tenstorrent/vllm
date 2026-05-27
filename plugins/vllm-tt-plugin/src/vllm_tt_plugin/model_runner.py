@@ -1959,12 +1959,6 @@ class TTModelRunner:
         )
         if not want_device_sampling:
             return False
-        if not is_decode:
-            # TT-metal deferred prefill sampling currently trips paged prefill
-            # constraints in vLLM batches. Keep prefill on host and use the
-            # split device path for decode, where grammar bitmasks are needed
-            # after the first sampled token.
-            return False
 
         # Calculate number of devices per DP rank
         assert self.device_config.num_devices is not None
