@@ -1979,10 +1979,9 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # Structured outputs can only use device sampling when the model exposes
-        # a split forward/sampling API so the grammar bitmask can be applied
-        # after vLLM produces it.
-        if has_structured_outputs and not self._can_defer_device_sampling(is_decode):
+        # Keep structured-output sampling on host for both prefill
+        # and decode.
+        if has_structured_outputs:
             return False
 
         # Logprobs on device require multi-device setups (num_devices in {8,32}).
