@@ -216,6 +216,33 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
 
+    # Gemma4 — text-only TT bridge.
+    #
+    # Gemma4 isn't in vLLM's upstream registry, so without an entry here
+    # the upstream architecture resolver falls back to
+    # ``TransformersMultiModalForCausalLM`` (because ``hf_config !=
+    # hf_text_config`` for Gemma4's nested config — see
+    # ``ModelConfig._get_transformers_backend_cls``) and crashes on the
+    # ``_processor_factory`` assertion in the multimodal registry. The
+    # plugin's later ``TT``-prefix logic runs after that resolution, so
+    # it can't help.
+    #
+    # We register the plain HF arch names directly so upstream resolution
+    # finds our class. Since ``Gemma4ForCausalLM`` (the TT class) does not
+    # use ``SupportsMultiModal``, vLLM's ``_model_info.supports_multimodal``
+    # is False, ``multimodal_config`` is not populated, and the request
+    # path stays text-only — which matches what the TT model implements.
+    # The ``TT``-prefixed aliases satisfy the plugin's later validation
+    # in ``check_and_update_config`` so no override is needed.
+    _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
+    for arch in (
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "TTGemma4ForCausalLM",
+        "TTGemma4ForConditionalGeneration",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
+
     # DeepseekV3
     _register_model_if_missing(
         ModelRegistry,
