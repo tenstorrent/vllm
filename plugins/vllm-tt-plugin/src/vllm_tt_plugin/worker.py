@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm_tt_plugin.config import get_tt_config
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
@@ -281,22 +281,17 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Expose the non-DP TT execution service to the executor layer.
-
-        Returns the runner's non-DP execution result for the provided
-        scheduler output.
-        """
-        return self.execute_model_with_grammar(scheduler_output, None)
-
-    def execute_model_with_grammar(
-        self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput | None",
-    ) -> ModelRunnerOutput | None:
-        """Execute a non-DP TT step with plugin-owned structured-output data."""
+        """Run non-DP TT forward. Sampling happens in sample_tokens()."""
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        output = self.model_runner.execute_model(scheduler_output, grammar_output)
+        output = self.model_runner.execute_model(scheduler_output)
         return output
+
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        assert self.is_driver_worker, "There should only be one Worker for TT"
+        return self.model_runner.sample_tokens(grammar_output)
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
@@ -307,7 +302,6 @@ class TTWorker(WorkerBase):
     def build_dp_model_input(
         self,
         scheduler_output: Optional["SchedulerOutput"],
-        grammar_output: Optional["GrammarOutput"],
     ) -> tuple[
         TTModelInput | None,
         int,
@@ -327,14 +321,11 @@ class TTWorker(WorkerBase):
         TT model input (or `None`) and the remaining fields are the
         per-rank metadata consumed by gathered-DP orchestration.
         """
-        return self.model_runner.prepare_dp_model_input(
-            scheduler_output, grammar_output
-        )
+        return self.model_runner.prepare_dp_model_input(scheduler_output)
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: Optional["SchedulerOutput"],
-        grammar_output: Optional["GrammarOutput"],
     ) -> bool:
         """Return whether this rank can submit decode one step ahead.
 
@@ -342,17 +333,16 @@ class TTWorker(WorkerBase):
         answers into a single global decision before using the DP steady path.
         """
         return self.model_runner.can_attempt_steady_dp_decode_from_scheduler(
-            scheduler_output, grammar_output
+            scheduler_output
         )
 
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: "SchedulerOutput",
-        grammar_output: Optional["GrammarOutput"],
     ) -> bool:
         """Return whether a scheduled non-DP step can overlap steady decode."""
         return self.model_runner.can_attempt_steady_decode_from_scheduler(
-            scheduler_output, grammar_output
+            scheduler_output
         )
 
     def build_dp_decode_gather_input(
@@ -392,7 +382,10 @@ class TTWorker(WorkerBase):
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         if local_dp_rank != 0:
-            return self._empty_dp_execute_result()
+            # This worker does not execute the merged TT batch, but the engine
+            # still needs every DP rank to take the forward-only finalize path
+            # so grammar/output collectives stay aligned.
+            return True
 
         return self.model_runner.submit_dp_execution(
             inputs,
@@ -401,6 +394,17 @@ class TTWorker(WorkerBase):
             any_structured_inputs,
             non_block=non_block,
         )
+
+    def sample_dp_forward_output(
+        self,
+        grammar_outputs: list[Any] | None,
+    ) -> tuple[torch.Tensor, list]:
+        """Sample a stored gathered-DP forward result on device ranks."""
+        assert self.is_driver_worker, "sample_dp_forward_output must run on driver"
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
+        if local_dp_rank != 0:
+            return self._empty_dp_execute_result()
+        return self.model_runner.sample_dp_forward_output(grammar_outputs)
 
     def _empty_dp_execute_result(self) -> tuple[torch.Tensor, list]:
         """Return the neutral DP payload for non-device local ranks.

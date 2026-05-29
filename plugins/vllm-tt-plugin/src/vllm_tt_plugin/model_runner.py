@@ -15,6 +15,7 @@ import ttnn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -23,6 +24,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -33,6 +35,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
+    SubmittedStepContext,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.input_batch import (
@@ -187,6 +190,10 @@ class TTModelInput:
     # For DP gather, this is true only if all ranks can sample on device.
     perform_device_sampling: bool
 
+    # True when any request in this TT input uses structured outputs. This is
+    # known from SchedulerOutput before the concrete grammar bitmask is ready.
+    has_structured_outputs: bool
+
     # always lists: single-element for non-DP, multi-element for DP
     # If not used, [None]
     grammar_bitmask: list[torch.Tensor | None]
@@ -218,6 +225,50 @@ class TTModelInput:
     # from slot j.  Identity when nothing moved.  Shape: [total_B] (concat of
     # per-rank [B] tensors for DP).
     slot_remap: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class TTForwardOutput:
+    """Forward-only TT payload consumed by the sampling phase."""
+
+    tt_out: Any
+    tt_log_probs: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None
+    sampling_params: TTSamplingParams
+    model_sampling_params: Any | None
+    model_input: TTModelInput
+    batch_size_per_dp: list[int]
+    perform_device_sampling: bool
+    device_sampling_deferred: bool
+    is_decode: bool
+
+
+@dataclass
+class TTPendingDecodeState:
+    """Async decode submission in-flight (DMA not yet waited on).
+
+    Pushed to ``_forward_state_queue`` by ``execute_model`` and consumed by
+    ``sample_tokens``. The async output wrapper then performs the DMA wait and
+    sampling off the main worker loop.
+    """
+
+    submission: Any  # TTDecodeSubmission
+    model_input: TTModelInput
+    completion_event: threading.Event
+    context: SubmittedStepContext
+
+
+@dataclass
+class TTPendingDPDecodeState:
+    """Async gathered-DP decode submission in-flight.
+
+    DP sampling is driven by ``sample_dp_forward_output`` after grammar outputs
+    are gathered on the engine side.  Keeping the raw submission here lets the
+    next gathered decode be submitted before the previous decode's async read is
+    finalized, matching the pre-split DP overlap behavior.
+    """
+
+    submission: Any  # TTDecodeSubmission
+    model_input: TTModelInput
 
 
 class TTModelRunner:
@@ -266,6 +317,16 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        # DP gather builds local model inputs on every DP rank, but only local
+        # DP rank 0 loads ``self.model``. Capability checks used during input
+        # construction therefore must not depend on the instance being present.
+        model_class, _ = get_model_architecture(self.model_config)
+        self._supports_deferred_decode_sampling = hasattr(
+            model_class, "sample_decode_on_device"
+        )
+        self._supports_deferred_prefill_sampling = hasattr(
+            model_class, "sample_prefill_on_device"
+        )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -306,6 +367,16 @@ class TTModelRunner:
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
+        # FIFO queues for forward state: execute_model pushes, sample_tokens
+        # pops. A deque (instead of a single slot) keeps non-DP and DP forward
+        # state ordered while vLLM's async scheduling overlaps output
+        # finalization with later worker calls.
+        self._forward_state_queue: deque[TTPendingDecodeState | TTForwardOutput] = (
+            deque()
+        )
+        self._dp_forward_state_queue: deque[
+            TTForwardOutput | TTPendingDPDecodeState
+        ] = deque()
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -327,6 +398,15 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        # On the device-owning rank, prefer the loaded instance as the
+        # authority. Non-device DP ranks keep using the class-level values from
+        # ``__init__`` because they never instantiate ``self.model``.
+        self._supports_deferred_decode_sampling = hasattr(
+            self.model, "sample_decode_on_device"
+        )
+        self._supports_deferred_prefill_sampling = hasattr(
+            self.model, "sample_prefill_on_device"
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -830,7 +910,6 @@ class TTModelRunner:
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> TTModelInput:
         # In DP, called on each rank
         # In non-DP, this is the only input preparation function
@@ -986,52 +1065,9 @@ class TTModelRunner:
         else:
             multi_modal_kwargs = {}
 
-        # If we're not using structured outputs, grammar_bitmask is None.
-        bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
-        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        scheduled_structured_req_ids = [
-            req_id
-            for req_id in scheduled_req_ids
-            if (req := self.requests.get(req_id)) is not None
-            and req.sampling_params is not None
-            and req.sampling_params.structured_outputs is not None
-        ]
-        has_structured_outputs = (
-            bitmask is not None
-            or scheduler_output.pending_structured_output_tokens
-            or bool(scheduled_structured_req_ids)
+        has_structured_outputs = self._scheduler_output_has_structured_outputs(
+            scheduler_output
         )
-        if bitmask is not None:
-            # Using torch tensor instead of numpy array for consistency
-            # because we need it as tensor for gather.
-            bitmask = torch.from_numpy(bitmask)
-            # unpadded for prefill, padded for decode
-            batch_length = input_tokens.shape[0]
-            grammar_bitmask_length = bitmask.shape[1]
-            # Ones in the compressed bitmask represent tokens that are allowed.
-            reordered_bitmask = torch.zeros(
-                (batch_length, grammar_bitmask_length), dtype=torch.int32
-            )
-            reordered_bitmask = torch.bitwise_not(reordered_bitmask)
-            # `structured_output_request_ids` comes from GrammarOutput as a list
-            # of request IDs (bitmask rows are in this order). TT does not support
-            # speculative decoding in this path, so we assume a single bitmask row
-            # per request.
-            structured_output_request_ids = (
-                grammar_output.structured_output_request_ids
-                if grammar_output is not None
-                else []
-            )
-            req_id_to_bitmask_row: dict[str, int] = {
-                req_id: i for i, req_id in enumerate(structured_output_request_ids)
-            }
-            for req_id, persistent_batch_index in input_batch.req_id_to_index.items():
-                scheduler_bitmask_row = req_id_to_bitmask_row.get(req_id)
-                if scheduler_bitmask_row is not None:
-                    reordered_bitmask[persistent_batch_index, :] = bitmask[
-                        scheduler_bitmask_row, :
-                    ]
-            bitmask = reordered_bitmask
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
@@ -1105,7 +1141,8 @@ class TTModelRunner:
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
-            grammar_bitmask=[bitmask],  # wrap to match DP case
+            has_structured_outputs=has_structured_outputs,
+            grammar_bitmask=[None],  # populated only during sampling
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
@@ -1118,10 +1155,21 @@ class TTModelRunner:
             generators_list=[generators],
         )
 
+    def _scheduler_output_has_structured_outputs(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        if scheduler_output.pending_structured_output_tokens:
+            return True
+        return any(
+            (req := self.requests.get(req_id)) is not None
+            and req.sampling_params is not None
+            and req.sampling_params.structured_outputs is not None
+            for req_id in scheduler_output.num_scheduled_tokens
+        )
+
     def build_model_input(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> TTModelInput | None:
         """
         Update internal state with the scheduler output and build
@@ -1137,23 +1185,21 @@ class TTModelRunner:
             return None
 
         # Prepare model inputs only
-        model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
+        model_input = self._prepare_model_inputs(scheduler_output)
         return model_input
 
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         """Return whether a scheduled non-DP step can overlap steady decode."""
         return self.async_decode.can_attempt_steady_decode_from_scheduler(
-            scheduler_output, grammar_output
+            scheduler_output
         )
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         """Check whether one DP rank can participate in steady gathered decode.
 
@@ -1163,7 +1209,7 @@ class TTModelRunner:
         work while the global gathered step still overlaps safely.
         """
         return self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
-            scheduler_output, grammar_output
+            scheduler_output
         )
 
     def build_dp_decode_gather_input(
@@ -1286,20 +1332,6 @@ class TTModelRunner:
             ],
             dim=0,
         ).contiguous()
-
-        if any_structured_inputs:
-            if model_input is None or model_input.grammar_bitmask[0] is None:
-                has_structured_inputs = torch.tensor([0], dtype=torch.int32)
-                bitmasks = torch.zeros(
-                    (max_batch, self.bitmask_size), dtype=torch.int32
-                )
-            else:
-                has_structured_inputs = torch.tensor([1], dtype=torch.int32)
-                bitmasks = model_input.grammar_bitmask[0]
-            bitmasks = bitmasks.contiguous().view(-1)  # B * bitmask_size
-            int_inputs = torch.cat(
-                [int_inputs, has_structured_inputs, bitmasks], dim=0
-            ).contiguous()
 
         float_inputs = torch.cat(
             [
@@ -1470,31 +1502,15 @@ class TTModelRunner:
             ]
             off += 1
 
-            # Slot remap for seed manager: per-rank values are in [0,B), but
-            # the row-sharded SeedManager uses global indices [0, total_B).
-            # Offset each rank's remap values by rank * B.
+            # Slot remap for seed manager. Keep values local to each DP rank:
+            # remap[i] = j means local slot i now contains the request that was
+            # previously in local slot j. The tt-metal side pads each rank's
+            # compact [B] remap to the sampling module's physical slot count.
             raw_remap = stacked_int[:, off : off + B]  # [world, B]
-            offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * B
-            slot_remap = (raw_remap + offsets).reshape(total_B)
+            slot_remap = raw_remap.reshape(total_B)
             off += B
 
-            # Optional structured inputs: keep as list[Optional[tensor]]
-            # per DP rank to match prefill behavior.
-            grammar_bitmask_list = []
-            if any_structured_inputs:
-                has_structured = stacked_int[:, off]
-                off += 1
-                bitmasks = stacked_int[:, off : off + (B * self.bitmask_size)].reshape(
-                    world, B, self.bitmask_size
-                )
-                off += B * self.bitmask_size
-                for r in range(world):
-                    if int(has_structured[r].item()) > 0:
-                        grammar_bitmask_list.append(bitmasks[r])
-                    else:
-                        grammar_bitmask_list.append(None)
-            else:
-                grammar_bitmask_list = [None] * world
+            grammar_bitmask_list = [None] * world
 
             # Extract host-only sampling params
             # from gathered inputs (per-rank lists)
@@ -1628,7 +1644,7 @@ class TTModelRunner:
                     cast(int, mi.unpadded_batch_size) if mi else 0
                 )
                 batch_size_per_dp.append(unpadded_batch_size)
-                grammar_bitmask_list.append(mi.grammar_bitmask[0] if mi else None)
+                grammar_bitmask_list.append(None)
 
                 # Collect host-only sampling params per rank
                 if mi is not None:
@@ -1768,6 +1784,11 @@ class TTModelRunner:
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
+            has_structured_outputs=(
+                any(mi.has_structured_outputs for mi in active_inputs)
+                if not is_decode
+                else any_structured_inputs
+            ),
             grammar_bitmask=grammar_bitmask_list,
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
@@ -1786,15 +1807,13 @@ class TTModelRunner:
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+    ) -> ModelRunnerOutput | None:
         """Public non-DP runner entrypoint used by the TT worker.
 
-        Dispatches one non-DP step from scheduler output to the appropriate TT
-        execution path and returns either a completed `ModelRunnerOutput` or an
-        async decode wrapper.
+        Runs TT forward only. Sampling is completed by sample_tokens().
         """
+        assert intermediate_tensors is None
         # In the DP case, this function is skipped!
         # tt_worker.py uses the dedicated DP facade instead.
         # With DP, the actual model pass happens on a batch
@@ -1806,36 +1825,92 @@ class TTModelRunner:
         # completed work pile up unbounded.
         self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
-            self.async_decode.can_attempt_steady_decode_from_scheduler(
-                scheduler_output, grammar_output
-            )
+            self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
             self.async_decode.wait_for_all_pending_async_steps()
 
         # Update cached state and prepare model inputs
-        model_input = self.build_model_input(scheduler_output, grammar_output)
+        model_input = self.build_model_input(scheduler_output)
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
         if self.non_dp_async_scheduling and is_decode:
-            steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
-                model_input
-            )
-            return self.async_decode.submit_async_non_dp_decode(
-                model_input,
-                steady_decode_fast_path=steady_decode_fast_path,
-            )
+            # Async decode keeps the TT readback/sampling work out of the
+            # engine thread. We submit the device forward and queue a
+            # TTPendingDecodeState; sample_tokens() will return an
+            # AsyncModelRunnerOutput that finalizes and samples on vLLM's async
+            # output thread.
+            self._submit_async_forward_with_model_input(model_input)
+            return None
 
-        # Synchronous path (prefill, or decode without async scheduling)
-        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(  # noqa: E501
-            model_input
+        # Sync path: prefill always uses this path, and decode uses it when
+        # non-DP async scheduling is disabled. The queue item is a
+        # TTForwardOutput, meaning the TT forward submission has already been
+        # finalized enough that sample_tokens() can consume logits/tokens
+        # directly on the engine thread. Sampling still happens later in
+        # sample_tokens(), after vLLM has had a chance to prepare grammar
+        # bitmasks for structured outputs.
+        self._forward_state_queue.append(
+            self.execute_forward_with_model_input(model_input)
+        )
+        return None
+
+    @torch.no_grad()
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Sample tokens from the oldest non-DP TT forward result.
+
+        Pops the front of ``_forward_state_queue``.
+
+        Queue entries have two shapes:
+
+        * ``TTForwardOutput``: sync path.  Forward/finalization already ran far
+          enough for this method to sample immediately on the engine thread.
+        * ``TTPendingDecodeState``: non-DP async decode path.  Decode forward
+          was submitted with async readback, so this method must return an
+          ``AsyncModelRunnerOutput`` wrapper instead of blocking the engine
+          thread here.
+        """
+        assert self._forward_state_queue, (
+            "sample_tokens called with no pending forward state"
+        )
+        pending = self._forward_state_queue.popleft()
+
+        if isinstance(pending, TTPendingDecodeState):
+            # Async path: the queue item is not logits/tokens yet. It is an
+            # in-flight decode submission plus the runner state captured at
+            # submit time. Do not wait or sample on the engine thread here;
+            # vLLM will call get_output() on the returned wrapper from its
+            # async output thread, where we wait/finalize, apply any grammar
+            # bitmask, sample, and build the ModelRunnerOutput.
+            return AsyncTTModelRunnerOutput(
+                controller=self.async_decode,
+                submission=pending.submission,
+                model_input=pending.model_input,
+                grammar_output=grammar_output,
+                completion_event=pending.completion_event,
+                context=pending.context,
+            )
+        else:
+            # Sync path: the queue item is a TTForwardOutput. It may contain
+            # host logits (host sampling), already sampled tokens (immediate
+            # device sampling), or a deferred device-sampling payload. In all
+            # cases the vLLM sampling phase can run now using grammar_output.
+            forward_output = pending
+
+        sampled_token_ids_per_dp, logprobs_per_dp = self.sample_forward_output(
+            forward_output, [grammar_output]
         )
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
-        output = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        output = self.apply_and_build_runner_output(
+            sampled_token_ids,
+            logprobs,
+        )
         return output
 
     def pack_dp_results(
@@ -1904,8 +1979,8 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # Structured outputs are not supported on device yet
-        # https://github.com/tenstorrent/vllm/issues/277
+        # Keep structured-output sampling on host for both prefill
+        # and decode.
         if has_structured_outputs:
             return False
 
@@ -1937,6 +2012,30 @@ class TTModelRunner:
         )
         return params_device_supported
 
+    def _can_defer_device_sampling(self, is_decode: bool) -> bool:
+        if not is_decode and self.request_specific_rope:
+            return False
+        return (
+            self._supports_deferred_decode_sampling
+            if is_decode
+            else self._supports_deferred_prefill_sampling
+        )
+
+    @staticmethod
+    def _to_model_sampling_params(sampling_params: TTSamplingParams) -> Any:
+        sampling_param_dict = {
+            field.name: (
+                getattr(sampling_params, field.name).tolist()
+                if getattr(sampling_params, field.name) is not None
+                else None
+            )
+            for field in fields(sampling_params)
+        }
+        sampling_param_dict["seed"] = [
+            None if s == SEED_NONE_SENTINEL else s for s in sampling_param_dict["seed"]
+        ]
+        return TTSamplingParams(**sampling_param_dict)
+
     def submit_prefill(
         self,
         model_input: TTModelInput,
@@ -1963,21 +2062,20 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        device_sampling_deferred = (
+            model_input.perform_device_sampling
+            and model_input.has_structured_outputs
+            and self._can_defer_device_sampling(is_decode=False)
+            and not self.request_specific_rope
+        )
+        model_sampling_params = None
         if model_input.perform_device_sampling:
-            sampling_params = model_input.tt_sampling_params
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+            model_sampling_params = self._to_model_sampling_params(
+                model_input.tt_sampling_params
+            )
+            kwargs["sampling_params"] = model_sampling_params
+            if device_sampling_deferred:
+                kwargs["defer_device_sampling"] = True
         if len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
             # "global" user ids instead for backwards compatibility.
@@ -1993,8 +2091,12 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
-            return tt_out
-        return self.model.prefill_forward(**kwargs)
+            return tt_out, model_sampling_params, device_sampling_deferred
+        return (
+            self.model.prefill_forward(**kwargs),
+            model_sampling_params,
+            device_sampling_deferred,
+        )
 
     def execute_sync_with_model_input(
         self,
@@ -2011,22 +2113,50 @@ class TTModelRunner:
             Each element in logprobs_per_dp is None if logprobs were not
             requested for that DP rank.
         """
-        is_decode = model_input.prompt_lens is None
+        forward_output = self.execute_forward_with_model_input(model_input)
+        return self.sample_forward_output(
+            forward_output, [None] * len(forward_output.batch_size_per_dp)
+        )
 
+    def _empty_forward_output(self, model_input: TTModelInput) -> TTForwardOutput:
+        batch_size_per_dp = model_input.unpadded_batch_size
+        if not isinstance(batch_size_per_dp, list):
+            batch_size_per_dp = [batch_size_per_dp]
+        return TTForwardOutput(
+            tt_out=torch.empty((0, 1, self.vocab_size), dtype=torch.float32),
+            tt_log_probs=None,
+            sampling_params=model_input.tt_sampling_params,
+            model_sampling_params=None,
+            model_input=model_input,
+            batch_size_per_dp=batch_size_per_dp,
+            perform_device_sampling=model_input.perform_device_sampling,
+            device_sampling_deferred=False,
+            is_decode=model_input.prompt_lens is None,
+        )
+
+    def execute_forward_with_model_input(
+        self,
+        model_input: TTModelInput,
+    ) -> TTForwardOutput:
+        """Run TT forward and return the payload needed by sampling."""
+        is_decode = model_input.prompt_lens is None
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
         if not any(bs > 0 for bs in batch_size_per_dp):
-            num_dp = len(batch_size_per_dp)
-            return ([torch.tensor([], dtype=torch.int32)] * num_dp, [None] * num_dp)
+            return self._empty_forward_output(model_input)
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        model_sampling_params = None
+        device_sampling_deferred = False
         tt_log_probs = None
-
-        # Execute model
         if not is_decode:
-            tt_out = self.submit_prefill(model_input, batch_size_per_dp)
+            (
+                tt_out,
+                model_sampling_params,
+                device_sampling_deferred,
+            ) = self.submit_prefill(model_input, batch_size_per_dp)
         else:
             submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
@@ -2038,28 +2168,134 @@ class TTModelRunner:
             batch_size_per_dp = submission.batch_size_per_dp
             sampling_params = submission.sampling_params
             perform_device_sampling = submission.perform_device_sampling
+            model_sampling_params = submission.model_sampling_params
+            device_sampling_deferred = submission.device_sampling_deferred
 
         assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
-        if perform_device_sampling and sampling_params.enable_log_probs.any():
+        if (
+            perform_device_sampling
+            and not device_sampling_deferred
+            and sampling_params.enable_log_probs.any()
+        ):
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
-        elif isinstance(tt_out, tuple):
+        elif not device_sampling_deferred and isinstance(tt_out, tuple):
             tt_out, _ = tt_out
 
-        return self._get_output_tokens(
+        return TTForwardOutput(
             tt_out=tt_out,
             tt_log_probs=tt_log_probs,
             sampling_params=sampling_params,
+            model_sampling_params=model_sampling_params,
             model_input=model_input,
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=perform_device_sampling,
+            device_sampling_deferred=device_sampling_deferred,
             is_decode=is_decode,
+        )
+
+    def _submit_async_forward_with_model_input(
+        self,
+        model_input: TTModelInput,
+    ) -> None:
+        """Submit async decode and push a pending state for sample_tokens().
+
+        The DMA is intentionally NOT waited on here.  ``sample_tokens`` pops
+        the ``TTPendingDecodeState`` and finalises the DMA there, so a second
+        ``execute_model`` call (for step K+1) can start the device decode
+        while step K's DMA is still in flight — realizing the
+        steady-decode pipeline.
+        """
+        steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
+            model_input
+        )
+        context = self.async_decode.capture_submitted_step_context()
+        event = threading.Event()
+        submission = self.async_decode.submit_decode(
+            model_input,
+            read_from_device=False,
+            async_read=True,
+        )
+        self.async_decode.register_pending_async_event(
+            event,
+            overlap_ok=steady_decode_fast_path,
+        )
+        if submission.tt_out is None:
+            # This is a no-op decode submission: no active users produced a TT
+            # output tensor, so there is no readback event to wait on. We still
+            # enqueue an empty forward output because EngineCore will call
+            # sample_tokens() for this scheduled step and pending-event drains
+            # must not block on a submission with no device work.
+            event.set()
+            self._forward_state_queue.append(self._empty_forward_output(model_input))
+            return
+        # Push the in-flight submission; sample_tokens will finalize it.
+        self._forward_state_queue.append(
+            TTPendingDecodeState(
+                submission=submission,
+                model_input=model_input,
+                completion_event=event,
+                context=context,
+            )
+        )
+
+    def _forward_output_from_finalized_decode(
+        self,
+        model_input: TTModelInput,
+        submission: Any,
+        finalized: Any | None,
+    ) -> TTForwardOutput:
+        if finalized is None:
+            return self._empty_forward_output(model_input)
+        return TTForwardOutput(
+            tt_out=finalized.tt_out,
+            tt_log_probs=finalized.tt_log_probs,
+            sampling_params=submission.sampling_params,
+            model_sampling_params=submission.model_sampling_params,
+            model_input=model_input,
+            batch_size_per_dp=submission.batch_size_per_dp,
+            perform_device_sampling=submission.perform_device_sampling,
+            device_sampling_deferred=submission.device_sampling_deferred,
+            is_decode=True,
+        )
+
+    def _submit_async_dp_forward_with_model_input(
+        self,
+        model_input: TTModelInput,
+    ) -> None:
+        submission = self.async_decode.submit_decode(
+            model_input,
+            read_from_device=False,
+            async_read=True,
+        )
+        if submission.tt_out is None:
+            self._dp_forward_state_queue.append(self._empty_forward_output(model_input))
+            return
+        self._dp_forward_state_queue.append(
+            TTPendingDPDecodeState(submission=submission, model_input=model_input)
+        )
+
+    def sample_forward_output(
+        self,
+        forward_output: TTForwardOutput,
+        grammar_outputs: list[Any] | None,
+    ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
+        return self._get_output_tokens(
+            tt_out=forward_output.tt_out,
+            tt_log_probs=forward_output.tt_log_probs,
+            sampling_params=forward_output.sampling_params,
+            model_sampling_params=forward_output.model_sampling_params,
+            model_input=forward_output.model_input,
+            batch_size_per_dp=forward_output.batch_size_per_dp,
+            perform_device_sampling=forward_output.perform_device_sampling,
+            device_sampling_deferred=forward_output.device_sampling_deferred,
+            is_decode=forward_output.is_decode,
+            grammar_outputs=grammar_outputs,
         )
 
     def prepare_dp_model_input(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> tuple[
         TTModelInput | None,
         int,
@@ -2084,7 +2320,7 @@ class TTModelRunner:
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         if scheduler_output is not None:
-            model_input = self.build_model_input(scheduler_output, grammar_output)
+            model_input = self.build_model_input(scheduler_output)
             if model_input is not None:
                 has_penalties = int(not self.input_batch.no_penalties)
                 reset_batch = int(model_input.reset_batch)
@@ -2097,7 +2333,7 @@ class TTModelRunner:
                 req_id_to_index = dict(self.input_batch.req_id_to_index)
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = (
-            int(model_input.grammar_bitmask[0] is not None) if model_input else 0
+            int(model_input.has_structured_outputs) if model_input else 0
         )
         return (
             model_input,
@@ -2119,20 +2355,48 @@ class TTModelRunner:
         any_structured_inputs: bool,
         non_block: bool = False,
     ) -> Any:
-        """Execute one merged DP batch and return the DP-facing result shape.
+        """Execute one merged DP forward and enqueue its sampling payload.
 
-        Merges gathered DP inputs, selects sync or async decode execution, and
-        returns the packed DP-facing result expected by the worker facade.
+        Pushes the ``TTForwardOutput`` onto ``_dp_forward_state_queue`` rather
+        than storing it in a single mutable slot.  This is what makes the DP
+        overlap path safe: when ``concat_and_execute_dp(K+1)`` is sent to the
+        worker *before* ``sample_dp_forward_output(K)`` (as happens in
+        ``step_dp_with_batch_queue`` with ``finalize_before_submit=False``),
+        both forwards are queued in FIFO order and each ``sample`` call pops
+        the correct entry regardless of RPC ordering.
         """
         merged = self.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
         )
-
         if non_block and is_decode:
-            return self.async_decode.submit_async_dp_decode(merged)
+            self._submit_async_dp_forward_with_model_input(merged)
+            return True
 
-        sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(
-            merged
+        self._dp_forward_state_queue.append(
+            self.execute_forward_with_model_input(merged)
+        )
+        return True
+
+    def sample_dp_forward_output(
+        self,
+        grammar_outputs: list[Any] | None,
+    ) -> tuple[torch.Tensor, list]:
+        """Sample the oldest gathered-DP forward output and pack results."""
+        assert self._dp_forward_state_queue, (
+            "sample_dp_forward_output called with no pending DP forward state"
+        )
+        pending = self._dp_forward_state_queue.popleft()
+        if isinstance(pending, TTPendingDPDecodeState):
+            finalized = self.async_decode.finalize_decode(pending.submission)
+            forward_output = self._forward_output_from_finalized_decode(
+                pending.model_input, pending.submission, finalized
+            )
+        else:
+            forward_output = pending
+        if grammar_outputs is None:
+            grammar_outputs = [None] * len(forward_output.batch_size_per_dp)
+        sampled_token_ids_per_dp, logprobs_per_dp = self.sample_forward_output(
+            forward_output, grammar_outputs
         )
         return self.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
 
@@ -2157,15 +2421,118 @@ class TTModelRunner:
             req_id_to_index=req_id_to_index,
         )
 
+    def _device_sampling_bitmask(
+        self,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+        is_decode: bool,
+        grammar_outputs: list[GrammarOutput | None] | None,
+    ) -> torch.Tensor | None:
+        if grammar_outputs is None:
+            return None
+        bitmasks: list[torch.Tensor] = []
+        for dp_rank, sz in enumerate(batch_size_per_dp):
+            grammar_payload = (
+                grammar_outputs[dp_rank] if dp_rank < len(grammar_outputs) else None
+            )
+            batch_length = (
+                model_input.input_tokens.shape[0]
+                if len(batch_size_per_dp) == 1
+                else self.scheduler_config.max_num_seqs
+            )
+            grammar_bitmask = self._reorder_grammar_bitmask(
+                grammar_payload,
+                batch_length=batch_length,
+            )
+            if grammar_bitmask is None:
+                continue
+            bitmasks.append(grammar_bitmask if is_decode else grammar_bitmask[:sz])
+        if not bitmasks:
+            return None
+        return torch.cat(bitmasks, dim=0)
+
+    def _sample_deferred_device_output(
+        self,
+        tt_out: Any,
+        model_sampling_params: Any,
+        model_input: TTModelInput,
+        batch_size_per_dp: list[int],
+        is_decode: bool,
+        grammar_outputs: list[GrammarOutput | None] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
+        assert model_sampling_params is not None
+        bitmask = self._device_sampling_bitmask(
+            model_input=model_input,
+            batch_size_per_dp=batch_size_per_dp,
+            is_decode=is_decode,
+            grammar_outputs=grammar_outputs,
+        )
+        if is_decode:
+            sampled = self.model.sample_decode_on_device(
+                tt_out,
+                model_sampling_params,
+                reset_batch=model_input.reset_batch,
+                prompt_tokens=model_input.prompt_tokens,
+                output_tokens=model_input.output_tokens,
+                slot_remap=model_input.slot_remap,
+                # Grammar bitmasks change the logits tensor, so the sampling
+                # trace captured for the unmasked logits cannot be reused.
+                enable_trace=(
+                    bitmask is None and self.trace_mode in ["all", "decode_only"]
+                ),
+                bitmask=bitmask,
+            )
+            if hasattr(self.model, "process_decode_output_host"):
+                processed = self.model.process_decode_output_host(
+                    sampled,
+                    is_tokens=True,
+                )
+            else:
+                processed = sampled
+            if isinstance(processed, tuple):
+                tt_tokens, tt_log_probs = processed
+            else:
+                tt_tokens, tt_log_probs = processed, None
+            return tt_tokens, tt_log_probs
+
+        if isinstance(tt_out, dict) and "deferred_sampling_tasks" in tt_out:
+            sampled = self.model.sample_prefill_on_device(
+                tt_out["deferred_sampling_tasks"],
+                tt_out["batch_size"],
+                model_sampling_params,
+                bitmask=bitmask,
+            )
+        elif isinstance(tt_out, dict) and "tt_logits_batch" in tt_out:
+            sampled = self.model.sample_prefill_on_device(
+                tt_logits_batch=tt_out["tt_logits_batch"],
+                sampling_params=model_sampling_params,
+                empty_slots=tt_out["empty_slots"],
+                prefill_ids=tt_out.get("prefill_ids"),
+                bitmask=bitmask,
+            )
+        else:
+            raise TypeError(
+                "Deferred prefill device sampling returned an unsupported "
+                f"payload type: {type(tt_out)}"
+            )
+        if isinstance(sampled, tuple):
+            tt_tokens, tt_log_probs = sampled
+        else:
+            tt_tokens, tt_log_probs = sampled, None
+        return tt_tokens, tt_log_probs
+
     def _get_output_tokens(
         self,
-        tt_out: torch.Tensor,
+        tt_out: Any,
         tt_log_probs: torch.Tensor | None,
         sampling_params: TTSamplingParams,
+        model_sampling_params: Any | None,
         model_input: TTModelInput,
         batch_size_per_dp: list[int],
         perform_device_sampling: bool,
+        device_sampling_deferred: bool,
         is_decode: bool,
+        grammar_outputs: list[GrammarOutput | None] | None = None,
     ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
         """Return sampled tokens per DP rank using concatenated model
         outputs, plus optional logprobs per DP rank.
@@ -2182,6 +2549,16 @@ class TTModelRunner:
             Each element in logprobs_per_dp is None if logprobs were not
             requested for that DP rank.
         """
+        if perform_device_sampling and device_sampling_deferred:
+            tt_out, tt_log_probs = self._sample_deferred_device_output(
+                tt_out=tt_out,
+                model_sampling_params=model_sampling_params,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                is_decode=is_decode,
+                grammar_outputs=grammar_outputs,
+            )
+
         sampled_token_ids_per_dp: list[torch.Tensor] = []
         logprobs_per_dp: list[LogprobsTensors | None] = []
 
@@ -2197,7 +2574,14 @@ class TTModelRunner:
             if not perform_device_sampling:
                 logits = tt_out[start : start + sz, -1, :]
 
-                grammar_bitmask = model_input.grammar_bitmask[dp_rank]
+                grammar_bitmask = None
+                if grammar_outputs is not None and dp_rank < len(grammar_outputs):
+                    grammar_bitmask = self._reorder_grammar_bitmask(
+                        grammar_outputs[dp_rank],
+                        batch_length=model_input.input_tokens.shape[0]
+                        if len(batch_size_per_dp) == 1
+                        else self.scheduler_config.max_num_seqs,
+                    )
 
                 if grammar_bitmask is not None:
                     # match shape of logits, which are now unpadded on batch dim
@@ -2281,7 +2665,7 @@ class TTModelRunner:
                 # (per-rank lists).
                 # These are populated for both DP and non-DP cases.
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
-                allowed_token_ids_mask = model_input.allowed_token_ids_mask_list[  # noqa: E501
+                allowed_token_ids_mask = model_input.allowed_token_ids_mask_list[
                     dp_rank
                 ]
                 if allowed_token_ids_mask is not None:
@@ -2379,6 +2763,41 @@ class TTModelRunner:
 
         return sampled_token_ids_per_dp, logprobs_per_dp
 
+    def _reorder_grammar_bitmask(
+        self,
+        grammar_payload: Any,
+        *,
+        batch_length: int,
+    ) -> torch.Tensor | None:
+        req_id_to_index = self.input_batch.req_id_to_index
+        grammar_output = grammar_payload
+        if isinstance(grammar_payload, tuple):
+            grammar_output, req_id_to_index = grammar_payload
+        if grammar_output is None:
+            return None
+        bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
+        grammar_bitmask_length = bitmask.shape[1]
+        reordered_bitmask = torch.zeros(
+            (batch_length, grammar_bitmask_length), dtype=torch.int32
+        )
+        # Ones in the compressed bitmask represent allowed tokens. Default rows
+        # therefore allow everything for requests without structured output.
+        reordered_bitmask = torch.bitwise_not(reordered_bitmask)
+        req_id_to_bitmask_row = {
+            req_id: i
+            for i, req_id in enumerate(grammar_output.structured_output_request_ids)
+        }
+        for req_id, persistent_batch_index in req_id_to_index.items():
+            scheduler_bitmask_row = req_id_to_bitmask_row.get(req_id)
+            if (
+                scheduler_bitmask_row is not None
+                and persistent_batch_index < batch_length
+            ):
+                reordered_bitmask[persistent_batch_index, :] = bitmask[
+                    scheduler_bitmask_row, :
+                ]
+        return reordered_bitmask
+
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor
     ) -> None:
@@ -2452,7 +2871,6 @@ class TTModelRunner:
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
-        row_indices: tuple[int, ...] | None = None,
     ) -> None:
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
@@ -2496,6 +2914,8 @@ class TTModelRunner:
             if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
+            # Resolve the live batch row at apply time; async scheduling may have
+            # moved requests since the submit-time snapshot was captured.
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
@@ -2518,6 +2938,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        request_states: tuple[CachedRequestState, ...] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -2527,6 +2948,7 @@ class TTModelRunner:
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
+            request_states=request_states,
         )
         return self._build_runner_output(
             sampled_token_ids=sampled_token_ids,

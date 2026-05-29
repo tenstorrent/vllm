@@ -4,15 +4,13 @@
 from __future__ import annotations
 
 import threading
-import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import ttnn
 
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
-from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -28,15 +26,17 @@ class TTDecodeSubmission:
     read_events: list[Any] | None
     batch_size_per_dp: list[int]
     sampling_params: Any
+    model_sampling_params: Any | None
     perform_device_sampling: bool
+    device_sampling_deferred: bool
 
 
 @dataclass(frozen=True)
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor
-    tt_log_probs: torch.Tensor | None
+    tt_out: Any
+    tt_log_probs: Any | None
 
 
 @dataclass(frozen=True)
@@ -46,8 +46,6 @@ class SubmittedStepContext:
     req_ids: list[str]
     req_id_to_index: dict[str, int]
     request_states: tuple[CachedRequestState, ...]
-    row_indices: tuple[int, ...]
-    submit_time_ns: int
 
 
 @dataclass(frozen=True)
@@ -57,23 +55,24 @@ class CompletedDecodeStep:
     sampled_token_ids: torch.Tensor
     logprobs: LogprobsLists | None
     context: SubmittedStepContext
-    completion_time_ns: int
 
 
 class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
-    """Wrap a non-blocking TT decode submission plus async read submit."""
+    """Finish TT non-DP sampling on vLLM's async output thread."""
 
     def __init__(
         self,
         controller: TTAsyncDecodeController,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
         completion_event: threading.Event,
         context: SubmittedStepContext,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
+        self._grammar_output = grammar_output
         self._completion_event = completion_event
         self._context = context
 
@@ -87,45 +86,11 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         completed = self._controller.complete_non_dp_decode_step(
             submission=self._submission,
             model_input=self._model_input,
+            grammar_output=self._grammar_output,
             context=self._context,
         )
         self._controller.enqueue_completed_decode_step(completed)
         return self._controller.build_runner_output_from_completed_step(completed)
-
-
-class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
-    """Wrap a non-blocking DP decode submission plus async read submit."""
-
-    def __init__(
-        self,
-        controller: TTAsyncDecodeController,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-    ):
-        self._controller = controller
-        self._submission = submission
-        self._model_input = model_input
-
-    def get_output(self) -> tuple[torch.Tensor, list]:  # type: ignore[override]
-        finalized = self._controller.finalize_decode(self._submission)
-        runner = self._controller.runner
-        if finalized is None:
-            return runner.pack_dp_results(
-                [torch.tensor([], dtype=torch.int32)]
-                * len(self._submission.batch_size_per_dp),
-                [None] * len(self._submission.batch_size_per_dp),
-            )
-
-        sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
-            tt_out=finalized.tt_out,
-            tt_log_probs=finalized.tt_log_probs,
-            sampling_params=self._submission.sampling_params,
-            model_input=self._model_input,
-            batch_size_per_dp=self._submission.batch_size_per_dp,
-            perform_device_sampling=self._submission.perform_device_sampling,
-            is_decode=True,
-        )
-        return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
 
 
 class TTAsyncDecodeController:
@@ -142,10 +107,6 @@ class TTAsyncDecodeController:
             req_ids=req_ids,
             req_id_to_index=dict(runner.input_batch.req_id_to_index),
             request_states=tuple(runner.requests[req_id] for req_id in req_ids),
-            row_indices=tuple(
-                runner.input_batch.req_id_to_index[req_id] for req_id in req_ids
-            ),
-            submit_time_ns=time.perf_counter_ns(),
         )
 
     def steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
@@ -165,7 +126,6 @@ class TTAsyncDecodeController:
     def steady_decode_scheduler_invariants_met(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         runner = self.runner
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -174,10 +134,9 @@ class TTAsyncDecodeController:
         )
         if is_prompt or runner._decode_layout_changed_since_last_decode:
             return False
-        if (
-            scheduler_output.pending_structured_output_tokens
-            or grammar_output is not None
-        ):
+        if scheduler_output.pending_structured_output_tokens:
+            return False
+        if runner._scheduler_output_has_structured_outputs(scheduler_output):
             return False
         input_batch = runner.input_batch
         if not input_batch.no_penalties:
@@ -203,26 +162,20 @@ class TTAsyncDecodeController:
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=False):
             return False
-        return self.steady_decode_scheduler_invariants_met(
-            scheduler_output, grammar_output
-        )
+        return self.steady_decode_scheduler_invariants_met(scheduler_output)
 
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=True):
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
-        return self.steady_decode_scheduler_invariants_met(
-            scheduler_output, grammar_output
-        )
+        return self.steady_decode_scheduler_invariants_met(scheduler_output)
 
     def can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=False):
@@ -233,7 +186,7 @@ class TTAsyncDecodeController:
             return False
         if model_input.reset_batch:
             return False
-        if model_input.grammar_bitmask[0] is not None:
+        if model_input.has_structured_outputs:
             return False
         if (
             model_input.prompt_tokens is not None
@@ -308,6 +261,7 @@ class TTAsyncDecodeController:
         self,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
         context: SubmittedStepContext,
     ) -> CompletedDecodeStep:
         finalized = self.finalize_decode(submission)
@@ -315,14 +269,22 @@ class TTAsyncDecodeController:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
         else:
+            grammar_payload = (
+                (grammar_output, context.req_id_to_index)
+                if grammar_output is not None
+                else None
+            )
             sampled_token_ids_per_dp, logprobs_per_dp = self.runner._get_output_tokens(
                 tt_out=finalized.tt_out,
                 tt_log_probs=finalized.tt_log_probs,
                 sampling_params=submission.sampling_params,
+                model_sampling_params=submission.model_sampling_params,
                 model_input=model_input,
                 batch_size_per_dp=submission.batch_size_per_dp,
                 perform_device_sampling=submission.perform_device_sampling,
+                device_sampling_deferred=submission.device_sampling_deferred,
                 is_decode=True,
+                grammar_outputs=[grammar_payload],
             )
             sampled_token_ids = sampled_token_ids_per_dp[0]
             logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
@@ -331,7 +293,6 @@ class TTAsyncDecodeController:
             sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
             context=context,
-            completion_time_ns=time.perf_counter_ns(),
         )
 
     def build_runner_output_from_completed_step(
@@ -350,49 +311,6 @@ class TTAsyncDecodeController:
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             request_states=completed.context.request_states,
-            row_indices=completed.context.row_indices,
-        )
-
-    def submit_async_non_dp_decode(
-        self,
-        model_input: TTModelInput,
-        *,
-        steady_decode_fast_path: bool,
-    ) -> AsyncTTModelRunnerOutput:
-        event = threading.Event()
-        context = self.capture_submitted_step_context()
-        submission = self.submit_decode(
-            model_input,
-            read_from_device=False,
-            async_read=True,
-        )
-        self.register_pending_async_event(
-            event,
-            overlap_ok=steady_decode_fast_path,
-        )
-        if submission.tt_out is None:
-            event.set()
-        return AsyncTTModelRunnerOutput(
-            controller=self,
-            submission=submission,
-            model_input=model_input,
-            completion_event=event,
-            context=context,
-        )
-
-    def submit_async_dp_decode(
-        self,
-        model_input: TTModelInput,
-    ) -> AsyncTTDPGatherOutput:
-        submission = self.submit_decode(
-            model_input,
-            read_from_device=False,
-            async_read=True,
-        )
-        return AsyncTTDPGatherOutput(
-            controller=self,
-            submission=submission,
-            model_input=model_input,
         )
 
     def submit_decode(
@@ -415,7 +333,9 @@ class TTAsyncDecodeController:
                 read_events=None,
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
+                model_sampling_params=None,
                 perform_device_sampling=perform_device_sampling,
+                device_sampling_deferred=False,
             )
 
         kwargs: dict[str, Any] = {
@@ -431,20 +351,17 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        device_sampling_deferred = (
+            perform_device_sampling
+            and model_input.has_structured_outputs
+            and runner._can_defer_device_sampling(is_decode=True)
+        )
+        model_sampling_params = None
         if perform_device_sampling:
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+            model_sampling_params = runner._to_model_sampling_params(sampling_params)
+            kwargs["sampling_params"] = model_sampling_params
+            if device_sampling_deferred:
+                kwargs["defer_device_sampling"] = True
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
@@ -477,7 +394,7 @@ class TTAsyncDecodeController:
             read_from_device=read_from_device,
         )
         read_events = None
-        if async_read:
+        if async_read and not device_sampling_deferred:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
@@ -499,30 +416,62 @@ class TTAsyncDecodeController:
             read_events=read_events,
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
+            model_sampling_params=model_sampling_params,
             perform_device_sampling=perform_device_sampling,
+            device_sampling_deferred=device_sampling_deferred,
         )
 
     def finalize_decode(
         self,
         submission: TTDecodeSubmission,
     ) -> TTFinalizedDecode | None:
+        """Turn a submitted decode into the payload consumed by sampling.
+
+        This method finalizes the TT decode submission. It is intentionally not
+        synonymous with "sample": depending on the mode, the returned ``tt_out``
+        may be host logits, already sampled token IDs, or still-device logits
+        that deferred sampling will consume later.
+        """
         runner = self.runner
         if submission.tt_out is None:
+            # No active users produced device work for this decode step.
             return None
 
         if submission.read_events is not None:
+            # Async decode readback path. The forward already submitted an
+            # asynchronous device-to-host read; wait here before exposing the
+            # payload to sampling/output construction.
             for read_event in submission.read_events:
                 ttnn.event_synchronize(read_event)
             tt_out = submission.tt_out
         else:
+            # No async readback event was registered. This covers synchronous
+            # decode finalization, deferred device sampling (device logits stay
+            # on device for sample_decode_on_device), and model paths that
+            # already returned host tensors.
             tt_out = submission.tt_out
 
+        if submission.device_sampling_deferred:
+            # Structured-output device sampling needs the grammar bitmask,
+            # which vLLM prepares after forward submission. Keep the device
+            # logits/payload untouched; _get_output_tokens() will later call
+            # sample_decode_on_device(..., bitmask=...).
+            return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=None)
+
         if hasattr(runner.model, "process_decode_output_host"):
+            # Normalize the model-specific decode result into host-visible
+            # tensors. For host sampling this means logits; for immediate
+            # device sampling this means sampled token IDs, and possibly
+            # logprobs. The is_tokens flag tells the model which shape/type to
+            # interpret.
             tt_out = runner.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
         else:
+            # Some tests or model paths may already return torch tensors. In
+            # that case there is no model-specific host processing to do, but
+            # device tensors would be unsafe to pass upward from this point.
             is_host_tensor = isinstance(tt_out, torch.Tensor)
             is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
                 tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
@@ -539,9 +488,13 @@ class TTAsyncDecodeController:
             submission.perform_device_sampling
             and submission.sampling_params.enable_log_probs.any()
         ):
+            # Immediate device sampling with logprobs returns a pair:
+            # (sampled_tokens, sampled_token_logprobs).
             assert isinstance(tt_out, tuple) and len(tt_out) == 2
             tt_out, tt_log_probs = tt_out
         elif isinstance(tt_out, tuple):
+            # Host-sampling decode commonly returns (logits, None). Keep only
+            # logits here; host logprobs are computed later by the host sampler.
             tt_out, _ = tt_out
 
         return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=tt_log_probs)
