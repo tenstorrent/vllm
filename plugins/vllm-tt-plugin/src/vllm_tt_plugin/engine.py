@@ -563,11 +563,17 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 handle.scheduler_output, model_output
             )
 
-        finalize_before_submit = prev_handle is not None and (
-            not global_has_requests
-            or not prev_handle.overlap_ok
-            or not current_overlap_ok
-        )
+        # Always finalize the previous step before submitting the next one.
+        #
+        # The submit reads ``input_batch.token_ids_cpu`` to build the decode
+        # input for the next step; that table is only updated once
+        # ``apply_dp_execution_result`` runs inside ``_finalize_previous``. The
+        # original overlap path (submit-next then finalize-prev) therefore
+        # built the next step's input from stale token state, so the device
+        # re-sampled the previous step's near-deterministic position — most
+        # visibly as doubled ``<|end|>`` and ``<|start|>assistant`` tokens,
+        # which break harmony parsing and silently null out chat responses.
+        finalize_before_submit = prev_handle is not None
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
         if finalize_before_submit:
