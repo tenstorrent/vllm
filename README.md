@@ -1,5 +1,5 @@
 <!-- markdownlint-disable MD001 MD041 -->
-**⚠️ Running on Tenstorrent hardware**: To use vLLM with Tenstorrent hardware, please follow the instructions in [tt_metal/README.md](https://github.com/tenstorrent/vllm/blob/dev/tt_metal/README.md) (Note: `dev` is the main development branch).
+**⚠️ Running on Tenstorrent hardware**: To use vLLM with Tenstorrent hardware, please follow the instructions in the [TT vLLM plugin README](https://github.com/tenstorrent/vllm/tree/dev/plugins/vllm-tt-plugin) (Note: `dev` is the main development branch).
 
 ---
 <p align="center">
