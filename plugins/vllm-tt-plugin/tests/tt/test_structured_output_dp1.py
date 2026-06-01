@@ -5,9 +5,6 @@ import asyncio
 import json
 import re
 
-import pytest
-
-
 CHOICES = ["red", "green", "blue", "yellow"]
 REGEX = r"LANE-[0-9]"
 JSON_SCHEMA = {
@@ -101,30 +98,31 @@ async def _send_plain_request(async_client, model: str, request_id: int) -> str:
     return content
 
 
-@pytest.mark.asyncio
-async def test_dp1_full_capacity_mixes_structured_and_plain_requests(
+def test_dp1_full_capacity_mixes_structured_and_plain_requests(
     tt_server,
     tt_model_name,
     max_batch_size,
 ):
-    async_client = tt_server.get_async_client()
-    request_count = min(max_batch_size, 32)
-    senders = [
-        _send_choice_request,
-        _send_regex_request,
-        _send_json_request,
-        _send_plain_request,
-    ]
+    async def _run() -> None:
+        async_client = tt_server.get_async_client()
+        request_count = min(max_batch_size, 32)
+        senders = [
+            _send_choice_request,
+            _send_regex_request,
+            _send_json_request,
+            _send_plain_request,
+        ]
 
-    tasks = [
-        senders[request_id % len(senders)](
-            async_client,
-            tt_model_name,
-            request_id,
-        )
-        for request_id in range(request_count)
-    ]
+        tasks = [
+            senders[request_id % len(senders)](
+                async_client,
+                tt_model_name,
+                request_id,
+            )
+            for request_id in range(request_count)
+        ]
 
-    results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+        assert len(results) == request_count
 
-    assert len(results) == request_count
+    asyncio.run(_run())
