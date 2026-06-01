@@ -174,9 +174,17 @@ class TestFullDPMode:
         rank_binding.write_text(
             "rank_bindings:\n"
             "  - rank: 0\n"
+            "    env_overrides:\n"
+            "      TT_VISIBLE_DEVICES: '0'\n"
             "  - rank: 1\n"
+            "    env_overrides:\n"
+            "      TT_VISIBLE_DEVICES: '1'\n"
             "  - rank: 2\n"
-            "  - rank: 3\n",
+            "    env_overrides:\n"
+            "      TT_VISIBLE_DEVICES: '2'\n"
+            "  - rank: 3\n"
+            "    env_overrides:\n"
+            "      TT_VISIBLE_DEVICES: '3'\n",
             encoding="utf-8",
         )
 
@@ -196,6 +204,38 @@ class TestFullDPMode:
         parsed_rank_binding, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
         assert parsed_rank_binding == str(rank_binding)
         assert non_device_dp_ranks == set()
+
+    def test_parse_tt_mpi_params_full_dp_requires_visible_devices(
+        self,
+        tmp_path,
+    ) -> None:
+        """``full_dp_mode`` requires TT_VISIBLE_DEVICES for each rank binding."""
+        rank_binding = tmp_path / "rank_binding.yaml"
+        rank_binding.write_text(
+            "rank_bindings:\n"
+            "  - rank: 0\n"
+            "    env_overrides:\n"
+            "      TT_VISIBLE_DEVICES: '0'\n"
+            "  - rank: 1\n"
+            "    env_overrides: {}\n",
+            encoding="utf-8",
+        )
+
+        vllm_config = SimpleNamespace(
+            plugin_config={
+                "tt": {
+                    "full_dp_mode": True,
+                    "rank_binding": str(rank_binding),
+                }
+            },
+            parallel_config=SimpleNamespace(
+                data_parallel_backend="mp",
+                data_parallel_size=2,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="TT_VISIBLE_DEVICES"):
+            parse_tt_mpi_params(vllm_config)
 
     def test_parse_tt_mpi_params_full_dp_rejects_mismatched_world(
         self,

@@ -193,6 +193,32 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     logger.info("Validated launching from MPI rank 0 host %s", rank0_host)
 
 
+def _validate_full_dp_rank_binding_visibility(rank_bindings: list) -> None:
+    if not isinstance(rank_bindings, list):
+        raise RuntimeError("rank_binding must contain a 'rank_bindings' list")
+
+    for i, binding in enumerate(rank_bindings):
+        if not isinstance(binding, dict):
+            raise RuntimeError(
+                "full_dp_mode requires each rank_binding entry to be a mapping"
+            )
+
+        env_overrides = binding.get("env_overrides")
+        if not isinstance(env_overrides, dict):
+            raise RuntimeError(
+                "full_dp_mode requires per-rank env_overrides with "
+                "TT_VISIBLE_DEVICES"
+            )
+
+        visible = env_overrides.get("TT_VISIBLE_DEVICES")
+        if not isinstance(visible, str) or not visible.strip():
+            rank = binding.get("rank", i)
+            raise RuntimeError(
+                "full_dp_mode requires TT_VISIBLE_DEVICES for every rank_binding "
+                f"entry (missing/invalid at rank={rank})"
+            )
+
+
 def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
     parallel_config = vllm_config.parallel_config
     assert parallel_config.data_parallel_backend != "ray", (
@@ -211,7 +237,8 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         try:
             with open(rank_binding_file) as f:
                 rb = yaml.safe_load(f)
-            mpi_world = len(rb.get("rank_bindings", []))
+            rank_bindings = rb.get("rank_bindings", [])
+            mpi_world = len(rank_bindings)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to read rank binding '{rank_binding_file}': {e}"
@@ -227,6 +254,7 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
                     f"data_parallel_size ({dp_size}) must equal number of "
                     f"device MPI ranks ({mpi_world})"
                 )
+            _validate_full_dp_rank_binding_visibility(rank_bindings)
             non_device_dp_ranks = set()
         else:
             if dp_size % mpi_world != 0:
