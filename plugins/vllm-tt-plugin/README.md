@@ -326,15 +326,17 @@ TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
 VLLM_RPC_TIMEOUT=900000 \
 python plugins/vllm-tt-plugin/examples/server_example_tt.py \
   --model "meta-llama/Llama-3.3-70B-Instruct" \
-  --max_num_seqs 8 \
+  --max_num_seqs 32 \
   --async-scheduling \
   --plugin-config '{"tt": {"tt_data_parallel_size": 4, "dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
 Notes:
 
-- `max_num_seqs` is per lane in this mode. With `tt_data_parallel_size=4` and
-  `max_num_seqs=8`, the server admits up to `32` concurrent running requests.
+- `max_num_seqs` is the global engine capacity in this mode and must be
+  divisible by `tt_data_parallel_size`. With `tt_data_parallel_size=4` and
+  `max_num_seqs=32`, each lane runs up to `8` requests, for `32` concurrent
+  running requests total (matching the older gathered multi-process DP=4 path).
 - Leave vLLM `--data_parallel_size` at `1` when using `tt_data_parallel_size`.
 
 ## Supported Model Families
