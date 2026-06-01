@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import os
 import threading
 import time
@@ -40,7 +39,11 @@ from vllm_tt_plugin.async_decode import (
     SubmittedStepContext,
     TTAsyncDecodeController,
 )
-from vllm_tt_plugin.config import get_tt_data_parallel_size
+from vllm_tt_plugin.config import (
+    get_tt_data_parallel_size,
+    get_tt_max_batch_size,
+    get_tt_per_lane_max_num_seqs,
+)
 from vllm_tt_plugin.input_batch import (
     LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
@@ -50,6 +53,7 @@ from vllm_tt_plugin.input_batch import (
 from vllm_tt_plugin.lane_scheduler import LaneStepMetadata
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -314,6 +318,8 @@ class TTModelRunner:
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
+        self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
+        self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
         self._lane_prev_decode_req_ids: list[list[str]] = [
             [] for _ in range(self.tt_data_parallel_size)
         ]
@@ -326,23 +332,8 @@ class TTModelRunner:
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
         # sampling isn't supported for a given batch.
-        host_logitsprocs_config = vllm_config
-        if (
-            self.parallel_config.data_parallel_size == 1
-            and self.tt_data_parallel_size > 1
-        ):
-            # The persistent host-side input batch is sized for the merged
-            # single-process lane capacity, so host logits processors must
-            # allocate per-request state for the same capacity.
-            host_logitsprocs_config = copy.copy(vllm_config)
-            host_logitsprocs_config.scheduler_config = copy.copy(
-                vllm_config.scheduler_config
-            )
-            host_logitsprocs_config.scheduler_config.max_num_seqs = (
-                self.scheduler_config.max_num_seqs * self.tt_data_parallel_size
-            )
         self._host_logitsprocs: LogitsProcessors = build_logitsprocs(
-            vllm_config=host_logitsprocs_config,
+            vllm_config=vllm_config,
             device=torch.device("cpu"),
             is_pin_memory=False,
             is_pooling_model=False,
@@ -406,7 +397,7 @@ class TTModelRunner:
         # rows allocated, never indexed).
         per_group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
 
-        max_num_reqs = self.scheduler_config.max_num_seqs * self.tt_data_parallel_size
+        max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         self.input_batch = InputBatch(
@@ -546,9 +537,7 @@ class TTModelRunner:
         # tables push their content into those buffers. Padding rows with
         # zeros is harmless — the kernel only reads up to each layer's
         # active block count.
-        max_batch = int(self.scheduler_config.max_num_seqs) * int(
-            self.tt_data_parallel_size
-        )
+        max_batch = self.tt_max_batch_size
         target_shape = (max_batch, self.max_num_blocks_per_req)
         padded = []
         for bt in result:
@@ -900,10 +889,10 @@ class TTModelRunner:
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
-        # Per-lane builds pad to per-lane capacity (max_num_seqs), not the
-        # merged input batch capacity (max_num_seqs * tt_data_parallel_size).
+        # Per-lane builds pad to the lane/rank wire capacity, not the merged
+        # input batch capacity.
         decode_pad_to = (
-            self.scheduler_config.max_num_seqs
+            self.tt_per_lane_max_num_seqs
             if req_indices is not None or num_reqs < batch_num_reqs
             else input_batch.max_num_reqs
         )
@@ -1005,7 +994,7 @@ class TTModelRunner:
             self._decode_layout_changed_since_last_decode = False
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
-            # Pad batch to max_num_reqs (per-lane for multi-lane builds).
+            # Pad decode to the lane/rank wire capacity.
             if input_tokens.shape[0] < decode_pad_to:
                 batch_pad = decode_pad_to - input_tokens.shape[0]
                 input_tokens = torch.cat(
@@ -1094,12 +1083,6 @@ class TTModelRunner:
             bitmask = torch.from_numpy(bitmask)
             # unpadded for prefill, padded for decode
             batch_length = input_tokens.shape[0]
-            grammar_bitmask_length = bitmask.shape[1]
-            # Ones in the compressed bitmask represent tokens that are allowed.
-            reordered_bitmask = torch.zeros(
-                (batch_length, grammar_bitmask_length), dtype=torch.int32
-            )
-            reordered_bitmask = torch.bitwise_not(reordered_bitmask)
             # `structured_output_request_ids` comes from GrammarOutput as a list
             # of request IDs (bitmask rows are in this order). TT does not support
             # speculative decoding in this path, so we assume a single bitmask row
@@ -1109,16 +1092,13 @@ class TTModelRunner:
                 if grammar_output is not None
                 else []
             )
-            req_id_to_bitmask_row: dict[str, int] = {
-                req_id: i for i, req_id in enumerate(structured_output_request_ids)
-            }
-            for req_id, persistent_batch_index in input_batch.req_id_to_index.items():
-                scheduler_bitmask_row = req_id_to_bitmask_row.get(req_id)
-                if scheduler_bitmask_row is not None:
-                    reordered_bitmask[persistent_batch_index, :] = bitmask[
-                        scheduler_bitmask_row, :
-                    ]
-            bitmask = reordered_bitmask
+            bitmask = reorder_grammar_bitmask_for_tt_batch(
+                bitmask=bitmask,
+                structured_output_request_ids=structured_output_request_ids,
+                req_id_to_index=input_batch.req_id_to_index,
+                req_indices=req_indices,
+                batch_length=batch_length,
+            )
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
@@ -1302,7 +1282,7 @@ class TTModelRunner:
             keys "prompt_tokens" and "output_tokens", or None if not needed.
         """
 
-        max_batch = int(self.scheduler_config.max_num_seqs)
+        max_batch = self.tt_per_lane_max_num_seqs
         num_groups = self._num_kv_cache_groups
         if model_input is None:
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
@@ -1315,9 +1295,8 @@ class TTModelRunner:
                 for _ in range(num_groups)
             ]
             unpadded_batch_size = torch.tensor([0], dtype=torch.int32)
-            # Default sampling tensors must match ``max_batch`` (per-lane
-            # capacity), not ``input_batch.max_num_reqs`` which is scaled by
-            # tt_data_parallel_size for in-process multi-lane batches.
+            # Default sampling tensors must match the lane/rank wire capacity,
+            # not the merged input batch capacity.
             sampling_defaults = self.input_batch.sampling.create_default_tensors()
             sampling_default_tensors = {
                 name: tensor[:max_batch] for name, tensor in sampling_defaults.items()
@@ -1408,8 +1387,8 @@ class TTModelRunner:
                 else LOGPROBS_NONE_SENTINEL
             )
         # Slot remap for seed manager reindexing after condense. The merged
-        # input batch uses max_num_reqs (lanes * max_num_seqs) but the decode
-        # gather wire format is per-rank max_num_seqs.
+        # input batch uses global max_num_seqs, but the decode gather wire
+        # format is per-lane/per-rank.
         slot_remap = self._decode_gather_slot_remap(model_input, max_batch)
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req, G = num kv_cache_groups.
@@ -1566,7 +1545,7 @@ class TTModelRunner:
             assert max_blocks_decode_batch is not None, (
                 "max_blocks_decode_batch must be provided for decode"
             )
-            B = int(self.scheduler_config.max_num_seqs)
+            B = self.tt_per_lane_max_num_seqs
             W = max_blocks_decode_batch
             reset_batch = inputs["reset_batch"]
             perform_device_sampling = inputs["all_sample_device"]
@@ -1894,8 +1873,8 @@ class TTModelRunner:
                             max_output_len, rank_output_tokens.shape[1]
                         )
 
-            # Create tensors with shape (max_num_reqs * DP_size, max_len)
-            max_num_reqs = int(self.scheduler_config.max_num_seqs)
+            # Create tensors with shape (per-rank batch * DP_size, max_len)
+            max_num_reqs = self.tt_per_lane_max_num_seqs
             total_batch_size = max_num_reqs * len(sampling_tokens_inputs)
 
             # Create prompt and output tokens tensors
@@ -2092,7 +2071,7 @@ class TTModelRunner:
         return torch.cat([tensor, padding], dim=0)
 
     def _lane_slot_remap(self, lane: int, current_req_ids: list[str]) -> torch.Tensor:
-        batch_size = int(self.scheduler_config.max_num_seqs)
+        batch_size = self.tt_per_lane_max_num_seqs
         lane_offset = lane * batch_size
         remap = torch.arange(lane_offset, lane_offset + batch_size, dtype=torch.int32)
         prev_index = {
@@ -2108,7 +2087,7 @@ class TTModelRunner:
         lane_inputs: list[TTModelInput | None],
         lane_req_ids: list[list[str]] | None,
     ) -> TTModelInput:
-        batch_size = int(self.scheduler_config.max_num_seqs)
+        batch_size = self.tt_per_lane_max_num_seqs
         world = len(lane_inputs)
         total_batch = batch_size * world
         max_bt_width = self.max_num_blocks_per_req
@@ -2645,7 +2624,7 @@ class TTModelRunner:
             lp.tolists() if lp is not None else None for lp in logprobs_per_dp
         ]
         world = self.tt_data_parallel_size
-        B = int(self.scheduler_config.max_num_seqs)
+        B = self.tt_per_lane_max_num_seqs
         for dp_rank in range(world):
             token_ids = sampled_token_ids_per_dp[dp_rank].to(torch.int32)
             if token_ids.numel() == 0:
@@ -2762,7 +2741,7 @@ class TTModelRunner:
         if len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
             # "global" user ids instead for backwards compatibility.
-            stride = int(self.scheduler_config.max_num_seqs)
+            stride = self.tt_per_lane_max_num_seqs
             empty_slots = []
             for dp_rank, sz in enumerate(batch_size_per_dp):
                 for i in range(int(sz)):
@@ -2981,7 +2960,7 @@ class TTModelRunner:
                 logprobs_per_dp.append(None)
                 if is_decode:
                     # Fixed stride segments per DP rank for decode
-                    start += self.scheduler_config.max_num_seqs
+                    start += self.tt_per_lane_max_num_seqs
                 continue
             if not perform_device_sampling:
                 logits = tt_out[start : start + sz, -1, :]
@@ -3161,7 +3140,7 @@ class TTModelRunner:
 
             if is_decode:
                 # Fixed stride segments per DP rank for decode
-                start += self.scheduler_config.max_num_seqs
+                start += self.tt_per_lane_max_num_seqs
             else:
                 # Prefill packed contiguously
                 start += sz
@@ -3354,8 +3333,7 @@ class TTModelRunner:
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
-            max_batch_size=self.scheduler_config.max_num_seqs
-            * self.tt_data_parallel_size,
+            max_batch_size=self.tt_max_batch_size,
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )

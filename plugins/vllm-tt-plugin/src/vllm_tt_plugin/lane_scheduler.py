@@ -12,7 +12,10 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.request import Request
-from vllm_tt_plugin.config import get_tt_data_parallel_size
+from vllm_tt_plugin.config import (
+    get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
+)
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
 if TYPE_CHECKING:
@@ -195,7 +198,7 @@ class TTLaneCoordinator(TTScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.num_lanes = get_tt_data_parallel_size(self.vllm_config)
-        self._per_lane_max = self.scheduler_config.max_num_seqs
+        self._per_lane_max = get_tt_per_lane_max_num_seqs(self.vllm_config)
         self._last_lane_metadata: LaneStepMetadata | None = None
 
     def _refresh_lane_counts(self) -> None:

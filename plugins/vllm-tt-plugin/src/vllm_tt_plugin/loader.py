@@ -7,7 +7,11 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
-from vllm_tt_plugin.config import get_tt_config, get_tt_data_parallel_size
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    get_tt_max_batch_size,
+)
 
 logger = init_logger(__name__)
 
@@ -19,8 +23,6 @@ class TTModelLoader(BaseModelLoader):
         """Load a model with the given configurations."""
 
         device_config = vllm_config.device_config
-        scheduler_config = vllm_config.scheduler_config
-
         model_class, _ = get_model_architecture(model_config)
         optimizations = get_tt_config(vllm_config).get("optimizations", None)
         if optimizations is not None:
@@ -30,10 +32,8 @@ class TTModelLoader(BaseModelLoader):
             ], f"""Invalid optimizations configuration `{optimizations}`,
             allowed values are 'performance' or 'accuracy'"""
 
-        # TT model init expects the global DP-sized batch contract:
-        # batch_size_per_dp * total_dp.
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
-        max_batch_size = scheduler_config.max_num_seqs * tt_data_parallel
+        max_batch_size = get_tt_max_batch_size(vllm_config)
 
         model = model_class.initialize_vllm_model(
             model_config.hf_config,

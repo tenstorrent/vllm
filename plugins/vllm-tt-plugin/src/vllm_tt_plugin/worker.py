@@ -26,6 +26,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_max_batch_size,
     uses_tt_lane_coordinator,
 )
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
@@ -417,7 +418,7 @@ class TTWorker(WorkerBase):
         do not execute the merged TT batch.
         """
         world = self.parallel_config.data_parallel_size
-        batch_size = int(self.model_runner.scheduler_config.max_num_seqs)
+        batch_size = self.model_runner.tt_per_lane_max_num_seqs
         return torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world
 
     def apply_dp_execution_result(
@@ -498,7 +499,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-    max_batch = scheduler_config.max_num_seqs * get_tt_data_parallel_size(vllm_config)
+    max_batch = get_tt_max_batch_size(vllm_config)
     max_tokens_all_users += cache_config.block_size * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers

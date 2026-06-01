@@ -88,6 +88,43 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     return lanes
 
 
+def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
+    """Return the global TT batch capacity for model/KV sizing.
+
+    Gathered multi-process DP keeps the historical contract: each rank receives
+    ``max_num_seqs`` requests and the TT model is initialized for the gathered
+    DP batch. Single-process lane mode is different: vLLM sees one engine, so
+    ``max_num_seqs`` is already the global engine capacity and lanes are only an
+    internal partition.
+    """
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        return max_num_seqs * get_tt_data_parallel_size(vllm_config)
+    return max_num_seqs
+
+
+def get_tt_per_lane_max_num_seqs(vllm_config: "VllmConfig") -> int:
+    """Return the per-lane/per-rank scheduling and wire-format capacity."""
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    if not uses_tt_lane_coordinator(vllm_config):
+        return max_num_seqs
+
+    lanes = get_tt_data_parallel_size(vllm_config)
+    if max_num_seqs % lanes != 0:
+        raise ValueError(
+            "max_num_seqs must be divisible by tt_data_parallel_size in "
+            "single-process TT lane mode; got "
+            f"max_num_seqs={max_num_seqs}, tt_data_parallel_size={lanes}."
+        )
+    per_lane = max_num_seqs // lanes
+    if per_lane < 1:
+        raise ValueError(
+            "max_num_seqs must provide at least one request per TT lane; got "
+            f"max_num_seqs={max_num_seqs}, tt_data_parallel_size={lanes}."
+        )
+    return per_lane
+
+
 def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     return (
         vllm_config.parallel_config.data_parallel_size == 1

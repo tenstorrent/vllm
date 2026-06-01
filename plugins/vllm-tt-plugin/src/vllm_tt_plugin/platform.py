@@ -13,6 +13,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
     uses_tt_lane_coordinator,
 )
 
@@ -508,6 +509,9 @@ class TTPlatform(Platform):
                 "Use one of gathered multi-process DP or single-process lanes."
             )
         if uses_tt_lane_coordinator(vllm_config):
+            # Run early validation: lane mode requires max_num_seqs to split
+            # evenly across the internal TT lanes.
+            get_tt_per_lane_max_num_seqs(vllm_config)
             vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
             logger.info(
                 "Using TTLaneCoordinator with tt_data_parallel_size=%d",

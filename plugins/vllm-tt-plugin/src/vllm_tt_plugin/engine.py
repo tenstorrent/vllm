@@ -24,7 +24,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, get_tt_per_lane_max_num_seqs
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 
 logger = init_logger(__name__)
@@ -976,7 +976,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
     def _completed_dp_gather_future(self) -> Future[tuple[torch.Tensor, list]]:
         parallel_config = self.vllm_config.parallel_config
         world = parallel_config.data_parallel_size
-        batch_size = self.vllm_config.scheduler_config.max_num_seqs
+        batch_size = get_tt_per_lane_max_num_seqs(self.vllm_config)
         return _as_future(
             (torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world)
         )
