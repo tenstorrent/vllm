@@ -4,7 +4,12 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm_tt_plugin.launcher import TTCoreEngineLauncher, TTLaunchPlan
+from vllm_tt_plugin.config import should_open_mesh_for_rank
+from vllm_tt_plugin.launcher import (
+    TTCoreEngineLauncher,
+    TTLaunchPlan,
+    parse_tt_mpi_params,
+)
 from vllm_tt_plugin.platform import TTPlatform
 
 
@@ -60,6 +65,14 @@ class TestFullDPMode:
 
         assert TTPlatform.full_dp_mode is True
         assert (
+            vllm_config.parallel_config.engine_core_cls
+            == "vllm.v1.engine.core.EngineCore"
+        )
+        assert (
+            vllm_config.parallel_config.engine_core_proc_cls
+            == "vllm.v1.engine.core.EngineCoreProc"
+        )
+        assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
         )
@@ -114,6 +127,14 @@ class TestFullDPMode:
 
         assert TTPlatform.full_dp_mode is False
         assert (
+            vllm_config.parallel_config.engine_core_cls
+            == "vllm_tt_plugin.engine.TTEngineCore"
+        )
+        assert (
+            vllm_config.parallel_config.engine_core_proc_cls
+            == "vllm_tt_plugin.engine.TTEngineCoreProc"
+        )
+        assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm_tt_plugin.engine.TTDPEngineCoreProc"
         )
@@ -142,3 +163,70 @@ class TestFullDPMode:
         assert isinstance(plan, TTLaunchPlan)
         assert plan.full_dp_mode is True
         assert plan.remote_launched is False
+
+    def test_parse_tt_mpi_params_full_dp_uses_all_device_ranks(
+        self,
+        tmp_path,
+    ) -> None:
+        """``full_dp_mode`` uses one MPI rank per DP rank (no non-device ranks)."""
+        rank_binding = tmp_path / "rank_binding.yaml"
+        rank_binding.write_text(
+            "rank_bindings:\n"
+            "  - rank: 0\n"
+            "  - rank: 1\n"
+            "  - rank: 2\n"
+            "  - rank: 3\n",
+            encoding="utf-8",
+        )
+
+        vllm_config = SimpleNamespace(
+            plugin_config={
+                "tt": {
+                    "full_dp_mode": True,
+                    "rank_binding": str(rank_binding),
+                }
+            },
+            parallel_config=SimpleNamespace(
+                data_parallel_backend="mp",
+                data_parallel_size=4,
+            ),
+        )
+
+        parsed_rank_binding, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+        assert parsed_rank_binding == str(rank_binding)
+        assert non_device_dp_ranks == set()
+
+    def test_parse_tt_mpi_params_full_dp_rejects_mismatched_world(
+        self,
+        tmp_path,
+    ) -> None:
+        """``full_dp_mode`` rejects rank layouts that imply local non-device ranks."""
+        rank_binding = tmp_path / "rank_binding.yaml"
+        rank_binding.write_text(
+            "rank_bindings:\n"
+            "  - rank: 0\n"
+            "  - rank: 1\n",
+            encoding="utf-8",
+        )
+
+        vllm_config = SimpleNamespace(
+            plugin_config={
+                "tt": {
+                    "full_dp_mode": True,
+                    "rank_binding": str(rank_binding),
+                }
+            },
+            parallel_config=SimpleNamespace(
+                data_parallel_backend="mp",
+                data_parallel_size=4,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="full_dp_mode requires one TT MPI"):
+            parse_tt_mpi_params(vllm_config)
+
+    def test_worker_device_rank_selection_for_full_dp_mode(self) -> None:
+        """Worker opens mesh on all ranks in full-DP, rank 0 only otherwise."""
+        assert should_open_mesh_for_rank(0, full_dp_mode=False) is True
+        assert should_open_mesh_for_rank(1, full_dp_mode=False) is False
+        assert should_open_mesh_for_rank(1, full_dp_mode=True) is True

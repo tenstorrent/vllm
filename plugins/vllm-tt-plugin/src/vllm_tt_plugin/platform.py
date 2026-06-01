@@ -335,18 +335,25 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
-        parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
-        parallel_config.engine_core_proc_cls = "vllm_tt_plugin.engine.TTEngineCoreProc"
 
         full_dp_mode = False
         if tt_config is not None and "full_dp_mode" in tt_config:
             full_dp_mode = tt_config["full_dp_mode"]
+
         if full_dp_mode:
-            # Use vLLM's standard DP core path for full-DP TT models.
+            # Full-DP mode uses upstream engine cores and DP orchestration.
+            parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
+            parallel_config.engine_core_proc_cls = (
+                "vllm.v1.engine.core.EngineCoreProc"
+            )
             parallel_config.dp_engine_core_proc_cls = (
                 "vllm.v1.engine.core.DPEngineCoreProc"
             )
         else:
+            parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
+            parallel_config.engine_core_proc_cls = (
+                "vllm_tt_plugin.engine.TTEngineCoreProc"
+            )
             parallel_config.dp_engine_core_proc_cls = (
                 "vllm_tt_plugin.engine.TTDPEngineCoreProc"
             )
