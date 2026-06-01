@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, should_open_mesh_for_rank
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
@@ -87,16 +87,17 @@ class TTWorker(WorkerBase):
         TTPlatform.check_and_update_config(self.vllm_config)
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
-        # Open mesh only on local DP rank 0 (device ranks).
-        if local_dp_rank == 0:
+        full_dp_mode = TTPlatform.full_dp_mode
+        if should_open_mesh_for_rank(local_dp_rank, full_dp_mode):
+            mesh_rank = 0 if (full_dp_mode or local_dp_rank is None) else local_dp_rank
             self.mesh_device = open_mesh_device(
-                get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+                get_tt_config(self.vllm_config), self.trace_mode, mesh_rank
             )
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
             self.device_config.num_devices = self.mesh_device.get_num_devices()
         else:
-            mesh_grid = get_mesh_grid(local_dp_rank)
+            mesh_grid = get_mesh_grid(0 if local_dp_rank is None else local_dp_rank)
             self.mesh_device = None
             # Num devices is required for determining num blocks in KV cache.
             self.device_config.num_devices = mesh_grid[0] * mesh_grid[1]
@@ -109,8 +110,10 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        # Only local DP rank 0 (device rank) loads the model
-        if self.parallel_config.data_parallel_rank_local == 0:
+        # In full-DP mode each rank owns a device and loads the model.
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
+        full_dp_mode = TTPlatform.full_dp_mode
+        if should_open_mesh_for_rank(local_dp_rank, full_dp_mode):
             self.model_runner.load_model()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
@@ -266,8 +269,9 @@ class TTWorker(WorkerBase):
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return
-        local_rank = self.parallel_config.data_parallel_rank_local
-        if local_rank == 0:
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
+        full_dp_mode = TTPlatform.full_dp_mode
+        if should_open_mesh_for_rank(local_dp_rank, full_dp_mode):
             self.model_runner.warmup_model()
 
     def execute_model(
