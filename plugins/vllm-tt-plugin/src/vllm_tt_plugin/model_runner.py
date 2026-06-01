@@ -2549,20 +2549,16 @@ class TTModelRunner:
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
         sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert sample_on_device_mode in (None, "all", "decode_only")
-        prefill_can_sample_on_device = sample_on_device_mode == "all"
-        decode_can_sample_on_device = sample_on_device_mode in ("all", "decode_only")
         prefill_kwargs = dict(
             kv_cache=self.kv_caches,
-            can_sample_on_device=prefill_can_sample_on_device,
-            non_greedy_decoding_on_device=prefill_can_sample_on_device,
+            can_sample_on_device=sample_on_device_mode == "all",
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
             max_batch_size=self.scheduler_config.max_num_seqs
             * self.parallel_config.data_parallel_size,
             num_blocks=self.max_num_blocks_per_req,
-            can_sample_on_device=decode_can_sample_on_device,
-            non_greedy_decoding_on_device=decode_can_sample_on_device,
+            can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )
 
         # Phase 1: compile all code paths (no trace capture)
