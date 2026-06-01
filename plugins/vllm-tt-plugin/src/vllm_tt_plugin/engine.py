@@ -243,6 +243,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        tt_config = get_tt_config(vllm_config)
+        if bool(tt_config.get("full_dp_mode", False)):
+            raise ValueError(
+                "TTDPEngineCoreProc is gathered-DP only and cannot be used with "
+                "full_dp_mode=True. Use vllm.v1.engine.core.DPEngineCoreProc "
+                "instead."
+            )
+
         DEBUG_DPG = os.environ.get("DP_GATHER_DEBUG") == "1"
 
         def dlog_logger(msg: str, *a: object) -> None:

@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm_tt_plugin import engine as tt_engine
 from vllm_tt_plugin.config import should_open_mesh_for_rank
 from vllm_tt_plugin.launcher import (
     TTCoreEngineLauncher,
@@ -230,3 +231,27 @@ class TestFullDPMode:
         assert should_open_mesh_for_rank(0, full_dp_mode=False) is True
         assert should_open_mesh_for_rank(1, full_dp_mode=False) is False
         assert should_open_mesh_for_rank(1, full_dp_mode=True) is True
+
+    def test_tt_gathered_dp_engine_rejects_full_dp_mode(self) -> None:
+        """Gathered-DP core must not be constructible when full-DP is enabled."""
+        vllm_config = SimpleNamespace(plugin_config={"tt": {"full_dp_mode": True}})
+        with pytest.raises(ValueError, match="full_dp_mode=True"):
+            tt_engine.TTDPEngineCoreProc(vllm_config)
+
+    def test_tt_gathered_dp_engine_accepts_default_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Default mode still uses the TT gathered-DP core path."""
+        called = {"base_init": False}
+
+        def _fake_base_init(self, *args, **kwargs):
+            called["base_init"] = True
+            self.batch_queue = None
+
+        monkeypatch.setattr(tt_engine.DPEngineCoreProc, "__init__", _fake_base_init)
+
+        vllm_config = SimpleNamespace(plugin_config={"tt": {}})
+        proc = tt_engine.TTDPEngineCoreProc(vllm_config)
+        assert called["base_init"] is True
+        assert proc._dp_in_flight is None
