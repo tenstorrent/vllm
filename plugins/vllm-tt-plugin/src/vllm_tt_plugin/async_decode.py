@@ -398,7 +398,9 @@ class TTAsyncDecodeController:
             model_input
         )
         completion_event = threading.Event()
-        submission = self.submit_decode(model_input, read_from_device=False, async_read=True)
+        submission = self.submit_decode(
+            model_input, read_from_device=False, async_read=True
+        )
         self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
         if submission.tt_out is None:
             completion_event.set()

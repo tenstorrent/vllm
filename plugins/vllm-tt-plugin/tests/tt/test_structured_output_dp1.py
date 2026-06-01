@@ -42,7 +42,9 @@ async def _send_regex_request(async_client, model: str, request_id: int) -> str:
         messages=[
             {
                 "role": "user",
-                "content": f"Return one code matching {REGEX} for request {request_id}.",
+                "content": (
+                    f"Return one code matching {REGEX} for request {request_id}."
+                ),
             }
         ],
         max_completion_tokens=16,
