@@ -231,6 +231,25 @@ class TTModelInput:
     slot_remap: torch.Tensor | None = None
 
 
+@dataclass
+class LaneInputMeta:
+    """Per-lane metadata returned by ``prepare_lane_dp_model_input``.
+
+    Groups the scalar flags and per-lane req lists that were previously
+    returned as an unnamed 9-tuple, making call sites self-documenting.
+    """
+
+    model_input: TTModelInput | None
+    max_blocks: int
+    has_structured_input: int
+    has_penalties: int
+    reset_batch: int
+    can_sample_device: int
+    needs_logprobs: int
+    req_ids: list[str]
+    req_id_to_index: dict[str, int]
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -889,11 +908,12 @@ class TTModelRunner:
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
-        # Per-lane builds pad to the lane/rank wire capacity, not the merged
-        # input batch capacity.
+        # Lane builds use a subset of the persistent batch (num_reqs <
+        # batch_num_reqs) and pad to the per-lane wire capacity. Non-lane
+        # (whole-batch) builds pad to the full persistent-batch capacity.
         decode_pad_to = (
             self.tt_per_lane_max_num_seqs
-            if req_indices is not None or num_reqs < batch_num_reqs
+            if num_reqs < batch_num_reqs
             else input_batch.max_num_reqs
         )
 
@@ -1433,12 +1453,15 @@ class TTModelRunner:
             if bitmasks.shape[0] > max_batch:
                 bitmasks = bitmasks[:max_batch]
             elif bitmasks.shape[0] < max_batch:
+                # Padding rows have no active request; fill with all-ones
+                # (all tokens allowed) to match the sentinel used everywhere
+                # else in the bitmask pipeline.
                 pad_rows = max_batch - bitmasks.shape[0]
                 bitmasks = torch.cat(
                     [
                         bitmasks,
-                        torch.zeros(
-                            (pad_rows, bitmasks.shape[1]), dtype=bitmasks.dtype
+                        torch.full(
+                            (pad_rows, bitmasks.shape[1]), -1, dtype=bitmasks.dtype
                         ),
                     ],
                     dim=0,
@@ -2001,20 +2024,20 @@ class TTModelRunner:
         self,
         lane_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
-    ) -> tuple[
-        TTModelInput | None,
-        int,
-        int,
-        int,
-        int,
-        int,
-        int,
-        list[str],
-        dict[str, int],
-    ]:
+    ) -> LaneInputMeta:
         """Build one lane payload after merged ``_update_states``."""
         if lane_output.total_num_scheduled_tokens == 0:
-            return (None, 0, 0, 0, 0, 0, 0, [], {})
+            return LaneInputMeta(
+                model_input=None,
+                max_blocks=0,
+                has_structured_input=0,
+                has_penalties=0,
+                reset_batch=0,
+                can_sample_device=1,
+                needs_logprobs=0,
+                req_ids=[],
+                req_id_to_index={},
+            )
 
         req_indices = self._req_indices_for_lane_output(lane_output)
         model_input = self._prepare_model_inputs(
@@ -2043,16 +2066,16 @@ class TTModelRunner:
         has_structured_input = (
             int(model_input.grammar_bitmask[0] is not None) if model_input else 0
         )
-        return (
-            model_input,
-            max_blocks,
-            has_structured_input,
-            has_penalties,
-            reset_batch,
-            can_sample_device,
-            needs_logprobs,
-            req_ids,
-            req_id_to_index,
+        return LaneInputMeta(
+            model_input=model_input,
+            max_blocks=max_blocks,
+            has_structured_input=has_structured_input,
+            has_penalties=has_penalties,
+            reset_batch=reset_batch,
+            can_sample_device=can_sample_device,
+            needs_logprobs=needs_logprobs,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
         )
 
     def _pad_decode_rows(
@@ -2320,19 +2343,7 @@ class TTModelRunner:
     def build_in_process_lane_decode_gather_inputs(
         self,
         lane_inputs: list[TTModelInput | None],
-        per_lane_meta: list[
-            tuple[
-                TTModelInput | None,
-                int,
-                int,
-                int,
-                int,
-                int,
-                int,
-                list[str],
-                dict[str, int],
-            ]
-        ],
+        per_lane_meta: list[LaneInputMeta],
         max_blocks_decode: int,
     ) -> tuple[dict[str, Any], int]:
         """Stack per-lane decode gather tensors (in-process DP substitute)."""
@@ -2340,31 +2351,20 @@ class TTModelRunner:
         any_penalties_inputs = False
         any_reset_batch = False
         all_sample_device = True
-        for (
-            _model_input,
-            _max_blocks,
-            has_structured,
-            has_penalties,
-            reset_batch,
-            can_sample_device,
-            _needs_logprobs,
-            _req_ids,
-            _req_id_to_index,
-        ) in per_lane_meta:
-            max_blocks_decode = max(max_blocks_decode, _max_blocks)
-            any_structured_inputs |= bool(has_structured)
-            any_penalties_inputs |= bool(has_penalties)
-            any_reset_batch |= bool(reset_batch)
-            all_sample_device &= bool(can_sample_device)
+        for lm in per_lane_meta:
+            max_blocks_decode = max(max_blocks_decode, lm.max_blocks)
+            any_structured_inputs |= bool(lm.has_structured_input)
+            any_penalties_inputs |= bool(lm.has_penalties)
+            any_reset_batch |= bool(lm.reset_batch)
+            all_sample_device &= bool(lm.can_sample_device)
         max_blocks_decode = max(
             max_blocks_decode,
             int(getattr(self, "_last_decode_block_width", 1)),
         )
         for lane_input in lane_inputs:
             if lane_input is not None:
-                max_blocks_decode = max(
-                    max_blocks_decode, lane_input.block_tables.shape[1]
-                )
+                # block_tables is block_tables_per_group[0]; scanning the
+                # group list is sufficient without a separate check.
                 for bt in lane_input.block_tables_per_group:
                     max_blocks_decode = max(max_blocks_decode, bt.shape[1])
         max_blocks_decode = max(max_blocks_decode, 1)
@@ -2448,38 +2448,25 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         lane_inputs: list[TTModelInput | None] = []
-        per_lane_meta: list[
-            tuple[
-                TTModelInput | None,
-                int,
-                int,
-                int,
-                int,
-                int,
-                int,
-                list[str],
-                dict[str, int],
-            ]
-        ] = []
+        per_lane_meta: list[LaneInputMeta] = []
         max_blocks_decode = 1
         any_structured_inputs = False
         for lane_output in meta.lane_outputs:
             lane_meta = self.prepare_lane_dp_model_input(lane_output, grammar_output)
             per_lane_meta.append(lane_meta)
-            model_input = lane_meta[0]
-            lane_inputs.append(model_input)
-            if model_input is not None:
-                for bt in model_input.block_tables_per_group:
+            lane_inputs.append(lane_meta.model_input)
+            if lane_meta.model_input is not None:
+                for bt in lane_meta.model_input.block_tables_per_group:
                     max_blocks_decode = max(max_blocks_decode, bt.shape[1])
-            max_blocks_decode = max(max_blocks_decode, lane_meta[1])
-            any_structured_inputs |= bool(lane_meta[2])
+            max_blocks_decode = max(max_blocks_decode, lane_meta.max_blocks)
+            any_structured_inputs |= bool(lane_meta.has_structured_input)
 
         normalized_meta = LaneStepMetadata(
             lane_outputs=meta.lane_outputs,
             batch_size_per_dp=meta.batch_size_per_dp,
             is_decode=meta.is_decode,
-            lane_req_ids=[list(lane_meta[7]) for lane_meta in per_lane_meta],
-            lane_req_id_to_index=[dict(lane_meta[8]) for lane_meta in per_lane_meta],
+            lane_req_ids=[list(lm.req_ids) for lm in per_lane_meta],
+            lane_req_id_to_index=[dict(lm.req_id_to_index) for lm in per_lane_meta],
         )
 
         dp_inputs = lane_inputs
@@ -2589,19 +2576,27 @@ class TTModelRunner:
                 )
             if not lane_output_model.sampled_token_ids:
                 continue
+            lane_has_logprobs = lane_output_model.logprobs is not None
             for req_id in req_ids:
                 local_idx = local_index[req_id]
                 merged_req_ids.append(req_id)
                 merged_req_id_to_index[req_id] = global_index
                 sampled_token_ids.append(lane_output_model.sampled_token_ids[local_idx])
-                if lane_output_model.logprobs is not None:
-                    logprobs_lists.append(lane_output_model.logprobs[local_idx])
+                # Keep logprobs_lists parallel to sampled_token_ids so the
+                # lists never diverge in length (possible if lanes disagree on
+                # whether logprobs are enabled, which shouldn't happen with a
+                # single global engine setting but is guarded here defensively).
+                logprobs_lists.append(
+                    lane_output_model.logprobs[local_idx] if lane_has_logprobs else None
+                )
                 global_index += 1
 
         if not merged_req_ids:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        logprobs = logprobs_lists if logprobs_lists else None
+        # Discard logprobs entirely when no lane produced them.
+        has_any_logprobs = any(lp is not None for lp in logprobs_lists)
+        logprobs = logprobs_lists if has_any_logprobs else None
         return ModelRunnerOutput(
             req_ids=merged_req_ids,
             req_id_to_index=merged_req_id_to_index,

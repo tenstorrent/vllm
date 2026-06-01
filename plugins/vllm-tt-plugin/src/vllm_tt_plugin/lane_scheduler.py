@@ -6,7 +6,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -17,9 +16,6 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
-
-if TYPE_CHECKING:
-    pass
 
 logger = init_logger(__name__)
 
@@ -124,74 +120,6 @@ def merge_lane_scheduler_outputs(
     )
 
 
-def filter_scheduler_output_for_lane(
-    scheduler_output: SchedulerOutput | None,
-    lane: int,
-    requests: dict[str, Request],
-) -> SchedulerOutput | None:
-    """Return a lane-local view of ``scheduler_output`` (or None if empty)."""
-    if scheduler_output is None:
-        return None
-
-    def _lane_req(req_id: str) -> bool:
-        req = requests.get(req_id)
-        return req is not None and getattr(req, "tt_lane", -1) == lane
-
-    scheduled_new_reqs = [
-        nr for nr in scheduler_output.scheduled_new_reqs if _lane_req(nr.req_id)
-    ]
-    cached = scheduler_output.scheduled_cached_reqs
-    lane_req_ids = [rid for rid in cached.req_ids if _lane_req(rid)]
-    if not scheduled_new_reqs and not lane_req_ids:
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            return scheduler_output
-        return None
-
-    indices = [i for i, rid in enumerate(cached.req_ids) if _lane_req(rid)]
-    lane_cached = CachedRequestData(
-        req_ids=[cached.req_ids[i] for i in indices],
-        resumed_req_ids={rid for rid in cached.resumed_req_ids if _lane_req(rid)},
-        new_token_ids=[cached.new_token_ids[i] for i in indices],
-        all_token_ids={
-            rid: toks for rid, toks in cached.all_token_ids.items() if _lane_req(rid)
-        },
-        new_block_ids=[cached.new_block_ids[i] for i in indices],
-        num_computed_tokens=[cached.num_computed_tokens[i] for i in indices],
-        num_output_tokens=[cached.num_output_tokens[i] for i in indices],
-    )
-    num_scheduled_tokens = {
-        rid: n
-        for rid, n in scheduler_output.num_scheduled_tokens.items()
-        if _lane_req(rid)
-    }
-    return SchedulerOutput(
-        scheduled_new_reqs=scheduled_new_reqs,
-        scheduled_cached_reqs=lane_cached,
-        num_scheduled_tokens=num_scheduled_tokens,
-        total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-        scheduled_spec_decode_tokens={
-            rid: toks
-            for rid, toks in scheduler_output.scheduled_spec_decode_tokens.items()
-            if _lane_req(rid)
-        },
-        scheduled_encoder_inputs={
-            rid: idxs
-            for rid, idxs in scheduler_output.scheduled_encoder_inputs.items()
-            if _lane_req(rid)
-        },
-        num_common_prefix_blocks=scheduler_output.num_common_prefix_blocks,
-        finished_req_ids={
-            rid for rid in scheduler_output.finished_req_ids if _lane_req(rid)
-        },
-        free_encoder_mm_hashes=scheduler_output.free_encoder_mm_hashes,
-        has_structured_output_requests=scheduler_output.has_structured_output_requests,
-        pending_structured_output_tokens=(
-            scheduler_output.pending_structured_output_tokens
-        ),
-        num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-    )
-
-
 class TTLaneCoordinator(TTScheduler):
     """Single-process multi-lane scheduler for TT gathered-batch execution."""
 
@@ -229,10 +157,10 @@ class TTLaneCoordinator(TTScheduler):
         return best_lane
 
     def add_request(self, request: Request) -> None:
-        preferred_dp_rank = getattr(request, "preferred_data_parallel_rank", None)
+        preferred_lane = getattr(request, "tt_preferred_lane", None)
         request_lane = getattr(request, "tt_lane", -1)
-        if preferred_dp_rank is not None:
-            request.tt_lane = preferred_dp_rank % self.num_lanes
+        if preferred_lane is not None:
+            request.tt_lane = preferred_lane % self.num_lanes
         elif request_lane < 0:
             request.tt_lane = self._pick_lane()
         super().add_request(request)

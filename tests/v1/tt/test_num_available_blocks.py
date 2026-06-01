@@ -21,6 +21,10 @@ def cfg():
 
     Mocks ttnn.get_arch_name so the wormhole check passes; otherwise we'd
     need a real device to land on the per-SKU branches.
+
+    additional_config and plugin_config are set to empty dicts so that
+    get_tt_config's isinstance(config, dict) guard doesn't raise on
+    the auto-generated MagicMock attributes.
     """
     c = MagicMock()
     c.model_config.model = "unknown-model-falls-into-default-branch"
@@ -29,6 +33,8 @@ def cfg():
     c.device_config.num_devices = 1
     c.scheduler_config.max_num_seqs = 32
     c.cache_config.block_size = 64
+    c.additional_config = {}
+    c.plugin_config = {}
     return c
 
 
@@ -45,7 +51,8 @@ def test_default_branch_no_sliding(cfg):
 
 def test_lane_mode_uses_global_batch_padding(cfg):
     """Single-process lane mode must size KV padding for all concurrent
-    requests, not just one lane's local ``max_num_seqs``."""
+    requests using the global engine capacity (max_num_seqs), not the
+    per-lane slice (max_num_seqs // tt_data_parallel_size)."""
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.scheduler_config.max_num_seqs = 8
@@ -54,9 +61,11 @@ def test_lane_mode_uses_global_batch_padding(cfg):
     with patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"):
         n = get_num_available_blocks_tt(cfg)
 
-    # Default tokens (131072) + global batch padding (64 * (8 * 4) = 2048)
-    # = 133120 tokens -> ceil/64 = 2080.
-    assert n == 2080
+    # max_num_seqs=8 is the total engine capacity; per-lane is 8//4=2.
+    # get_tt_max_batch_size returns 8 (global, not per-lane).
+    # Default tokens (131072) + global batch padding (64 * 8 = 512)
+    # = 131584 tokens -> ceil/64 = 2056.
+    assert n == 2056
 
 
 def test_sliding_window_adds_headroom(cfg):
