@@ -908,12 +908,12 @@ class TTModelRunner:
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
-        # Lane builds use a subset of the persistent batch (num_reqs <
-        # batch_num_reqs) and pad to the per-lane wire capacity. Non-lane
-        # (whole-batch) builds pad to the full persistent-batch capacity.
+        # Lane builds always pad to the per-lane wire capacity, even when one
+        # lane temporarily owns the full active batch. Non-lane (whole-batch)
+        # builds pad to the full persistent-batch capacity.
         decode_pad_to = (
             self.tt_per_lane_max_num_seqs
-            if num_reqs < batch_num_reqs
+            if req_indices is not None or num_reqs < batch_num_reqs
             else input_batch.max_num_reqs
         )
 
@@ -2192,7 +2192,14 @@ class TTModelRunner:
                 continue
 
             any_reset_batch |= lane_input.reset_batch
-            batch_size_per_dp.append(cast(int, lane_input.unpadded_batch_size))
+            lane_batch_size = cast(int, lane_input.unpadded_batch_size)
+            if lane_batch_size > batch_size:
+                raise ValueError(
+                    "Lane decode batch exceeds per-lane capacity: "
+                    f"lane={lane}, batch_size={lane_batch_size}, "
+                    f"per_lane_max={batch_size}"
+                )
+            batch_size_per_dp.append(lane_batch_size)
 
             input_tokens_list.append(
                 self._pad_decode_rows(lane_input.input_tokens, batch_size, pad_value=0)
