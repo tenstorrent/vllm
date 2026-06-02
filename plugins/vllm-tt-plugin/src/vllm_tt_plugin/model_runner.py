@@ -905,6 +905,7 @@ class TTModelRunner:
         input_batch = self.input_batch
         batch_num_reqs = input_batch.num_reqs
         assert batch_num_reqs > 0
+        has_explicit_req_indices = req_indices is not None
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
@@ -913,7 +914,7 @@ class TTModelRunner:
         # builds pad to the full persistent-batch capacity.
         decode_pad_to = (
             self.tt_per_lane_max_num_seqs
-            if req_indices is not None or num_reqs < batch_num_reqs
+            if has_explicit_req_indices or num_reqs < batch_num_reqs
             else input_batch.max_num_reqs
         )
 
