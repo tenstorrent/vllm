@@ -30,6 +30,11 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinPLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
@@ -1217,17 +1222,17 @@ class TTModelRunner:
         }
 
         # Builtin logits processors (min_p / logit_bias / min_tokens) hold
-        # per-row state tied to the merged batch and cannot be sliced to a
-        # lane-local view here. Refuse rather than silently apply them to the
-        # wrong lane-local rows. The check is gated on ``is_lane_build`` because
-        # non-lane builds already pass a whole-batch-aligned processor set.
+        # per-row state keyed by merged-batch row index. A lane build samples
+        # only ``req_indices`` and hands the host sampler a logits tensor whose
+        # row ``i`` is ``req_indices[i]``, so the processors must be remapped to
+        # those lane-local rows before they can be applied. Non-lane builds
+        # already pass a whole-batch-aligned processor set, so reuse it as-is.
         if is_lane_build and input_batch.sampling.has_active_logitsprocs():
-            raise NotImplementedError(
-                "Builtin logits processors (min_p / logit_bias / min_tokens) "
-                "are not yet supported with single-process lane DP "
-                "(tt_data_parallel_size > 1)."
+            logitsprocs = self._slice_logitsprocs_to_lane(
+                input_batch.sampling.logitsprocs, req_indices
             )
-        logitsprocs = input_batch.sampling.logitsprocs
+        else:
+            logitsprocs = input_batch.sampling.logitsprocs
 
         generators = dict()
         if not perform_device_sampling:
@@ -1283,6 +1288,107 @@ class TTModelRunner:
             logitsprocs_list=[logitsprocs],
             generators_list=[generators],
         )
+
+    def _slice_logitsprocs_to_lane(
+        self,
+        merged: LogitsProcessors,
+        req_indices: list[int],
+    ) -> LogitsProcessors:
+        """Build a lane-local view of the merged builtin logits processors.
+
+        ``merged`` holds per-row state keyed by merged-batch row index. The
+        lane samples the rows in ``req_indices`` and the host sampler receives
+        a logits tensor whose row ``i`` is ``req_indices[i]``. This rebuilds the
+        active builtin processors with their state remapped to the lane-local
+        rows ``0..len(req_indices)-1`` so ``apply`` lines up with that tensor.
+
+        Custom (non-builtin) processors cannot be remapped this way and raise.
+        The host processors live on CPU (see ``_host_logitsprocs``), so the
+        rebuilt processors are constructed on CPU as well.
+        """
+        device = torch.device("cpu")
+        # merged-batch row -> lane-local row
+        remap = {g: local for local, g in enumerate(req_indices)}
+        procs: list = []
+        for proc in merged.all:
+            if isinstance(proc, MinPLogitsProcessor):
+                procs.append(self._lane_min_p(proc, req_indices, device))
+            elif isinstance(proc, LogitBiasLogitsProcessor):
+                procs.append(self._lane_logit_bias(proc, remap, device))
+            elif isinstance(proc, MinTokensLogitsProcessor):
+                procs.append(self._lane_min_tokens(proc, remap, device))
+            else:
+                raise NotImplementedError(
+                    "Custom logits processors are not yet supported with "
+                    "single-process lane DP (tt_data_parallel_size > 1)."
+                )
+        return LogitsProcessors(iter(procs))
+
+    def _lane_min_p(
+        self,
+        src: MinPLogitsProcessor,
+        req_indices: list[int],
+        device: torch.device,
+    ) -> MinPLogitsProcessor:
+        proc = MinPLogitsProcessor(self.vllm_config, device, False)
+        n = len(req_indices)
+        # Fancy-indexing with the lane's merged rows yields a length-``n`` copy
+        # already ordered to match the lane logits.
+        lane_vals = src.min_p_cpu[req_indices]
+        proc.min_p_cpu[:n] = lane_vals
+        proc.min_p_count = int((lane_vals != 0).sum())
+        if proc.min_p_count:
+            proc.min_p = proc.min_p_device[:n]
+            proc.min_p.copy_(proc.min_p_cpu_tensor[:n])
+            proc.min_p.unsqueeze_(1)
+        return proc
+
+    def _lane_logit_bias(
+        self,
+        src: LogitBiasLogitsProcessor,
+        remap: dict[int, int],
+        device: torch.device,
+    ) -> LogitBiasLogitsProcessor:
+        proc = LogitBiasLogitsProcessor(None, device, False)
+        proc.biases = {
+            remap[g]: lb for g, lb in src.biases.items() if g in remap
+        }
+        if proc.biases:
+            reqs: list[int] = []
+            tok_ids: list[int] = []
+            biases: list[float] = []
+            for req, lb in proc.biases.items():
+                reqs.extend([req] * len(lb))
+                tok_ids.extend(lb.keys())
+                biases.extend(lb.values())
+            proc.bias_tensor = proc._device_tensor(biases, torch.float32)
+            proc.logits_slice = (
+                proc._device_tensor(reqs, torch.int32),
+                proc._device_tensor(tok_ids, torch.int32),
+            )
+        return proc
+
+    def _lane_min_tokens(
+        self,
+        src: MinTokensLogitsProcessor,
+        remap: dict[int, int],
+        device: torch.device,
+    ) -> MinTokensLogitsProcessor:
+        proc = MinTokensLogitsProcessor(self.vllm_config, device, False)
+        proc.min_toks = {
+            remap[g]: v for g, v in src.min_toks.items() if g in remap
+        }
+        if proc.min_toks:
+            reqs: list[int] = []
+            tok_ids: list[int] = []
+            for req, (_, _, stop_tok_ids) in proc.min_toks.items():
+                reqs.extend([req] * len(stop_tok_ids))
+                tok_ids.extend(stop_tok_ids)
+            proc.logits_slice = (
+                proc._device_tensor(reqs, torch.int32),
+                proc._device_tensor(tok_ids, torch.int32),
+            )
+        return proc
 
     def build_model_input(
         self,
