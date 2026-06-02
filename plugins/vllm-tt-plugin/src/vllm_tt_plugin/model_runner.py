@@ -365,22 +365,20 @@ class TTModelRunner:
         # group structure during input prep / forward.
         self.kv_cache_config = kv_cache_config
 
-        # Build the persistent input batch. Upstream's hybrid kv cache
-        # manager enforces a uniform page_size across groups, and to keep
-        # the existing block-table plumbing intact we additionally require
-        # a single block_size across groups for now. Different block_sizes
-        # per group will require the input batch + block table consumers
-        # to learn to address per-group block tables with mixed block
-        # sizes.
-        block_size = kv_cache_groups[0].kv_cache_spec.block_size
-        assert all(g.kv_cache_spec.block_size == block_size for g in kv_cache_groups), (
-            "Mixed block sizes across kv_cache_groups not yet supported"
-        )
-
-        # One block table per group, all with the same block_size. The
-        # MultiGroupBlockTable then has ``len(kv_cache_groups)`` entries
-        # — single-group models keep the previous shape (length 1).
-        per_group_block_sizes = [block_size] * len(kv_cache_groups)
+        # Upstream's hybrid kv cache manager equalises *page size*
+        # (block_size × num_kv_heads × head_size × dtype_bytes) across
+        # groups, not block_size itself: when groups have different
+        # ``num_kv_heads × head_size`` (e.g. Gemma4's full layers use
+        # head_dim=512 vs sliding head_dim=256), upstream's
+        # ``unify_kv_cache_spec_page_size`` adjusts ``block_size`` per
+        # spec instead. Use each group's own ``block_size`` here; the
+        # input batch / MultiGroupBlockTable already takes a per-group
+        # list. ``self.cache_config.block_size`` (the user-specified
+        # value) is still used elsewhere for per-request bounds — that's
+        # the smaller of the unified sizes, which conservatively
+        # overestimates for the larger-block groups (extra block-table
+        # rows allocated, never indexed).
+        per_group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
 
         max_num_reqs = self.scheduler_config.max_num_seqs
         max_model_len = self.model_config.max_model_len
@@ -841,13 +839,32 @@ class TTModelRunner:
         assert num_reqs > 0
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
-        # Slice to self.max_num_blocks_per_req which also takes into
-        # account max num blocks in KV cache in case max KV blocks is smaller.
-        # Constant shape is required for ttnn tracing to work.
-        block_tables_per_group = [
-            bt.get_cpu_tensor()[:num_reqs, : self.max_num_blocks_per_req]
-            for bt in input_batch.block_table.block_tables
-        ]
+        # Slice/pad to self.max_num_blocks_per_req: slicing handles
+        # over-wide tables (a group's native width can exceed the global
+        # cap when ``max_num_blocks_per_req`` is bound by total KV cache
+        # size rather than max_model_len), and padding handles
+        # under-wide ones (hybrid kv-cache-groups with unified page sizes
+        # produce per-group block_tables of different native widths —
+        # e.g. Gemma4-E2B with ``cache_config.block_size=64`` ends up
+        # with sliding's group at 128 block_size and full's at 64,
+        # giving widths cdiv(max_model_len, 128) and
+        # cdiv(max_model_len, 64) respectively). The TT side captures
+        # decode traces against ``max_num_blocks_per_req`` (see
+        # ``warmup_model_decode``) and ``copy_host_to_device`` asserts
+        # shape-equality on replay, so runtime block_tables must match
+        # that width even when their underlying group is narrower.
+        target_width = self.max_num_blocks_per_req
+        block_tables_per_group = []
+        for bt in input_batch.block_table.block_tables:
+            bt_cpu = bt.get_cpu_tensor()[:num_reqs, :target_width]
+            if bt_cpu.shape[1] < target_width:
+                pad = torch.zeros(
+                    bt_cpu.shape[0],
+                    target_width - bt_cpu.shape[1],
+                    dtype=bt_cpu.dtype,
+                )
+                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
+            block_tables_per_group.append(bt_cpu)
 
         # DP optimization: don't send padding blocks if possible to reduce
         # overhead from gathering inputs to rank 0 and rely on DP concat
