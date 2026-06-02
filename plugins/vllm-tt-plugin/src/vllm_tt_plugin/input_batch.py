@@ -61,7 +61,6 @@ class SamplingInputBatch:
             assert hasattr(self, name), (
                 f"Missing attribute '{name}' in SamplingInputBatch"
             )
-        self.sampling_param_names = list(self.DEFAULTS.keys())
 
         # req_index -> generator
         # NOTE: The indices of the requests that do not have their own
@@ -96,14 +95,6 @@ class SamplingInputBatch:
             if isinstance(proc, MinTokensLogitsProcessor) and proc.min_toks:
                 return True
         return False
-
-    def pad_with_defaults(self, num_reqs: int) -> None:
-        """Pad sampling parameters with default values for indices >=
-        num_reqs."""
-        for name in self.sampling_param_names:
-            param_tensor = getattr(self, name)
-            default_value = self.DEFAULTS[name]
-            param_tensor[num_reqs:] = default_value
 
     def create_default_tensors(self) -> dict[str, torch.Tensor]:
         """Create tensors filled with default values for all parameters in
@@ -338,6 +329,13 @@ class InputBatch:
             self.sampling.allowed_token_ids_mask[req_index][
                 sampling_params.allowed_token_ids
             ] = False
+        elif self.sampling.allowed_token_ids_mask is not None:
+            # This request has no allowlist. The slot may have been reused from
+            # a previous request that did, so its mask row could hold stale
+            # "disallowed" bits. The mask is read as ``mask[req_indices]``
+            # whenever *any* batched request has an allowlist, so a stale row
+            # would wrongly constrain this request. Reset it.
+            self.sampling.allowed_token_ids_mask[req_index] = False
 
         # Bad words
         if sampling_params.bad_words_token_ids:
@@ -365,6 +363,10 @@ class InputBatch:
         self.sampling.generators.pop(req_index, None)
         self.sampling.has_allowed_token_ids.discard(req_id)
         self.sampling.bad_words_token_ids.pop(req_index, None)
+        # Clear the allowlist mask row so a stale "disallowed" set can never
+        # survive into a request that later reuses this slot.
+        if self.sampling.allowed_token_ids_mask is not None:
+            self.sampling.allowed_token_ids_mask[req_index] = False
 
         return req_index
 
@@ -488,66 +490,95 @@ class InputBatch:
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
 
-    def make_prompt_token_ids_tensor(self) -> torch.Tensor:
+    def make_prompt_token_ids_tensor(
+        self, req_indices: list[int] | None = None
+    ) -> torch.Tensor:
         """Create a tensor of prompt token IDs, padded with -1.
+
+        ``req_indices`` selects which rows of the persistent batch to emit (one
+        row per index, in order). ``None`` means the whole local batch
+        (``range(num_reqs)``). Lane-DP passes one lane's indices so the result
+        is attributed to that lane's requests rather than the merged batch's
+        leading rows.
 
         NOTE: TT device sampling relies on -1 as the padding sentinel.
         If these tokens are passed to the host sampler for penalties, they must
         be canonicalized (cast to int64 and -1 replaced with vocab_size) before
         scatter operations.
         """
-        max_prompt_len = (
-            self.num_prompt_tokens[: self.num_reqs].max() if self.num_reqs > 0 else 0
-        )
+        rows = list(range(self.num_reqs)) if req_indices is None else list(req_indices)
+        n = len(rows)
+        idx = np.asarray(rows, dtype=np.int64)
+        max_prompt_len = int(self.num_prompt_tokens[idx].max()) if n > 0 else 0
         prompt_token_ids_tensor = torch.full(
-            (self.num_reqs, max_prompt_len),
+            (n, max_prompt_len),
             -1,
             device="cpu",
             dtype=torch.int32,
         )
         prompt_token_ids = prompt_token_ids_tensor.numpy()
-        prompt_token_ids[:] = self.token_ids_cpu[: self.num_reqs, :max_prompt_len]
+        prompt_token_ids[:] = self.token_ids_cpu[idx, :max_prompt_len]
         # Pad with -1 for positions beyond actual prompt length
-        for i in range(self.num_reqs):
-            prompt_token_ids[i, self.num_prompt_tokens[i] :] = -1
+        for row, i in enumerate(rows):
+            prompt_token_ids[row, self.num_prompt_tokens[i] :] = -1
         return prompt_token_ids_tensor
 
-    def make_output_token_ids_tensor(self) -> torch.Tensor:
+    def make_output_token_ids_tensor(
+        self, req_indices: list[int] | None = None
+    ) -> torch.Tensor:
         """Create a tensor of output token IDs, padded with -1.
+
+        ``req_indices`` selects which rows of the persistent batch to emit (see
+        ``make_prompt_token_ids_tensor``).
 
         NOTE: TT device sampling relies on -1 as the padding sentinel.
         If these tokens are used by the host sampler penalties logic, -1 padding
         should be removed/handled before use.
         """
-        output_lens = (
-            self.num_tokens[: self.num_reqs] - self.num_prompt_tokens[: self.num_reqs]
-        )
-        max_output_len = int(output_lens.max()) if self.num_reqs > 0 else 0
+        rows = list(range(self.num_reqs)) if req_indices is None else list(req_indices)
+        n = len(rows)
+        idx = np.asarray(rows, dtype=np.int64)
+        output_lens = self.num_tokens[idx] - self.num_prompt_tokens[idx]
+        max_output_len = int(output_lens.max()) if n > 0 else 0
 
         output_token_ids_tensor = torch.full(
-            (self.num_reqs, max_output_len),
+            (n, max_output_len),
             -1,
             device="cpu",
             dtype=torch.int32,
         )
         output_token_ids = output_token_ids_tensor.numpy()
         # Copy output tokens from token_ids_cpu
-        for i in range(self.num_reqs):
+        for row, i in enumerate(rows):
             prompt_len = self.num_prompt_tokens[i]
             total_len = self.num_tokens[i]
             output_len = total_len - prompt_len
             if output_len > 0:
-                output_token_ids[i, :output_len] = self.token_ids_cpu[
+                output_token_ids[row, :output_len] = self.token_ids_cpu[
                     i, prompt_len:total_len
                 ]
         return output_token_ids_tensor
 
-    def advance_generators(self) -> None:
+    def advance_generators(self, req_indices: list[int] | None = None) -> None:
         # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied,
         # so the original object is not modified.
         # Otherwise, the generator at local_rank 0
         # would get out of sync with the others.
-        for generator in self.sampling.generators.values():
+        #
+        # ``req_indices`` restricts advancement to the build's own requests.
+        # Each generator belongs to a single request, so lane-DP (which calls
+        # this once per lane) passes the lane's indices to advance every
+        # generator exactly once per step rather than once per lane. ``None``
+        # advances all generators (whole-batch build, called once per step).
+        if req_indices is None:
+            generators = list(self.sampling.generators.values())
+        else:
+            generators = [
+                self.sampling.generators[i]
+                for i in req_indices
+                if i in self.sampling.generators
+            ]
+        for generator in generators:
             # Sample once from the generator to advance its state.
             torch.rand(1, generator=generator)

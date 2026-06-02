@@ -943,7 +943,11 @@ class TTModelRunner:
         # An explicit ``req_indices`` is passed only by the lane-DP path
         # (``prepare_lane_dp_model_input``), which slices one lane's requests
         # out of the merged cross-lane ``input_batch``. Non-DP and gathered-DP
-        # leave it ``None`` and operate on the whole local batch.
+        # leave it ``None`` and operate on the whole local batch. Per-lane
+        # builds therefore restrict every ``input_batch`` read to ``req_indices``
+        # (sampling rows, penalty token history, generator advancement,
+        # host-only per-request state) so they never touch other lanes' rows.
+        is_lane_build = req_indices is not None
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
@@ -1077,8 +1081,12 @@ class TTModelRunner:
                     for bt in block_tables_per_group
                 ]
                 block_tables = block_tables_per_group[0]
-                # Pad sampling parameters with default values
-                sample_params.pad_with_defaults(num_reqs)
+                # Sampling parameters are intentionally NOT padded here. The
+                # per-row wire tensors are built below by
+                # ``_sampling_params_for_padded_decode``, which gathers this
+                # build's ``req_indices`` rows and right-pads with fresh
+                # defaults. The persistent ``input_batch.sampling`` tail is
+                # never read, so there is nothing to default in place.
 
         if is_prompt:
             # Convert num_logprobs (int tensor)
@@ -1170,8 +1178,13 @@ class TTModelRunner:
         prompt_tokens = None
         output_tokens = None
         if (not input_batch.no_penalties) and not is_prompt:
-            prompt_tokens = input_batch.make_prompt_token_ids_tensor()
-            output_tokens = input_batch.make_output_token_ids_tensor()
+            # Restrict to this build's requests. For lane builds ``req_indices``
+            # selects one lane's rows out of the merged batch; passing them
+            # keeps penalty history attributed to the right requests instead of
+            # the merged batch's leading rows. Non-DP / gathered-DP pass
+            # ``range(num_reqs)``, so this is a no-op there.
+            prompt_tokens = input_batch.make_prompt_token_ids_tensor(req_indices)
+            output_tokens = input_batch.make_output_token_ids_tensor(req_indices)
 
             # Pad batch to max_num_reqs for non-DP case (don't send padding for
             # DP to reduce overhead from gathering inputs to rank 0).
@@ -1197,24 +1210,65 @@ class TTModelRunner:
                     ]
                 )
 
-        # Build host-only sampling params from input_batch
+        # Build host-only sampling params from input_batch. The host sampler
+        # interprets every per-request key/index as a row in the batch it is
+        # handed, so each of these must be reindexed to this build's rows
+        # (lane-local 0..num_reqs-1). ``req_indices`` is ``range(num_reqs)`` for
+        # non-DP / gathered-DP, so the remaps below are the identity there and
+        # only do real work for lane builds.
         allowed_token_ids_mask = None
         if (
             not input_batch.no_allowed_token_ids
             and input_batch.sampling.allowed_token_ids_mask is not None
         ):
+            # Gather already reindexes to lane-local rows.
             allowed_token_ids_mask = input_batch.sampling.allowed_token_ids_mask[
                 req_indices
             ].clone()
 
+        # Re-key the bad-words dict (req_index -> token id lists) to lane-local
+        # rows. ``condense`` keeps the source keys aligned with active rows.
+        src_bad_words = input_batch.sampling.bad_words_token_ids
+        bad_words_token_ids = {
+            local: src_bad_words[g]
+            for local, g in enumerate(req_indices)
+            if g in src_bad_words
+        }
+
+        # Builtin logits processors (min_p / logit_bias / min_tokens) hold
+        # per-row state tied to the merged batch and cannot be sliced to a
+        # lane-local view here. Refuse rather than silently apply them to the
+        # wrong lane-local rows. The check is gated on ``is_lane_build`` because
+        # non-lane builds already pass a whole-batch-aligned processor set.
+        if is_lane_build and input_batch.sampling.has_active_logitsprocs():
+            raise NotImplementedError(
+                "Builtin logits processors (min_p / logit_bias / min_tokens) "
+                "are not yet supported with single-process lane DP "
+                "(tt_data_parallel_size > 1)."
+            )
+        logitsprocs = input_batch.sampling.logitsprocs
+
         generators = dict()
         if not perform_device_sampling:
-            generators = input_batch.sampling.generators
+            # Re-key generators (req_index -> Generator) to lane-local rows.
+            # The values are the same Generator objects advanced just below, so
+            # advancing via the shared ``input_batch`` keeps them in step.
+            src_generators = input_batch.sampling.generators
+            generators = {
+                local: src_generators[g]
+                for local, g in enumerate(req_indices)
+                if g in src_generators
+            }
             # Technically this advances the generator before it is copied,
             # but it's ok because this happens consistently.
-            # We're assuming that _prepare_model_inputs is called
-            # exactly once per step.
-            input_batch.advance_generators()
+            #
+            # Each generator belongs to exactly one request (one lane), so we
+            # advance only this build's generators. Non-DP / gathered-DP build
+            # the whole batch once per step, so all generators advance exactly
+            # once; lane builds run once per lane, and passing the lane's
+            # ``req_indices`` keeps each generator advancing exactly once per
+            # step instead of once per lane.
+            input_batch.advance_generators(req_indices)
             # NOTE: Our sampling paths are different between host and device.
             # Whether a request is sampled on device or host
             # depends also on other requests in the batch.
@@ -1243,9 +1297,9 @@ class TTModelRunner:
             slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
-            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
+            bad_words_token_ids_list=[bad_words_token_ids],
             max_num_logprobs=[input_batch.max_num_logprobs],
-            logitsprocs_list=[input_batch.sampling.logitsprocs],
+            logitsprocs_list=[logitsprocs],
             generators_list=[generators],
         )
 

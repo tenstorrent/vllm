@@ -328,7 +328,7 @@ python plugins/vllm-tt-plugin/examples/server_example_tt.py \
   --model "meta-llama/Llama-3.3-70B-Instruct" \
   --max_num_seqs 32 \
   --async-scheduling \
-  --plugin-config '{"tt": {"tt_data_parallel_size": 4, "dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
+  --additional-config '{"tt": {"tt_data_parallel_size": 4, "dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
 Notes:
