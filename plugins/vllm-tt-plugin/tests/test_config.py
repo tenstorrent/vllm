@@ -66,13 +66,23 @@ def test_get_tt_data_parallel_size_rejects_zero_lane_count():
         tt_config.get_tt_data_parallel_size(config)
 
 
-def test_gathered_dp_ignores_conflicting_tt_lane_count_for_batch_sizing():
+def test_validate_tt_parallel_config_rejects_gathered_dp_with_tt_lanes():
     config = _vllm_config(
         data_parallel_size=4,
         max_num_seqs=8,
         tt_data_parallel_size=2,
     )
 
-    assert tt_config.get_tt_data_parallel_size(config) == 4
-    assert tt_config.get_tt_max_batch_size(config) == 32
-    assert tt_config.get_tt_per_lane_max_num_seqs(config) == 8
+    with pytest.raises(ValueError, match="cannot be used with data_parallel_size"):
+        tt_config.validate_tt_parallel_config(config)
+
+
+def test_validate_tt_parallel_config_allows_each_mode_alone():
+    # Gathered DP without explicit TT lanes, and single-process lanes without
+    # gathered DP, are both valid and must not raise.
+    tt_config.validate_tt_parallel_config(
+        _vllm_config(data_parallel_size=4, max_num_seqs=8)
+    )
+    tt_config.validate_tt_parallel_config(
+        _vllm_config(data_parallel_size=1, tt_data_parallel_size=4)
+    )

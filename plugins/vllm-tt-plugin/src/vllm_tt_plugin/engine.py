@@ -120,6 +120,12 @@ class TTExecutionMixin:
         return result[0]
 
     def preprocess_add_request(self, request: Any) -> tuple[Request, int]:
+        """Stamp TT lane-routing hints onto an incoming request.
+
+        Sets ``tt_lane`` (assigned lane, ``-1`` until the lane coordinator
+        picks one) and ``tt_preferred_lane`` (the requested DP rank), both
+        consumed by ``lane_scheduler.TTLaneCoordinator``.
+        """
         req, request_wave = super().preprocess_add_request(request)
         # Keep TT-only routing hints plugin-local rather than extending the
         # shared vLLM Request model.

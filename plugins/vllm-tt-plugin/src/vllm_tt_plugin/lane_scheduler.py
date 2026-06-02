@@ -246,6 +246,3 @@ class TTLaneCoordinator(TTScheduler):
         merged._tt_lane_step_metadata = self._last_lane_metadata
         self._refresh_lane_counts()
         return merged
-
-    def get_last_lane_metadata(self) -> LaneStepMetadata | None:
-        return self._last_lane_metadata

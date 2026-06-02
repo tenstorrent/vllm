@@ -15,6 +15,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
     uses_tt_lane_coordinator,
+    validate_tt_parallel_config,
 )
 
 if TYPE_CHECKING:
@@ -495,19 +496,8 @@ class TTPlatform(Platform):
             )
             vllm_config.scheduler_config.async_scheduling = False
 
-        # TT uses a single scheduler implementation for both sync and async
-        # execution modes; async_scheduling only controls execution overlap.
-        configured_lanes = tt_config.get("tt_data_parallel_size")
-        if (
-            configured_lanes is not None
-            and vllm_config.parallel_config.data_parallel_size > 1
-        ):
-            raise ValueError(
-                "tt_data_parallel_size cannot be used with "
-                f"data_parallel_size="
-                f"{vllm_config.parallel_config.data_parallel_size}. "
-                "Use one of gathered multi-process DP or single-process lanes."
-            )
+        # Gathered DP and single-process TT lanes are mutually exclusive.
+        validate_tt_parallel_config(vllm_config)
         if uses_tt_lane_coordinator(vllm_config):
             # Run early validation: lane mode requires max_num_seqs to split
             # evenly across the internal TT lanes.

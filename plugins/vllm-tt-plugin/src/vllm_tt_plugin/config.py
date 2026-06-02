@@ -64,6 +64,11 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     When vLLM ``data_parallel_size > 1``, gathered-DP uses one engine per rank
     and this returns ``data_parallel_size``. When ``data_parallel_size == 1``,
     optional ``tt.tt_data_parallel_size`` enables in-process lanes.
+
+    Setting both ``data_parallel_size > 1`` and ``tt_data_parallel_size`` is
+    rejected up front by ``validate_tt_parallel_config`` (the two are
+    orthogonal and the combination is untested), so ``configured`` is ignored
+    here whenever ``data_parallel_size > 1``.
     """
     parallel_config = vllm_config.parallel_config
     vllm_dp = parallel_config.data_parallel_size
@@ -71,13 +76,6 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     configured = tt_config.get("tt_data_parallel_size")
 
     if vllm_dp > 1:
-        if configured is not None and int(configured) != vllm_dp:
-            logger.warning(
-                "Ignoring tt_data_parallel_size=%s because "
-                "data_parallel_size=%d (gathered-DP uses vLLM DP size).",
-                configured,
-                vllm_dp,
-            )
         return vllm_dp
 
     if configured is None:
@@ -86,6 +84,25 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     if lanes < 1:
         raise ValueError(f"tt_data_parallel_size must be >= 1, got {lanes}")
     return lanes
+
+
+def validate_tt_parallel_config(vllm_config: "VllmConfig") -> None:
+    """Reject configs that combine gathered DP with single-process TT lanes.
+
+    ``data_parallel_size > 1`` (gathered multi-process DP) and
+    ``tt_data_parallel_size`` (single-process in-process lanes) are orthogonal
+    parallelism mechanisms. The combination is untested, so it is rejected
+    rather than silently picking one. Called from
+    ``TTPlatform.check_and_update_config``.
+    """
+    configured = get_tt_config(vllm_config).get("tt_data_parallel_size")
+    data_parallel_size = vllm_config.parallel_config.data_parallel_size
+    if configured is not None and data_parallel_size > 1:
+        raise ValueError(
+            "tt_data_parallel_size cannot be used with "
+            f"data_parallel_size={data_parallel_size}. "
+            "Use one of gathered multi-process DP or single-process lanes."
+        )
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
