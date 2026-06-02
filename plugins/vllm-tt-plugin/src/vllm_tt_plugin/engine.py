@@ -24,7 +24,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, uses_tt_gathered_dp
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 
 logger = init_logger(__name__)
@@ -243,12 +243,11 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        tt_config = get_tt_config(vllm_config)
-        if bool(tt_config.get("full_dp_mode", False)):
+        if not uses_tt_gathered_dp(vllm_config):
             raise ValueError(
-                "TTDPEngineCoreProc is gathered-DP only and cannot be used with "
-                "full_dp_mode=True. Use vllm.v1.engine.core.DPEngineCoreProc "
-                "instead."
+                "`TTDPEngineCoreProc` is gathered-DP only and cannot be used with "
+                "standard DP mode. Use `vllm.v1.engine.core.DPEngineCoreProc` "
+                "for standard DP execution."
             )
 
         DEBUG_DPG = os.environ.get("DP_GATHER_DEBUG") == "1"

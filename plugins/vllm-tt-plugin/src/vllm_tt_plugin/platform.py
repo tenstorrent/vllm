@@ -10,7 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, uses_tt_gathered_dp
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -246,7 +246,7 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
     device_type: str = "tt"
-    full_dp_mode: ClassVar[bool] = False
+    gathered_dp_mode: ClassVar[bool] = False
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
@@ -336,26 +336,25 @@ class TTPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
 
-        full_dp_mode = False
-        if tt_config is not None and "full_dp_mode" in tt_config:
-            full_dp_mode = tt_config["full_dp_mode"]
+        gathered_dp_mode = uses_tt_gathered_dp(vllm_config)
 
-        if full_dp_mode:
-            # Full-DP mode uses upstream engine cores and DP orchestration.
-            parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
-            parallel_config.engine_core_proc_cls = (
-                "vllm.v1.engine.core.EngineCoreProc"
-            )
-            parallel_config.dp_engine_core_proc_cls = (
-                "vllm.v1.engine.core.DPEngineCoreProc"
-            )
-        else:
+        if gathered_dp_mode:
+            # TT gathered-DP mode uses plugin engine cores.
             parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
             parallel_config.engine_core_proc_cls = (
                 "vllm_tt_plugin.engine.TTEngineCoreProc"
             )
             parallel_config.dp_engine_core_proc_cls = (
                 "vllm_tt_plugin.engine.TTDPEngineCoreProc"
+            )
+        else:
+            # Standard mode uses upstream DP engine cores.
+            parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
+            parallel_config.engine_core_proc_cls = (
+                "vllm.v1.engine.core.EngineCoreProc"
+            )
+            parallel_config.dp_engine_core_proc_cls = (
+                "vllm.v1.engine.core.DPEngineCoreProc"
             )
 
         parallel_config.engine_core_launcher_cls = (
@@ -400,7 +399,7 @@ class TTPlatform(Platform):
             sample_on_device_mode = None
         cls.sample_on_device_mode = sample_on_device_mode  # type: ignore[attr-defined]
 
-        cls.full_dp_mode = full_dp_mode  # type: ignore[attr-defined]
+        cls.gathered_dp_mode = gathered_dp_mode  # type: ignore[attr-defined]
 
         # Compat sampling uses the full vLLM sampling pipeline,
         # with logit processors and sampler, instead of our custom sampling.

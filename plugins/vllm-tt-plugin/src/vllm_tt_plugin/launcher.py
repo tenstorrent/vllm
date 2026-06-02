@@ -20,29 +20,21 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.system_utils import kill_process_tree
 from vllm.v1.engine.utils import CoreEngine, CoreEngineLauncher, EngineLaunchPlan
 from vllm.v1.executor.abstract import UniProcExecutor
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, uses_tt_gathered_dp
 
 logger = init_logger(__name__)
 
 
 class TTLaunchPlan(EngineLaunchPlan):
     rank_binding_file: str | None = None
-    full_dp_mode: bool = False
 
 
 class TTCoreEngineLauncher(CoreEngineLauncher):
     def prepare_launch(self, vllm_config: VllmConfig) -> EngineLaunchPlan:
         rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
 
-        tt_config = get_tt_config(vllm_config)
-        full_dp_mode = False
-        if tt_config and "full_dp_mode" in tt_config:
-            full_dp_mode = tt_config["full_dp_mode"]
-
         if rank_binding_file is None:
-            plan = TTLaunchPlan()
-            plan.full_dp_mode = full_dp_mode
-            return plan
+            return TTLaunchPlan()
 
         parallel_config = vllm_config.parallel_config
         if (
@@ -59,7 +51,6 @@ class TTCoreEngineLauncher(CoreEngineLauncher):
             non_device_dp_ranks=non_device_dp_ranks,
         )
         plan.rank_binding_file = rank_binding_file
-        plan.full_dp_mode = full_dp_mode
         return plan
 
     def get_engines_to_handshake(
@@ -193,20 +184,20 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     logger.info("Validated launching from MPI rank 0 host %s", rank0_host)
 
 
-def _validate_full_dp_rank_binding_visibility(rank_bindings: list) -> None:
+def _validate_standard_dp_rank_binding_visibility(rank_bindings: list) -> None:
     if not isinstance(rank_bindings, list):
         raise RuntimeError("rank_binding must contain a 'rank_bindings' list")
 
     for i, binding in enumerate(rank_bindings):
         if not isinstance(binding, dict):
             raise RuntimeError(
-                "full_dp_mode requires each rank_binding entry to be a mapping"
+                "standard DP mode requires each rank_binding entry to be a mapping"
             )
 
         env_overrides = binding.get("env_overrides")
         if not isinstance(env_overrides, dict):
             raise RuntimeError(
-                "full_dp_mode requires per-rank env_overrides with "
+                "standard DP mode requires per-rank env_overrides with "
                 "TT_VISIBLE_DEVICES"
             )
 
@@ -214,7 +205,7 @@ def _validate_full_dp_rank_binding_visibility(rank_bindings: list) -> None:
         if not isinstance(visible, str) or not visible.strip():
             rank = binding.get("rank", i)
             raise RuntimeError(
-                "full_dp_mode requires TT_VISIBLE_DEVICES for every rank_binding "
+                "standard DP mode requires TT_VISIBLE_DEVICES for every rank_binding "
                 f"entry (missing/invalid at rank={rank})"
             )
 
@@ -225,8 +216,8 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         "TT does not support ray-based data parallel backend"
     )
     dp_size = parallel_config.data_parallel_size
+    gathered_dp_mode = uses_tt_gathered_dp(vllm_config)
     tt_config = get_tt_config(vllm_config)
-    full_dp_mode = bool(tt_config.get("full_dp_mode", False))
     rank_binding_file = tt_config.get("rank_binding")
     non_device_dp_ranks: set[int] = set()
     if rank_binding_file:
@@ -247,16 +238,7 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         if mpi_world <= 0:
             raise RuntimeError("rank_binding must contain at least one MPI rank")
 
-        if full_dp_mode:
-            if dp_size != mpi_world:
-                raise RuntimeError(
-                    "full_dp_mode requires one TT MPI rank per DP rank: "
-                    f"data_parallel_size ({dp_size}) must equal number of "
-                    f"device MPI ranks ({mpi_world})"
-                )
-            _validate_full_dp_rank_binding_visibility(rank_bindings)
-            non_device_dp_ranks = set()
-        else:
+        if gathered_dp_mode:
             if dp_size % mpi_world != 0:
                 raise RuntimeError(
                     f"data_parallel_size ({dp_size}) must be divisible by number "
@@ -270,6 +252,15 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
             non_device_dp_ranks = {
                 i for i in range(dp_size) if i not in device_dp_ranks
             }
+        else:
+            if dp_size != mpi_world:
+                raise RuntimeError(
+                    "Standard DP mode requires one TT MPI rank per DP rank: "
+                    f"data_parallel_size ({dp_size}) must equal number of "
+                    f"device MPI ranks ({mpi_world})"
+                )
+            _validate_standard_dp_rank_binding_visibility(rank_bindings)
+            non_device_dp_ranks = set()
 
     return rank_binding_file, non_device_dp_ranks
 
@@ -424,19 +415,23 @@ def main() -> None:
         raise RuntimeError("TT engine core must be launched under MPI")
 
     pc = vllm_config.parallel_config
-    full_dp_mode = bool(get_tt_config(vllm_config).get("full_dp_mode", False))
-    if full_dp_mode:
+    gathered_dp_mode = uses_tt_gathered_dp(vllm_config)
+    if gathered_dp_mode:
+        if pc.data_parallel_size % mpi_world != 0:
+            raise RuntimeError(
+                f"data_parallel_size ({pc.data_parallel_size}) must be divisible "
+                f"by MPI world size ({mpi_world}) in TT gathered-DP mode"
+            )
+        segment = pc.data_parallel_size // mpi_world
+        pc.data_parallel_rank = mpi_rank * segment
+    else:
         if pc.data_parallel_size != mpi_world:
             raise RuntimeError(
-                "full_dp_mode requires one TT MPI rank per DP rank: "
+                "Standard DP mode requires one TT MPI rank per DP rank: "
                 f"data_parallel_size ({pc.data_parallel_size}) must equal "
                 f"MPI world size ({mpi_world})"
             )
         pc.data_parallel_rank = mpi_rank
-    else:
-        assert pc.data_parallel_size % mpi_world == 0
-        segment = pc.data_parallel_size // mpi_world
-        pc.data_parallel_rank = mpi_rank * segment
     pc.data_parallel_rank_local = 0
     assert pc.distributed_executor_backend == "uni", (
         "TT MPI must be used with uniproc executor backend"

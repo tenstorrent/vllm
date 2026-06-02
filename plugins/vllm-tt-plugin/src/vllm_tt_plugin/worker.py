@@ -87,9 +87,12 @@ class TTWorker(WorkerBase):
         TTPlatform.check_and_update_config(self.vllm_config)
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
-        full_dp_mode = TTPlatform.full_dp_mode
-        if should_open_mesh_for_rank(local_dp_rank, full_dp_mode):
-            mesh_rank = 0 if (full_dp_mode or local_dp_rank is None) else local_dp_rank
+        gathered_dp_mode = TTPlatform.gathered_dp_mode
+        if should_open_mesh_for_rank(local_dp_rank, gathered_dp_mode):
+            mesh_rank = (
+                0 if (not gathered_dp_mode or local_dp_rank is None)
+                else local_dp_rank
+            )
             self.mesh_device = open_mesh_device(
                 get_tt_config(self.vllm_config), self.trace_mode, mesh_rank
             )
@@ -110,10 +113,10 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        # In full-DP mode each rank owns a device and loads the model.
+        # In standard DP mode each rank owns a device and loads the model.
         local_dp_rank = self.parallel_config.data_parallel_rank_local
-        full_dp_mode = TTPlatform.full_dp_mode
-        if should_open_mesh_for_rank(local_dp_rank, full_dp_mode):
+        gathered_dp_mode = TTPlatform.gathered_dp_mode
+        if should_open_mesh_for_rank(local_dp_rank, gathered_dp_mode):
             self.model_runner.load_model()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
@@ -270,8 +273,8 @@ class TTWorker(WorkerBase):
             logger.warning("Skipping model warmup")
             return
         local_dp_rank = self.parallel_config.data_parallel_rank_local
-        full_dp_mode = TTPlatform.full_dp_mode
-        if should_open_mesh_for_rank(local_dp_rank, full_dp_mode):
+        gathered_dp_mode = TTPlatform.gathered_dp_mode
+        if should_open_mesh_for_rank(local_dp_rank, gathered_dp_mode):
             self.model_runner.warmup_model()
 
     def execute_model(
