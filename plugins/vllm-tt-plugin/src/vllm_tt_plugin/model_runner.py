@@ -898,24 +898,62 @@ class TTModelRunner:
         req_indices: list[int] | None = None,
         capture_slot_remap: bool = True,
     ) -> TTModelInput:
-        # In DP, called on each rank
-        # In non-DP, this is the only input preparation function
+        """Build a ``TTModelInput`` for one prefill or decode step.
 
+        Reads the current persistent ``self.input_batch`` and assembles the
+        padded, fixed-shape tensors a TT model needs (constant shapes are
+        required for ttnn tracing). This is the single input-builder shared by
+        all three execution modes:
+
+        - **Non-DP**: called once per step (via ``build_model_input``) with
+          ``req_indices=None``; covers the whole local batch.
+        - **Gathered-DP**: called on each rank (via ``build_model_input``) with
+          ``req_indices=None``; each rank's ``input_batch`` holds only its own
+          requests and the results are later gathered to rank 0.
+        - **Lane-DP**: called once per lane (via
+          ``prepare_lane_dp_model_input``) with an explicit ``req_indices``
+          that slices that lane's requests out of the merged cross-lane
+          ``input_batch``.
+
+        Args:
+            scheduler_output: Scheduler decisions for this step. Used to detect
+                prefill vs. decode and (for grammar) which requests carry
+                structured-output bitmasks.
+            grammar_output: Structured-output bitmasks for this step, or
+                ``None`` when no request uses guided decoding.
+            req_indices: Indices into ``input_batch`` selecting the requests to
+                build. ``None`` means the whole local batch (non-DP /
+                gathered-DP); an explicit list marks a lane-DP build and
+                determines the per-lane wire padding (see ``decode_pad_to``).
+            capture_slot_remap: Whether to pop and attach the input batch's
+                pending slot remap. Lane-DP builds pass ``False`` because the
+                remap is handled during the lane merge instead.
+
+        Returns:
+            A ``TTModelInput`` with tokens, positions, block tables, sampling
+            params and host-only metadata, padded to the appropriate wire
+            capacity. ``unpadded_batch_size`` records the real (pre-pad)
+            request count.
+        """
         assert scheduler_output.total_num_scheduled_tokens > 0
         input_batch = self.input_batch
         batch_num_reqs = input_batch.num_reqs
         assert batch_num_reqs > 0
-        has_explicit_req_indices = req_indices is not None
+
+        # An explicit ``req_indices`` is passed only by the lane-DP path
+        # (``prepare_lane_dp_model_input``), which slices one lane's requests
+        # out of the merged cross-lane ``input_batch``. Non-DP and gathered-DP
+        # leave it ``None`` and operate on the whole local batch.
+        is_lane_build = req_indices is not None
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
-        # Lane builds always pad to the per-lane wire capacity, even when one
-        # lane temporarily owns the full active batch. Non-lane (whole-batch)
-        # builds pad to the full persistent-batch capacity.
+
+        # Lane builds pad to the per-lane wire capacity, even when one lane
+        # temporarily owns the full active batch. Whole-batch (non-DP and
+        # gathered-DP) builds pad to the full persistent-batch capacity.
         decode_pad_to = (
-            self.tt_per_lane_max_num_seqs
-            if has_explicit_req_indices or num_reqs < batch_num_reqs
-            else input_batch.max_num_reqs
+            self.tt_per_lane_max_num_seqs if is_lane_build else input_batch.max_num_reqs
         )
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
