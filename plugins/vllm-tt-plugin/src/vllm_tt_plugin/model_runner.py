@@ -923,8 +923,8 @@ class TTModelRunner:
                 ``None`` when no request uses guided decoding.
             req_indices: Indices into ``input_batch`` selecting the requests to
                 build. ``None`` means the whole local batch (non-DP /
-                gathered-DP); an explicit list marks a lane-DP build and
-                determines the per-lane wire padding (see ``decode_pad_to``).
+                gathered-DP); an explicit list marks a lane-DP build that
+                slices one lane's requests out of the merged ``input_batch``.
             capture_slot_remap: Whether to pop and attach the input batch's
                 pending slot remap. Lane-DP builds pass ``False`` because the
                 remap is handled during the lane merge instead.
@@ -944,17 +944,18 @@ class TTModelRunner:
         # (``prepare_lane_dp_model_input``), which slices one lane's requests
         # out of the merged cross-lane ``input_batch``. Non-DP and gathered-DP
         # leave it ``None`` and operate on the whole local batch.
-        is_lane_build = req_indices is not None
         if req_indices is None:
             req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
 
-        # Lane builds pad to the per-lane wire capacity, even when one lane
-        # temporarily owns the full active batch. Whole-batch (non-DP and
-        # gathered-DP) builds pad to the full persistent-batch capacity.
-        decode_pad_to = (
-            self.tt_per_lane_max_num_seqs if is_lane_build else input_batch.max_num_reqs
-        )
+        # All modes pad decode to the per-rank/per-lane wire capacity. The
+        # DP-decode gather packs and unpacks each rank at
+        # ``tt_per_lane_max_num_seqs``; padding to ``input_batch.max_num_reqs``
+        # (the *global* gathered capacity ``max_num_seqs * dp_size`` for
+        # gathered multi-process DP) would carry too many rows in the
+        # never-trimmed tokens/positions/block_tables fields and desync the
+        # packed gather layout. For non-DP these two capacities are equal.
+        decode_pad_to = self.tt_per_lane_max_num_seqs
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
@@ -1297,8 +1298,18 @@ class TTModelRunner:
         )
 
     @staticmethod
-    def _decode_gather_take_batch(tensor: torch.Tensor, max_batch: int) -> torch.Tensor:
-        """Trim or pad a per-row decode gather tensor to ``max_batch`` elements."""
+    def _decode_gather_take_batch(
+        tensor: torch.Tensor,
+        max_batch: int,
+        pad_value: float | int | bool = 0,
+    ) -> torch.Tensor:
+        """Trim or pad a per-row decode gather tensor to ``max_batch`` elements.
+
+        Padding rows are filled with ``pad_value`` — the sampling parameter's
+        neutral default (see ``SamplingInputBatch.DEFAULTS``) — rather than a
+        bare 0, so that a padded row can never inject an invalid sampling
+        parameter (e.g. ``top_k=0``) if it is ever sampled.
+        """
         flat = tensor.contiguous().view(-1)
         n = int(flat.numel())
         if n == max_batch:
@@ -1306,7 +1317,9 @@ class TTModelRunner:
         if n > max_batch:
             return flat[:max_batch]
         pad = max_batch - n
-        return torch.cat([flat, torch.zeros(pad, dtype=flat.dtype, device=flat.device)])
+        return torch.cat(
+            [flat, torch.full((pad,), pad_value, dtype=flat.dtype, device=flat.device)]
+        )
 
     def _decode_gather_slot_remap(
         self, model_input: TTModelInput | None, max_batch: int
@@ -1419,26 +1432,41 @@ class TTModelRunner:
                 [cast(int, model_input.unpadded_batch_size)], dtype=torch.int32
             )
             sampling_params: TTSamplingParams = model_input.tt_sampling_params
+            defaults = self.input_batch.sampling.DEFAULTS
             temperature = self._decode_gather_take_batch(
-                sampling_params.temperature, max_batch
+                sampling_params.temperature, max_batch, defaults["temperature"]
             )
-            top_k = self._decode_gather_take_batch(sampling_params.top_k, max_batch)
-            top_p = self._decode_gather_take_batch(sampling_params.top_p, max_batch)
+            top_k = self._decode_gather_take_batch(
+                sampling_params.top_k, max_batch, defaults["top_k"]
+            )
+            top_p = self._decode_gather_take_batch(
+                sampling_params.top_p, max_batch, defaults["top_p"]
+            )
             presence_penalty = self._decode_gather_take_batch(
-                sampling_params.presence_penalty, max_batch
+                sampling_params.presence_penalty,
+                max_batch,
+                defaults["presence_penalty"],
             )
             frequency_penalty = self._decode_gather_take_batch(
-                sampling_params.frequency_penalty, max_batch
+                sampling_params.frequency_penalty,
+                max_batch,
+                defaults["frequency_penalty"],
             )
             repetition_penalty = self._decode_gather_take_batch(
-                sampling_params.repetition_penalty, max_batch
+                sampling_params.repetition_penalty,
+                max_batch,
+                defaults["repetition_penalty"],
             )
-            seed = self._decode_gather_take_batch(sampling_params.seed, max_batch)
+            seed = self._decode_gather_take_batch(
+                sampling_params.seed, max_batch, defaults["seed"]
+            )
             num_logprobs = self._decode_gather_take_batch(
-                sampling_params.num_logprobs, max_batch
+                sampling_params.num_logprobs, max_batch, defaults["num_logprobs"]
             )
+            # enable_log_probs has no DEFAULTS entry; its neutral default is
+            # "logprobs disabled" (num_logprobs default < 0 -> False).
             enable_log_probs = self._decode_gather_take_batch(
-                sampling_params.enable_log_probs, max_batch
+                sampling_params.enable_log_probs, max_batch, False
             )
             max_num_logprobs_val = (
                 model_input.max_num_logprobs[0]
@@ -2265,39 +2293,58 @@ class TTModelRunner:
                 block_tables_per_group_list[group_idx].append(padded)
 
             sampling_params = lane_input.tt_sampling_params
+            defaults = self.input_batch.sampling.DEFAULTS
             temperature_list.append(
-                self._decode_gather_take_batch(sampling_params.temperature, batch_size)
+                self._decode_gather_take_batch(
+                    sampling_params.temperature, batch_size, defaults["temperature"]
+                )
             )
             top_k_list.append(
-                self._decode_gather_take_batch(sampling_params.top_k, batch_size)
+                self._decode_gather_take_batch(
+                    sampling_params.top_k, batch_size, defaults["top_k"]
+                )
             )
             top_p_list.append(
-                self._decode_gather_take_batch(sampling_params.top_p, batch_size)
+                self._decode_gather_take_batch(
+                    sampling_params.top_p, batch_size, defaults["top_p"]
+                )
             )
             presence_penalty_list.append(
                 self._decode_gather_take_batch(
-                    sampling_params.presence_penalty, batch_size
+                    sampling_params.presence_penalty,
+                    batch_size,
+                    defaults["presence_penalty"],
                 )
             )
             frequency_penalty_list.append(
                 self._decode_gather_take_batch(
-                    sampling_params.frequency_penalty, batch_size
+                    sampling_params.frequency_penalty,
+                    batch_size,
+                    defaults["frequency_penalty"],
                 )
             )
             repetition_penalty_list.append(
                 self._decode_gather_take_batch(
-                    sampling_params.repetition_penalty, batch_size
+                    sampling_params.repetition_penalty,
+                    batch_size,
+                    defaults["repetition_penalty"],
                 )
             )
             seed_list.append(
-                self._decode_gather_take_batch(sampling_params.seed, batch_size)
+                self._decode_gather_take_batch(
+                    sampling_params.seed, batch_size, defaults["seed"]
+                )
             )
             num_logprobs_list.append(
-                self._decode_gather_take_batch(sampling_params.num_logprobs, batch_size)
+                self._decode_gather_take_batch(
+                    sampling_params.num_logprobs, batch_size, defaults["num_logprobs"]
+                )
             )
+            # enable_log_probs has no DEFAULTS entry; its neutral default is
+            # "logprobs disabled" (num_logprobs default < 0 -> False).
             enable_log_probs_list.append(
                 self._decode_gather_take_batch(
-                    sampling_params.enable_log_probs, batch_size
+                    sampling_params.enable_log_probs, batch_size, False
                 )
             )
 
