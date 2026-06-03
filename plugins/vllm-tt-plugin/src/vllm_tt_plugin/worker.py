@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm_tt_plugin.config import get_tt_config, should_open_mesh_for_rank
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
@@ -59,6 +59,10 @@ class TTWorker(WorkerBase):
 
         # Initialized by init_device
         self.mesh_device = None
+
+        # Stash for `execute_model`-`sample_tokens` handoff.
+        # See notes for `self.execute_model` and `self.sample_tokens`.
+        self._last_output: ModelRunnerOutput | None = None
 
         # Whether to use ttnn tracing for model execution
         tt_config = get_tt_config(self.vllm_config)
@@ -283,10 +287,41 @@ class TTWorker(WorkerBase):
     ) -> ModelRunnerOutput | None:
         """Expose the non-DP TT execution service to the executor layer.
 
-        Returns the runner's non-DP execution result for the provided
-        scheduler output.
+        In standard DP mode, the upstream ``EngineCore`` calls ``execute_model``
+        followed by ``sample_tokens``.  TT sampling runs inside the model
+        forward pass, so we stash the finished output here and return
+        None to signal "sampling deferred" so that ``sample_tokens`` hands
+        back the stashed result.
+
+        When no tokens are scheduled, the model runner returns an empty
+        output, which we pass through directly (no ``sample_tokens`` call
+        expected by the upstream engine for empty batches).
         """
-        return self.execute_model_with_grammar(scheduler_output, None)
+        output = self.execute_model_with_grammar(scheduler_output, None)
+        if output is not EMPTY_MODEL_RUNNER_OUTPUT and output is not None:
+            # Real work was done => stash for `sample_tokens`.
+            self._last_output = output
+            return None
+        # If empty/no-op batch, return directly.
+        return output
+
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput | None:
+        """Returns the result previously computed by ``self.execute_model``.
+
+        The upstream ``EngineCore`` batch-queue path always calls
+        ``sample_tokens`` after ``execute_model``.  Since TT performs sampling
+        on-device during the forward pass, we simply return the stashed
+        output produced by execute_model.
+
+        TODO: Might need refactoring after ``tt-metal`` introduces forward-sample
+              decoupling. Attributes affected: ``self.execute_model``,
+              ``self.sample_tokens`` (this), and ``self._last_output``.
+        """
+        output, self._last_output = self._last_output, None
+        return output
 
     def execute_model_with_grammar(
         self,
