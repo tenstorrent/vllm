@@ -26,6 +26,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
     uses_tt_lane_coordinator,
 )
 from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
@@ -498,7 +499,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-    max_batch = scheduler_config.max_num_seqs
+    #
+    # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
+    # padding must use the *per-lane/per-rank* batch -- the number of requests
+    # a single submesh actually serves -- not the global engine capacity. In
+    # gathered DP this is ``max_num_seqs`` (each rank is its own engine); in
+    # single-process lane mode it is ``max_num_seqs // tt_data_parallel_size``.
+    # Both reduce to the same per-submesh value, keeping the KV shape identical
+    # regardless of how parallelism is expressed.
+    max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     max_tokens_all_users += cache_config.block_size * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers
