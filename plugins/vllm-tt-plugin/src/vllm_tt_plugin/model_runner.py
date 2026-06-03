@@ -460,9 +460,14 @@ class TTModelRunner:
         side for TT (caches are replicated per submesh and each device
         carries ``num_kv_heads // tp`` heads internally).
         """
-        data_parallel = self.parallel_config.data_parallel_size
         assert self.device_config.num_devices is not None
-        num_devices = self.device_config.num_devices // data_parallel
+        if TTPlatform.gathered_dp_mode:
+            num_devices = (
+                self.device_config.num_devices
+                // self.parallel_config.data_parallel_size
+            )
+        else:
+            num_devices = self.device_config.num_devices
         num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
@@ -1887,9 +1892,13 @@ class TTModelRunner:
 
         # Calculate number of devices per DP rank
         assert self.device_config.num_devices is not None
-        num_devices = (
-            self.device_config.num_devices // self.parallel_config.data_parallel_size
-        )
+        if TTPlatform.gathered_dp_mode:
+            num_devices = (
+                self.device_config.num_devices
+                // self.parallel_config.data_parallel_size
+            )
+        else:
+            num_devices = self.device_config.num_devices
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.

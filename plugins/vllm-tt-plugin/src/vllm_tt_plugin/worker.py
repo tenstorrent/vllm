@@ -495,7 +495,12 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     # region Get default or model- and device-specific `max_tokens_all_users`
     try:
-        data_parallel = vllm_config.parallel_config.data_parallel_size
+        # In gathered-DP, one model spans all DP ranks;
+        # in standard DP each rank's model handles a single shard.
+        if TTPlatform.gathered_dp_mode:
+            data_parallel = vllm_config.parallel_config.data_parallel_size
+        else:
+            data_parallel = 1
         model_class, _ = get_model_architecture(model_config)
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,

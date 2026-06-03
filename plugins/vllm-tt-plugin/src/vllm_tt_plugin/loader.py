@@ -7,7 +7,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, uses_tt_gathered_dp
 
 logger = init_logger(__name__)
 
@@ -32,9 +32,14 @@ class TTModelLoader(BaseModelLoader):
 
         # TT model init expects the global DP-sized batch contract:
         # batch_size_per_dp * total_dp.
-        parallel_config = vllm_config.parallel_config
-        data_parallel = parallel_config.data_parallel_size
-        max_batch_size = scheduler_config.max_num_seqs * data_parallel
+        if uses_tt_gathered_dp(vllm_config):
+            data_parallel = vllm_config.parallel_config.data_parallel_size
+            max_batch_size = scheduler_config.max_num_seqs * data_parallel
+        # In standard DP each rank's model owns its own mesh and
+        # handles only its own batch shard.
+        else:
+            data_parallel = 1
+            max_batch_size = scheduler_config.max_num_seqs
 
         model = model_class.initialize_vllm_model(
             model_config.hf_config,
