@@ -19,7 +19,10 @@ runtime = [
     "torchaudio==2.10.0",
     # Pinned to exact version to match tt-metal's pyproject.toml and prevent numpy 2.x upgrades.
     "numpy==1.26.4",
-    "transformers<=4.57.1",
+    # Allow transformers 5.x (>=5.6) so the qwen3_5 checkpoint loads via HF Auto*,
+    # while still permitting 4.57.x for other TT models. 5.0-5.5 are excluded per
+    # upstream vLLM's v5 spec (known issues); mirrors requirements/common.txt.
+    "transformers>=4.56.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0",
     "qwen-vl-utils",
     "tblib==3.1.0",
 ]

@@ -181,6 +181,32 @@ def register_tt_models(register_test_models=False) -> None:
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
+    # Qwen3.5 - Hybrid (DeltaNet + Full-Attention), text-only - Blackhole P150.
+    #
+    # The HF checkpoint's architecture is the *VL* name
+    # ``Qwen3_5ForConditionalGeneration`` even though Qwen3.5-9B is text-only
+    # (no vision_config). vLLM's native class for that name inherits
+    # ``Qwen3VLForConditionalGeneration`` (multimodal): leaving it enters the MM
+    # pipeline, while pointing it at our tt-metal ``Generator`` subclass makes
+    # ``ModelConfig`` validation reject it ("does not support --runner generate")
+    # because a Generator isn't a vLLM model class.
+    #
+    # So point the bare (VL) arch at vLLM's native *text* class
+    # ``Qwen3_5ForCausalLM`` purely for ModelConfig metadata/validation
+    # (is_text_generation=True, supports_multimodal=False -> passes the runner
+    # check and skips the MM pipeline; it is never instantiated because the TT
+    # loader builds the model). Execution routes to our tt-metal class via the
+    # "TT"-prefixed alias that ``check_and_update_config`` resolves.
+    ModelRegistry.register_model(
+        "Qwen3_5ForConditionalGeneration",
+        "vllm.model_executor.models.qwen3_5:Qwen3_5ForCausalLM",
+    )
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3_5ForConditionalGeneration",
+        "models.demos.blackhole.qwen3_5_9b.tt.qwen35_vllm:Qwen35ForCausalLM",
+    )
+
     # Qwen2.5 - Vision
     _register_model_if_missing(
         ModelRegistry,
