@@ -1,27 +1,163 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import pytest
-from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
-from vllm_tt_plugin.scheduler import TTScheduler
+"""Unit tests for the single-process lane-DP coordinator.
+
+The coordinator is exercised over lightweight fake lane schedulers: a real
+``TTScheduler`` needs a device KV cache config, but the coordinator only relies
+on a small surface of each lane (``waiting`` / ``running`` length, forced-mode
+scheduling, and ``update_from_output``).
+"""
+
+from vllm_tt_plugin.lane_scheduler import (
+    LaneStepMetadata,
+    TTLaneCoordinator,
+)
+from vllm_tt_plugin.scheduler import TTSchedulingMode
 
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreOutputs
 
 
-def test_lane_scheduler_preserves_finished_only_cleanup(
-    monkeypatch: pytest.MonkeyPatch,
-):
+class FakeLane:
+    """Minimal stand-in for a per-lane ``TTScheduler``.
+
+    Prefill always schedules zero tokens here (simulating "no full prefill fits"
+    under KV pressure); decode schedules one token per running request. Pending
+    finished IDs are emitted on the first ``schedule`` call and then drained, so
+    tests can assert the coordinator carries them across a prefill->decode
+    fallback.
+    """
+
+    def __init__(self, waiting=0, running=0, pending_finished=()):
+        self.waiting = [object()] * waiting
+        self.running = [object()] * running
+        self._pending_finished = set(pending_finished)
+        self._mode = TTSchedulingMode.DEFAULT
+        self.scheduled_modes: list[TTSchedulingMode] = []
+        self.update_calls: list[SchedulerOutput] = []
+        self._eco: dict[int, EngineCoreOutputs] = {}
+
+    def set_forced_mode(self, mode):
+        self._mode = mode
+
+    def schedule(self):
+        self.scheduled_modes.append(self._mode)
+        finished = self._pending_finished
+        self._pending_finished = set()
+        out = SchedulerOutput.make_empty()
+        out.finished_req_ids = set(finished)
+        if self._mode == TTSchedulingMode.DECODE_ONLY and self.running:
+            out.num_scheduled_tokens = {f"dec-{id(self)}": len(self.running)}
+            out.total_num_scheduled_tokens = len(self.running)
+        return out
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        self.update_calls.append(scheduler_output)
+        return self._eco
+
+
+def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
     coordinator = TTLaneCoordinator.__new__(TTLaneCoordinator)
-    coordinator.num_lanes = 4
-    coordinator._last_lane_metadata = object()
-    coordinator._refresh_lane_counts = lambda: None
-    coordinator._lane_has_work = lambda lane: False
+    coordinator.lanes = lanes
+    coordinator.num_lanes = len(lanes)
+    coordinator._per_lane_max = per_lane_max
+    coordinator.log_stats = log_stats
+    coordinator.structured_output_manager = None
+    coordinator.connector = None
+    coordinator._last_lane_metadata = None
+    return coordinator
 
-    sentinel = SchedulerOutput.make_empty()
-    sentinel.finished_req_ids = {"finished-req"}
-    monkeypatch.setattr(TTScheduler, "schedule", lambda self: sentinel)
 
-    output = TTLaneCoordinator.schedule(coordinator)
+def test_negotiate_prefill_when_any_lane_wants_prefill():
+    # Lane 1 has a queued request and nothing running -> wants prefill.
+    coordinator = _make_coordinator([FakeLane(running=2), FakeLane(waiting=1)])
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
-    assert output is sentinel
-    assert output.finished_req_ids == {"finished-req"}
-    assert coordinator._last_lane_metadata is None
+
+def test_negotiate_decode_when_no_lane_wants_prefill():
+    coordinator = _make_coordinator([FakeLane(running=2), FakeLane(running=1)])
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.DECODE_ONLY
+
+
+def test_idle_step_propagates_finished_req_ids():
+    # No lane has work, but one lane still has a finished request to report.
+    lanes = [FakeLane(pending_finished={"done-0"}), FakeLane()]
+    coordinator = _make_coordinator(lanes)
+
+    output = coordinator.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert output.finished_req_ids == {"done-0"}
+    # No lane wanted prefill, so the step is decode-only.
+    assert coordinator._last_lane_metadata.is_decode is True
+    # Every lane is scheduled (so each drains its own finished set).
+    assert lanes[0].scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
+    assert lanes[1].scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
+
+
+def test_decode_fallback_when_forced_prefill_schedules_nothing():
+    # Lane 0 has running decodes (and a finished req to report); lane 1 has a
+    # queued request that forces prefill. Prefill schedules nothing, so the
+    # coordinator must fall back to decode to make progress.
+    lane0 = FakeLane(running=2, pending_finished={"done-0"})
+    lane1 = FakeLane(waiting=1)
+    coordinator = _make_coordinator([lane0, lane1])
+
+    output = coordinator.schedule()
+
+    # Fell back to decode: lane 0's two decodes are scheduled.
+    assert output.total_num_scheduled_tokens == 2
+    assert coordinator._last_lane_metadata.is_decode is True
+    # Finished IDs drained during the discarded prefill pass are carried over.
+    assert output.finished_req_ids == {"done-0"}
+    # Lane 0 was scheduled once for prefill, then again for the decode fallback.
+    assert lane0.scheduled_modes == [
+        TTSchedulingMode.PREFILL_ONLY,
+        TTSchedulingMode.DECODE_ONLY,
+    ]
+
+
+def test_no_fallback_when_no_running_requests():
+    # Forced prefill schedules nothing and there are no running decodes
+    # anywhere: nothing to fall back to, so the step stays prefill (empty).
+    lane0 = FakeLane(waiting=1)
+    lane1 = FakeLane(waiting=1)
+    coordinator = _make_coordinator([lane0, lane1])
+
+    output = coordinator.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert coordinator._last_lane_metadata.is_decode is False
+    # Only the prefill pass ran (no decode fallback).
+    assert lane0.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
+
+
+def test_update_from_output_routes_and_merges_per_lane():
+    lane0 = FakeLane()
+    lane1 = FakeLane()
+    lane0._eco = {0: EngineCoreOutputs(outputs=["a"])}
+    lane1._eco = {0: EngineCoreOutputs(outputs=["b"], finished_requests={"x"})}
+    coordinator = _make_coordinator([lane0, lane1])
+
+    out0 = SchedulerOutput.make_empty()
+    out1 = SchedulerOutput.make_empty()
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output._tt_lane_step_metadata = LaneStepMetadata(
+        lane_outputs=[out0, out1], is_decode=True
+    )
+
+    merged = coordinator.update_from_output(scheduler_output, model_runner_output=None)
+
+    # Each lane received its own SchedulerOutput.
+    assert lane0.update_calls == [out0]
+    assert lane1.update_calls == [out1]
+    # Per-client outputs concatenated and finished sets unioned.
+    assert merged[0].outputs == ["a", "b"]
+    assert merged[0].finished_requests == {"x"}
+    # Stats disabled -> none attached.
+    assert merged[0].scheduler_stats is None
+
+
+def test_update_from_output_no_metadata_returns_empty():
+    coordinator = _make_coordinator([FakeLane(), FakeLane()])
+    assert coordinator.update_from_output(SchedulerOutput.make_empty(), None) == {}

@@ -2632,7 +2632,6 @@ class TTModelRunner:
 
         normalized_meta = LaneStepMetadata(
             lane_outputs=meta.lane_outputs,
-            batch_size_per_dp=meta.batch_size_per_dp,
             is_decode=meta.is_decode,
             lane_req_ids=[list(lm.req_ids) for lm in per_lane_meta],
             lane_req_id_to_index=[dict(lm.req_id_to_index) for lm in per_lane_meta],
