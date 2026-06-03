@@ -154,6 +154,49 @@ def _build_logprobs_from_topk(
     return LogprobsTensors(logprob_token_ids, logprobs_values, selected_token_ranks)
 
 
+def _concat_request_logprobs(
+    per_request: list[LogprobsLists | None],
+) -> LogprobsLists | None:
+    """Concatenate per-request single-row LogprobsLists into one LogprobsLists.
+
+    vLLM's scheduler expects ModelRunnerOutput.logprobs to be a single
+    LogprobsLists whose rows are ordered by global request index (it calls
+    logprobs.slice_request(req_index, num_tokens)). When merging lane-DP
+    outputs we collect one row per request; this stacks them back into the
+    expected layout. Requests without logprobs (a lane with logprobs disabled
+    while another lane has them enabled — guarded against defensively) get a
+    zero-filled placeholder row so the row index stays aligned with
+    req_id_to_index. Returns None when no request produced logprobs.
+    """
+    if not any(lp is not None for lp in per_request):
+        return None
+
+    template = next(lp for lp in per_request if lp is not None)
+    width = template.logprob_token_ids.shape[1]
+    token_id_dtype = template.logprob_token_ids.dtype
+    logprob_dtype = template.logprobs.dtype
+    rank_dtype = template.sampled_token_ranks.dtype
+
+    token_id_rows: list[np.ndarray] = []
+    logprob_rows: list[np.ndarray] = []
+    rank_rows: list[np.ndarray] = []
+    for lp in per_request:
+        if lp is None:
+            token_id_rows.append(np.zeros((1, width), dtype=token_id_dtype))
+            logprob_rows.append(np.zeros((1, width), dtype=logprob_dtype))
+            rank_rows.append(np.zeros((1,), dtype=rank_dtype))
+        else:
+            token_id_rows.append(lp.logprob_token_ids)
+            logprob_rows.append(lp.logprobs)
+            rank_rows.append(lp.sampled_token_ranks)
+
+    return LogprobsLists(
+        np.concatenate(token_id_rows, axis=0),
+        np.concatenate(logprob_rows, axis=0),
+        np.concatenate(rank_rows, axis=0),
+    )
+
+
 @dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
@@ -1350,9 +1393,7 @@ class TTModelRunner:
         device: torch.device,
     ) -> LogitBiasLogitsProcessor:
         proc = LogitBiasLogitsProcessor(None, device, False)
-        proc.biases = {
-            remap[g]: lb for g, lb in src.biases.items() if g in remap
-        }
+        proc.biases = {remap[g]: lb for g, lb in src.biases.items() if g in remap}
         if proc.biases:
             reqs: list[int] = []
             tok_ids: list[int] = []
@@ -1375,9 +1416,7 @@ class TTModelRunner:
         device: torch.device,
     ) -> MinTokensLogitsProcessor:
         proc = MinTokensLogitsProcessor(self.vllm_config, device, False)
-        proc.min_toks = {
-            remap[g]: v for g, v in src.min_toks.items() if g in remap
-        }
+        proc.min_toks = {remap[g]: v for g, v in src.min_toks.items() if g in remap}
         if proc.min_toks:
             reqs: list[int] = []
             tok_ids: list[int] = []
@@ -2716,17 +2755,25 @@ class TTModelRunner:
                 # lists never diverge in length (possible if lanes disagree on
                 # whether logprobs are enabled, which shouldn't happen with a
                 # single global engine setting but is guarded here defensively).
+                # Each lane's `logprobs` is a LogprobsLists whose rows are
+                # indexed by local request row, so slice out this request's
+                # single row (one generated token per decode step).
                 logprobs_lists.append(
-                    lane_output_model.logprobs[local_idx] if lane_has_logprobs else None
+                    lane_output_model.logprobs.slice_request(local_idx, 1)
+                    if lane_has_logprobs
+                    else None
                 )
                 global_index += 1
 
         if not merged_req_ids:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        # Discard logprobs entirely when no lane produced them.
-        has_any_logprobs = any(lp is not None for lp in logprobs_lists)
-        logprobs = logprobs_lists if has_any_logprobs else None
+        # vLLM's scheduler expects ModelRunnerOutput.logprobs to be a single
+        # LogprobsLists covering all requests in req_id order (it calls
+        # logprobs.slice_request(req_index, ...)), not a plain list. Concatenate
+        # the per-request rows back into one LogprobsLists (or None if no lane
+        # produced logprobs).
+        logprobs = _concat_request_logprobs(logprobs_lists)
         return ModelRunnerOutput(
             req_ids=merged_req_ids,
             req_id_to_index=merged_req_id_to_index,
