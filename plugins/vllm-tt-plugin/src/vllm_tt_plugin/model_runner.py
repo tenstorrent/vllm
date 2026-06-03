@@ -1942,17 +1942,7 @@ class TTModelRunner:
             if max_lp > 0 and not self.supports_topk_logprobs:
                 return False
 
-        # TTPlatform.non_greedy_decoding_on_device must be True
-        # for random sampling,
-        # or all requests must be greedy without penalties.
-        non_greedy_decoding_on_device = getattr(
-            TTPlatform, "non_greedy_decoding_on_device", False
-        )
-        assert isinstance(non_greedy_decoding_on_device, bool)
-        params_device_supported = non_greedy_decoding_on_device or (
-            self.input_batch.all_greedy and self.input_batch.no_penalties
-        )
-        return params_device_supported
+        return True
 
     def submit_prefill(
         self,
@@ -2576,22 +2566,16 @@ class TTModelRunner:
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
         sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert sample_on_device_mode in (None, "all", "decode_only")
-        non_greedy_decoding_on_device = getattr(
-            TTPlatform, "non_greedy_decoding_on_device", False
-        )
-        assert isinstance(non_greedy_decoding_on_device, bool)
         prefill_kwargs = dict(
             kv_cache=self.kv_caches,
             can_sample_on_device=sample_on_device_mode == "all",
-            non_greedy_decoding_on_device=non_greedy_decoding_on_device,
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
             max_batch_size=self.scheduler_config.max_num_seqs
             * self.parallel_config.data_parallel_size,
             num_blocks=self.max_num_blocks_per_req,
-            can_sample_on_device=self.sample_on_device_mode in ["all", "decode_only"],
-            non_greedy_decoding_on_device=non_greedy_decoding_on_device,
+            can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )
 
         # Phase 1: compile all code paths (no trace capture)

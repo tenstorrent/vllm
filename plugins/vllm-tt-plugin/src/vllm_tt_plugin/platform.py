@@ -449,29 +449,26 @@ class TTPlatform(Platform):
 
         model_class, _ = get_model_architecture(vllm_config.model_config)
 
-        # infer if non-greedy decoding is supported on-device
-        # based on model implementation, and update platform
-        # TODO: this should come from the class itself as an attribute
-        cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
-        if model_class.__module__.startswith(
-            "models.demos.llama3_70b_galaxy.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if model_class.__module__.startswith(
-            "models.tt_transformers.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if model_class.__module__.startswith(
-            "models.demos.deepseek_v3.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # A model either supports the full on-device sampling pipeline or it
+        # doesn't — there is no greedy-only mode. Models opt in by setting
+        # `supports_sample_on_device` in their `model_capabilities` dict.
+        supports_sample_on_device = (
+            model_capabilities.get("supports_sample_on_device", False)
+            if model_capabilities
+            else False
+        )
+        if sample_on_device_mode is not None and not supports_sample_on_device:
+            raise ValueError(
+                f"sample_on_device_mode={sample_on_device_mode!r} was requested, "
+                f"but model {model_class.__name__} "
+                f"({model_class.__module__}) does not support on-device sampling. "
+                "Unset sample_on_device_mode or use a model that supports it."
+            )
 
         # Model-gated async scheduling. Async overlap requires generators that
         # support split decode submission via `decode_forward(...,
