@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-import re
+import regex as re
 
 CHOICES = ["red", "green", "blue", "yellow"]
 REGEX = r"LANE-[0-9]"
