@@ -74,9 +74,10 @@ def _model_budget(max_tokens: int):
 def test_default_branch_no_sliding(cfg):
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ), _fallback_arch():
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+    ):
         n = get_num_available_blocks_tt(cfg)
 
     # Default branch: max_tokens_all_users = 131072, plus block_size*batch
@@ -84,24 +85,29 @@ def test_default_branch_no_sliding(cfg):
     assert n == 2080
 
 
-def test_lane_mode_uses_global_batch_padding(cfg):
-    """Single-process lane mode must size KV padding for all concurrent
-    requests using the global engine capacity (max_num_seqs), not the
-    per-lane slice (max_num_seqs // tt_data_parallel_size)."""
+def test_lane_mode_kv_shape_matches_dev(cfg):
+    """Enabling single-process lanes must not change ``num_blocks``.
+
+    ``num_blocks`` is applied to each submesh KV cache un-divided, and the
+    model -- plus its on-disk tensor cache -- must see the identical KV shape
+    regardless of parallelism mode. So the batch padding uses the engine's
+    ``max_num_seqs`` directly (exactly as dev/main), independent of the lane
+    count. Scaling it by the lane count would change the shape (and its
+    tensor-cache filename) and break reuse of the read-only weight cache."""
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.scheduler_config.max_num_seqs = 8
     cfg.plugin_config = {"tt": {"tt_data_parallel_size": 4}}
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ), _fallback_arch():
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+    ):
         n = get_num_available_blocks_tt(cfg)
 
-    # max_num_seqs=8 is the total engine capacity; per-lane is 8//4=2.
-    # get_tt_max_batch_size returns 8 (global, not per-lane).
-    # Default tokens (131072) + global batch padding (64 * 8 = 512)
-    # = 131584 tokens -> ceil/64 = 2056.
+    # Identical to a non-lane run with the same max_num_seqs=8: the lane count
+    # does not enter the formula. Default tokens (131072) + batch padding
+    # (64 * 8 = 512) = 131584 tokens -> ceil/64 = 2056.
     assert n == 2056
 
 
@@ -114,11 +120,11 @@ def test_sliding_window_adds_headroom(cfg):
 
     cfg.model_config.get_sliding_window.return_value = 1024
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ), patch(
-        "vllm_tt_plugin.worker._HYBRID_KV_CACHE_GROUPS_ENABLED", True
-    ), _fallback_arch():
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        patch("vllm_tt_plugin.worker._HYBRID_KV_CACHE_GROUPS_ENABLED", True),
+        _fallback_arch(),
+    ):
         n = get_num_available_blocks_tt(cfg)
 
     # Default tokens (131072) + batch padding (64*32=2048) +
@@ -135,9 +141,10 @@ def test_n150_branch_unchanged_for_uniform_model(cfg):
     cfg.model_config.model = "/path/to/Llama-3.1-8B-Instruct"
     cfg.device_config.num_devices = 1
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ), _model_budget(32768):
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _model_budget(32768),
+    ):
         n = get_num_available_blocks_tt(cfg)
 
     # Llama8B-N150 branch: 32768 + 64*32 padding = 34816 -> ceil/64 = 544.
@@ -153,11 +160,11 @@ def test_per_model_branch_with_sliding_window(cfg):
     cfg.model_config.get_sliding_window.return_value = 1024
     cfg.device_config.num_devices = 2
 
-    with patch(
-        "vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"
-    ), patch(
-        "vllm_tt_plugin.worker._HYBRID_KV_CACHE_GROUPS_ENABLED", True
-    ), _model_budget(65536):
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        patch("vllm_tt_plugin.worker._HYBRID_KV_CACHE_GROUPS_ENABLED", True),
+        _model_budget(65536),
+    ):
         n = get_num_available_blocks_tt(cfg)
 
     # gemma-3-4b N300 branch: 65536 base + 64*32 padding + 1024*32*8 sliding
