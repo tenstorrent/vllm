@@ -365,6 +365,27 @@ class TTPlatform(Platform):
         if vllm_config.scheduler_config.enable_chunked_prefill:
             logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
+
+        # With chunked prefill disabled, each prefill must be scheduled in a single
+        # step. The v1 scheduler `break`s out of the waiting loop (scheduling nothing)
+        # whenever num_new_tokens > token_budget and chunked prefill is off
+        # (vllm/v1/core/sched/scheduler.py), so any prompt longer than
+        # max_num_batched_tokens silently stalls the engine in a busy-loop. vLLM's
+        # SchedulerConfig.verify_max_model_len enforces max_num_batched_tokens >=
+        # max_model_len for exactly this case, but it runs in __post_init__ — before
+        # this hook, while chunked prefill still looked enabled — so the invariant is
+        # never established for the TT backend. Re-establish it here so full-length
+        # prefills up to max_model_len are schedulable.
+        sched_config = vllm_config.scheduler_config
+        max_len = vllm_config.model_config.max_model_len
+        if sched_config.max_num_batched_tokens < max_len:
+            logger.info(
+                "TT: raising max_num_batched_tokens %d -> %d so full-length prefills "
+                "are schedulable with chunked prefill disabled.",
+                sched_config.max_num_batched_tokens,
+                max_len,
+            )
+            sched_config.max_num_batched_tokens = max_len
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
