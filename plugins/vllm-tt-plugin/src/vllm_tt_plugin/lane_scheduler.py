@@ -257,6 +257,24 @@ class TTLaneCoordinator(SchedulerInterface):
             )
             for _ in range(self.num_lanes)
         ]
+        self._apply_per_lane_caps(self.lanes)
+
+    def _apply_per_lane_caps(self, lanes: list[TTScheduler]) -> None:
+        """Cap each lane's running set at the per-lane batch capacity.
+
+        Each lane scheduler is built from the shared ``vllm_config``, whose
+        ``scheduler_config.max_num_seqs`` is the *global* concurrency
+        (``num_lanes * per_lane``). The base scheduler turns that into its hard
+        running cap (``max_num_running_reqs``), so without this override every
+        lane believes it may run the *entire* global batch. With uneven lane
+        assignment that lets the lanes' combined running set exceed
+        ``max_num_seqs``, overflowing the merged persistent batch in the runner
+        (``req_index >= max_num_reqs``). Pinning each lane to ``_per_lane_max``
+        restores the per-rank semantics gathered DP had and keeps the merged
+        batch within ``num_lanes * per_lane == max_num_seqs``.
+        """
+        for sched in lanes:
+            sched.max_num_running_reqs = self._per_lane_max
 
     # ------------------------------------------------------------------
     # Lane selection / mode negotiation

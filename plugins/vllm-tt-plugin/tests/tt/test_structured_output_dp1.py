@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+
 import regex as re
 
 CHOICES = ["red", "green", "blue", "yellow"]

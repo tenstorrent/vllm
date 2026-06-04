@@ -36,6 +36,10 @@ class FakeLane:
         self.scheduled_modes: list[TTSchedulingMode] = []
         self.update_calls: list[SchedulerOutput] = []
         self._eco: dict[int, EngineCoreOutputs] = {}
+        # Mirrors the base scheduler attribute the coordinator caps; starts at
+        # the global value a lane is built with so the test can assert it is
+        # narrowed to the per-lane capacity.
+        self.max_num_running_reqs = 32
 
     def set_forced_mode(self, mode):
         self._mode = mode
@@ -161,3 +165,19 @@ def test_update_from_output_routes_and_merges_per_lane():
 def test_update_from_output_no_metadata_returns_empty():
     coordinator = _make_coordinator([FakeLane(), FakeLane()])
     assert coordinator.update_from_output(SchedulerOutput.make_empty(), None) == {}
+
+
+def test_apply_per_lane_caps_narrows_running_cap_to_per_lane():
+    # Lanes are built from the shared (global) max_num_seqs == 32. Without the
+    # cap each lane would run up to 32, letting the four lanes' combined running
+    # set reach 128 and overflow the merged persistent batch (req_index >=
+    # max_num_reqs). The coordinator must pin every lane to the per-lane cap so
+    # num_lanes * per_lane == global max_num_seqs.
+    lanes = [FakeLane(), FakeLane(), FakeLane(), FakeLane()]
+    coordinator = _make_coordinator(lanes, per_lane_max=8)
+
+    coordinator._apply_per_lane_caps(lanes)
+
+    assert [lane.max_num_running_reqs for lane in lanes] == [8, 8, 8, 8]
+    # The capped lanes never sum past the global concurrency.
+    assert sum(lane.max_num_running_reqs for lane in lanes) == 32
