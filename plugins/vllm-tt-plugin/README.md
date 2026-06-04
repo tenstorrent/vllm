@@ -178,7 +178,7 @@ LLAMA_DIR=<path-to-weights> \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
   --model "meta-llama/Llama-3.1-70B-Instruct" \
-  --plugin-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
 ```
 
 To run GPT-OSS 20B on Galaxy:
@@ -188,7 +188,7 @@ MESH_DEVICE="(4,8)" \
 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
   --model "openai/gpt-oss-20b" \
   --max_seqs_in_batch 1 \
-  --plugin-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'
+  --additional-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'
 ```
 
 Run Llama 3.2 Vision on N300:
@@ -207,8 +207,8 @@ Useful vision-model variants:
 - Llama 3.2 11B Vision on QuietBox: set `MESH_DEVICE=T3K` and `--max_seqs_in_batch 32`.
 - Llama 3.2 90B Vision: set `MESH_DEVICE=T3K`, `--model "meta-llama/Llama-3.2-90B-Vision-Instruct"`, and `--max_seqs_in_batch 4`.
 - Qwen 2.5-VL 32B: set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-32B"`, and `--max_seqs_in_batch 32`.
-- Qwen 2.5-VL 72B: set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, `--max_model_len 2048`, and `--plugin-config '{"tt": {"trace_region_size": 28467200}}'`.
-- Gemma 3 27B: set `MESH_DEVICE=T3K`, `--model "google/gemma-3-27b-it"`, `--max_seqs_in_batch 32`, `--plugin-config '{"tt": {"l1_small_size": 768, "fabric_config": "FABRIC_1D"}}'`, `--multi_modal`, `--multi_image`, and `--mm_processor_kwargs '{"use_fast": true, "do_convert_rgb": true}'`.
+- Qwen 2.5-VL 72B: set `MESH_DEVICE=T3K`, `--model "Qwen/Qwen2.5-VL-72B"`, `--max_seqs_in_batch 32`, `--max_model_len 2048`, and `--additional-config '{"tt": {"trace_region_size": 28467200}}'`.
+- Gemma 3 27B: set `MESH_DEVICE=T3K`, `--model "google/gemma-3-27b-it"`, `--max_seqs_in_batch 32`, `--additional-config '{"tt": {"l1_small_size": 768, "fabric_config": "FABRIC_1D"}}'`, `--multi_modal`, `--multi_image`, and `--mm_processor_kwargs '{"use_fast": true, "do_convert_rgb": true}'`.
 
 For debugging V1, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to disable
 multiprocessing. This is useful for stepping through code or making scheduling
@@ -249,15 +249,15 @@ base64 `data:image/...` URL or a real URL such as
 
 ## Configuration
 
-TT options are passed through vLLM's generic plugin namespace:
+TT options are passed through vLLM's generic additional config namespace:
 
 ```bash
---plugin-config '{"tt": {"sample_on_device_mode": "all"}}'
+--additional-config '{"tt": {"sample_on_device_mode": "all"}}'
 ```
 
 Plugin code reads this through `vllm_tt_plugin.config.get_tt_config()`, which
-returns `vllm_config.plugin_config["tt"]`. Do not add TT-specific options to the
-core vLLM CLI namespace.
+returns `vllm_config.additional_config["tt"]`. The deprecated
+`--plugin-config '{"tt": {...}}'` form is still accepted with a warning.
 
 Common options:
 
@@ -405,7 +405,7 @@ python -u plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
   --model <MODEL_NAME> \
   --data_parallel_size 2 \
   --async_engine \
-  --plugin-config '{
+  --additional-config '{
     "tt": {
       "rank_binding": "<TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml",
       "extra_ttrun_args": "--tcp-interface cnx1",
@@ -423,7 +423,7 @@ Notes:
 - The `rank_binding` YAML needs an absolute path for `mesh_graph_desc_path`.
 - `config_pkl_dir` must be shared by all hosts.
 - Environment variables can be propagated through `env_passthrough` in
-  `--plugin-config` or through `global_env` in the rank-binding file.
+  `--additional-config` or through `global_env` in the rank-binding file.
 - `extra_ttrun_args` passes raw flags to `tt-run`, such as
   `"--tcp-interface cnx1"`, `"--bare"`, or `"--debug-gdbserver"`.
 
@@ -469,8 +469,6 @@ will work against stock vLLM without any fork.
 
 The extensions needed are:
 
-- `VllmConfig.plugin_config`: a namespaced dict that lets any plugin pass
-  backend-specific configuration without touching the core CLI.
 - `ParallelConfig.engine_core_cls`: lets a platform plugin select an
   alternative `EngineCore` implementation.
 - `ParallelConfig.engine_core_proc_cls`: lets a platform plugin select an

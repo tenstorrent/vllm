@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -248,6 +249,7 @@ def run_inference(
     mm_processor_kwargs=None,
     test_increasing_seq_lens=False,
     plugin_config=None,
+    additional_config=None,
     max_model_len=None,
     max_num_batched_tokens=None,
     data_parallel_size=1,
@@ -300,13 +302,36 @@ def run_inference(
     }
 
     try:
+        parsed_additional_config = None
+        if additional_config:
+            parsed_additional_config = json.loads(additional_config)
+            if not isinstance(parsed_additional_config, dict):
+                raise ValueError("additional_config must be a JSON object")
+
+        parsed_plugin_config = None
         if plugin_config:
+            print(
+                "WARNING: --plugin-config is deprecated. "
+                "Use --additional-config '{\"tt\": {...}}' instead.",
+                file=sys.stderr,
+            )
             parsed_plugin_config = json.loads(plugin_config)
             if not isinstance(parsed_plugin_config, dict):
                 raise ValueError("plugin_config must be a JSON object")
-            engine_kw_args["plugin_config"] = parsed_plugin_config
+
+        if parsed_additional_config is not None and parsed_plugin_config is not None:
+            raise ValueError(
+                "Only one of additional_config or plugin_config may be provided. "
+                "Prefer additional_config."
+            )
+        if parsed_additional_config is not None or parsed_plugin_config is not None:
+            engine_kw_args["additional_config"] = (
+                parsed_additional_config
+                if parsed_additional_config is not None
+                else parsed_plugin_config
+            )
     except json.JSONDecodeError as err:
-        raise ValueError(f"Invalid JSON string for plugin_config: {err}") from err
+        raise ValueError(f"Invalid JSON config string: {err}") from err
 
     try:
         if mm_processor_kwargs:
@@ -663,11 +688,21 @@ if __name__ == "__main__":
         help="Test generations of small to large sequences",
     )
     parser.add_argument(
+        "--additional-config",
+        dest="additional_config",
+        type=str,
+        default=None,
+        help="Additional vLLM options as JSON, for example '{\"tt\": {...}}'",
+    )
+    parser.add_argument(
         "--plugin-config",
         dest="plugin_config",
         type=str,
         default=None,
-        help="Plugin options as JSON, for example '{\"tt\": {...}}'",
+        help=(
+            "Deprecated alias; prefer --additional-config. "
+            "Value must use the same '{\"tt\": {...}}' JSON shape."
+        ),
     )
     parser.add_argument("--max_model_len", type=int, default=None, help="Max model len")
     parser.add_argument(
@@ -727,6 +762,7 @@ if __name__ == "__main__":
         multi_image=args.multi_image,
         mm_processor_kwargs=args.mm_processor_kwargs,
         test_increasing_seq_lens=args.test_increasing_seq_lens,
+        additional_config=args.additional_config,
         plugin_config=args.plugin_config,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,

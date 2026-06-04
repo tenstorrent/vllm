@@ -25,6 +25,18 @@ else:
 logger = init_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
+_warned_cli_plugin_config = False
+
+
+def _warn_cli_plugin_config() -> None:
+    global _warned_cli_plugin_config
+    if _warned_cli_plugin_config:
+        return
+    logger.warning(
+        "TT config passed through --plugin-config is deprecated. "
+        "Use --additional-config '{\"tt\": {...}}' instead."
+    )
+    _warned_cli_plugin_config = True
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -38,41 +50,48 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
 
 
 def _should_pre_register_tt_test_models_from_cli() -> bool:
-    """Return True iff `--plugin-config` enables TT test models.
+    """Return True iff CLI TT config enables TT test models.
 
     `TTPlatform.pre_register_and_update()` runs before `VllmConfig` is
     constructed, but ModelConfig may inspect architectures early.
     """
     argv = list(sys.argv[1:])
 
-    def _parse_plugin_config(raw: str) -> dict | None:
+    def _parse_namespaced_config(raw: str) -> dict | None:
         try:
             parsed = json.loads(raw)
         except Exception:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    canonical_flag = "--plugin-config"
+    canonical_flags = {"--additional-config", "--plugin-config"}
+    parsed_configs: dict[str, dict] = {}
     for i, arg in enumerate(argv):
         if "=" in arg:
             flag, value = arg.split("=", 1)
-            if flag.replace("_", "-") == canonical_flag:
-                cfg = _parse_plugin_config(value)
-                tt_config = cfg.get("tt", {}) if cfg else {}
-                return bool(
-                    isinstance(tt_config, dict)
-                    and tt_config.get("register_test_models") is True
-                )
+            normalized_flag = flag.replace("_", "-")
+            if normalized_flag in canonical_flags:
+                if normalized_flag == "--plugin-config":
+                    _warn_cli_plugin_config()
+                cfg = _parse_namespaced_config(value)
+                if cfg:
+                    parsed_configs[normalized_flag] = cfg
         else:
-            if arg.replace("_", "-") == canonical_flag and i + 1 < len(argv):
-                cfg = _parse_plugin_config(argv[i + 1])
-                tt_config = cfg.get("tt", {}) if cfg else {}
-                return bool(
-                    isinstance(tt_config, dict)
-                    and tt_config.get("register_test_models") is True
-                )
+            normalized_arg = arg.replace("_", "-")
+            if normalized_arg in canonical_flags and i + 1 < len(argv):
+                if normalized_arg == "--plugin-config":
+                    _warn_cli_plugin_config()
+                cfg = _parse_namespaced_config(argv[i + 1])
+                if cfg:
+                    parsed_configs[normalized_arg] = cfg
 
-    return False
+    cfg = parsed_configs.get("--additional-config") or parsed_configs.get(
+        "--plugin-config"
+    )
+    tt_config = cfg.get("tt", {}) if cfg else {}
+    return bool(
+        isinstance(tt_config, dict) and tt_config.get("register_test_models") is True
+    )
 
 
 def _install_tt_harmony_truncation_patch() -> None:
@@ -196,6 +215,33 @@ def register_tt_models(register_test_models=False) -> None:
         "TTGemma3ForConditionalGeneration",
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
+
+    # Gemma4 — text-only TT bridge.
+    #
+    # Gemma4 isn't in vLLM's upstream registry, so without an entry here
+    # the upstream architecture resolver falls back to
+    # ``TransformersMultiModalForCausalLM`` (because ``hf_config !=
+    # hf_text_config`` for Gemma4's nested config — see
+    # ``ModelConfig._get_transformers_backend_cls``) and crashes on the
+    # ``_processor_factory`` assertion in the multimodal registry. The
+    # plugin's later ``TT``-prefix logic runs after that resolution, so
+    # it can't help.
+    #
+    # We register the plain HF arch names directly so upstream resolution
+    # finds our class. Since ``Gemma4ForCausalLM`` (the TT class) does not
+    # use ``SupportsMultiModal``, vLLM's ``_model_info.supports_multimodal``
+    # is False, ``multimodal_config`` is not populated, and the request
+    # path stays text-only — which matches what the TT model implements.
+    # The ``TT``-prefixed aliases satisfy the plugin's later validation
+    # in ``check_and_update_config`` so no override is needed.
+    _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
+    for arch in (
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "TTGemma4ForCausalLM",
+        "TTGemma4ForConditionalGeneration",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
     # DeepseekV3
     _register_model_if_missing(
@@ -423,29 +469,26 @@ class TTPlatform(Platform):
 
         model_class, _ = get_model_architecture(vllm_config.model_config)
 
-        # infer if non-greedy decoding is supported on-device
-        # based on model implementation, and update platform
-        # TODO: this should come from the class itself as an attribute
-        cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
-        if model_class.__module__.startswith(
-            "models.demos.llama3_70b_galaxy.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if model_class.__module__.startswith(
-            "models.tt_transformers.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if model_class.__module__.startswith(
-            "models.demos.deepseek_v3.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # A model either supports the full on-device sampling pipeline or it
+        # doesn't — there is no greedy-only mode. Models opt in by setting
+        # `supports_sample_on_device` in their `model_capabilities` dict.
+        supports_sample_on_device = (
+            model_capabilities.get("supports_sample_on_device", False)
+            if model_capabilities
+            else False
+        )
+        if sample_on_device_mode is not None and not supports_sample_on_device:
+            raise ValueError(
+                f"sample_on_device_mode={sample_on_device_mode!r} was requested, "
+                f"but model {model_class.__name__} "
+                f"({model_class.__module__}) does not support on-device sampling. "
+                "Unset sample_on_device_mode or use a model that supports it."
+            )
 
         # Model-gated async scheduling. Async overlap requires generators that
         # support split decode submission via `decode_forward(...,
