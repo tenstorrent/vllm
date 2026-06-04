@@ -265,7 +265,6 @@ Common options:
 | Key | Purpose |
 | --- | --- |
 | `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
-| `tt_data_parallel_size` | Enable single-process TT lanes when `data_parallel_size == 1`. For Galaxy 70B this is the preferred replacement for gathered multi-process DP. |
 | `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
 | `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
 | `trace_region_size` | Trace region size for TT runtime tracing. |
@@ -305,23 +304,29 @@ The execution model matches TT hardware characteristics:
 - Chunked prefill is not used.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
-- When `tt.tt_data_parallel_size > 1` and vLLM `data_parallel_size == 1`,
-  `TTLaneCoordinator` schedules one engine across multiple in-process TT lanes.
-- Gathered DP collects local rank inputs, executes across the TT mesh, and
-  scatters outputs back to the participating ranks.
+- For Galaxy-generator models (Llama3 70B, Qwen3-32B), `--data_parallel_size N`
+  runs as `N` in-process TT lanes scheduled by `TTLaneCoordinator` (one engine,
+  one device mesh); see [Single-Process Galaxy Serving](#single-process-galaxy-serving).
+- For other models, `--data_parallel_size N` uses gathered multi-process DP:
+  local rank inputs are collected, executed across the TT mesh, and outputs
+  scattered back to the participating ranks.
 - Multi-host execution uses `tt-run` / MPI while vLLM sees a normal
   engine-client handshake.
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.
 
-## Llama3 70B Galaxy Serving
+## Single-Process Galaxy Serving
 
-For Llama 3.3 70B on Galaxy, use single-process TT lanes: one vLLM engine
-process with internal TT lanes. This is the only supported serving path for
-this model. Gathered multi-process DP (`--data_parallel_size > 1`) for Galaxy
-70B is deprecated; it still runs but logs a warning and is no longer
-maintained as the recommended path.
+Galaxy text models served by the single-execute Galaxy generator
+(Llama 3.3 70B via `TT_LLAMA_TEXT_VER=llama3_70b_galaxy`, Qwen3-32B via
+`TT_QWEN3_TEXT_VER=qwen3_32b_galaxy`) run on a single Galaxy device mesh, so
+they use single-process TT lanes: one vLLM engine process with internal TT
+lanes.
+
+Serve them with the familiar `--data_parallel_size N --max_num_seqs M` flags;
+the TT backend transparently maps them to `N` in-process lanes. No config
+changes are needed:
 
 ```bash
 MESH_DEVICE=TG \
@@ -329,21 +334,16 @@ TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
 VLLM_RPC_TIMEOUT=900000 \
 python plugins/vllm-tt-plugin/examples/server_example_tt.py \
   --model "meta-llama/Llama-3.3-70B-Instruct" \
-  --max_num_seqs 32 \
+  --data_parallel_size 4 \
+  --max_num_seqs 8 \
   --async-scheduling \
-  --additional-config '{"tt": {"tt_data_parallel_size": 4, "dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
-Notes:
-
-- `max_num_seqs` is the global engine capacity in this mode and must be
-  divisible by `tt_data_parallel_size`. With `tt_data_parallel_size=4` and
-  `max_num_seqs=32`, each lane runs up to `8` requests, for `32` concurrent
-  running requests total (matching the older gathered multi-process DP=4 path).
-- Leave vLLM `--data_parallel_size` at `1` when using `tt_data_parallel_size`.
-- The older gathered multi-process DP path (`--data_parallel_size 4
-  --max_num_seqs 8`) is deprecated for this model and emits a warning at
-  startup. Migrate to `tt_data_parallel_size`.
+`--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
+each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. This is
+equivalent to the historical gathered DP=4 setup, so there is nothing to
+migrate. At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
 

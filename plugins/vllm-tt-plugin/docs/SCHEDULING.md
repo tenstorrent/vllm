@@ -244,40 +244,19 @@ So the TT async path is best understood as a fast path for steady decode, not as
 
 ## Queueing in Single-Process Lane TT
 
-Single-process lane mode sits between non-DP and older gathered-DP:
+Single-process lane mode sits between non-DP and gathered-DP: still one vLLM
+engine process and one TT worker, but `TTLaneCoordinator` owns one independent
+`TTScheduler` per lane (each with its own `waiting`/`running` queues and
+prefill/decode admission) and merges their `SchedulerOutput` objects into one
+engine-facing batch. Unlike gathered-DP there is no MPI coordination or
+gather/scatter: one process computes the global forced mode, one worker builds
+the per-lane TT inputs, one merged TT launch runs across all submeshes, and the
+merged runner output is split back by lane in-process.
 
-- there is still one vLLM engine process
-- there is still one TT worker process
-- requests are assigned to sticky logical lanes inside one scheduler
-- execution still uses merged per-lane TT inputs and per-lane output splitting
-
-### What becomes lane-local
-
-Each lane has its own logical share of:
-
-- `waiting`
-- `running`
-- prefill/decode admission decisions
-
-The implementation uses `TTLaneCoordinator` to expose only one lane at a time
-to the underlying `TTScheduler`, then merges the per-lane `SchedulerOutput`
-objects back into one engine-facing batch.
-
-### What stays process-global
-
-Unlike older gathered-DP, there is no MPI rank coordination or object gather/scatter:
-
-- one process computes the global forced mode
-- one worker builds the per-lane TT model inputs
-- one merged TT launch runs across all submeshes
-- one merged runner output is split back by lane in-process
-
-### Queueing model in lane mode
-
-Lane mode uses the same TT async queue depth as ordinary non-DP execution, but
-the queued item now represents a merged multi-lane step. Decode overlap is
-still controlled by the same steady-state checks; if any lane breaks the steady
-decode assumptions, pending async decode work is drained before the next step.
+Lane mode reuses the non-DP TT async queue depth, but each queued item is a
+merged multi-lane step; decode overlap uses the same steady-state checks, and
+if any lane breaks them pending async decode work is drained before the next
+step.
 
 ## Queueing in Gathered-DP TT
 

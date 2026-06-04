@@ -14,8 +14,8 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
+    store_tt_lane_count,
     uses_tt_lane_coordinator,
-    validate_tt_parallel_config,
 )
 
 if TYPE_CHECKING:
@@ -33,7 +33,6 @@ logger = init_logger(__name__)
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 _warned_cli_plugin_config = False
-_warned_galaxy_gather_dp = False
 
 # TT model versions backed by the single-execute Galaxy generator
 # (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these, gathered
@@ -68,33 +67,74 @@ def _warn_cli_plugin_config() -> None:
     _warned_cli_plugin_config = True
 
 
-def _warn_galaxy_gather_dp(version: str, data_parallel_size: int) -> None:
-    """Warn when a Galaxy-generator model uses gathered multi-process DP.
+def _collapse_parallel_config_to_single_process(parallel_config) -> None:
+    """Reset DP-derived ParallelConfig fields to single-process values.
 
-    Gathered multi-process DP (``--data_parallel_size > 1``) for models backed
-    by the single-execute Galaxy generator (``llama3_70b_galaxy``,
-    ``qwen3_32b_galaxy``) is deprecated in favor of single-process TT lane mode
-    (``--additional-config '{"tt": {"tt_data_parallel_size": N}}'`` with
-    ``--data_parallel_size 1``). The gathered-DP path is kept working for now
-    but is no longer the recommended way to serve these models.
+    ``ParallelConfig.__post_init__`` has already derived multi-process DP state
+    (rank, local size, master port, LB mode) from ``data_parallel_size`` by the
+    time the platform hook runs. When we fold gathered DP into single-process TT
+    lanes we must undo that so vLLM does not stand up multi-process DP
+    coordination. ``world_size`` stays 1 because the TT backend requires
+    ``tensor_parallel_size == pipeline_parallel_size == 1`` and DP does not
+    multiply it (no external launcher), so ``world_size_across_dp`` collapses to
+    1 automatically once ``data_parallel_size`` is reset.
     """
-    global _warned_galaxy_gather_dp
-    if _warned_galaxy_gather_dp:
+    parallel_config.data_parallel_size = 1
+    parallel_config.data_parallel_size_local = 1
+    parallel_config.data_parallel_rank = 0
+    parallel_config.data_parallel_rank_local = None
+    parallel_config.data_parallel_index = 0
+    parallel_config.data_parallel_external_lb = False
+    parallel_config.data_parallel_hybrid_lb = False
+
+
+def _convert_galaxy_gather_dp_to_lanes(vllm_config: "VllmConfig") -> None:
+    """Transparently convert gathered multi-process DP into in-process TT lanes.
+
+    Galaxy-generator models (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``) are
+    served by a single Galaxy device mesh. Gathered multi-process DP is
+    deprecated in favor of single-process TT lanes. Rather than asking users to
+    migrate flags, we run ``--data_parallel_size N`` as ``N`` in-process lanes:
+    record the resolved lane count and reset ``data_parallel_size`` to 1.
+
+    To preserve the historical capacity contract -- where each of the ``N``
+    gathered DP ranks handled ``max_num_seqs`` requests -- the global
+    ``max_num_seqs`` is scaled by the lane count. Lane mode then partitions that
+    global capacity evenly across lanes, so the per-lane capacity stays at the
+    value the user requested (e.g. ``--data_parallel_size 4 --max_num_seqs 8``
+    becomes 4 lanes, each with max 8 seqs, for a global max of 32).
+
+    No-op unless a Galaxy-generator model is active with
+    ``data_parallel_size > 1``. Idempotent: after conversion
+    ``data_parallel_size == 1``, so re-entry short-circuits.
+    """
+    parallel_config = vllm_config.parallel_config
+    data_parallel_size = parallel_config.data_parallel_size
+    if data_parallel_size <= 1:
         return
-    logger.warning(
-        "Running Galaxy model %s with gathered multi-process DP "
-        "(--data_parallel_size=%d) is DEPRECATED. "
-        "Use single-process TT lane mode instead: set --data_parallel_size 1 "
-        'and pass --additional-config \'{"tt": {"tt_data_parallel_size": %d, '
-        "...}}' with --max_num_seqs set to the global capacity "
-        "(e.g. tt_data_parallel_size=4 with --max_num_seqs 32). The gathered-DP "
-        "path still works but is no longer maintained as the recommended path; "
-        'see plugins/vllm-tt-plugin/README.md ("Llama3 70B Galaxy Serving").',
-        version,
-        data_parallel_size,
-        data_parallel_size,
+    galaxy_version = _galaxy_generator_version()
+    if galaxy_version is None:
+        return
+
+    lanes = data_parallel_size
+    scheduler_config = vllm_config.scheduler_config
+    per_lane_max_num_seqs = int(scheduler_config.max_num_seqs)
+    global_max_num_seqs = per_lane_max_num_seqs * lanes
+
+    store_tt_lane_count(vllm_config, lanes)
+    scheduler_config.max_num_seqs = global_max_num_seqs
+    _collapse_parallel_config_to_single_process(parallel_config)
+
+    logger.info(
+        "Galaxy model %s requested DP "
+        "(--data_parallel_size=%d); running single-process TT lane-DP instead "
+        "(%d lanes, per-lane max_num_seqs=%d, global max_num_seqs=%d).",
+        galaxy_version,
+        lanes,
+        lanes,
+        per_lane_max_num_seqs,
+        global_max_num_seqs,
     )
-    _warned_galaxy_gather_dp = True
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -547,31 +587,24 @@ class TTPlatform(Platform):
             )
             vllm_config.scheduler_config.async_scheduling = False
 
-        # Gathered DP and single-process TT lanes are mutually exclusive.
-        validate_tt_parallel_config(vllm_config)
+        # Galaxy-generator models (Llama3 70B, Qwen3-32B) are served by a single
+        # device mesh. Convert
+        # it transparently into single-process TT lanes so users keep passing
+        # --data_parallel_size with no other flag changes. Must run before the
+        # validation/routing below so the lane path is selected.
+        _convert_galaxy_gather_dp_to_lanes(vllm_config)
+
         if uses_tt_lane_coordinator(vllm_config):
             # Run early validation: lane mode requires max_num_seqs to split
             # evenly across the internal TT lanes.
             get_tt_per_lane_max_num_seqs(vllm_config)
             vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
             logger.info(
-                "Using TTLaneCoordinator with tt_data_parallel_size=%d",
+                "Using TTLaneCoordinator with %d in-process TT lanes",
                 get_tt_data_parallel_size(vllm_config),
             )
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
-            # Gathered multi-process DP for Galaxy-generator models (Llama3 70B,
-            # Qwen3-32B) is deprecated in favor of single-process TT lanes
-            # (tt_data_parallel_size).
-            galaxy_version = _galaxy_generator_version()
-            if (
-                vllm_config.parallel_config.data_parallel_size > 1
-                and galaxy_version is not None
-            ):
-                _warn_galaxy_gather_dp(
-                    galaxy_version,
-                    vllm_config.parallel_config.data_parallel_size,
-                )
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

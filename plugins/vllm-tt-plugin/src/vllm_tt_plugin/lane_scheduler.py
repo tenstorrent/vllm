@@ -296,10 +296,6 @@ class TTLaneCoordinator(SchedulerInterface):
                 best_lane = lane
         return best_lane
 
-    def _lane_has_work(self, sched: TTScheduler) -> bool:
-        """Whether a lane has any waiting or running requests to schedule."""
-        return bool(sched.waiting) or bool(sched.running)
-
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
 

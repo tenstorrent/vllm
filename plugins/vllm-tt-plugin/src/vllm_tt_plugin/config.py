@@ -58,51 +58,45 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config if has_additional_config else plugin_config)
 
 
+# Internal key recording the resolved TT lane count. Stored at the top level of
+# additional_config -- deliberately outside the user "tt" namespace -- so it
+# never collides with user config and reads as platform-derived state rather
+# than user input. Written by store_tt_lane_count, read by
+# get_tt_data_parallel_size.
+_RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
+
+
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     """Effective TT lane count for batching, KV sizing, and merged execution.
 
-    When vLLM ``data_parallel_size > 1``, gathered-DP uses one engine per rank
-    and this returns ``data_parallel_size``. When ``data_parallel_size == 1``,
-    optional ``tt.tt_data_parallel_size`` enables in-process lanes.
-
-    Setting both ``data_parallel_size > 1`` and ``tt_data_parallel_size`` is
-    rejected up front by ``validate_tt_parallel_config`` (the two are
-    orthogonal and the combination is untested), so ``configured`` is ignored
-    here whenever ``data_parallel_size > 1``.
+    With gathered multi-process DP (``data_parallel_size > 1``) this is just
+    ``data_parallel_size`` (one engine per rank). With a single engine
+    (``data_parallel_size == 1``) it is the lane count resolved by the Galaxy
+    gather-DP-to-lanes conversion (see ``platform.py``) and recorded via
+    ``store_tt_lane_count``; absent that, the count is 1. Not user-facing.
     """
-    parallel_config = vllm_config.parallel_config
-    vllm_dp = parallel_config.data_parallel_size
-    tt_config = get_tt_config(vllm_config)
-    configured = tt_config.get("tt_data_parallel_size")
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        return vllm_config.parallel_config.data_parallel_size
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_RESOLVED_LANE_COUNT_KEY, 1))
 
-    if vllm_dp > 1:
-        return vllm_dp
 
-    if configured is None:
-        return 1
-    lanes = int(configured)
+def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
+    """Record the resolved in-process TT lane count on the config.
+
+    Writes an internal, top-level key into ``additional_config`` (kept out of
+    the user "tt" namespace) so ``get_tt_data_parallel_size`` observes it both
+    here and in the worker subprocess -- ``additional_config`` is a declared
+    config field, so it survives the copy/pickle to that process. Internal
+    handoff from the Galaxy gather-DP-to-lanes conversion; not user-facing.
+    """
     if lanes < 1:
-        raise ValueError(f"tt_data_parallel_size must be >= 1, got {lanes}")
-    return lanes
-
-
-def validate_tt_parallel_config(vllm_config: "VllmConfig") -> None:
-    """Reject configs that combine gathered DP with single-process TT lanes.
-
-    ``data_parallel_size > 1`` (gathered multi-process DP) and
-    ``tt_data_parallel_size`` (single-process in-process lanes) are orthogonal
-    parallelism mechanisms. The combination is untested, so it is rejected
-    rather than silently picking one. Called from
-    ``TTPlatform.check_and_update_config``.
-    """
-    configured = get_tt_config(vllm_config).get("tt_data_parallel_size")
-    data_parallel_size = vllm_config.parallel_config.data_parallel_size
-    if configured is not None and data_parallel_size > 1:
-        raise ValueError(
-            "tt_data_parallel_size cannot be used with "
-            f"data_parallel_size={data_parallel_size}. "
-            "Use one of gathered multi-process DP or single-process lanes."
-        )
+        raise ValueError(f"resolved TT lane count must be >= 1, got {lanes}")
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_RESOLVED_LANE_COUNT_KEY] = lanes
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
@@ -129,15 +123,15 @@ def get_tt_per_lane_max_num_seqs(vllm_config: "VllmConfig") -> int:
     lanes = get_tt_data_parallel_size(vllm_config)
     if max_num_seqs % lanes != 0:
         raise ValueError(
-            "max_num_seqs must be divisible by tt_data_parallel_size in "
-            "single-process TT lane mode; got "
-            f"max_num_seqs={max_num_seqs}, tt_data_parallel_size={lanes}."
+            "max_num_seqs must be divisible by the TT lane count in "
+            f"single-process lane mode; got max_num_seqs={max_num_seqs}, "
+            f"lanes={lanes}."
         )
     per_lane = max_num_seqs // lanes
     if per_lane < 1:
         raise ValueError(
             "max_num_seqs must provide at least one request per TT lane; got "
-            f"max_num_seqs={max_num_seqs}, tt_data_parallel_size={lanes}."
+            f"max_num_seqs={max_num_seqs}, lanes={lanes}."
         )
     return per_lane
 

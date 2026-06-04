@@ -59,7 +59,7 @@ def test_get_tt_config_rejects_both_config_sources():
 
 def test_get_tt_per_lane_max_num_seqs_derives_lane_capacity_from_global_cap():
     config = _vllm_config(
-        additional_config={"tt": {"tt_data_parallel_size": 4}},
+        additional_config={tt_config._RESOLVED_LANE_COUNT_KEY: 4},
         max_num_seqs=32,
     )
 
@@ -68,7 +68,7 @@ def test_get_tt_per_lane_max_num_seqs_derives_lane_capacity_from_global_cap():
 
 def test_get_tt_per_lane_max_num_seqs_requires_divisible_global_cap():
     config = _vllm_config(
-        additional_config={"tt": {"tt_data_parallel_size": 4}},
+        additional_config={tt_config._RESOLVED_LANE_COUNT_KEY: 4},
         max_num_seqs=30,
     )
 

@@ -1382,7 +1382,7 @@ class TTModelRunner:
             else:
                 raise NotImplementedError(
                     "Custom logits processors are not yet supported with "
-                    "single-process lane DP (tt_data_parallel_size > 1)."
+                    "single-process lane DP."
                 )
         return LogitsProcessors(iter(procs))
 

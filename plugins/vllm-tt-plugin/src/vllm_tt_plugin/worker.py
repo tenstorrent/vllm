@@ -504,7 +504,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # padding must use the *per-lane/per-rank* batch -- the number of requests
     # a single submesh actually serves -- not the global engine capacity. In
     # gathered DP this is ``max_num_seqs`` (each rank is its own engine); in
-    # single-process lane mode it is ``max_num_seqs // tt_data_parallel_size``.
+    # single-process lane mode it is ``max_num_seqs // lane count``.
     # Both reduce to the same per-submesh value, keeping the KV shape identical
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
