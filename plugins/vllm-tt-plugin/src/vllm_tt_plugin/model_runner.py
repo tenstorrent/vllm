@@ -2958,24 +2958,29 @@ class TTModelRunner:
         # Execute model
         if not is_decode:
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
+            # Prefill returns the raw model output: an optional
+            # ``(tokens/logits, logprobs)`` tuple when device sampling ran.
+            # Unpack it here. The decode branch below is already unpacked by
+            # ``finalize_decode``, so re-running this would double-unpack and
+            # assert on an already-extracted tensor.
+            assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
+            if perform_device_sampling and sampling_params.enable_log_probs.any():
+                assert isinstance(tt_out, tuple) and len(tt_out) == 2
+                tt_out, tt_log_probs = tt_out
+            elif isinstance(tt_out, tuple):
+                tt_out, _ = tt_out
         else:
             submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
             finalized = self.async_decode.finalize_decode(submission)
             assert finalized is not None
+            # ``finalize_decode`` already unpacked ``(tt_out, tt_log_probs)``.
             tt_out = finalized.tt_out
             tt_log_probs = finalized.tt_log_probs
             batch_size_per_dp = submission.batch_size_per_dp
             sampling_params = submission.sampling_params
             perform_device_sampling = submission.perform_device_sampling
-
-        assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
-        if perform_device_sampling and sampling_params.enable_log_probs.any():
-            assert isinstance(tt_out, tuple) and len(tt_out) == 2
-            tt_out, tt_log_probs = tt_out
-        elif isinstance(tt_out, tuple):
-            tt_out, _ = tt_out
 
         return self._get_output_tokens(
             tt_out=tt_out,
