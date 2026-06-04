@@ -14,16 +14,21 @@ from vllm_tt_plugin.model_runner import TTModelRunner
 
 # Unbound methods called against a lightweight stub ``self``.
 _sync = TTModelRunner._sync_lane_slot_assignment
+_free = TTModelRunner._free_finished_lane_slots
 _slots_for = TTModelRunner._lane_slots_for
 _scatter = TTModelRunner._scatter_rows_to_slots
 
 
 def _runner(num_lanes: int, per_lane: int) -> SimpleNamespace:
-    return SimpleNamespace(
+    r = SimpleNamespace(
         tt_data_parallel_size=num_lanes,
         tt_per_lane_max_num_seqs=per_lane,
         _lane_slot_assignment=[{} for _ in range(num_lanes)],
     )
+    # ``_sync_lane_slot_assignment`` delegates freeing to this method, so the
+    # stub must expose it as a bound callable.
+    r._free_finished_lane_slots = lambda fin, _r=r: _free(_r, fin)
+    return r
 
 
 class TestLaneSlotAssignment:
@@ -56,6 +61,23 @@ class TestLaneSlotAssignment:
         r = _runner(num_lanes=1, per_lane=8)
         _sync(r, [["a", "b", "c"]], set())
         assert _slots_for(r, 0, ["c", "a", "b"]) == [2, 0, 1]
+
+    def test_free_on_zero_token_drain_step_does_not_leak(self):
+        # A finished request is reported one step after it completes; if the
+        # lane has drained by then, that step schedules zero tokens and
+        # ``execute_model_lanes`` returns before slot assignment runs. Freeing
+        # must still happen via ``_free_finished_lane_slots`` so the slot is
+        # reclaimed instead of leaking until the lane overflows capacity.
+        r = _runner(num_lanes=1, per_lane=2)
+        for i in range(10):
+            req = f"req-{i}"
+            _sync(r, [[req]], set())  # admit
+            _free(r, {req})  # drained: finish reported on a zero-token step
+        # No leak: every finished slot was reclaimed, so a fresh request still
+        # fits even though far more than ``per_lane`` requests have come and
+        # gone through this lane.
+        _sync(r, [["fresh"]], set())
+        assert _slots_for(r, 0, ["fresh"]) == [0]
 
 
 class TestScatterRowsToSlots:

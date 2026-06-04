@@ -2298,6 +2298,22 @@ class TTModelRunner:
                 indices.append(batch_index)
         return sorted(indices)
 
+    def _free_finished_lane_slots(self, finished_req_ids: set[str]) -> None:
+        """Release the lane slots of finished requests across all lanes.
+
+        Driven by ``finished_req_ids`` exactly like ``_update_states`` releases
+        the cached request state, and must run on the same unconditional path:
+        a request's finish is reported one step after it completes, and if the
+        lane has drained by then that reporting step schedules zero tokens.
+        ``execute_model_lanes`` returns early on such a step (before slot
+        *assignment* runs), so freeing here — rather than only inside
+        ``_sync_lane_slot_assignment`` — is what keeps a drained lane from
+        leaking its slots and eventually overflowing capacity.
+        """
+        for assignment in self._lane_slot_assignment:
+            for req_id in [r for r in assignment if r in finished_req_ids]:
+                del assignment[req_id]
+
     def _sync_lane_slot_assignment(
         self,
         lane_req_ids: list[list[str]],
@@ -2312,9 +2328,7 @@ class TTModelRunner:
         Freed slots are left empty until a later request reuses them.
         """
         B = self.tt_per_lane_max_num_seqs
-        for assignment in self._lane_slot_assignment:
-            for req_id in [r for r in assignment if r in finished_req_ids]:
-                del assignment[req_id]
+        self._free_finished_lane_slots(finished_req_ids)
         for lane, req_ids in enumerate(lane_req_ids):
             assignment = self._lane_slot_assignment[lane]
             used = set(assignment.values())
@@ -2706,6 +2720,12 @@ class TTModelRunner:
             self.async_decode.wait_for_all_pending_async_steps()
 
         self._update_states(scheduler_output)
+        # Release finished requests' lane slots unconditionally, mirroring the
+        # finished-request cleanup ``_update_states`` just did. A zero-token
+        # step (e.g. a fully drained lane reporting its finishes) returns below
+        # before slot assignment runs, so doing this only in
+        # ``_sync_lane_slot_assignment`` would leak those slots.
+        self._free_finished_lane_slots(set(scheduler_output.finished_req_ids))
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
