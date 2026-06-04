@@ -67,6 +67,10 @@ def test_collapse_resets_derived_parallel_fields(monkeypatch):
     pc = config.parallel_config
     assert pc.data_parallel_size_local == 1
     assert pc.data_parallel_rank == 0
+    # Local rank must collapse to 0, not None: the TT plugin gates mesh open,
+    # model load, and KV-cache allocation on ``data_parallel_rank_local == 0``,
+    # which is the value a genuine single-process run resolves to.
+    assert pc.data_parallel_rank_local == 0
     assert pc.data_parallel_index == 0
     assert pc.data_parallel_external_lb is False
     assert pc.data_parallel_hybrid_lb is False

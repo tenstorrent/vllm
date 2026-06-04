@@ -78,11 +78,20 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     ``tensor_parallel_size == pipeline_parallel_size == 1`` and DP does not
     multiply it (no external launcher), so ``world_size_across_dp`` collapses to
     1 automatically once ``data_parallel_size`` is reset.
+
+    ``data_parallel_rank_local`` is reset to ``0`` -- the value a genuine
+    single-process run resolves to (``ParallelConfig.__post_init__`` falls back
+    to ``VLLM_DP_RANK_LOCAL``, which defaults to ``VLLM_DP_RANK`` == 0). The TT
+    plugin treats local rank 0 as the device rank that opens the mesh, loads the
+    model, and allocates the KV cache (see ``worker.init_device``/``load_model``
+    and ``TTModelRunner.initialize_kv_cache``); leaving it ``None`` makes every
+    ``== 0`` gate take the non-device branch, so the mesh is never opened and
+    ``self.kv_caches`` is never allocated.
     """
     parallel_config.data_parallel_size = 1
     parallel_config.data_parallel_size_local = 1
     parallel_config.data_parallel_rank = 0
-    parallel_config.data_parallel_rank_local = None
+    parallel_config.data_parallel_rank_local = 0
     parallel_config.data_parallel_index = 0
     parallel_config.data_parallel_external_lb = False
     parallel_config.data_parallel_hybrid_lb = False
