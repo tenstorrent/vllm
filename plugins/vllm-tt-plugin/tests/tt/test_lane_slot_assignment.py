@@ -9,6 +9,7 @@ disturbed by admissions/finishes in the same lane). No device required.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -89,7 +90,8 @@ class TestScatterRowsToSlots:
     def test_scatter_1d_param_uses_default_for_gaps(self):
         vals = torch.tensor([0.7, 0.9], dtype=torch.float32)
         out = _scatter(None, vals, slots=[1, 3], batch_size=4, pad_value=1.0)
-        assert out.tolist() == [1.0, 0.7, 1.0, 0.9]
+        # float32 round-trip: compare with tolerance, not against float64 literals.
+        assert out.tolist() == pytest.approx([1.0, 0.7, 1.0, 0.9])
 
     def test_scatter_empty_is_all_padding(self):
         rows = torch.zeros((0, 1), dtype=torch.int32)
