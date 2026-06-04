@@ -317,8 +317,11 @@ For a deeper walk-through of the scheduling and execution model, read
 
 ## Llama3 70B Galaxy Serving
 
-For Llama 3.3 70B on Galaxy, the preferred serving path is one vLLM engine
-process with internal TT lanes:
+For Llama 3.3 70B on Galaxy, use single-process TT lanes: one vLLM engine
+process with internal TT lanes. This is the only supported serving path for
+this model. Gathered multi-process DP (`--data_parallel_size > 1`) for Galaxy
+70B is deprecated; it still runs but logs a warning and is no longer
+maintained as the recommended path.
 
 ```bash
 MESH_DEVICE=TG \
@@ -338,6 +341,9 @@ Notes:
   `max_num_seqs=32`, each lane runs up to `8` requests, for `32` concurrent
   running requests total (matching the older gathered multi-process DP=4 path).
 - Leave vLLM `--data_parallel_size` at `1` when using `tt_data_parallel_size`.
+- The older gathered multi-process DP path (`--data_parallel_size 4
+  --max_num_seqs 8`) is deprecated for this model and emits a warning at
+  startup. Migrate to `tt_data_parallel_size`.
 
 ## Supported Model Families
 

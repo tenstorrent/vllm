@@ -33,6 +33,28 @@ logger = init_logger(__name__)
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 _warned_cli_plugin_config = False
+_warned_galaxy_gather_dp = False
+
+# TT model versions backed by the single-execute Galaxy generator
+# (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these, gathered
+# multi-process DP is deprecated in favor of single-process TT lanes. Maps the
+# selecting env var to the version value that routes through that generator.
+_GALAXY_GENERATOR_VERSIONS = {
+    "TT_LLAMA_TEXT_VER": "llama3_70b_galaxy",
+    "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
+}
+
+
+def _galaxy_generator_version() -> str | None:
+    """Return the active Galaxy-generator model version, or None.
+
+    Both ``llama3_70b_galaxy`` (Llama3 70B) and ``qwen3_32b_galaxy`` (Qwen3-32B)
+    are served by ``models.demos.llama3_70b_galaxy.tt.generator:Generator``.
+    """
+    for env_var, version in _GALAXY_GENERATOR_VERSIONS.items():
+        if os.getenv(env_var) == version:
+            return version
+    return None
 
 
 def _warn_cli_plugin_config() -> None:
@@ -44,6 +66,35 @@ def _warn_cli_plugin_config() -> None:
         "Use --additional-config '{\"tt\": {...}}' instead."
     )
     _warned_cli_plugin_config = True
+
+
+def _warn_galaxy_gather_dp(version: str, data_parallel_size: int) -> None:
+    """Warn when a Galaxy-generator model uses gathered multi-process DP.
+
+    Gathered multi-process DP (``--data_parallel_size > 1``) for models backed
+    by the single-execute Galaxy generator (``llama3_70b_galaxy``,
+    ``qwen3_32b_galaxy``) is deprecated in favor of single-process TT lane mode
+    (``--additional-config '{"tt": {"tt_data_parallel_size": N}}'`` with
+    ``--data_parallel_size 1``). The gathered-DP path is kept working for now
+    but is no longer the recommended way to serve these models.
+    """
+    global _warned_galaxy_gather_dp
+    if _warned_galaxy_gather_dp:
+        return
+    logger.warning(
+        "Running Galaxy model %s with gathered multi-process DP "
+        "(--data_parallel_size=%d) is DEPRECATED. "
+        "Use single-process TT lane mode instead: set --data_parallel_size 1 "
+        'and pass --additional-config \'{"tt": {"tt_data_parallel_size": %d, '
+        "...}}' with --max_num_seqs set to the global capacity "
+        "(e.g. tt_data_parallel_size=4 with --max_num_seqs 32). The gathered-DP "
+        "path still works but is no longer maintained as the recommended path; "
+        'see plugins/vllm-tt-plugin/README.md ("Llama3 70B Galaxy Serving").',
+        version,
+        data_parallel_size,
+        data_parallel_size,
+    )
+    _warned_galaxy_gather_dp = True
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -509,6 +560,18 @@ class TTPlatform(Platform):
             )
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+            # Gathered multi-process DP for Galaxy-generator models (Llama3 70B,
+            # Qwen3-32B) is deprecated in favor of single-process TT lanes
+            # (tt_data_parallel_size).
+            galaxy_version = _galaxy_generator_version()
+            if (
+                vllm_config.parallel_config.data_parallel_size > 1
+                and galaxy_version is not None
+            ):
+                _warn_galaxy_gather_dp(
+                    galaxy_version,
+                    vllm_config.parallel_config.data_parallel_size,
+                )
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
