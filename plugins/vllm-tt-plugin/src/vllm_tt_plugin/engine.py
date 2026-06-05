@@ -234,6 +234,16 @@ class TTEngineCoreProc(TTExecutionMixin, EngineCoreProc):
     """Multiprocessing TT engine core."""
 
 
+class TTStandardDPEngineCoreProc(DPEngineCoreProc):
+    """TT standard DP engine core (one device per DP rank).
+
+    Inherits the upstream ``DPEngineCoreProc`` behaviour unchanged.
+
+    ???: The subclass exists so that the upstream ``DPEngineCoreProc`` assertion
+         (``is_moe or uses_dp_engine_core``) is satisfied for non-MoE TT models.
+    """
+
+
 class TTDPEngineCoreProc(DPEngineCoreProc):
     """TT data-parallel engine core with gathered-batch orchestration."""
 

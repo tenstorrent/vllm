@@ -400,7 +400,7 @@ class TTPlatform(Platform):
                 "vllm.v1.engine.core.EngineCoreProc"
             )
             parallel_config.dp_engine_core_proc_cls = (
-                "vllm.v1.engine.core.DPEngineCoreProc"
+                "vllm_tt_plugin.engine.TTStandardDPEngineCoreProc"
             )
 
         parallel_config.engine_core_launcher_cls = (

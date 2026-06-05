@@ -71,7 +71,7 @@ class TestFullDPMode:
         )
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
-            == "vllm.v1.engine.core.DPEngineCoreProc"
+            == "vllm_tt_plugin.engine.TTStandardDPEngineCoreProc"
         )
 
     def test_tt_platform_tt_data_parallel_size_uses_tt_dp_engine_core(
