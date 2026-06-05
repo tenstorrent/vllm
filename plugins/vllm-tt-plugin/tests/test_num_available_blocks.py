@@ -28,6 +28,7 @@ the sliding tests patch it ``True`` to exercise the headroom formula.
 from unittest.mock import MagicMock, patch
 
 import pytest
+from vllm_tt_plugin import config as tt_config
 
 
 @pytest.fixture
@@ -94,14 +95,16 @@ def test_lane_mode_kv_shape_matches_dev(cfg):
     of requests, so the batch padding uses ``max_num_seqs // lanes``, matching
     a gathered-DP rank that received ``max_num_seqs`` directly. dev/main ran
     this config as ``--data_parallel_size 4 --max_num_seqs 8`` (per-rank batch
-    8); the single-process equivalent is ``tt_data_parallel_size=4`` with the
-    *global* ``max_num_seqs=32`` (= 8 per lane). Padding with the global 32
-    here would inflate ``num_blocks`` (2080 vs 2056) and break reuse of the
-    read-only tensor cache."""
+    8); the single-process equivalent is 4 resolved lanes with the *global*
+    ``max_num_seqs=32`` (= 8 per lane). Padding with the global 32 here would
+    inflate ``num_blocks`` (2080 vs 2056) and break reuse of the read-only
+    tensor cache."""
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.scheduler_config.max_num_seqs = 32
-    cfg.plugin_config = {"tt": {"tt_data_parallel_size": 4}}
+    # Lane count is read from the resolved-lane-count key on additional_config
+    # (the user-facing tt_data_parallel_size knob was dropped).
+    cfg.additional_config = {tt_config._RESOLVED_LANE_COUNT_KEY: 4}
 
     with (
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
