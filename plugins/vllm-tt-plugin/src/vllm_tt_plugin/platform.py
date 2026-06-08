@@ -394,8 +394,7 @@ class TTPlatform(Platform):
                 "vllm_tt_plugin.engine.TTDPEngineCoreProc"
             )
         else:
-            # Standard mode uses upstream DP engine cores.
-            parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
+            parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
             parallel_config.engine_core_proc_cls = (
                 "vllm.v1.engine.core.EngineCoreProc"
             )

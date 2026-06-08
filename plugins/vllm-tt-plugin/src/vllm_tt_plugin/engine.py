@@ -530,7 +530,9 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         scheduler_output = self.scheduler.schedule()
         self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
 
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        grammar_output: GrammarOutput | None = None
+        if not scheduler_output.pending_structured_output_tokens:
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         model_output = self._execute_model_dp_gather(scheduler_output, grammar_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(

@@ -63,11 +63,11 @@ class TestFullDPMode:
         assert TTPlatform.gathered_dp_mode is False
         assert (
             vllm_config.parallel_config.engine_core_cls
-            == "vllm.v1.engine.core.EngineCore"
+            == "vllm_tt_plugin.engine.TTEngineCore"
         )
         assert (
             vllm_config.parallel_config.engine_core_proc_cls
-            == "vllm.v1.engine.core.EngineCoreProc"
+            == "vllm_tt_plugin.engine.TTEngineCoreProc"
         )
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
