@@ -1164,9 +1164,15 @@ class TTModelRunner:
             num_logprobs=sample_params.num_logprobs[req_indices],
             enable_log_probs=enable_log_probs,
         )
-        if not is_prompt and input_tokens.shape[0] > len(req_indices):
-            # Decode inputs are padded to the lane batch size; pad the sampling
-            # params to match, right-filling padding rows with neutral defaults.
+        if (
+            not is_lane_build
+            and not is_prompt
+            and input_tokens.shape[0] > len(req_indices)
+        ):
+            # Non-lane decode inputs are padded to the rank batch size; pad the
+            # sampling params to match, right-filling padding rows with neutral
+            # defaults. Lane-DP decode keeps sampling params request-ordered and
+            # lets _merge_lane_decode_model_inputs scatter/fill padding slots.
             tt_sampling_params = self._sampling_params_for_padded_decode(
                 sample_params, req_indices, input_tokens.shape[0]
             )
