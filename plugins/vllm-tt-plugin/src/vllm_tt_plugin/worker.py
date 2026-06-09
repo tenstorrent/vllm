@@ -67,9 +67,23 @@ class TTWorker(WorkerBase):
         # Initialized by init_device
         self.mesh_device = None
 
+        # region Stashed outputs
+        # The upstream ``EngineCore`` batch-queue path always calls
+        # ``sample_tokens`` after ``execute_model``.  Since TT performs sampling
+        # on-device during the forward pass, we simply return the stashed
+        # output produced by execute_model.
+        # TODO: Might need refactoring after `tt-metal` introduces forward-sample
+        #       decoupling. Attributes affected:
+        #       `self.execute_model`,
+        #       `self.sample_tokens`,
+        #       `self._pending_scheduler_output_for_sample`,
+        #       and `self._last_output`.
         # Stash for `execute_model`-`sample_tokens` handoff.
-        # See notes for `self.execute_model` and `self.sample_tokens`.
         self._last_output: ModelRunnerOutput | None = None
+        # Standard-DP handoff: keep scheduler output until `self.sample_tokens`
+        # provides `grammar_output` from upstream engine logic.
+        self._pending_scheduler_output_for_sample: SchedulerOutput | None = None
+        # endregion
 
         # Whether to use ttnn tracing for model execution
         tt_config = get_tt_config(self.vllm_config)
@@ -292,43 +306,52 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Expose the non-DP TT execution service to the executor layer.
+        """Executes one step according to DP mode semantics.
 
-        In standard DP mode, the upstream ``EngineCore`` calls ``execute_model``
-        followed by ``sample_tokens``.  TT sampling runs inside the model
-        forward pass, so we stash the finished output here and return
-        None to signal "sampling deferred" so that ``sample_tokens`` hands
-        back the stashed result.
+        In gathered-DP mode, keep the plugin's legacy execute->sample stash
+        contract. In standard DP mode, defer execution until ``sample_tokens``
+        so upstream grammar ownership remains intact.
 
-        When no tokens are scheduled, the model runner returns an empty
-        output, which we pass through directly (no ``sample_tokens`` call
-        expected by the upstream engine for empty batches).
+        See also notes for `self._last_output`.
         """
-        output = self.execute_model_with_grammar(scheduler_output, None)
-        if output is not EMPTY_MODEL_RUNNER_OUTPUT and output is not None:
-            # Real work was done => stash for `sample_tokens`.
-            self._last_output = output
+        if TTPlatform.gathered_dp_mode:
+            output = self.execute_model_with_grammar(scheduler_output, None)
+            if output is not EMPTY_MODEL_RUNNER_OUTPUT and output is not None:
+                # Real work was done => stash for `sample_tokens`.
+                self._last_output = output
+                return None
+            # If empty/no-op batch, return directly.
+            return output
+
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            # Standard DP: wait for upstream grammar_output delivered via
+            # `sample_tokens` before executing the step.
+            self._pending_scheduler_output_for_sample = scheduler_output
             return None
-        # If empty/no-op batch, return directly.
-        return output
+
+        # Empty/no-op batch: execute directly and pass through.
+        return self.execute_model_with_grammar(scheduler_output, None)
 
     def sample_tokens(
         self,
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | None:
-        """Returns the result previously computed by ``self.execute_model``.
+        """Completes sampling according to DP mode semantics.
 
-        The upstream ``EngineCore`` batch-queue path always calls
-        ``sample_tokens`` after ``execute_model``.  Since TT performs sampling
-        on-device during the forward pass, we simply return the stashed
-        output produced by execute_model.
-
-        TODO: Might need refactoring after ``tt-metal`` introduces forward-sample
-              decoupling. Attributes affected: ``self.execute_model``,
-              ``self.sample_tokens`` (this), and ``self._last_output``.
+        See also notes for `self._pending_scheduler_output_for_sample`.
         """
-        output, self._last_output = self._last_output, None
-        return output
+        if TTPlatform.gathered_dp_mode:
+            output, self._last_output = self._last_output, None
+            return output
+
+        pending = self._pending_scheduler_output_for_sample
+        if pending is None:
+            raise RuntimeError(
+                "`sample_tokens` called in standard DP mode without a pending "
+                "`execute_model` step"
+            )
+        self._pending_scheduler_output_for_sample = None
+        return self.execute_model_with_grammar(pending, grammar_output)
 
     def execute_model_with_grammar(
         self,

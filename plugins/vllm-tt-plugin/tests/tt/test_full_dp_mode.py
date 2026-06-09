@@ -8,6 +8,7 @@ from vllm_tt_plugin import engine as tt_engine
 from vllm_tt_plugin.config import should_open_mesh_for_rank
 from vllm_tt_plugin.launcher import parse_tt_mpi_params
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.worker import TTWorker
 
 
 class TestFullDPMode:
@@ -295,3 +296,98 @@ class TestFullDPMode:
         proc = tt_engine.TTDPEngineCoreProc(vllm_config)
         assert called["base_init"] is True
         assert proc._dp_in_flight is None
+
+    def test_standard_dp_worker_defers_execute_until_sample_with_grammar(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Standard DP should pass grammar through the upstream sample phase."""
+        monkeypatch.setattr(TTPlatform, "gathered_dp_mode", False)
+
+        worker = object.__new__(TTWorker)
+        worker._last_output = None
+        worker._pending_scheduler_output_for_sample = None
+
+        called: list[tuple[object, object]] = []
+
+        def fake_execute_model_with_grammar(scheduler_output, grammar_output):
+            called.append((scheduler_output, grammar_output))
+            return "upstream-compatible-output"
+
+        worker.execute_model_with_grammar = fake_execute_model_with_grammar
+
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+        grammar_output = SimpleNamespace(grammar_bitmask=None)
+
+        out = TTWorker.execute_model(worker, scheduler_output)
+        assert out is None
+        assert worker._pending_scheduler_output_for_sample is scheduler_output
+
+        out = TTWorker.sample_tokens(worker, grammar_output)
+        assert out == "upstream-compatible-output"
+        assert called == [(scheduler_output, grammar_output)]
+        assert worker._pending_scheduler_output_for_sample is None
+        assert worker._last_output is None
+
+    def test_standard_dp_worker_empty_batch_executes_immediately(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Standard DP should pass through empty/no-op batches directly."""
+        monkeypatch.setattr(TTPlatform, "gathered_dp_mode", False)
+
+        worker = object.__new__(TTWorker)
+        worker._last_output = None
+        worker._pending_scheduler_output_for_sample = None
+
+        def fake_execute_model_with_grammar(scheduler_output, grammar_output):
+            assert grammar_output is None
+            return "empty-output"
+
+        worker.execute_model_with_grammar = fake_execute_model_with_grammar
+
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+        out = TTWorker.execute_model(worker, scheduler_output)
+
+        assert out == "empty-output"
+        assert worker._pending_scheduler_output_for_sample is None
+
+    def test_standard_dp_worker_sample_without_pending_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Standard DP sample phase requires a pending execute step."""
+        monkeypatch.setattr(TTPlatform, "gathered_dp_mode", False)
+
+        worker = object.__new__(TTWorker)
+        worker._last_output = None
+        worker._pending_scheduler_output_for_sample = None
+
+        with pytest.raises(RuntimeError, match="without a pending execute_model"):
+            TTWorker.sample_tokens(worker, None)
+
+    def test_gathered_dp_worker_preserves_stashed_output_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Gathered DP keeps the legacy stash handoff unchanged."""
+        monkeypatch.setattr(TTPlatform, "gathered_dp_mode", True)
+
+        worker = object.__new__(TTWorker)
+        worker._last_output = None
+        worker._pending_scheduler_output_for_sample = None
+
+        def fake_execute_model_with_grammar(scheduler_output, grammar_output):
+            assert grammar_output is None
+            return "tt-gathered-output"
+
+        worker.execute_model_with_grammar = fake_execute_model_with_grammar
+
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+        out = TTWorker.execute_model(worker, scheduler_output)
+        assert out is None
+        assert worker._last_output == "tt-gathered-output"
+
+        out = TTWorker.sample_tokens(worker, None)
+        assert out == "tt-gathered-output"
+        assert worker._last_output is None

@@ -235,12 +235,14 @@ class TTEngineCoreProc(TTExecutionMixin, EngineCoreProc):
 
 
 class TTStandardDPEngineCoreProc(DPEngineCoreProc):
-    """TT standard DP engine core (one device per DP rank).
+    """Standard TT DP path.
 
-    Inherits the upstream ``DPEngineCoreProc`` behaviour unchanged.
+    Uses upstream vLLM DP scheduling, grammar, and FSM handling unchanged.
+    TT-specific behavior should remain in the worker/model/device layer only.
 
-    ???: The subclass exists so that the upstream ``DPEngineCoreProc`` assertion
-         (``is_moe or uses_dp_engine_core``) is satisfied for non-MoE TT models.
+    ??? The subclass exists so non-MoE TT models satisfy the upstream
+        ``DPEngineCoreProc`` assertion requiring either MoE or an explicit DP
+        engine-core subclass.
     """
 
 
