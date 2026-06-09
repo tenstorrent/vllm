@@ -186,6 +186,10 @@ class InputBatch:
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
         return remap
 
+    def reset_slot_remap_for_new_request(self, req_index: int) -> None:
+        """Clear stale sampler-state remap for a slot reused by a new request."""
+        self._slot_remap[req_index] = req_index
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -230,6 +234,11 @@ class InputBatch:
             self.req_output_token_ids[req_index] = request.output_token_ids
 
         self.req_id_to_index[req_id] = req_index
+        # A reused slot now holds a new logical request. Any pending condense
+        # remap for that slot belongs to the previous occupant and must not be
+        # applied to the device sampler after this request's prefill resets the
+        # slot-local seed state.
+        self.reset_slot_remap_for_new_request(req_index)
 
         # Copy the prompt token ids and output token ids.
         prompt_token_ids = request.prompt_token_ids

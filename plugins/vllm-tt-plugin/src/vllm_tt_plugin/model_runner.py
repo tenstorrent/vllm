@@ -272,6 +272,15 @@ class TTPendingDPDecodeState:
     model_input: TTModelInput
 
 
+def _slot_remap_for_model_input(
+    input_batch: InputBatch, is_prompt: bool
+) -> torch.Tensor | None:
+    """Consume slot remap only on decode, where TT applies it to sampler state."""
+    if is_prompt:
+        return None
+    return input_batch.pop_slot_remap()
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -1164,7 +1173,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
-            slot_remap=input_batch.pop_slot_remap(),
+            slot_remap=_slot_remap_for_model_input(input_batch, is_prompt),
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
