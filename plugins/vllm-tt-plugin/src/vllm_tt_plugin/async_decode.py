@@ -154,10 +154,17 @@ class TTAsyncDecodeController:
             return False
         if runner.model_config.logits_processors:
             return False
-        return runner.check_perform_device_sampling(
-            is_decode=True,
-            has_structured_outputs=False,
+        return (
+            runner.check_perform_device_sampling(
+                is_decode=True,
+                has_structured_outputs=False,
+            )
+            and self.can_defer_decode_sampling()
         )
+
+    def can_defer_decode_sampling(self) -> bool:
+        """Async overlap requires sampling to remain outside decode_forward."""
+        return self.runner._can_defer_device_sampling(is_decode=True)
 
     def can_attempt_steady_decode_from_scheduler(
         self,
@@ -183,6 +190,8 @@ class TTAsyncDecodeController:
         if model_input.prompt_lens is not None:
             return False
         if not model_input.perform_device_sampling:
+            return False
+        if not self.can_defer_decode_sampling():
             return False
         if model_input.reset_batch:
             return False
