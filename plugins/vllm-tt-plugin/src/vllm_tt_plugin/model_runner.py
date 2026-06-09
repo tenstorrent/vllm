@@ -2021,6 +2021,8 @@ class TTModelRunner:
         return True
 
     def _can_defer_device_sampling(self, is_decode: bool) -> bool:
+        # Temp: return False for now
+        return False
         if not is_decode and self.request_specific_rope:
             return False
         return (
