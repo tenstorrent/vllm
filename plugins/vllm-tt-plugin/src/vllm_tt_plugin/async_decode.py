@@ -351,10 +351,8 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
-        device_sampling_deferred = (
-            perform_device_sampling
-            and model_input.has_structured_outputs
-            and runner._can_defer_device_sampling(is_decode=True)
+        device_sampling_deferred = perform_device_sampling and (
+            runner._can_defer_device_sampling(is_decode=True)
         )
         model_sampling_params = None
         if perform_device_sampling:
