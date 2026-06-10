@@ -470,28 +470,6 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
-        if output_shape is None:
-            # Handle both 2D [num_tokens, hidden] and
-            # 3D [num_tokens, heads, head_dim] query
-            num_tokens = query.shape[0]
-            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
-
-        if self.attn_backend.accept_output_buffer:
-            output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
-            output = output.view(-1, self.num_heads, self.head_size_v)
-        else:
-            output = None
-            orig_query_shape = query.shape
-
-        hidden_size = output_shape[-1]
-        # Reshape the query, key, and value tensors.
-        # NOTE(woosuk): We do this outside the custom op to minimize the
-        # CPU overheads from the non-CUDA-graph regions.
-        query = query.view(-1, self.num_heads, self.head_size)
-        if key is not None:
-            key = key.view(-1, self.num_kv_heads, self.head_size)
-        if value is not None:
-            value = value.view(-1, self.num_kv_heads, self.head_size_v)
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -504,14 +482,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep = unified_kv_cache_update(
                     key, value, self.layer_name
                 )
-            result = unified_attention(
-                query,
-                key,
-                value,
-                self.layer_name,
-                output=output,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
-            )
         else:
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
@@ -524,18 +494,55 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                     key, value, encoded
                 )
-            result = torch.ops.vllm.unified_attention(
+
+        if (
+            self.use_direct_call
+            and output_shape is None
+            and not self.attn_backend.accept_output_buffer
+        ):
+            return unified_attention_without_output(
                 query,
                 key,
                 value,
-                encoded,
-                output,
+                self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
-        if self.attn_backend.accept_output_buffer:
-            return result.view(-1, hidden_size)
+
+        if output_shape is None:
+            # Handle both 2D [num_tokens, hidden] and
+            # 3D [num_tokens, heads, head_dim] query
+            num_tokens = query.shape[0]
+            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
+        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+        hidden_size = output_shape[-1]
+        # Reshape the query, key, and value tensors.
+        # NOTE(woosuk): We do this outside the custom op to minimize the
+        # CPU overheads from the non-CUDA-graph regions.
+        query = query.view(-1, self.num_heads, self.head_size)
+        output = output.view(-1, self.num_heads, self.head_size_v)
+        if key is not None:
+            key = key.view(-1, self.num_kv_heads, self.head_size)
+        if value is not None:
+            value = value.view(-1, self.num_kv_heads, self.head_size_v)
+        if self.use_direct_call:
+            unified_attention_with_output(
+                query,
+                key,
+                value,
+                output,
+                self.layer_name,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
         else:
-            return result.view(orig_query_shape)
+            torch.ops.vllm.unified_attention_with_output(
+                query,
+                key,
+                value,
+                output,
+                encoded,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+        return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -740,16 +747,16 @@ direct_register_custom_op(
 
 
 @maybe_transfer_kv_layer
-def unified_attention(
+def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    output: torch.Tensor,
     layer_name: LayerNameType,
-    output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> None:
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
@@ -757,7 +764,7 @@ def unified_attention(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
-    out = self.impl.forward(
+    self.impl.forward(
         self,
         query,
         key,
@@ -768,27 +775,72 @@ def unified_attention(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
-    return out
 
 
-def unified_attention_fake(
+def unified_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="unified_attention_with_output",
+    op_func=unified_attention_with_output,
+    mutates_args=["output", "output_block_scale"],
+    fake_impl=unified_attention_with_output_fake,
+)
+
+
+@maybe_transfer_kv_layer
+def unified_attention_without_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: LayerNameType,
-    output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if output is not None:
-        return output
-    return torch.empty_like(query, memory_format=torch.contiguous_format)
+    # kv_cache_dummy_dep is not used but accepting it creates a data dependency
+    # that ensures torch.compile preserves ordering between KV cache update and
+    # attention forward.
+    del kv_cache_dummy_dep
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    return self.impl.forward(
+        self,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output_scale=output_scale,
+        output_block_scale=output_block_scale,
+    )
+
+
+def unified_attention_without_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: LayerNameType,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(query).contiguous()
 
 
 direct_register_custom_op(
-    op_name="unified_attention",
-    op_func=unified_attention,
-    mutates_args=["output", "output_block_scale"],
-    fake_impl=unified_attention_fake,
+    op_name="unified_attention_without_output",
+    op_func=unified_attention_without_output,
+    mutates_args=["output_block_scale"],
+    fake_impl=unified_attention_without_output_fake,
 )
