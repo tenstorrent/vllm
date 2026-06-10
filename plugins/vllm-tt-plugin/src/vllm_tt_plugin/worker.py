@@ -114,12 +114,16 @@ class TTWorker(WorkerBase):
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         gathered_dp_mode = TTPlatform.gathered_dp_mode
         if should_open_mesh_for_rank(local_dp_rank, gathered_dp_mode):
-            mesh_rank = (
-                0 if (not gathered_dp_mode or local_dp_rank is None)
-                else local_dp_rank
+            mesh_rank = local_dp_rank or 0
+            dp_size = (
+                1 if gathered_dp_mode
+                else self.parallel_config.data_parallel_size
             )
             self.mesh_device = open_mesh_device(
-                get_tt_config(self.vllm_config), self.trace_mode, mesh_rank
+                get_tt_config(self.vllm_config),
+                self.trace_mode,
+                mesh_rank,
+                dp_size,
             )
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
@@ -759,27 +763,80 @@ def get_mesh_grid(local_dp_rank=0):
     return mesh_grid
 
 
-def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
-    assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
+def compute_per_rank_mesh(mesh_grid, local_dp_rank, data_parallel_size):
+    """Partitions a full mesh grid into per-rank submesh shape and offset.
+
+    Divides rows first to preserve columns for tensor parallelism, then
+    splits the remaining DP factor from columns. This produces submeshes
+    with maximum column width (e.g. (1,2) from (2,4) with DP=4).
+    """
+    if data_parallel_size <= 1:
+        return mesh_grid, None
+
+    rows, cols = mesh_grid
+
+    # Find largest factor of dp_size that divides rows
+    row_factor = 1
+    for f in range(min(rows, data_parallel_size), 0, -1):
+        if data_parallel_size % f == 0 and rows % f == 0:
+            row_factor = f
+            break
+    col_factor = data_parallel_size // row_factor
+
+    if cols % col_factor != 0:
+        raise ValueError(
+            f"Cannot partition mesh grid {mesh_grid} into "
+            f"{data_parallel_size} equal parts for data parallelism"
+        )
+
+    per_rank_rows = rows // row_factor
+    per_rank_cols = cols // col_factor
+    per_rank_grid = (per_rank_rows, per_rank_cols)
+
+    # 2D tiling: ranks fill columns first within each row strip
+    row_idx = local_dp_rank // col_factor
+    col_idx = local_dp_rank % col_factor
+    offset = ttnn.MeshCoordinate([row_idx * per_rank_rows,
+                                  col_idx * per_rank_cols])
+
+    return per_rank_grid, offset
+
+
+def open_mesh_device(tt_config, trace_mode, local_dp_rank=0, data_parallel_size=1):
     mesh_grid = get_mesh_grid(local_dp_rank)
-    logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
+    per_rank_grid, offset = compute_per_rank_mesh(
+        mesh_grid, local_dp_rank, data_parallel_size
+    )
+
+    logger.info(
+        "DP rank %d/%d: opening submesh %s at offset %s (full mesh %s)",
+        local_dp_rank, data_parallel_size, per_rank_grid, offset, mesh_grid,
+    )
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
 
-    # Set fabric before opening the device
-    num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested)
+    # Only enable fabric when opening the full mesh (no DP partitioning).
+    # Fabric requires ALL system devices to be active, which is incompatible
+    # with per-rank subsets opened via offset.
+    if offset is None:
+        num_devices_requested = per_rank_grid[0] * per_rank_grid[1]
+        set_fabric(tt_config, num_devices_requested)
 
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(*mesh_grid),
+    open_kwargs = dict(
         dispatch_core_config=get_dispatch_core_config(tt_config),
         **device_params,
     )
+    if offset is not None:
+        open_kwargs["offset"] = offset
+
+    mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*per_rank_grid), **open_kwargs)
+
     logger.info(
         "multidevice with %d devices and grid %s is created",
         mesh_device.get_num_devices(),
-        mesh_grid,
+        per_rank_grid,
     )
+
     return mesh_device
 
 
