@@ -16,6 +16,7 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
 )
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -582,3 +583,255 @@ class InputBatch:
         for generator in generators:
             # Sample once from the generator to advance its state.
             torch.rand(1, generator=generator)
+
+
+class TTLaneInputBatch(InputBatch):
+    """Persistent input batch for single-process multi-lane (lane-DP) execution.
+
+    One engine process drives ``num_lanes`` data-parallel KV-cache replicas
+    ("lanes") that execute in lockstep against a single gathered device batch.
+    This batch owns the lane layout so the model runner does not: it lays the
+    persistent rows out as ``num_lanes`` contiguous chunks of ``per_lane`` rows
+    and binds each request to a stable row for its whole lifetime.
+
+    Layout: lane ``l`` owns rows ``[l * per_lane, (l + 1) * per_lane)``. A
+    request placed at lane-local slot ``s`` lives at persistent row
+    ``l * per_lane + s``. **That persistent row IS the request's device decode
+    slot**, so the merged device input is the batch's own row layout -- no
+    scatter, and no separate ``req_id -> slot`` map. ``max_num_reqs`` is
+    ``num_lanes * per_lane`` (the global ``max_num_seqs`` in lane mode).
+
+    Stable slots: a request never moves once placed. Removing a request leaves
+    its row as an empty gap to be reused by a later request in the same lane.
+    There is no condense (``condense`` is a no-op): keeping every live request
+    pinned to its row keeps the on-device per-slot seed RNG correct and makes
+    the seed manager's ``slot_remap`` the identity. Gaps are reset to neutral
+    sampling defaults so they cannot perturb batch-wide flags (``all_greedy`` /
+    ``no_penalties``) or sample an invalid value.
+
+    Merged host sampling: because rows are the device slots and gaps carry
+    neutral defaults, the runner samples the whole ``max_num_reqs`` slot batch
+    in one call against one :class:`SamplingMetadata` built here over every row
+    (``build_merged_sampling_metadata``). The builtin/custom logits processors
+    keep per-row state over this full slot batch (``refresh_logitsprocs`` passes
+    ``max_num_reqs`` as the batch size), exactly like a normal single-engine
+    vLLM batch -- so there is no per-lane slicing, no per-lane generator/penalty
+    remap, and custom logits processors work unchanged. Pad rows sample greedy
+    garbage that the runner drops when reading back the occupied rows.
+    """
+
+    def __init__(
+        self,
+        num_lanes: int,
+        per_lane: int,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        vocab_size: int,
+        block_sizes: list[int],
+        kernel_block_sizes: list[int],
+        logitsprocs: LogitsProcessors | None = None,
+    ):
+        if num_lanes < 1 or per_lane < 1:
+            raise ValueError(
+                f"num_lanes and per_lane must be >= 1, got num_lanes={num_lanes}, "
+                f"per_lane={per_lane}"
+            )
+        self.num_lanes = num_lanes
+        self.per_lane = per_lane
+        super().__init__(
+            max_num_reqs=num_lanes * per_lane,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            vocab_size=vocab_size,
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+            logitsprocs=logitsprocs,
+        )
+        # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
+        # pre-size so a request can occupy any slot in its lane's chunk, with
+        # gaps, instead of always appending at ``num_reqs``.
+        self._req_ids = [None] * self.max_num_reqs
+        self.req_output_token_ids = [None] * self.max_num_reqs
+        # req_id -> lane (static; set at admission, never changes).
+        self._lane_of: dict[str, int] = {}
+
+    # ------------------------------------------------------------------
+    # Lane geometry / membership
+    # ------------------------------------------------------------------
+
+    def lane_of(self, req_id: str) -> int:
+        """Return the lane a request is bound to."""
+        return self._lane_of[req_id]
+
+    def lane_base_row(self, lane: int) -> int:
+        """First persistent row of ``lane``'s chunk."""
+        return lane * self.per_lane
+
+    def occupied_rows(self) -> list[int]:
+        """Persistent rows holding a live request, in ascending (lane-major,
+        slot) order. This is the canonical merged order used for output."""
+        return [row for row, rid in enumerate(self._req_ids) if rid is not None]
+
+    # ------------------------------------------------------------------
+    # Placement (stable lane-local slots)
+    # ------------------------------------------------------------------
+
+    def add_request_to_lane(self, request: "CachedRequestState", lane: int) -> int:
+        """Place ``request`` at the lowest free slot in ``lane``'s chunk.
+
+        The lane is decided by the scheduler and passed in; this method only
+        records the membership and assigns the stable row. Returns the
+        persistent row (== device decode slot).
+        """
+        if not (0 <= lane < self.num_lanes):
+            raise ValueError(f"lane {lane} out of range [0, {self.num_lanes})")
+        row = self._claim_free_slot(lane)
+        super().add_request(request, row)
+        self._lane_of[request.req_id] = lane
+        return row
+
+    def _claim_free_slot(self, lane: int) -> int:
+        """Lowest free row in ``lane``'s chunk, reconciled with pending removals.
+
+        If the chosen row was freed earlier in this same step it is still in the
+        logitsproc batch-update ``removed`` list. Drop it from that list so the
+        reused row is recorded only as an ``added`` update, not both -- mirroring
+        upstream ``gpu_input_batch._register_add_request``'s ``pop_removed()`` so
+        the builtin logits processors do not first set then clear the new
+        request's per-row state.
+        """
+        base = self.lane_base_row(lane)
+        builder = self.sampling.batch_update_builder
+        for slot in range(self.per_lane):
+            row = base + slot
+            if self._req_ids[row] is None:
+                if row in builder._removed:
+                    builder._removed.remove(row)
+                return row
+        raise ValueError(f"lane {lane} has no free slot (capacity {self.per_lane})")
+
+    def remove_request(self, req_id: str) -> int | None:
+        row = super().remove_request(req_id)
+        if row is not None:
+            self._lane_of.pop(req_id, None)
+            self._reset_slot(row)
+        return row
+
+    def _reset_slot(self, row: int) -> None:
+        """Reset a freed row to neutral defaults so a gap never perturbs the
+        merged batch's sampling. ``super().remove_request`` already clears the
+        generator, bad-words and allowed-token-ids entries; this also resets the
+        per-row sampling tensors and token counts (so the row reads as an empty,
+        greedy, no-penalty request until it is reused)."""
+        sampling = self.sampling
+        for name, default in sampling.DEFAULTS.items():
+            getattr(sampling, name)[row] = default
+        self.num_tokens[row] = 0
+        self.num_prompt_tokens[row] = 0
+        self.num_computed_tokens_cpu[row] = 0
+
+    def condense(self, empty_req_indices: list[int]) -> None:
+        """No-op: lane slots are stable.
+
+        The base class condenses by moving the highest live request into the
+        lowest empty index. That would move requests across lane boundaries and
+        shift their device slots, corrupting the on-device per-slot seed RNG.
+        Lane mode instead leaves freed rows as gaps (reused in place by later
+        requests in the same lane), so live requests never move and the seed
+        manager's ``slot_remap`` stays the identity.
+        """
+        return
+
+    # ------------------------------------------------------------------
+    # Sampling layout (merged, over the full slot batch)
+    # ------------------------------------------------------------------
+
+    @property
+    def max_num_logprobs(self) -> int | None:
+        """Max logprobs across live requests, or None if none need logprobs.
+
+        Computed over every slot row rather than ``[:num_reqs]`` because live
+        rows are not front-packed; gap rows carry the ``LOGPROBS_NONE_SENTINEL``
+        default (the minimum value), so the max over all rows equals the max
+        over the live rows.
+        """
+        if self.num_reqs == 0:
+            return None
+        max_val = int(self.sampling.num_logprobs[: self.max_num_reqs].max().item())
+        if max_val < 0:
+            return None
+        return max_val
+
+    def refresh_logitsprocs(self) -> None:
+        """Apply batch state changes to logits processors over the full slot
+        batch. Passes ``max_num_reqs`` (not ``num_reqs``) as the batch size so
+        each processor's per-row state spans every slot, matching the full slot
+        logits the runner samples."""
+        batch_update = self.sampling.batch_update_builder.get_and_reset(
+            self.max_num_reqs
+        )
+        for logit_proc in self.sampling.logitsprocs.all:
+            logit_proc.update_state(batch_update)
+
+    def build_merged_sampling_metadata(self) -> SamplingMetadata:
+        """Build one :class:`SamplingMetadata` over every slot row.
+
+        Mirrors a normal single-engine vLLM ``SamplingMetadata`` build, but over
+        the full ``max_num_reqs`` slot batch (live rows interleaved with neutral
+        gap rows) so it lines up row-for-row with the full slot logits the
+        runner hands the host sampler and with the per-row logits-processor
+        state. Gap rows carry neutral defaults (greedy, no penalties), so they
+        do not change ``all_greedy`` / ``no_penalties`` and sample harmless
+        greedy tokens the runner discards.
+
+        ``all_random`` is intentionally computed over the full tensor, so it is
+        False whenever any gap exists; that keeps the sampler's div-by-zero
+        guard active for the default-``temperature=0`` gap rows.
+        """
+        n = self.max_num_reqs
+        sampling = self.sampling
+        temperature = sampling.temperature[:n]
+        all_greedy = bool((temperature == 0.0).all())
+        all_random = bool((temperature != 0.0).all())
+        presence = sampling.presence_penalty[:n]
+        frequency = sampling.frequency_penalty[:n]
+        repetition = sampling.repetition_penalty[:n]
+        no_penalties = bool(
+            (presence == 0.0).all()
+            and (frequency == 0.0).all()
+            and (repetition == 1.0).all()
+        )
+        rows = list(range(n))
+        if not no_penalties:
+            prompt_token_ids = self.make_prompt_token_ids_tensor(rows).to(torch.int64)
+            prompt_token_ids = prompt_token_ids.masked_fill(
+                prompt_token_ids == -1, self.vocab_size
+            )
+            output_rows = self.make_output_token_ids_tensor(rows)
+            output_token_ids = [
+                [tok for tok in row.tolist() if tok != -1] for row in output_rows
+            ]
+        else:
+            prompt_token_ids = None
+            output_token_ids = [[] for _ in range(n)]
+        allowed_token_ids_mask = sampling.allowed_token_ids_mask
+        if allowed_token_ids_mask is not None:
+            allowed_token_ids_mask = allowed_token_ids_mask[:n]
+        return SamplingMetadata(
+            temperature=temperature if not all_greedy else None,
+            all_greedy=all_greedy,
+            all_random=all_random,
+            top_p=sampling.top_p[:n],
+            top_k=sampling.top_k[:n],
+            generators=dict(sampling.generators),
+            max_num_logprobs=self.max_num_logprobs,
+            no_penalties=no_penalties,
+            prompt_token_ids=prompt_token_ids,
+            frequency_penalties=frequency,
+            presence_penalties=presence,
+            repetition_penalties=repetition,
+            output_token_ids=output_token_ids,
+            allowed_token_ids_mask=allowed_token_ids_mask,
+            bad_words_token_ids=dict(sampling.bad_words_token_ids),
+            logitsprocs=sampling.logitsprocs,
+        )

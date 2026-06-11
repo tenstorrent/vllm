@@ -110,16 +110,36 @@ def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
     """
     max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     if vllm_config.parallel_config.data_parallel_size > 1:
-        return max_num_seqs * get_tt_data_parallel_size(vllm_config)
+        return max_num_seqs * vllm_config.parallel_config.data_parallel_size
     return max_num_seqs
 
 
 def get_tt_per_lane_max_num_seqs(vllm_config: "VllmConfig") -> int:
-    """Return the per-lane/per-rank scheduling and wire-format capacity."""
-    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
-    if not uses_tt_lane_coordinator(vllm_config):
-        return max_num_seqs
+    """Return the per-lane/per-rank scheduling and wire-format capacity.
 
+    Outside lane mode the global ``max_num_seqs`` is already the per-rank
+    capacity. In single-process lane mode it is the validated per-lane split
+    (see ``validate_tt_lane_config``).
+    """
+    if not uses_tt_lane_coordinator(vllm_config):
+        return int(vllm_config.scheduler_config.max_num_seqs)
+    return validate_tt_lane_config(vllm_config)
+
+
+def validate_tt_lane_config(vllm_config: "VllmConfig") -> int:
+    """Validate single-process lane-mode batch sizing; return per-lane capacity.
+
+    Lane mode partitions the global ``max_num_seqs`` evenly across the lanes
+    (one in-process DP replica each), so the global value must be a positive
+    multiple of the lane count; raises ``ValueError`` otherwise. Assumes lane
+    mode is active (callers gate on ``uses_tt_lane_coordinator``).
+
+    Exposed as a named helper so ``platform.check_and_update_config`` can run
+    this check at config time -- calling it for its raising side effect so a
+    misconfiguration fails fast with a clear message -- rather than calling the
+    per-lane getter and discarding its result.
+    """
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     lanes = get_tt_data_parallel_size(vllm_config)
     if max_num_seqs % lanes != 0:
         raise ValueError(

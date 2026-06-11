@@ -13,9 +13,9 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
-    get_tt_per_lane_max_num_seqs,
     store_tt_lane_count,
     uses_tt_lane_coordinator,
+    validate_tt_lane_config,
 )
 
 if TYPE_CHECKING:
@@ -79,14 +79,16 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     multiply it (no external launcher), so ``world_size_across_dp`` collapses to
     1 automatically once ``data_parallel_size`` is reset.
 
-    ``data_parallel_rank_local`` is reset to ``0`` -- the value a genuine
-    single-process run resolves to (``ParallelConfig.__post_init__`` falls back
-    to ``VLLM_DP_RANK_LOCAL``, which defaults to ``VLLM_DP_RANK`` == 0). The TT
-    plugin treats local rank 0 as the device rank that opens the mesh, loads the
-    model, and allocates the KV cache (see ``worker.init_device``/``load_model``
-    and ``TTModelRunner.initialize_kv_cache``); leaving it ``None`` makes every
-    ``== 0`` gate take the non-device branch, so the mesh is never opened and
-    ``self.kv_caches`` is never allocated.
+    ``data_parallel_rank_local`` must be ``0`` here. The TT plugin gates device
+    bring-up on ``data_parallel_rank_local == 0``: that rank opens the mesh,
+    loads the model, and allocates the KV cache (see
+    ``worker.init_device``/``load_model`` and
+    ``TTModelRunner.initialize_kv_cache``). A single-process lane run owns the
+    one device mesh, so it is that device rank and must be ``0`` for those gates
+    to fire and bring the device up. ``0`` is also the value a genuine
+    single-process run resolves to (``ParallelConfig.__post_init__`` defaults
+    ``data_parallel_rank_local`` from ``VLLM_DP_RANK_LOCAL`` / ``VLLM_DP_RANK``,
+    both ``0``).
     """
     parallel_config.data_parallel_size = 1
     parallel_config.data_parallel_size_local = 1
@@ -604,9 +606,9 @@ class TTPlatform(Platform):
         _convert_galaxy_gather_dp_to_lanes(vllm_config)
 
         if uses_tt_lane_coordinator(vllm_config):
-            # Run early validation: lane mode requires max_num_seqs to split
-            # evenly across the internal TT lanes.
-            get_tt_per_lane_max_num_seqs(vllm_config)
+            # Fail fast on misconfiguration: lane mode requires max_num_seqs to
+            # split evenly across the internal TT lanes.
+            validate_tt_lane_config(vllm_config)
             vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
             logger.info(
                 "Using TTLaneCoordinator with %d in-process TT lanes",

@@ -19,7 +19,8 @@ This module bridges vLLM's single-queue scheduler to that layout:
   the model runner routes each lane's block table to its own submesh.
 - ``merge_lane_scheduler_outputs`` performs that stitching.
 - ``LaneStepMetadata`` rides along on the merged output so the model runner can
-  later split the gathered batch back into per-lane pieces.
+  recover which requests belonged to which lane and place them in that lane's
+  slot chunk of the merged device batch.
 
 Because the device executes all lanes together, every lane in a step must agree
 on a single scheduling mode (all-prefill or all-decode); the coordinator
@@ -28,8 +29,9 @@ negotiates that mode before scheduling any lane.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -61,32 +63,22 @@ logger = init_logger(__name__)
 
 @dataclass
 class LaneStepMetadata:
-    """Per-step lane bookkeeping for the runner's merge/split.
+    """Per-step lane bookkeeping the coordinator hands the model runner.
 
     The coordinator merges every lane's work into one ``SchedulerOutput``, which
-    erases the lane boundaries. This metadata records what those boundaries were
-    so the model runner can scatter the gathered batch onto the right DP
-    replicas and gather the results back, indexed by lane.
-
-    The coordinator only fills in ``lane_outputs`` and ``is_decode`` — the
-    minimal contract the runner needs. The runner derives the per-lane request
-    ordering itself while preparing inputs and writes ``lane_req_ids`` /
-    ``lane_req_id_to_index`` back onto its own copy; those are the authoritative
-    values used to scatter device outputs back per request.
+    erases the lane boundaries. This metadata records which requests belonged to
+    which lane (via each lane's own ``SchedulerOutput``) and whether the step is
+    decode-only, so the runner can place each request in its lane's slot chunk
+    of the merged device batch (see ``TTModelRunner._update_lane_states``).
     """
 
     # The raw, unmerged output for each lane (empty for idle lanes), in lane
-    # order. Lets the runner reconstruct per-lane inputs after the merge.
+    # order. The runner reads each lane's scheduled requests from it to assign
+    # them to that lane.
     lane_outputs: list[SchedulerOutput]
     # True if this is a decode-only step, False if prefill-only. Lanes never mix
     # the two within a step (a TT device constraint).
     is_decode: bool
-    # Request IDs scheduled on each lane, in the order they appear in the batch,
-    # plus the reverse lookup (request ID -> position within the lane). Left
-    # empty by the coordinator; populated by the runner after it prepares the
-    # per-lane inputs.
-    lane_req_ids: list[list[str]] = field(default_factory=list)
-    lane_req_id_to_index: list[dict[str, int]] = field(default_factory=list)
 
 
 def merge_lane_scheduler_outputs(
@@ -144,9 +136,15 @@ def merge_lane_scheduler_outputs(
 
     for out in lane_outputs:
         scheduled_new_reqs.extend(out.scheduled_new_reqs)
-        # CachedRequestData is a struct-of-arrays; concatenate each parallel
-        # array so the merged object stays internally consistent. Skip empty
-        # lanes to avoid touching the shared make_empty() sentinel.
+        # ``CachedRequestData`` is a struct-of-arrays (parallel ``req_ids`` /
+        # ``new_token_ids`` / ``new_block_ids`` / ... lists plus
+        # ``resumed_req_ids`` and ``all_token_ids``); concatenate each field so
+        # the merged object stays internally consistent. An idle lane returns a
+        # ``CachedRequestData.make_empty()`` struct (all-empty arrays), so the
+        # ``num_reqs > 0`` guard just skips lanes that would contribute nothing
+        # -- it is a clarity/efficiency skip, not a correctness guard
+        # (``make_empty()`` builds a fresh object each call, so there is no
+        # shared instance to protect).
         lane_cached = out.scheduled_cached_reqs
         if lane_cached.num_reqs > 0:
             cached.req_ids.extend(lane_cached.req_ids)
@@ -241,13 +239,28 @@ class TTLaneCoordinator(SchedulerInterface):
         # No KV connector on TT; surfaced for engine-core attribute access.
         self.connector: KVConnectorBase_V1 | None = None
 
+        # Each lane scheduler must cap its running set at the *per-lane*
+        # capacity, not the global ``max_num_seqs`` the coordinator sees. The
+        # base scheduler derives its hard running cap from
+        # ``scheduler_config.max_num_seqs`` (``max_num_running_reqs``), so if
+        # every lane saw the global value (``num_lanes * per_lane``) the lanes'
+        # combined running set could reach ``num_lanes * max_num_seqs`` and
+        # overflow the runner's merged persistent batch
+        # (``req_index >= max_num_reqs``). Give each lane a config view whose
+        # ``max_num_seqs`` is the per-lane cap so the running-cap derivation is
+        # correct at construction, rather than mutating ``max_num_running_reqs``
+        # after the fact. The coordinator keeps the original ``vllm_config`` so
+        # the global capacity (used for KV/model sizing in the runner) is
+        # untouched.
+        per_lane_vllm_config = self._build_per_lane_vllm_config(vllm_config)
+
         # One independent scheduler per lane. Each gets the same kv_cache_config
         # (every submesh cache is the same size) and its own KV cache manager,
         # so lane block-ID spaces are independent. Per-lane stats are disabled;
         # the coordinator aggregates stats itself.
         self.lanes: list[TTScheduler] = [
             TTScheduler(
-                vllm_config,
+                per_lane_vllm_config,
                 kv_cache_config,
                 structured_output_manager,
                 block_size,
@@ -257,24 +270,22 @@ class TTLaneCoordinator(SchedulerInterface):
             )
             for _ in range(self.num_lanes)
         ]
-        self._apply_per_lane_caps(self.lanes)
 
-    def _apply_per_lane_caps(self, lanes: list[TTScheduler]) -> None:
-        """Cap each lane's running set at the per-lane batch capacity.
+    def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
+        """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
 
-        Each lane scheduler is built from the shared ``vllm_config``, whose
-        ``scheduler_config.max_num_seqs`` is the *global* concurrency
-        (``num_lanes * per_lane``). The base scheduler turns that into its hard
-        running cap (``max_num_running_reqs``), so without this override every
-        lane believes it may run the *entire* global batch. With uneven lane
-        assignment that lets the lanes' combined running set exceed
-        ``max_num_seqs``, overflowing the merged persistent batch in the runner
-        (``req_index >= max_num_reqs``). Pinning each lane to ``_per_lane_max``
-        restores the per-rank semantics gathered DP had and keeps the merged
-        batch within ``num_lanes * per_lane == max_num_seqs``.
+        Shallow-copies ``vllm_config`` and its ``scheduler_config`` so the
+        per-lane ``max_num_seqs`` override does not leak back onto the shared
+        config the coordinator and model runner read for global sizing. All
+        lanes share this one view; the base scheduler only reads
+        ``max_num_seqs`` from it (to set ``max_num_running_reqs``), never
+        mutates it.
         """
-        for sched in lanes:
-            sched.max_num_running_reqs = self._per_lane_max
+        per_lane_vllm_config = copy.copy(vllm_config)
+        per_lane_scheduler_config = copy.copy(vllm_config.scheduler_config)
+        per_lane_scheduler_config.max_num_seqs = self._per_lane_max
+        per_lane_vllm_config.scheduler_config = per_lane_scheduler_config
+        return per_lane_vllm_config
 
     # ------------------------------------------------------------------
     # Lane selection / mode negotiation
@@ -283,9 +294,22 @@ class TTLaneCoordinator(SchedulerInterface):
     def _pick_lane(self) -> int:
         """Choose the least-loaded lane for a newly arriving request.
 
-        Scores each lane by load, weighting waiting requests more heavily than
-        running ones (a queued request will cost a future prefill), and picks
-        the lowest score. Ties resolve to the lowest lane index.
+        Scores each lane ``waiting * 4 + running`` and picks the lowest
+        (ties resolve to the lowest lane index). This is intentionally the same
+        load score vLLM uses to route requests across DP engines
+        (``DPLBAsyncMPClient.get_core_engine_for_request`` in
+        ``vllm/v1/engine/core_client.py``): queued requests are weighted more
+        heavily than running ones because each will cost a future prefill. The
+        lane coordinator stands in for vLLM's multi-process DP load balancer, so
+        it keeps the same policy.
+
+        Assignment is static: a request is bound to one lane here at admission
+        (recorded on ``request.tt_lane`` in ``add_request``) and never migrates,
+        exactly as vLLM DP binds each request to one engine at intake with no
+        later migration. So a lane can sit idle while another has queued work --
+        no worse than the gathered-DP behavior this replaces. Cross-lane
+        rebalancing (e.g. work-stealing) is a possible future follow-up, not
+        part of this change.
         """
         best_lane = 0
         best_score: int | None = None
@@ -327,14 +351,21 @@ class TTLaneCoordinator(SchedulerInterface):
         Idle lanes are scheduled too (rather than short-circuited to an empty
         output) so each lane drains its own pending ``finished_req_ids`` for the
         runner's cleanup; an empty schedule for an idle lane is cheap.
+
+        No ``try/finally`` is needed to restore ``DEFAULT`` mode. Every lane's
+        forced mode is set here immediately before its ``schedule()`` call and
+        read only by that one call, so it never persists in a meaningful way
+        across coordinator steps: the next ``_schedule_all_lanes`` re-sets it
+        before scheduling again. A mid-loop ``schedule()`` exception fails the
+        whole engine step, and any lane left in ``forced_mode`` is harmless
+        because it is overwritten before it is next read. The reset after each
+        call simply keeps lanes in a tidy ``DEFAULT`` state between steps.
         """
         lane_outputs: list[SchedulerOutput] = []
         for sched in self.lanes:
             sched.set_forced_mode(forced_mode)
-            try:
-                lane_outputs.append(sched.schedule())
-            finally:
-                sched.set_forced_mode(TTSchedulingMode.DEFAULT)
+            lane_outputs.append(sched.schedule())
+            sched.set_forced_mode(TTSchedulingMode.DEFAULT)
         return lane_outputs
 
     # ------------------------------------------------------------------
@@ -487,18 +518,20 @@ class TTLaneCoordinator(SchedulerInterface):
     # ------------------------------------------------------------------
 
     def add_request(self, request: Request) -> None:
-        # Assign the request to a lane before handing it to that lane's
-        # scheduler. An explicit preference wins (wrapped into range); otherwise
-        # balance onto the least-loaded lane. A request that already carries a
-        # valid lane keeps it.
-        preferred_lane = getattr(request, "tt_preferred_lane", None)
+        # Bind the request to a lane before handing it to that lane's scheduler.
+        # ``request.tt_lane`` is the coordinator's own ownership state: a request
+        # already carrying a valid lane keeps it (e.g. re-add of a request the
+        # coordinator previously placed); otherwise balance onto the least-loaded
+        # lane via ``_pick_lane``. Assignment is static -- see ``_pick_lane`` --
+        # so once set the lane never changes.
+        #
+        # There is no user-facing preferred-lane routing: ``InputProcessor``
+        # rejects any request whose ``data_parallel_rank`` exceeds the engine's
+        # DP rank count, which is always 1 for the in-process lane coordinator
+        # (vLLM sees a single engine). So no real request can carry a meaningful
+        # per-lane preference here, and lane choice is purely the coordinator's.
         request_lane = getattr(request, "tt_lane", -1)
-        if preferred_lane is not None:
-            lane = preferred_lane % self.num_lanes
-        elif 0 <= request_lane < self.num_lanes:
-            lane = request_lane
-        else:
-            lane = self._pick_lane()
+        lane = request_lane if 0 <= request_lane < self.num_lanes else self._pick_lane()
         request.tt_lane = lane
         self.lanes[lane].add_request(request)
 

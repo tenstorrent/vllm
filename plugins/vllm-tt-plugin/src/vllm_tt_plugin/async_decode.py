@@ -136,6 +136,46 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
         return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
 
 
+class AsyncTTLaneModelRunnerOutput(AsyncModelRunnerOutput):
+    """Finalize one async single-process multi-lane decode step.
+
+    The merged step already executed every lane's slot together, so this just
+    finalizes the device read, samples the merged batch once, and maps the
+    sampled tokens back to the scheduled requests -- there is no per-lane
+    stitching. State application is deferred (the step is enqueued) so steady
+    decode can overlap, exactly like the non-DP async path.
+    """
+
+    def __init__(
+        self,
+        controller: TTAsyncDecodeController,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        completion_event: threading.Event,
+        context: SubmittedStepContext,
+        scheduled_rows: list[int],
+    ):
+        self._controller = controller
+        self._submission = submission
+        self._model_input = model_input
+        self._completion_event = completion_event
+        self._context = context
+        self._scheduled_rows = scheduled_rows
+
+    def get_output(self) -> ModelRunnerOutput:
+        try:
+            completed = self._controller.complete_lane_decode_step(
+                submission=self._submission,
+                model_input=self._model_input,
+                context=self._context,
+                scheduled_rows=self._scheduled_rows,
+            )
+            self._controller.enqueue_completed_decode_step(completed)
+            return self._controller.build_runner_output_from_completed_step(completed)
+        finally:
+            self._completion_event.set()
+
+
 class TTAsyncDecodeController:
     """Own the TT async decode lifecycle for a `TTModelRunner`."""
 
@@ -409,6 +449,57 @@ class TTAsyncDecodeController:
             submission=submission,
             model_input=model_input,
             completion_event=completion_event,
+        )
+
+    def submit_async_lane_decode(
+        self,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+        scheduled_rows: list[int],
+    ) -> AsyncTTLaneModelRunnerOutput:
+        """Submit a non-blocking single-process multi-lane decode step."""
+        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+        completion_event = threading.Event()
+        submission = self.submit_decode(
+            model_input, read_from_device=False, async_read=True
+        )
+        self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
+        if submission.tt_out is None:
+            completion_event.set()
+        return AsyncTTLaneModelRunnerOutput(
+            controller=self,
+            submission=submission,
+            model_input=model_input,
+            completion_event=completion_event,
+            context=context,
+            scheduled_rows=scheduled_rows,
+        )
+
+    def complete_lane_decode_step(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+        scheduled_rows: list[int],
+    ) -> CompletedDecodeStep:
+        """Finalize a lane decode read and sample the merged batch once."""
+        finalized = self.finalize_decode(submission)
+        if finalized is None:
+            sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
+            logprobs = None
+        else:
+            sampled_token_ids, logprobs = self.runner._extract_lane_step(
+                finalized.tt_out,
+                finalized.tt_log_probs,
+                model_input,
+                scheduled_rows,
+                is_decode=True,
+            )
+        return CompletedDecodeStep(
+            sampled_token_ids=sampled_token_ids,
+            logprobs=logprobs,
+            context=context,
+            completion_time_ns=time.perf_counter_ns(),
         )
 
     def submit_decode(

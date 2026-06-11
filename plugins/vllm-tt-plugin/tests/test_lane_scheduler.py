@@ -8,6 +8,8 @@ on a small surface of each lane (``waiting`` / ``running`` length, forced-mode
 scheduling, and ``update_from_output``).
 """
 
+from types import SimpleNamespace
+
 from vllm_tt_plugin.lane_scheduler import (
     LaneStepMetadata,
     TTLaneCoordinator,
@@ -36,10 +38,6 @@ class FakeLane:
         self.scheduled_modes: list[TTSchedulingMode] = []
         self.update_calls: list[SchedulerOutput] = []
         self._eco: dict[int, EngineCoreOutputs] = {}
-        # Mirrors the base scheduler attribute the coordinator caps; starts at
-        # the global value a lane is built with so the test can assert it is
-        # narrowed to the per-lane capacity.
-        self.max_num_running_reqs = 32
 
     def set_forced_mode(self, mode):
         self._mode = mode
@@ -167,17 +165,23 @@ def test_update_from_output_no_metadata_returns_empty():
     assert coordinator.update_from_output(SchedulerOutput.make_empty(), None) == {}
 
 
-def test_apply_per_lane_caps_narrows_running_cap_to_per_lane():
-    # Lanes are built from the shared (global) max_num_seqs == 32. Without the
-    # cap each lane would run up to 32, letting the four lanes' combined running
-    # set reach 128 and overflow the merged persistent batch (req_index >=
-    # max_num_reqs). The coordinator must pin every lane to the per-lane cap so
-    # num_lanes * per_lane == global max_num_seqs.
-    lanes = [FakeLane(), FakeLane(), FakeLane(), FakeLane()]
-    coordinator = _make_coordinator(lanes, per_lane_max=8)
+def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():
+    # Lanes must be constructed from a config whose max_num_seqs is the
+    # *per-lane* cap, so the base scheduler derives max_num_running_reqs ==
+    # per_lane at __init__ (Scheduler.__init__:
+    # self.max_num_running_reqs = scheduler_config.max_num_seqs). Without this,
+    # four lanes built from the global cap (32) would each believe they may run
+    # the whole global batch, letting their combined running set reach 128 and
+    # overflow the runner's merged persistent batch (req_index >= max_num_reqs).
+    coordinator = TTLaneCoordinator.__new__(TTLaneCoordinator)
+    coordinator._per_lane_max = 8
+    global_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=32))
 
-    coordinator._apply_per_lane_caps(lanes)
+    per_lane_config = coordinator._build_per_lane_vllm_config(global_config)
 
-    assert [lane.max_num_running_reqs for lane in lanes] == [8, 8, 8, 8]
-    # The capped lanes never sum past the global concurrency.
-    assert sum(lane.max_num_running_reqs for lane in lanes) == 32
+    # The lanes' config carries the per-lane cap...
+    assert per_lane_config.scheduler_config.max_num_seqs == 8
+    # ...while the shared global config the coordinator/runner read for KV and
+    # model sizing is left untouched (copied, not aliased/mutated).
+    assert global_config.scheduler_config.max_num_seqs == 32
+    assert per_lane_config.scheduler_config is not global_config.scheduler_config

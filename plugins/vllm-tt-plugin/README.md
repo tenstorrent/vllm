@@ -341,9 +341,12 @@ python plugins/vllm-tt-plugin/examples/server_example_tt.py \
 ```
 
 `--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
-each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. This is
-equivalent to the historical gathered DP=4 setup, so there is nothing to
-migrate. At startup the backend logs that it is running single-process lane-DP.
+each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. For
+these single-execute Galaxy models this replaces the gathered DP=4 setup they
+used historically, so there is nothing to migrate. This conversion is specific
+to the Galaxy generators; other model families still run `--data_parallel_size`
+as gathered multi-process DP (see [Runtime Architecture](#runtime-architecture)).
+At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
 
