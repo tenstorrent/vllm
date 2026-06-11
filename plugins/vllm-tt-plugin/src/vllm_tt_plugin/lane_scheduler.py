@@ -101,27 +101,11 @@ def merge_lane_scheduler_outputs(
     if not lane_outputs:
         return SchedulerOutput.make_empty()
 
-    # Fast path: no lane scheduled any tokens this step. We still need to
-    # propagate finished-request and freed-encoder bookkeeping so the runner can
-    # release that state, but everything else is empty.
-    if not any(out.total_num_scheduled_tokens > 0 for out in lane_outputs):
-        finished: set[str] = set()
-        free_encoder: list[str] = []
-        for out in lane_outputs:
-            finished |= out.finished_req_ids
-            free_encoder.extend(out.free_encoder_mm_hashes)
-        return SchedulerOutput(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={},
-            total_num_scheduled_tokens=0,
-            scheduled_spec_decode_tokens={},
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
-            finished_req_ids=finished,
-            free_encoder_mm_hashes=free_encoder,
-        )
-
+    # The general merge below already handles the "no lane scheduled any tokens"
+    # case correctly: every list/dict/set field aggregates to empty while
+    # ``finished_req_ids`` and ``free_encoder_mm_hashes`` (the bookkeeping the
+    # runner still needs to release that state) are unioned/extended as usual.
+    # So there is no separate fast path -- one path covers both.
     scheduled_new_reqs: list = []
     cached = CachedRequestData.make_empty()
     num_scheduled_tokens: dict[str, int] = {}
@@ -130,6 +114,7 @@ def merge_lane_scheduler_outputs(
     num_common_prefix_blocks: list[int] = []
     finished_req_ids: set[str] = set()
     free_encoder_mm_hashes: list[str] = []
+    preempted_req_ids: set[str] | None = None
     has_structured_output_requests = False
     pending_structured_output_tokens = False
     num_invalid_spec_tokens: dict[str, int] | None = None
@@ -173,6 +158,14 @@ def merge_lane_scheduler_outputs(
                 ]
         finished_req_ids |= out.finished_req_ids
         free_encoder_mm_hashes.extend(out.free_encoder_mm_hashes)
+        # A lane can preempt a running request under its own KV pressure. Union
+        # the per-lane sets (request IDs are globally unique); stay None unless
+        # some lane reported a preemption, matching the base output's "absent"
+        # representation rather than an empty set.
+        if out.preempted_req_ids:
+            if preempted_req_ids is None:
+                preempted_req_ids = set()
+            preempted_req_ids |= out.preempted_req_ids
         has_structured_output_requests |= out.has_structured_output_requests
         pending_structured_output_tokens |= out.pending_structured_output_tokens
         # Stays None unless some lane reported invalid spec tokens, matching the
@@ -193,6 +186,7 @@ def merge_lane_scheduler_outputs(
         num_common_prefix_blocks=num_common_prefix_blocks,
         finished_req_ids=finished_req_ids,
         free_encoder_mm_hashes=free_encoder_mm_hashes,
+        preempted_req_ids=preempted_req_ids,
         has_structured_output_requests=has_structured_output_requests,
         pending_structured_output_tokens=pending_structured_output_tokens,
         num_invalid_spec_tokens=num_invalid_spec_tokens,

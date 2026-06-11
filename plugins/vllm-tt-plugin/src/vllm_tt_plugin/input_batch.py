@@ -773,7 +773,9 @@ class TTLaneInputBatch(InputBatch):
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
 
-    def build_merged_sampling_metadata(self) -> SamplingMetadata:
+    def build_merged_sampling_metadata(
+        self, scheduled_rows: list[int] | None = None
+    ) -> SamplingMetadata:
         """Build one :class:`SamplingMetadata` over every slot row.
 
         Mirrors a normal single-engine vLLM ``SamplingMetadata`` build, but over
@@ -787,6 +789,15 @@ class TTLaneInputBatch(InputBatch):
         ``all_random`` is intentionally computed over the full tensor, so it is
         False whenever any gap exists; that keeps the sampler's div-by-zero
         guard active for the default-``temperature=0`` gap rows.
+
+        ``scheduled_rows`` are the rows actually producing a token this step. The
+        host sampler advances *every* per-request generator handed to it (one
+        ``exponential_`` draw per row in ``generators``), so only the scheduled
+        rows' generators are passed through: a seeded request occupying a slot
+        but not scheduled this step (e.g. a running decode request during a
+        prefill-only step) must not have its RNG advanced, or its token stream
+        would drift by one draw per step it sat out. ``None`` advances all live
+        generators (whole-batch fallback / tests).
         """
         n = self.max_num_reqs
         sampling = self.sampling
@@ -814,16 +825,32 @@ class TTLaneInputBatch(InputBatch):
         else:
             prompt_token_ids = None
             output_token_ids = [[] for _ in range(n)]
-        allowed_token_ids_mask = sampling.allowed_token_ids_mask
-        if allowed_token_ids_mask is not None:
-            allowed_token_ids_mask = allowed_token_ids_mask[:n]
+        # Only hand the sampler an allowlist mask when some live request
+        # actually constrains its tokens. The mask tensor is allocated lazily
+        # and never freed, and freed rows are reset to all-False, so once any
+        # request has ever used an allowlist the tensor lingers as an all-False
+        # no-op; passing it would just make the sampler do wasted masked_fill
+        # work. Gate on ``no_allowed_token_ids`` exactly like upstream.
+        if self.no_allowed_token_ids:
+            allowed_token_ids_mask = None
+        else:
+            allowed_token_ids_mask = sampling.allowed_token_ids_mask
+            if allowed_token_ids_mask is not None:
+                allowed_token_ids_mask = allowed_token_ids_mask[:n]
+        if scheduled_rows is None:
+            generators = dict(sampling.generators)
+        else:
+            scheduled = set(scheduled_rows)
+            generators = {
+                row: gen for row, gen in sampling.generators.items() if row in scheduled
+            }
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
             all_greedy=all_greedy,
             all_random=all_random,
             top_p=sampling.top_p[:n],
             top_k=sampling.top_k[:n],
-            generators=dict(sampling.generators),
+            generators=generators,
             max_num_logprobs=self.max_num_logprobs,
             no_penalties=no_penalties,
             prompt_token_ids=prompt_token_ids,

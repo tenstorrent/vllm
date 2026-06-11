@@ -2394,16 +2394,19 @@ class TTModelRunner:
         rows_all = list(range(total))
         tt_sampling_params = self._lane_sampling_params(rows_all)
 
-        prompt_tokens = output_tokens = None
-        if not lane_batch.no_penalties:
-            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
-            output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
-
         bitmask = self._lane_grammar_bitmask(grammar_output, total)
         has_structured = self._has_structured_outputs(scheduler_output, bitmask)
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=True, has_structured_outputs=has_structured
         )
+
+        # The prompt/output token tensors feed device-side penalties only. Host
+        # sampling rebuilds them itself in ``build_merged_sampling_metadata``, so
+        # building them here too would be dead work on the host path.
+        prompt_tokens = output_tokens = None
+        if perform_device_sampling and not lane_batch.no_penalties:
+            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
+            output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
         reset_batch = self._decode_layout_changed_since_last_decode
         self._decode_layout_changed_since_last_decode = False
         slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
@@ -2461,11 +2464,6 @@ class TTModelRunner:
         block_tables_per_group = self._lane_block_tables(rows, zero_gaps=False, total=0)
         tt_sampling_params = self._lane_sampling_params(rows)
 
-        prompt_tokens = output_tokens = None
-        if not lane_batch.no_penalties:
-            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows)
-            output_tokens = lane_batch.make_output_token_ids_tensor(rows)
-
         per_lane = lane_batch.per_lane
         lane_slots: list[list[int]] = [[] for _ in range(lane_batch.num_lanes)]
         for row in rows:
@@ -2477,6 +2475,14 @@ class TTModelRunner:
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=False, has_structured_outputs=has_structured
         )
+
+        # Device-side penalties only; host sampling rebuilds these in
+        # ``build_merged_sampling_metadata`` (over the full slot batch), so
+        # building them here on the host path would be dead work.
+        prompt_tokens = output_tokens = None
+        if perform_device_sampling and not lane_batch.no_penalties:
+            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows)
+            output_tokens = lane_batch.make_output_token_ids_tensor(rows)
 
         multi_modal_kwargs = (
             self._gather_multi_modal_inputs(req_indices=list(rows))
@@ -2639,7 +2645,7 @@ class TTModelRunner:
             self.apply_grammar_bitmask(logits, bitmask)
         sampling_metadata = cast(
             TTLaneInputBatch, self.input_batch
-        ).build_merged_sampling_metadata()
+        ).build_merged_sampling_metadata(scheduled_rows)
         sampler_output = self.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )

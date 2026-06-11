@@ -39,6 +39,16 @@ class TTFinalizedDecode:
     tt_log_probs: torch.Tensor | None
 
 
+def _is_host_decode_output(tt_out: Any) -> bool:
+    if isinstance(tt_out, torch.Tensor):
+        return True
+    if isinstance(tt_out, tuple):
+        return all(
+            tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        )
+    return False
+
+
 @dataclass(frozen=True)
 class SubmittedStepContext:
     """Immutable snapshot of the host state associated with one decode submit."""
@@ -624,21 +634,17 @@ class TTAsyncDecodeController:
         else:
             tt_out = submission.tt_out
 
-        if hasattr(runner.model, "process_decode_output_host"):
+        is_host_output = _is_host_decode_output(tt_out)
+        if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             tt_out = runner.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
-        else:
-            is_host_tensor = isinstance(tt_out, torch.Tensor)
-            is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        elif not is_host_output:
+            raise AttributeError(
+                "TT model must implement process_decode_output_host() "
+                "unless decode output is already a torch tensor"
             )
-            if not (is_host_tensor or is_host_tensor_tuple):
-                raise AttributeError(
-                    "TT model must implement process_decode_output_host() "
-                    "unless decode output is already a torch tensor"
-                )
 
         tt_log_probs = None
         assert isinstance(submission.sampling_params.enable_log_probs, torch.Tensor)
