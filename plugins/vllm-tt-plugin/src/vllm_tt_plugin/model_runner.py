@@ -191,6 +191,27 @@ def _concat_request_logprobs(
     )
 
 
+def _warn_if_nonfinite(tag: str, values: torch.Tensor, rows: list[int]) -> None:
+    """Diagnostic: log when an active (scheduled) row carries a non-finite
+    value. A NaN that reaches the request's logprobs serializes to an invalid
+    JSON float and crashes the API response, so catching it here pins whether
+    the model handed back bad logits or the host sampler produced bad logprobs.
+    Gap rows are excluded by construction: only ``rows`` are inspected."""
+    sub = values[torch.as_tensor(rows, dtype=torch.long)]
+    if torch.isfinite(sub).all():
+        return
+    flat = sub.reshape(len(rows), -1)
+    nan_local = torch.isnan(flat).any(dim=-1).nonzero(as_tuple=True)[0].tolist()
+    inf_local = torch.isinf(flat).any(dim=-1).nonzero(as_tuple=True)[0].tolist()
+    logger.warning(
+        "TT non-finite %s: active rows with nan=%s inf=%s (shape=%s)",
+        tag,
+        [rows[i] for i in nan_local],
+        [rows[i] for i in inf_local],
+        tuple(sub.shape),
+    )
+
+
 @dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
@@ -2640,6 +2661,11 @@ class TTModelRunner:
         # Host sampling over the full slot batch.
         total = cast(TTLaneInputBatch, self.input_batch).max_num_reqs
         logits = self._lane_host_logits(tt_out, scheduled_rows, is_decode, total)
+        _warn_if_nonfinite(
+            f"model_logits[{'decode' if is_decode else 'prefill'}]",
+            logits,
+            scheduled_rows,
+        )
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
             self.apply_grammar_bitmask(logits, bitmask)
@@ -2649,6 +2675,12 @@ class TTModelRunner:
         sampler_output = self.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
+        if sampler_output.logprobs_tensors is not None:
+            _warn_if_nonfinite(
+                f"sampler_logprobs[{'decode' if is_decode else 'prefill'}]",
+                sampler_output.logprobs_tensors.logprobs,
+                scheduled_rows,
+            )
         sampled = sampler_output.sampled_token_ids.reshape(-1)[rows_t].reshape(n, 1)
         logprobs = self._lane_host_logprobs(
             sampler_output.logprobs_tensors, scheduled_rows
@@ -2722,6 +2754,11 @@ class TTModelRunner:
                 logprobs=sampled_log_probs.unsqueeze(-1).to(torch.float32),
                 selected_token_ranks=torch.full((n,), -1, dtype=torch.int32),
             )
+        _warn_if_nonfinite(
+            f"device_logprobs[{'decode' if is_decode else 'prefill'}]",
+            logprobs_tensors.logprobs,
+            list(range(n)),
+        )
         return logprobs_tensors.tolists()
 
     def _finalize_lane_output(
