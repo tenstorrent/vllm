@@ -267,6 +267,7 @@ class InputBatch:
             # Normalize top_k <= 0 or >= vocab_size to vocab_size
             # (consider all tokens)
             top_k = self.vocab_size
+        # Workaround for https://github.com/tenstorrent/tt-metal/issues/46827
         # top_k == 1 means greedy/argmax for this request. The on-device sampler
         # always builds a fixed top-32 candidate set and its per-user top_k does
         # NOT collapse that set to a single token before the RNG draw, so with
