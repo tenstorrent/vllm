@@ -170,6 +170,25 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
+    # tt_symbiote-ported models (generic tiered adapter in tt-inference-server's
+    # vllm-tt-metal/src/tt_symbiote_generators.py; one row per RUNTIME_PINS model).
+    # Registered HERE — in the `vllm.general_plugins` hook that runs in EVERY
+    # process the `tt` platform loads — not only in the run_vllm_api_server
+    # entrypoint (parent-only). The vLLM v1 engine-core subprocess never runs the
+    # entrypoint's main(), so without this a multimodal tt_symbiote model
+    # (e.g. dots.ocr) resolves in the engine worker to a class missing
+    # `_processor_factory` (MULTIMODAL_REGISTRY assertion). Force-register (not
+    # _if_missing) so the import-path entry wins over any propagated stale entry,
+    # ensuring tt_symbiote_generators is (re)imported and its per-arch multimodal
+    # subclasses (with `_processor_factory`) are synthesized in this process.
+    try:
+        from tt_symbiote_generators import registration_entries
+
+        for tt_arch, import_path in registration_entries().items():
+            ModelRegistry.register_model(tt_arch, import_path)
+    except Exception as e:
+        logger.info("tt_symbiote model registration skipped: %r", e)
+
     # Optionally register test models if explicitly enabled
     if register_test_models:
         register_tt_test_models()
