@@ -49,7 +49,7 @@ from vllm_tt_plugin.input_batch import (
     InputBatch,
     TTLaneInputBatch,
 )
-from vllm_tt_plugin.lane_scheduler import LaneStepMetadata
+from vllm_tt_plugin.lane_scheduler import TTStepPlan, get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
@@ -293,13 +293,9 @@ class TTModelInput:
     # per-rank [B] tensors for DP).
     slot_remap: torch.Tensor | None = None
 
-    # Single-process lane DP only: the stable lane-local device slot for each
-    # active request, per lane and aligned with that lane's request order. Lets
-    # prefill place users at their stable ``empty_slots`` and lets decode output
-    # extraction read each request back from its slot instead of assuming active
-    # requests are packed at the front of the lane block. ``None`` for non-lane
-    # paths (gather-DP / non-DP), which keep the contiguous-front convention.
-    lane_slots: list[list[int]] | None = None
+    # Single-process DP prefill only: global stable slots supplied by the
+    # scheduler-owned step plan. ``None`` for non-DP, gathered-DP, and decode.
+    prefill_empty_slots: list[int] | None = None
 
 
 class TTModelRunner:
@@ -2097,10 +2093,6 @@ class TTModelRunner:
 
         if os.environ.get("DP_GATHER_DEBUG") == "1":
             logger.info("batch_size_per_dp=%s", batch_size_per_dp)
-        # ``lane_slots`` is only used by single-process lane mode, which builds
-        # its inputs directly from ``TTLaneInputBatch`` and never reaches this
-        # gathered-DP concat.
-        lane_slots = None
         merged = TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -2128,7 +2120,7 @@ class TTModelRunner:
             max_num_logprobs=max_num_logprobs,
             logitsprocs_list=logitsprocs_list,
             generators_list=generators_list,
-            lane_slots=lane_slots,
+            prefill_empty_slots=None,
         )
         return merged
 
@@ -2198,41 +2190,18 @@ class TTModelRunner:
     # it updates the batch, reads the slot-ordered rows straight into one
     # merged device input, executes, and samples the whole slot batch once.
 
-    def _lane_scheduled_rows(self, scheduler_output: SchedulerOutput) -> list[int]:
-        """Persistent rows (== device slots) of the requests scheduled this
-        step, in ascending (lane-major, slot) order. Decode schedules every
-        running request (all occupied rows); prefill schedules only the new /
-        resumed requests."""
-        rows = [
-            row
-            for req_id in scheduler_output.num_scheduled_tokens
-            if (row := self.input_batch.req_id_to_index.get(req_id)) is not None
-        ]
-        return sorted(rows)
-
     def _update_lane_states(
-        self, scheduler_output: SchedulerOutput, meta: LaneStepMetadata
+        self, scheduler_output: SchedulerOutput, plan: TTStepPlan
     ) -> None:
-        """Update cached states and the lane batch from the merged scheduler
-        output, placing each request in its scheduler-assigned lane.
+        """Update cached states and the stable-slot batch from the step plan.
 
         Unlike the base ``_update_states`` this does **not** evict
-        merely-unscheduled requests: a lane prefill step leaves the other
-        lanes' running decodes unscheduled, and freeing their stable device
-        slot would move it on the next decode and disturb the on-device
-        per-slot seed RNG. Only finished requests (and resumed-from-preemption
-        requests, whose KV was rebuilt) release their slot. There is no
-        condense -- the lane batch keeps stable slots.
+        merely-unscheduled requests: a prefill step can leave running decodes
+        unscheduled, and freeing their stable device slot would disturb the
+        on-device per-slot seed RNG. Only finished requests and resumed requests
+        whose KV was rebuilt release their slot. There is no condense.
         """
         lane_batch = cast(TTLaneInputBatch, self.input_batch)
-        # req_id -> lane for this step's scheduled requests. A request is
-        # scheduled in exactly one lane, so this is unambiguous, and it covers
-        # every request that will be (re-)added to the batch below.
-        lane_of_req: dict[str, int] = {}
-        for lane, lane_output in enumerate(meta.lane_outputs):
-            for req_id in lane_output.num_scheduled_tokens:
-                lane_of_req[req_id] = lane
-
         layout_changed = False
 
         # Finished requests release their slot.
@@ -2306,9 +2275,9 @@ class TTModelRunner:
             if new_block_ids is not None:
                 lane_batch.block_table.append_row(new_block_ids, req_index)
 
-        # Place new / resumed requests in their lane's chunk.
+        # Place new / resumed requests at scheduler-owned stable rows.
         for req_id in req_ids_to_add:
-            lane_batch.add_request_to_lane(self.requests[req_id], lane_of_req[req_id])
+            lane_batch.add_request_to_row(self.requests[req_id], plan.req_id_to_row[req_id])
             layout_changed = True
 
         if layout_changed:
@@ -2392,13 +2361,16 @@ class TTModelRunner:
         )
 
     def _build_lane_decode_input(
-        self, scheduler_output: SchedulerOutput, grammar_output: GrammarOutput | None
+        self,
+        scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
+        plan: TTStepPlan,
     ) -> TTModelInput:
-        """Build the merged decode input straight from the slot-ordered lane
+        """Build the merged decode input straight from the slot-ordered
         batch. Every slot is present (gaps padded), so this is the device
         decode batch with no scatter: row == device slot."""
         lane_batch = cast(TTLaneInputBatch, self.input_batch)
-        total = lane_batch.max_num_reqs
+        total = plan.capacity
         occupied = lane_batch.occupied_rows()
 
         num_tokens = lane_batch.num_tokens
@@ -2440,7 +2412,7 @@ class TTModelRunner:
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             # Device decodes every slot; only used for the empty-batch guard.
-            unpadded_batch_size=total,
+            unpadded_batch_size=list(plan.batch_size_per_dp),
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs={},
             perform_device_sampling=perform_device_sampling,
@@ -2456,24 +2428,24 @@ class TTModelRunner:
             max_num_logprobs=[lane_batch.max_num_logprobs],
             logitsprocs_list=[None],
             generators_list=[{}],
-            lane_slots=None,
+            prefill_empty_slots=None,
         )
 
     def _build_lane_prefill_input(
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
-        scheduled_rows: list[int],
+        plan: TTStepPlan,
     ) -> TTModelInput:
         """Build the prefill input for the requests scheduled this step.
 
-        Prefill rows are front-packed in lane-major (== ``scheduled_rows``)
-        order; ``lane_slots`` carries their lane-local slots so ``submit_prefill``
-        seeds each new user at the device slot decode will read it from. The
-        output is one token per prefilled request, in this same order.
+        Prefill rows are front-packed in scheduler plan order. The plan carries
+        the stable slots so ``submit_prefill`` seeds each user at the device row
+        decode will read it from. The output is one token per prefilled request,
+        in this same order.
         """
         lane_batch = cast(TTLaneInputBatch, self.input_batch)
-        rows = scheduled_rows
+        rows = list(plan.input_rows)
         rows_np = np.asarray(rows, dtype=np.int64)
         input_positions = torch.from_numpy(
             lane_batch.num_computed_tokens_cpu[rows_np].astype(np.int32)
@@ -2485,11 +2457,7 @@ class TTModelRunner:
         block_tables_per_group = self._lane_block_tables(rows, zero_gaps=False, total=0)
         tt_sampling_params = self._lane_sampling_params(rows)
 
-        per_lane = lane_batch.per_lane
-        lane_slots: list[list[int]] = [[] for _ in range(lane_batch.num_lanes)]
-        for row in rows:
-            lane_slots[row // per_lane].append(row % per_lane)
-        batch_size_per_dp = [len(slots) for slots in lane_slots]
+        batch_size_per_dp = list(plan.batch_size_per_dp)
 
         bitmask = self._lane_grammar_bitmask(grammar_output, lane_batch.max_num_reqs)
         has_structured = self._has_structured_outputs(scheduler_output, bitmask)
@@ -2532,7 +2500,11 @@ class TTModelRunner:
             max_num_logprobs=[lane_batch.max_num_logprobs],
             logitsprocs_list=[None],
             generators_list=[{}],
-            lane_slots=lane_slots,
+            prefill_empty_slots=(
+                list(plan.prefill_empty_slots)
+                if plan.prefill_empty_slots is not None
+                else None
+            ),
         )
 
     @torch.no_grad()
@@ -2543,8 +2515,8 @@ class TTModelRunner:
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         """Execute one merged multi-lane TT step in a single process."""
-        meta = getattr(scheduler_output, "_tt_lane_step_metadata", None)
-        if meta is None:
+        plan = get_tt_step_plan(scheduler_output)
+        if plan is None:
             return self.execute_model(
                 scheduler_output, grammar_output, intermediate_tensors
             )
@@ -2558,18 +2530,18 @@ class TTModelRunner:
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
             self.async_decode.wait_for_all_pending_async_steps()
 
-        self._update_lane_states(scheduler_output, meta)
+        self._update_lane_states(scheduler_output, plan)
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        is_decode = meta.is_decode
-        scheduled_rows = self._lane_scheduled_rows(scheduler_output)
+        is_decode = plan.is_decode
+        scheduled_rows = list(plan.scheduled_rows)
         if not scheduled_rows:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         if is_decode:
             model_input = self._build_lane_decode_input(
-                scheduler_output, grammar_output
+                scheduler_output, grammar_output, plan
             )
             non_block = self.non_dp_async_scheduling
             if non_block:
@@ -2591,7 +2563,7 @@ class TTModelRunner:
             )
         else:
             model_input = self._build_lane_prefill_input(
-                scheduler_output, grammar_output, scheduled_rows
+                scheduler_output, grammar_output, plan
             )
             tt_out = self.submit_prefill(model_input, model_input.unpadded_batch_size)
             tt_log_probs = None
@@ -2913,23 +2885,16 @@ class TTModelRunner:
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
         if len(batch_size_per_dp) > 1:
-            # TODO: the model should only require DP ranks, but passing
-            # "global" user ids instead for backwards compatibility.
-            stride = self.tt_per_lane_max_num_seqs
-            empty_slots = []
-            if model_input.lane_slots is not None:
-                # Lane DP: place each new user at its stable lane-local slot so
-                # the seed/KV state set here is read back from the same slot at
-                # decode. ``lane_slots`` is per-lane in request order, matching
-                # the lane-major, request-order row concatenation above.
-                for dp_rank, slots in enumerate(model_input.lane_slots):
-                    for slot in slots:
-                        empty_slots.append(dp_rank * stride + slot)
-            else:
+            empty_slots = model_input.prefill_empty_slots
+            if empty_slots is None:
+                # TODO: the model should only require DP ranks, but passing
+                # "global" user ids instead for backwards compatibility.
+                stride = self.tt_per_lane_max_num_seqs
+                empty_slots = []
                 for dp_rank, sz in enumerate(batch_size_per_dp):
                     for i in range(int(sz)):
                         empty_slots.append(dp_rank * stride + i)
-            kwargs["empty_slots"] = empty_slots
+            kwargs["empty_slots"] = list(empty_slots)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

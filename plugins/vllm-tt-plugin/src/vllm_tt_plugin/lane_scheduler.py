@@ -18,9 +18,8 @@ This module bridges vLLM's single-queue scheduler to that layout:
   block IDs independently: block IDs repeat across lanes, which is correct since
   the model runner routes each lane's block table to its own submesh.
 - ``merge_lane_scheduler_outputs`` performs that stitching.
-- ``LaneStepMetadata`` rides along on the merged output so the model runner can
-  recover which requests belonged to which lane and place them in that lane's
-  slot chunk of the merged device batch.
+- ``TTStepPlan`` rides along on the merged output so the model runner receives
+  a device-row plan instead of lane internals.
 
 Because the device executes all lanes together, every lane in a step must agree
 on a single scheduling mode (all-prefill or all-decode); the coordinator
@@ -63,13 +62,12 @@ logger = init_logger(__name__)
 
 @dataclass
 class LaneStepMetadata:
-    """Per-step lane bookkeeping the coordinator hands the model runner.
+    """Scheduler-private lane bookkeeping for update paths.
 
-    The coordinator merges every lane's work into one ``SchedulerOutput``, which
-    erases the lane boundaries. This metadata records which requests belonged to
-    which lane (via each lane's own ``SchedulerOutput``) and whether the step is
-    decode-only, so the runner can place each request in its lane's slot chunk
-    of the merged device batch (see ``TTModelRunner._update_lane_states``).
+    The coordinator merges every lane's work into one ``SchedulerOutput``. Lane
+    schedulers still need their original per-lane output when
+    ``update_from_output`` runs, but the model runner should only see
+    ``TTStepPlan``.
     """
 
     # The raw, unmerged output for each lane (empty for idle lanes), in lane
@@ -79,6 +77,31 @@ class LaneStepMetadata:
     # True if this is a decode-only step, False if prefill-only. Lanes never mix
     # the two within a step (a TT device constraint).
     is_decode: bool
+
+
+@dataclass(frozen=True)
+class TTStepPlan:
+    """Runner-facing physical layout for one single-process lane-DP step."""
+
+    is_decode: bool
+    capacity: int
+    scheduled_req_ids: tuple[str, ...]
+    scheduled_rows: tuple[int, ...]
+    input_rows: tuple[int, ...]
+    req_id_to_row: dict[str, int]
+    batch_size_per_dp: tuple[int, ...]
+    prefill_empty_slots: tuple[int, ...] | None
+
+
+@dataclass(frozen=True)
+class _LaneStepState:
+    lane_outputs: list[SchedulerOutput]
+    plan: TTStepPlan
+
+
+def get_tt_step_plan(scheduler_output: SchedulerOutput) -> TTStepPlan | None:
+    state: _LaneStepState | None = getattr(scheduler_output, "_tt_step_state", None)
+    return None if state is None else state.plan
 
 
 def merge_lane_scheduler_outputs(
@@ -208,8 +231,8 @@ class TTLaneCoordinator(SchedulerInterface):
     The coordinator implements :class:`SchedulerInterface` by routing requests
     to their lane, negotiating the single shared scheduling mode each step,
     running every lane, and merging the per-lane results into one engine-facing
-    ``SchedulerOutput`` tagged with :class:`LaneStepMetadata` so the runner can
-    split it apart again.
+    ``SchedulerOutput`` tagged with :class:`TTStepPlan` so the runner only sees
+    device rows and slots.
     """
 
     def __init__(
@@ -230,6 +253,11 @@ class TTLaneCoordinator(SchedulerInterface):
         # Max concurrent running requests a single lane may hold.
         self._per_lane_max = get_tt_per_lane_max_num_seqs(vllm_config)
         self._last_lane_metadata: LaneStepMetadata | None = None
+        self._req_to_lane: dict[str, int] = {}
+        self._req_to_row: dict[str, int] = {}
+        self._free_slots_by_lane: list[list[int]] = [
+            list(range(self._per_lane_max)) for _ in range(self.num_lanes)
+        ]
         # No KV connector on TT; surfaced for engine-core attribute access.
         self.connector: KVConnectorBase_V1 | None = None
 
@@ -297,8 +325,8 @@ class TTLaneCoordinator(SchedulerInterface):
         lane coordinator stands in for vLLM's multi-process DP load balancer, so
         it keeps the same policy.
 
-        Assignment is static: a request is bound to one lane here at admission
-        (recorded on ``request.tt_lane`` in ``add_request``) and never migrates,
+        Assignment is static: a request is bound to one lane at admission
+        (recorded in the coordinator's maps) and never migrates,
         exactly as vLLM DP binds each request to one engine at intake with no
         later migration. So a lane can sit idle while another has queued work --
         no worse than the gathered-DP behavior this replaces. Cross-lane
@@ -366,6 +394,95 @@ class TTLaneCoordinator(SchedulerInterface):
     # SchedulerInterface: scheduling
     # ------------------------------------------------------------------
 
+    def _lane_for_req(self, req_id: str) -> int:
+        return self._req_to_lane[req_id]
+
+    def _assign_slot(self, req_id: str, lane: int) -> int:
+        existing = self._req_to_row.get(req_id)
+        if existing is not None:
+            return existing
+        free_slots = self._free_slots_by_lane[lane]
+        if not free_slots:
+            raise ValueError(
+                f"lane {lane} has no free slot (capacity {self._per_lane_max})"
+            )
+        local_slot = free_slots.pop(0)
+        row = lane * self._per_lane_max + local_slot
+        self._req_to_row[req_id] = row
+        return row
+
+    def _release_slot(self, req_id: str) -> None:
+        row = self._req_to_row.pop(req_id, None)
+        if row is None:
+            return
+        lane = row // self._per_lane_max
+        local_slot = row % self._per_lane_max
+        free_slots = self._free_slots_by_lane[lane]
+        if local_slot not in free_slots:
+            free_slots.append(local_slot)
+            free_slots.sort()
+
+    def _lane_of_scheduled_reqs(
+        self, lane_outputs: list[SchedulerOutput]
+    ) -> dict[str, int]:
+        lane_of_req: dict[str, int] = {}
+        for lane, lane_output in enumerate(lane_outputs):
+            for req_id in lane_output.num_scheduled_tokens:
+                lane_of_req[req_id] = lane
+        return lane_of_req
+
+    def _build_step_plan(
+        self,
+        lane_outputs: list[SchedulerOutput],
+        merged: SchedulerOutput,
+        is_decode: bool,
+    ) -> TTStepPlan:
+        lane_of_req = self._lane_of_scheduled_reqs(lane_outputs)
+        for req_id in merged.finished_req_ids:
+            self._release_slot(req_id)
+            self._req_to_lane.pop(req_id, None)
+
+        resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
+        for req_id in resumed_req_ids:
+            self._release_slot(req_id)
+
+        for req_id in merged.num_scheduled_tokens:
+            lane = lane_of_req.get(req_id, self._req_to_lane.get(req_id))
+            if lane is None:
+                raise KeyError(f"no TT lane recorded for scheduled request {req_id!r}")
+            self._req_to_lane[req_id] = lane
+            self._assign_slot(req_id, lane)
+
+        scheduled_pairs = [
+            (req_id, self._req_to_row[req_id])
+            for req_id in merged.num_scheduled_tokens
+            if req_id in self._req_to_row
+        ]
+        scheduled_pairs.sort(key=lambda item: item[1])
+        scheduled_req_ids = tuple(req_id for req_id, _ in scheduled_pairs)
+        scheduled_rows = tuple(row for _, row in scheduled_pairs)
+        capacity = self.num_lanes * self._per_lane_max
+        input_rows = tuple(range(capacity)) if is_decode else scheduled_rows
+        if is_decode:
+            batch_size_per_dp = tuple([self._per_lane_max] * self.num_lanes)
+            prefill_empty_slots = None
+        else:
+            per_lane_counts = [0] * self.num_lanes
+            for row in scheduled_rows:
+                per_lane_counts[row // self._per_lane_max] += 1
+            batch_size_per_dp = tuple(per_lane_counts)
+            prefill_empty_slots = scheduled_rows
+        return TTStepPlan(
+            is_decode=is_decode,
+            capacity=capacity,
+            scheduled_req_ids=scheduled_req_ids,
+            scheduled_rows=scheduled_rows,
+            input_rows=input_rows,
+            req_id_to_row=dict(self._req_to_row),
+            batch_size_per_dp=batch_size_per_dp,
+            prefill_empty_slots=prefill_empty_slots,
+        )
+
     def schedule(self) -> SchedulerOutput:
         forced_mode = self._negotiate_forced_mode()
         lane_outputs = self._schedule_all_lanes(forced_mode)
@@ -396,12 +513,12 @@ class TTLaneCoordinator(SchedulerInterface):
             )
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
+        plan = self._build_step_plan(lane_outputs, merged, is_decode)
         self._last_lane_metadata = LaneStepMetadata(
             lane_outputs=lane_outputs,
             is_decode=is_decode,
         )
-        # Smuggle the metadata across to the runner on the output object itself.
-        merged._tt_lane_step_metadata = self._last_lane_metadata
+        merged._tt_step_state = _LaneStepState(lane_outputs=lane_outputs, plan=plan)
         return merged
 
     def get_grammar_bitmask(
@@ -437,10 +554,8 @@ class TTLaneCoordinator(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        meta: LaneStepMetadata | None = getattr(
-            scheduler_output, "_tt_lane_step_metadata", None
-        )
-        if meta is None:
+        state: _LaneStepState | None = getattr(scheduler_output, "_tt_step_state", None)
+        if state is None:
             return {}
 
         # Each lane scheduler processes only its own SchedulerOutput. The merged
@@ -450,7 +565,9 @@ class TTLaneCoordinator(SchedulerInterface):
         # num_scheduled_tokens, so a lane only ever touches its own requests.
         per_lane_outputs: list[dict[int, EngineCoreOutputs]] = [
             sched.update_from_output(lane_output, model_runner_output)
-            for sched, lane_output in zip(self.lanes, meta.lane_outputs, strict=True)
+            for sched, lane_output in zip(
+                self.lanes, state.lane_outputs, strict=True
+            )
         ]
         merged = self._merge_engine_core_outputs(per_lane_outputs)
 
@@ -499,12 +616,10 @@ class TTLaneCoordinator(SchedulerInterface):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
-        meta: LaneStepMetadata | None = getattr(
-            scheduler_output, "_tt_lane_step_metadata", None
-        )
-        if meta is None:
+        state: _LaneStepState | None = getattr(scheduler_output, "_tt_step_state", None)
+        if state is None:
             return
-        for sched, lane_output in zip(self.lanes, meta.lane_outputs, strict=True):
+        for sched, lane_output in zip(self.lanes, state.lane_outputs, strict=True):
             sched.update_draft_token_ids_in_output(draft_token_ids, lane_output)
 
     # ------------------------------------------------------------------
@@ -512,21 +627,12 @@ class TTLaneCoordinator(SchedulerInterface):
     # ------------------------------------------------------------------
 
     def add_request(self, request: Request) -> None:
-        # Bind the request to a lane before handing it to that lane's scheduler.
-        # ``request.tt_lane`` is the coordinator's own ownership state: a request
-        # already carrying a valid lane keeps it (e.g. re-add of a request the
-        # coordinator previously placed); otherwise balance onto the least-loaded
-        # lane via ``_pick_lane``. Assignment is static -- see ``_pick_lane`` --
-        # so once set the lane never changes.
-        #
-        # There is no user-facing preferred-lane routing: ``InputProcessor``
-        # rejects any request whose ``data_parallel_rank`` exceeds the engine's
-        # DP rank count, which is always 1 for the in-process lane coordinator
-        # (vLLM sees a single engine). So no real request can carry a meaningful
-        # per-lane preference here, and lane choice is purely the coordinator's.
-        request_lane = getattr(request, "tt_lane", -1)
-        lane = request_lane if 0 <= request_lane < self.num_lanes else self._pick_lane()
-        request.tt_lane = lane
+        # Bind the request before handing it to a lane scheduler. The binding is
+        # coordinator-owned state; the shared vLLM Request object stays generic.
+        lane = self._req_to_lane.get(request.request_id)
+        if lane is None:
+            lane = self._pick_lane()
+            self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
 
     def finish_requests(

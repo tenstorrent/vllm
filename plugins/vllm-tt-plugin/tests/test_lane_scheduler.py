@@ -11,8 +11,9 @@ scheduling, and ``update_from_output``).
 from types import SimpleNamespace
 
 from vllm_tt_plugin.lane_scheduler import (
-    LaneStepMetadata,
+    TTStepPlan,
     TTLaneCoordinator,
+    get_tt_step_plan,
 )
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 
@@ -67,7 +68,19 @@ def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
     coordinator.structured_output_manager = None
     coordinator.connector = None
     coordinator._last_lane_metadata = None
+    coordinator._req_to_lane = {}
+    coordinator._req_to_row = {}
+    coordinator._free_slots_by_lane = [
+        list(range(per_lane_max)) for _ in range(len(lanes))
+    ]
     return coordinator
+
+
+def _scheduled_output(req_ids):
+    out = SchedulerOutput.make_empty()
+    out.num_scheduled_tokens = {req_id: 1 for req_id in req_ids}
+    out.total_num_scheduled_tokens = len(req_ids)
+    return out
 
 
 def test_negotiate_prefill_when_any_lane_wants_prefill():
@@ -140,19 +153,13 @@ def test_update_from_output_routes_and_merges_per_lane():
     lane0._eco = {0: EngineCoreOutputs(outputs=["a"])}
     lane1._eco = {0: EngineCoreOutputs(outputs=["b"], finished_requests={"x"})}
     coordinator = _make_coordinator([lane0, lane1])
-
-    out0 = SchedulerOutput.make_empty()
-    out1 = SchedulerOutput.make_empty()
-    scheduler_output = SchedulerOutput.make_empty()
-    scheduler_output._tt_lane_step_metadata = LaneStepMetadata(
-        lane_outputs=[out0, out1], is_decode=True
-    )
+    scheduler_output = coordinator.schedule()
 
     merged = coordinator.update_from_output(scheduler_output, model_runner_output=None)
 
     # Each lane received its own SchedulerOutput.
-    assert lane0.update_calls == [out0]
-    assert lane1.update_calls == [out1]
+    assert lane0.update_calls == [scheduler_output._tt_step_state.lane_outputs[0]]
+    assert lane1.update_calls == [scheduler_output._tt_step_state.lane_outputs[1]]
     # Per-client outputs concatenated and finished sets unioned.
     assert merged[0].outputs == ["a", "b"]
     assert merged[0].finished_requests == {"x"}
@@ -163,6 +170,50 @@ def test_update_from_output_routes_and_merges_per_lane():
 def test_update_from_output_no_metadata_returns_empty():
     coordinator = _make_coordinator([FakeLane(), FakeLane()])
     assert coordinator.update_from_output(SchedulerOutput.make_empty(), None) == {}
+
+
+def test_schedule_attaches_runner_step_plan_with_stable_rows():
+    lane0 = FakeLane()
+    lane1 = FakeLane()
+    coordinator = _make_coordinator([lane0, lane1], per_lane_max=4)
+    lane0.schedule = lambda: _scheduled_output(["a", "b"])
+    lane1.schedule = lambda: _scheduled_output(["c"])
+    coordinator._req_to_lane = {"a": 0, "b": 0, "c": 1}
+    coordinator._assign_slot("a", 0)
+    coordinator._assign_slot("b", 0)
+    coordinator._assign_slot("c", 1)
+
+    output = coordinator.schedule()
+    plan = get_tt_step_plan(output)
+
+    assert isinstance(plan, TTStepPlan)
+    assert plan.is_decode is True
+    assert plan.scheduled_rows == (0, 1, 4)
+    assert plan.scheduled_req_ids == ("a", "b", "c")
+    assert plan.input_rows == tuple(range(8))
+    assert plan.batch_size_per_dp == (4, 4)
+    assert plan.prefill_empty_slots is None
+
+
+def test_prefill_step_plan_exposes_empty_slots_without_lane_metadata():
+    lane0 = FakeLane()
+    lane1 = FakeLane(waiting=1)
+    coordinator = _make_coordinator([lane0, lane1], per_lane_max=4)
+    lane0.schedule = SchedulerOutput.make_empty
+    lane1.schedule = lambda: _scheduled_output(["a"])
+    coordinator._req_to_lane = {"a": 1}
+
+    output = coordinator.schedule()
+    plan = get_tt_step_plan(output)
+
+    assert isinstance(plan, TTStepPlan)
+    assert plan.is_decode is False
+    assert plan.scheduled_rows == (4,)
+    assert plan.scheduled_req_ids == ("a",)
+    assert plan.input_rows == (4,)
+    assert plan.batch_size_per_dp == (0, 1)
+    assert plan.prefill_empty_slots == (4,)
+    assert not hasattr(output, "_tt_lane_step_metadata")
 
 
 def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():

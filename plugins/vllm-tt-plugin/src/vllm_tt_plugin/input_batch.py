@@ -690,6 +690,19 @@ class TTLaneInputBatch(InputBatch):
         self._lane_of[request.req_id] = lane
         return row
 
+    def add_request_to_row(self, request: "CachedRequestState", row: int) -> int:
+        """Materialize a scheduler-owned stable row assignment."""
+        if not (0 <= row < self.max_num_reqs):
+            raise ValueError(f"row {row} out of range [0, {self.max_num_reqs})")
+        if self._req_ids[row] is not None and self._req_ids[row] != request.req_id:
+            raise ValueError(f"row {row} is already occupied")
+        builder = self.sampling.batch_update_builder
+        if row in builder._removed:
+            builder._removed.remove(row)
+        super().add_request(request, row)
+        self._lane_of[request.req_id] = row // self.per_lane
+        return row
+
     def _claim_free_slot(self, lane: int) -> int:
         """Lowest free row in ``lane``'s chunk, reconciled with pending removals.
 

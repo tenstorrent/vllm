@@ -120,19 +120,7 @@ class TTExecutionMixin:
         return result[0]
 
     def preprocess_add_request(self, request: Any) -> tuple[Request, int]:
-        """Initialize the TT lane-ownership marker on an incoming request.
-
-        Sets ``tt_lane`` to ``-1`` (unassigned); ``lane_scheduler.
-        TTLaneCoordinator`` picks the lane at admission and records it here.
-        There is no user-facing preferred-lane routing -- vLLM sees a single
-        engine in lane mode, so a request cannot carry a meaningful DP rank to
-        honor (see ``TTLaneCoordinator.add_request``).
-        """
-        req, request_wave = super().preprocess_add_request(request)
-        # Keep this TT-only marker plugin-local rather than extending the shared
-        # vLLM Request model.
-        req.tt_lane = -1
-        return req, request_wave
+        return super().preprocess_add_request(request)
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """TT regular execution path.
