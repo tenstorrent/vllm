@@ -60,25 +60,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@dataclass
-class LaneStepMetadata:
-    """Scheduler-private lane bookkeeping for update paths.
-
-    The coordinator merges every lane's work into one ``SchedulerOutput``. Lane
-    schedulers still need their original per-lane output when
-    ``update_from_output`` runs, but the model runner should only see
-    ``TTStepPlan``.
-    """
-
-    # The raw, unmerged output for each lane (empty for idle lanes), in lane
-    # order. The runner reads each lane's scheduled requests from it to assign
-    # them to that lane.
-    lane_outputs: list[SchedulerOutput]
-    # True if this is a decode-only step, False if prefill-only. Lanes never mix
-    # the two within a step (a TT device constraint).
-    is_decode: bool
-
-
 @dataclass(frozen=True)
 class TTStepPlan:
     """Runner-facing physical layout for one single-process lane-DP step."""
@@ -95,12 +76,34 @@ class TTStepPlan:
 
 @dataclass(frozen=True)
 class _LaneStepState:
+    # The raw, unmerged output for each lane (empty for idle lanes), in lane
+    # order. The coordinator's update paths read each lane's scheduled requests
+    # back from it; the runner sees only ``plan``.
     lane_outputs: list[SchedulerOutput]
     plan: TTStepPlan
 
 
+# The coordinator stashes per-step lane state on the engine-facing
+# ``SchedulerOutput`` so the runner sees only ``TTStepPlan`` while the
+# coordinator's own update paths can still recover each lane's unmerged output.
+# This relies on ``SchedulerOutput`` being a plain attrs-mutable dataclass with
+# no ``__slots__``; the attribute is invisible in that class's definition, so
+# every access goes through the two helpers below to keep the name in one place.
+_TT_STEP_STATE_ATTR = "_tt_step_state"
+
+
+def _set_tt_step_state(
+    scheduler_output: SchedulerOutput, state: _LaneStepState
+) -> None:
+    setattr(scheduler_output, _TT_STEP_STATE_ATTR, state)
+
+
+def _get_tt_step_state(scheduler_output: SchedulerOutput) -> _LaneStepState | None:
+    return getattr(scheduler_output, _TT_STEP_STATE_ATTR, None)
+
+
 def get_tt_step_plan(scheduler_output: SchedulerOutput) -> TTStepPlan | None:
-    state: _LaneStepState | None = getattr(scheduler_output, "_tt_step_state", None)
+    state = _get_tt_step_state(scheduler_output)
     return None if state is None else state.plan
 
 
@@ -166,7 +169,10 @@ def merge_lane_scheduler_outputs(
         scheduled_spec_decode_tokens.update(out.scheduled_spec_decode_tokens)
         scheduled_encoder_inputs.update(out.scheduled_encoder_inputs)
         # Take the elementwise max so the merged batch reserves enough common
-        # prefix blocks for the most demanding lane.
+        # prefix blocks for the most demanding lane. All lanes share one
+        # ``kv_cache_config`` and so report one entry per KV cache group, making
+        # the per-lane lists equal length; ``strict=True`` turns any mismatch
+        # into an error instead of silently dropping the extra groups.
         if out.num_common_prefix_blocks:
             if not num_common_prefix_blocks:
                 num_common_prefix_blocks = list(out.num_common_prefix_blocks)
@@ -176,7 +182,7 @@ def merge_lane_scheduler_outputs(
                     for a, b in zip(
                         num_common_prefix_blocks,
                         out.num_common_prefix_blocks,
-                        strict=False,
+                        strict=True,
                     )
                 ]
         finished_req_ids |= out.finished_req_ids
@@ -252,7 +258,6 @@ class TTLaneCoordinator(SchedulerInterface):
         self.num_lanes = get_tt_data_parallel_size(vllm_config)
         # Max concurrent running requests a single lane may hold.
         self._per_lane_max = get_tt_per_lane_max_num_seqs(vllm_config)
-        self._last_lane_metadata: LaneStepMetadata | None = None
         self._req_to_lane: dict[str, int] = {}
         self._req_to_row: dict[str, int] = {}
         self._free_slots_by_lane: list[list[int]] = [
@@ -514,11 +519,7 @@ class TTLaneCoordinator(SchedulerInterface):
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
         plan = self._build_step_plan(lane_outputs, merged, is_decode)
-        self._last_lane_metadata = LaneStepMetadata(
-            lane_outputs=lane_outputs,
-            is_decode=is_decode,
-        )
-        merged._tt_step_state = _LaneStepState(lane_outputs=lane_outputs, plan=plan)
+        _set_tt_step_state(merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan))
         return merged
 
     def get_grammar_bitmask(
@@ -554,7 +555,7 @@ class TTLaneCoordinator(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        state: _LaneStepState | None = getattr(scheduler_output, "_tt_step_state", None)
+        state = _get_tt_step_state(scheduler_output)
         if state is None:
             return {}
 
@@ -565,9 +566,7 @@ class TTLaneCoordinator(SchedulerInterface):
         # num_scheduled_tokens, so a lane only ever touches its own requests.
         per_lane_outputs: list[dict[int, EngineCoreOutputs]] = [
             sched.update_from_output(lane_output, model_runner_output)
-            for sched, lane_output in zip(
-                self.lanes, state.lane_outputs, strict=True
-            )
+            for sched, lane_output in zip(self.lanes, state.lane_outputs, strict=True)
         ]
         merged = self._merge_engine_core_outputs(per_lane_outputs)
 
@@ -616,7 +615,7 @@ class TTLaneCoordinator(SchedulerInterface):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
-        state: _LaneStepState | None = getattr(scheduler_output, "_tt_step_state", None)
+        state = _get_tt_step_state(scheduler_output)
         if state is None:
             return
         for sched, lane_output in zip(self.lanes, state.lane_outputs, strict=True):

@@ -464,19 +464,25 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     model_config = vllm_config.model_config
     device_config = vllm_config.device_config
-    scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
     # region Get default or model- and device-specific `max_tokens_all_users`
     try:
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         model_class, _ = get_model_architecture(model_config)
+        # Pass the per-submesh batch (the requests one submesh actually serves),
+        # not the global engine capacity, so a model that derives a per-user
+        # token budget from ``max_num_seqs`` computes the same value whether
+        # parallelism is expressed as gathered DP (each rank its own engine) or
+        # single-process lane mode. This matches the padding term below, which
+        # also uses ``get_tt_per_lane_max_num_seqs``, and keeps the KV shape
+        # identical across both modes.
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
             num_devices=device_config.num_devices,
             tt_data_parallel=tt_data_parallel,
             max_model_len=model_config.max_model_len,
-            max_num_seqs=scheduler_config.max_num_seqs,
+            max_num_seqs=get_tt_per_lane_max_num_seqs(vllm_config),
         )
 
         logger.info(

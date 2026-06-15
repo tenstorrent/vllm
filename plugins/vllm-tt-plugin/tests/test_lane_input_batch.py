@@ -93,6 +93,22 @@ def _lane_batch(num_lanes, per_lane, with_custom=True):
     )
 
 
+def _add_to_lane(batch, req, lane):
+    """Place ``req`` at the lowest free row in ``lane``'s chunk.
+
+    Slot allocation (which lane, which free row) is the coordinator's job
+    (see ``TTLaneCoordinator``). This helper stands in for that policy so the
+    batch's placement behavior can be tested in isolation, driving the batch
+    through its scheduler-owned entry point ``add_request_to_row``.
+    """
+    base = lane * batch.per_lane
+    for slot in range(batch.per_lane):
+        row = base + slot
+        if batch._req_ids[row] is None:
+            return batch.add_request_to_row(req, row)
+    raise ValueError(f"lane {lane} has no free slot (capacity {batch.per_lane})")
+
+
 # --------------------------------------------------------------------------
 # Placement / stable slots
 # --------------------------------------------------------------------------
@@ -100,9 +116,9 @@ def _lane_batch(num_lanes, per_lane, with_custom=True):
 
 def test_requests_land_in_their_lane_chunk():
     b = _lane_batch(num_lanes=2, per_lane=4)  # rows 0..3 lane0, 4..7 lane1
-    r0 = b.add_request_to_lane(_make_req("a", [1], [], dict(temperature=0.0)), lane=0)
-    r1 = b.add_request_to_lane(_make_req("b", [1], [], dict(temperature=0.0)), lane=1)
-    r2 = b.add_request_to_lane(_make_req("c", [1], [], dict(temperature=0.0)), lane=0)
+    r0 = _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), lane=0)
+    r1 = _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0)), lane=1)
+    r2 = _add_to_lane(b, _make_req("c", [1], [], dict(temperature=0.0)), lane=0)
     assert (r0, r2) == (0, 1)  # lane 0 chunk, lowest free slots
     assert r1 == 4  # lane 1 chunk base
     assert b.occupied_rows() == [0, 1, 4]
@@ -112,7 +128,7 @@ def test_requests_land_in_their_lane_chunk():
 def test_existing_requests_keep_row_on_admission_and_removal():
     b = _lane_batch(num_lanes=1, per_lane=8)
     rows = {
-        rid: b.add_request_to_lane(_make_req(rid, [1], [], dict(temperature=0.0)), 0)
+        rid: _add_to_lane(b, _make_req(rid, [1], [], dict(temperature=0.0)), 0)
         for rid in ("a", "b", "c")
     }
     assert rows == {"a": 0, "b": 1, "c": 2}
@@ -121,13 +137,13 @@ def test_existing_requests_keep_row_on_admission_and_removal():
     assert b.req_id_to_index["a"] == 0 and b.req_id_to_index["c"] == 2
     assert b.occupied_rows() == [0, 2]
     # A new request reuses the lowest free slot (the gap at row 1).
-    assert b.add_request_to_lane(_make_req("d", [1], [], dict(temperature=0.0)), 0) == 1
+    assert _add_to_lane(b, _make_req("d", [1], [], dict(temperature=0.0)), 0) == 1
 
 
 def test_condense_is_noop():
     b = _lane_batch(num_lanes=1, per_lane=4)
-    b.add_request_to_lane(_make_req("a", [1], [], dict(temperature=0.0)), 0)
-    b.add_request_to_lane(_make_req("b", [1], [], dict(temperature=0.0)), 0)
+    _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)
+    _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0)), 0)
     b.remove_request("a")  # gap at row 0
     b.condense([0])  # must not move "b" down into row 0
     assert b.req_id_to_index["b"] == 1
@@ -136,10 +152,10 @@ def test_condense_is_noop():
 
 def test_lane_full_raises():
     b = _lane_batch(num_lanes=1, per_lane=2)
-    b.add_request_to_lane(_make_req("a", [1], [], dict(temperature=0.0)), 0)
-    b.add_request_to_lane(_make_req("b", [1], [], dict(temperature=0.0)), 0)
+    _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)
+    _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0)), 0)
     try:
-        b.add_request_to_lane(_make_req("c", [1], [], dict(temperature=0.0)), 0)
+        _add_to_lane(b, _make_req("c", [1], [], dict(temperature=0.0)), 0)
     except ValueError as e:
         assert "no free slot" in str(e)
     else:
@@ -263,8 +279,8 @@ def test_merged_lane_sampling_equals_per_request():
     rows = {}
     for lane, rid in placement:
         s = spec_by_id[rid]
-        rows[rid] = batch.add_request_to_lane(
-            _make_req(rid, s["prompt"], s["output"], s["sp"]), lane
+        rows[rid] = _add_to_lane(
+            batch, _make_req(rid, s["prompt"], s["output"], s["sp"]), lane
         )
     batch.refresh_logitsprocs()
 
@@ -307,14 +323,14 @@ def test_merged_sampling_correct_after_free_and_reuse_same_step():
     batch = _lane_batch(num_lanes=1, per_lane=4, with_custom=False)
     a = _make_req("a", [1], [], dict(temperature=0.0, min_p=0.5))
     keep = _make_req("b", [2], [], dict(temperature=0.0, min_p=0.3))
-    batch.add_request_to_lane(a, 0)  # row 0
-    batch.add_request_to_lane(keep, 0)  # row 1
+    _add_to_lane(batch, a, 0)  # row 0
+    _add_to_lane(batch, keep, 0)  # row 1
     batch.refresh_logitsprocs()
 
     # Same step: remove "a" (frees row 0), admit "c" (min_p) -> reuses row 0.
     batch.remove_request("a")
     c = _make_req("c", [3], [], dict(temperature=0.0, min_p=0.7))
-    row_c = batch.add_request_to_lane(c, 0)
+    row_c = _add_to_lane(batch, c, 0)
     assert row_c == 0  # reused the freed gap
     batch.refresh_logitsprocs()
 
@@ -350,9 +366,9 @@ def test_merged_sampling_correct_after_free_and_reuse_same_step():
 def test_max_num_logprobs_over_gappy_layout():
     b = _lane_batch(num_lanes=2, per_lane=4, with_custom=False)
     assert b.max_num_logprobs is None  # empty
-    b.add_request_to_lane(_make_req("a", [1], [], dict(temperature=0.0)), 0)
+    _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)
     assert b.max_num_logprobs is None  # no logprobs requested
-    b.add_request_to_lane(_make_req("b", [1], [], dict(temperature=0.0, logprobs=5)), 1)
+    _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0, logprobs=5)), 1)
     assert b.max_num_logprobs == 5  # found despite the gappy (row 0 + row 4) layout
 
 

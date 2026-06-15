@@ -191,27 +191,6 @@ def _concat_request_logprobs(
     )
 
 
-def _warn_if_nonfinite(tag: str, values: torch.Tensor, rows: list[int]) -> None:
-    """Diagnostic: log when an active (scheduled) row carries a non-finite
-    value. A NaN that reaches the request's logprobs serializes to an invalid
-    JSON float and crashes the API response, so catching it here pins whether
-    the model handed back bad logits or the host sampler produced bad logprobs.
-    Gap rows are excluded by construction: only ``rows`` are inspected."""
-    sub = values[torch.as_tensor(rows, dtype=torch.long)]
-    if torch.isfinite(sub).all():
-        return
-    flat = sub.reshape(len(rows), -1)
-    nan_local = torch.isnan(flat).any(dim=-1).nonzero(as_tuple=True)[0].tolist()
-    inf_local = torch.isinf(flat).any(dim=-1).nonzero(as_tuple=True)[0].tolist()
-    logger.warning(
-        "TT non-finite %s: active rows with nan=%s inf=%s (shape=%s)",
-        tag,
-        [rows[i] for i in nan_local],
-        [rows[i] for i in inf_local],
-        tuple(sub.shape),
-    )
-
-
 @dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
@@ -2277,7 +2256,9 @@ class TTModelRunner:
 
         # Place new / resumed requests at scheduler-owned stable rows.
         for req_id in req_ids_to_add:
-            lane_batch.add_request_to_row(self.requests[req_id], plan.req_id_to_row[req_id])
+            lane_batch.add_request_to_row(
+                self.requests[req_id], plan.req_id_to_row[req_id]
+            )
             layout_changed = True
 
         if layout_changed:
@@ -2587,16 +2568,14 @@ class TTModelRunner:
     def _capture_lane_context(self, scheduled_rows: list[int]) -> SubmittedStepContext:
         """Snapshot the scheduled requests for deferred async state application.
 
-        ``row_indices`` are the persistent rows (== device slots); ``req_ids``
-        are those rows' requests in the same order, which is the canonical
-        merged output order.
+        ``req_ids`` are the scheduled rows' requests in row order, which is the
+        canonical merged output order.
         """
         req_ids = [self.input_batch.req_ids[row] for row in scheduled_rows]
         return SubmittedStepContext(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
             request_states=tuple(self.requests[rid] for rid in req_ids),
-            row_indices=tuple(scheduled_rows),
             submit_time_ns=time.perf_counter_ns(),
         )
 
@@ -2633,11 +2612,6 @@ class TTModelRunner:
         # Host sampling over the full slot batch.
         total = cast(TTLaneInputBatch, self.input_batch).max_num_reqs
         logits = self._lane_host_logits(tt_out, scheduled_rows, is_decode, total)
-        _warn_if_nonfinite(
-            f"model_logits[{'decode' if is_decode else 'prefill'}]",
-            logits,
-            scheduled_rows,
-        )
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
             self.apply_grammar_bitmask(logits, bitmask)
@@ -2647,12 +2621,6 @@ class TTModelRunner:
         sampler_output = self.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
-        if sampler_output.logprobs_tensors is not None:
-            _warn_if_nonfinite(
-                f"sampler_logprobs[{'decode' if is_decode else 'prefill'}]",
-                sampler_output.logprobs_tensors.logprobs,
-                scheduled_rows,
-            )
         sampled = sampler_output.sampled_token_ids.reshape(-1)[rows_t].reshape(n, 1)
         logprobs = self._lane_host_logprobs(
             sampler_output.logprobs_tensors, scheduled_rows
@@ -2726,11 +2694,6 @@ class TTModelRunner:
                 logprobs=sampled_log_probs.unsqueeze(-1).to(torch.float32),
                 selected_token_ranks=torch.full((n,), -1, dtype=torch.int32),
             )
-        _warn_if_nonfinite(
-            f"device_logprobs[{'decode' if is_decode else 'prefill'}]",
-            logprobs_tensors.logprobs,
-            list(range(n)),
-        )
         return logprobs_tensors.tolists()
 
     def _finalize_lane_output(
@@ -3376,8 +3339,13 @@ class TTModelRunner:
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
-        row_indices: tuple[int, ...] | None = None,
     ) -> None:
+        # When applying a deferred async step, the write row is resolved live
+        # from ``req_id_to_index`` (below), not from the row captured at submit
+        # time: lane mode pins each request to a stable slot for its lifetime
+        # and the ``request_states`` identity check guards slot reuse, so the
+        # live row equals the captured one. ``req_id_to_index`` is therefore the
+        # single source of truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         assert sampled_token_ids.shape[0] == num_reqs, (

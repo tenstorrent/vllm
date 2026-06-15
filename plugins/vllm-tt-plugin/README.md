@@ -23,6 +23,7 @@ plugins/vllm-tt-plugin/
 |   +-- worker.py            # TT worker implementation
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
+|   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
 |   +-- engine.py            # TT engine core and DP engine processes
 |   +-- launcher.py          # tt-run / MPI launch integration
 |   +-- loader.py            # TT model loader

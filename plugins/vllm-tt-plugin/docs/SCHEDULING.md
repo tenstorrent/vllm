@@ -8,7 +8,7 @@ The emphasis here is on the concepts:
 - non-DP vs gathered-DP
 - what is scheduled locally vs what is coordinated globally
 
-Code pointers are intentionally minimal. If you need them, the main entry points are `plugins/vllm-tt-plugin/src/vllm_tt_plugin/scheduler.py`, `plugins/vllm-tt-plugin/src/vllm_tt_plugin/engine.py`, and `plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py` in the TT vLLM tree.
+Code pointers are intentionally minimal. If you need them, the main entry points are `plugins/vllm-tt-plugin/src/vllm_tt_plugin/scheduler.py`, `plugins/vllm-tt-plugin/src/vllm_tt_plugin/engine.py`, `plugins/vllm-tt-plugin/src/vllm_tt_plugin/lane_scheduler.py`, and `plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py` in the TT vLLM tree.
 
 ## Short Version
 
@@ -68,11 +68,12 @@ This is the main conceptual difference from upstream.
 
 ### 3. Engine step selection
 
-After scheduling, the engine uses one of three execution styles:
+After scheduling, the engine uses one of four execution styles:
 
 1. Synchronous path
 2. Non-DP async path
-3. Single-process multi-lane path
+3. Gathered-DP async path
+4. Single-process multi-lane path
 
 Which path is used depends mostly on:
 

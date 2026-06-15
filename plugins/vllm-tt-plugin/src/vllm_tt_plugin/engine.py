@@ -119,9 +119,6 @@ class TTExecutionMixin:
             )
         return result[0]
 
-    def preprocess_add_request(self, request: Any) -> tuple[Request, int]:
-        return super().preprocess_add_request(request)
-
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """TT regular execution path.
 

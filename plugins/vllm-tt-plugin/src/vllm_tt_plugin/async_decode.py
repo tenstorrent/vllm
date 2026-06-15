@@ -56,7 +56,6 @@ class SubmittedStepContext:
     req_ids: list[str]
     req_id_to_index: dict[str, int]
     request_states: tuple[CachedRequestState, ...]
-    row_indices: tuple[int, ...]
     submit_time_ns: int
 
 
@@ -200,9 +199,6 @@ class TTAsyncDecodeController:
             req_ids=req_ids,
             req_id_to_index=dict(runner.input_batch.req_id_to_index),
             request_states=tuple(runner.requests[req_id] for req_id in req_ids),
-            row_indices=tuple(
-                runner.input_batch.req_id_to_index[req_id] for req_id in req_ids
-            ),
             submit_time_ns=time.perf_counter_ns(),
         )
 
@@ -408,7 +404,6 @@ class TTAsyncDecodeController:
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             request_states=completed.context.request_states,
-            row_indices=completed.context.row_indices,
         )
 
     def submit_async_non_dp_decode(
@@ -444,6 +439,14 @@ class TTAsyncDecodeController:
         *,
         allow_decode_overlap: bool = True,
     ) -> AsyncTTDPGatherOutput:
+        """Submit a non-blocking gathered-DP decode step.
+
+        ``allow_decode_overlap`` is the caller's veto on overlapping this step's
+        device work with the next scheduler step: it only sets ``overlap_ok``
+        when both it is True (the default) and ``can_use_steady_decode_fast_path``
+        holds. Passing False forces the next step to drain this one regardless of
+        the fast-path check.
+        """
         overlap_ok = allow_decode_overlap and self.can_use_steady_decode_fast_path(
             model_input
         )

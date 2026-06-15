@@ -652,20 +652,19 @@ class TTLaneInputBatch(InputBatch):
         # gaps, instead of always appending at ``num_reqs``.
         self._req_ids = [None] * self.max_num_reqs
         self.req_output_token_ids = [None] * self.max_num_reqs
-        # req_id -> lane (static; set at admission, never changes).
-        self._lane_of: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lane geometry / membership
     # ------------------------------------------------------------------
 
     def lane_of(self, req_id: str) -> int:
-        """Return the lane a request is bound to."""
-        return self._lane_of[req_id]
+        """Return the lane a request is bound to.
 
-    def lane_base_row(self, lane: int) -> int:
-        """First persistent row of ``lane``'s chunk."""
-        return lane * self.per_lane
+        Derived from the request's row: lane ``l`` owns the contiguous chunk
+        ``[l * per_lane, (l + 1) * per_lane)``, so the row alone determines the
+        lane and no separate ``req_id -> lane`` map is needed.
+        """
+        return self.req_id_to_index[req_id] // self.per_lane
 
     def occupied_rows(self) -> list[int]:
         """Persistent rows holding a live request, in ascending (lane-major,
@@ -676,57 +675,32 @@ class TTLaneInputBatch(InputBatch):
     # Placement (stable lane-local slots)
     # ------------------------------------------------------------------
 
-    def add_request_to_lane(self, request: "CachedRequestState", lane: int) -> int:
-        """Place ``request`` at the lowest free slot in ``lane``'s chunk.
-
-        The lane is decided by the scheduler and passed in; this method only
-        records the membership and assigns the stable row. Returns the
-        persistent row (== device decode slot).
-        """
-        if not (0 <= lane < self.num_lanes):
-            raise ValueError(f"lane {lane} out of range [0, {self.num_lanes})")
-        row = self._claim_free_slot(lane)
-        super().add_request(request, row)
-        self._lane_of[request.req_id] = lane
-        return row
-
     def add_request_to_row(self, request: "CachedRequestState", row: int) -> int:
-        """Materialize a scheduler-owned stable row assignment."""
+        """Materialize a scheduler-owned stable row assignment.
+
+        :class:`~vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` owns slot
+        allocation (which lane, which free row); this batch only places the
+        request at the row the coordinator already chose.
+        """
         if not (0 <= row < self.max_num_reqs):
             raise ValueError(f"row {row} out of range [0, {self.max_num_reqs})")
         if self._req_ids[row] is not None and self._req_ids[row] != request.req_id:
             raise ValueError(f"row {row} is already occupied")
+        # If this row was freed earlier in the same step it is still in the
+        # logitsproc batch-update ``removed`` list. Drop it so the reused row is
+        # recorded only as an ``added`` update, not both -- mirroring upstream
+        # ``gpu_input_batch._register_add_request``'s ``pop_removed()`` so the
+        # builtin logits processors do not first set then clear the new
+        # request's per-row state.
         builder = self.sampling.batch_update_builder
         if row in builder._removed:
             builder._removed.remove(row)
         super().add_request(request, row)
-        self._lane_of[request.req_id] = row // self.per_lane
         return row
-
-    def _claim_free_slot(self, lane: int) -> int:
-        """Lowest free row in ``lane``'s chunk, reconciled with pending removals.
-
-        If the chosen row was freed earlier in this same step it is still in the
-        logitsproc batch-update ``removed`` list. Drop it from that list so the
-        reused row is recorded only as an ``added`` update, not both -- mirroring
-        upstream ``gpu_input_batch._register_add_request``'s ``pop_removed()`` so
-        the builtin logits processors do not first set then clear the new
-        request's per-row state.
-        """
-        base = self.lane_base_row(lane)
-        builder = self.sampling.batch_update_builder
-        for slot in range(self.per_lane):
-            row = base + slot
-            if self._req_ids[row] is None:
-                if row in builder._removed:
-                    builder._removed.remove(row)
-                return row
-        raise ValueError(f"lane {lane} has no free slot (capacity {self.per_lane})")
 
     def remove_request(self, req_id: str) -> int | None:
         row = super().remove_request(req_id)
         if row is not None:
-            self._lane_of.pop(req_id, None)
             self._reset_slot(row)
         return row
 
