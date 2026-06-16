@@ -1197,6 +1197,8 @@ class TTModelRunner:
     def _scheduler_output_has_structured_outputs(
         self, scheduler_output: SchedulerOutput
     ) -> bool:
+        if scheduler_output.has_structured_output_requests:
+            return True
         if scheduler_output.pending_structured_output_tokens:
             return True
         return any(
