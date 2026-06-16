@@ -349,7 +349,6 @@ class TTWorker(WorkerBase):
         self,
         model_input: TTModelInput | None,
         max_blocks_decode_batch: int,
-        any_structured_inputs: bool,
         any_penalties_inputs: bool,
     ) -> dict[str, Any]:
         """Prepare the fixed-shape decode gather payload for DP orchestration.
@@ -360,7 +359,6 @@ class TTWorker(WorkerBase):
         return self.model_runner.build_dp_decode_gather_input(
             model_input,
             max_blocks_decode_batch,
-            any_structured_inputs,
             any_penalties_inputs,
         )
 

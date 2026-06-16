@@ -93,6 +93,41 @@ class TestReorderGrammarBitmask:
         )
         assert torch.equal(reordered, expected)
 
+    def test_rows_beyond_batch_length_are_dropped(self):
+        # A structured request whose slot index exceeds the padded decode
+        # batch_length must be dropped rather than indexed out of bounds.
+        runner = self._runner_with_live_mapping(
+            {
+                "req_in_range": 0,
+                "req_out_of_range": 2,
+            }
+        )
+        grammar_output = SimpleNamespace(
+            structured_output_request_ids=["req_in_range", "req_out_of_range"],
+            grammar_bitmask=np.array(
+                [
+                    [0x0F0F0F0F, 0x0F0F0F0F],
+                    [0x12345678, 0x7FFFFFFF],
+                ],
+                dtype=np.int32,
+            ),
+        )
+
+        reordered = runner._reorder_grammar_bitmask(grammar_output, batch_length=2)
+
+        assert reordered is not None
+        assert reordered.shape[0] == 2
+        # In-range row carries its grammar; the dropped out-of-range row leaves
+        # the default allow-all row untouched.
+        assert torch.equal(
+            reordered[0],
+            torch.tensor([0x0F0F0F0F, 0x0F0F0F0F], dtype=torch.int32),
+        )
+        assert torch.equal(
+            reordered[1],
+            torch.full((2,), -1, dtype=torch.int32),
+        )
+
     def test_unstructured_rows_allow_all_tokens(self):
         runner = self._runner_with_live_mapping(
             {

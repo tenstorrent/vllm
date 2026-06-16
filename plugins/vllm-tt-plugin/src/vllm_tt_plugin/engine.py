@@ -371,7 +371,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         handle = self.dp_gather_submit(scheduler_output, overlap_ok=False)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        model_output = self.dp_gather_finalize(handle, grammar_output)
+        model_output = self.dp_gather_apply_runner_state(handle, grammar_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -434,6 +434,8 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         # re-sampled the previous step's near-deterministic position — most
         # visibly as doubled ``<|end|>`` and ``<|start|>assistant`` tokens,
         # which break harmony parsing and silently null out chat responses.
+        #
+        # TODO: This code will go away when gather-DP is fully removed.
         finalize_before_submit = prev_handle is not None
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
@@ -559,7 +561,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 args=(
                     local_input,
                     max_blocks_decode,
-                    any_structured_inputs,
                     any_penalties_inputs,
                 ),
             )[0]
@@ -799,14 +800,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             return output
         return EMPTY_MODEL_RUNNER_OUTPUT
 
-    def dp_gather_finalize(
-        self,
-        handle: DPGatherHandle,
-        grammar_output: GrammarOutput | None = None,
-    ) -> ModelRunnerOutput:
-        """Backward-compatible alias for ``dp_gather_apply_runner_state``."""
-        return self.dp_gather_apply_runner_state(handle, grammar_output)
-
     def _gather_grammar_outputs(
         self,
         grammar_output: GrammarOutput | None,
@@ -849,7 +842,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         grammar_output = None
         if scheduler_output is not None:
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        return self.dp_gather_finalize(handle, grammar_output)
+        return self.dp_gather_apply_runner_state(handle, grammar_output)
 
     def _completed_dp_gather_future(self) -> Future[tuple[torch.Tensor, list]]:
         parallel_config = self.vllm_config.parallel_config

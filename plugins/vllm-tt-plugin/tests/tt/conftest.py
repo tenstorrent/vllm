@@ -30,14 +30,14 @@ def pytest_addoption(parser):
         action="store",
         type=int,
         default=128,
-        help="Structured request count for async churn test (default: 48)",
+        help="Structured request count for async churn test (default: 128)",
     )
     parser.addoption(
         "--tt-structured-churn-plain-count",
         action="store",
         type=int,
         default=32,
-        help="Plain request count for async churn test (default: 16)",
+        help="Plain request count for async churn test (default: 32)",
     )
     parser.addoption(
         "--tt-structured-churn-short-max-tokens",

@@ -50,6 +50,7 @@ from vllm_tt_plugin.platform import TTPlatform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm_tt_plugin.async_decode import TTDecodeSubmission
 
 import numpy as np
 
@@ -252,7 +253,7 @@ class TTPendingDecodeState:
     sampling off the main worker loop.
     """
 
-    submission: Any  # TTDecodeSubmission
+    submission: TTDecodeSubmission
     model_input: TTModelInput
     completion_event: threading.Event
     context: SubmittedStepContext
@@ -268,7 +269,7 @@ class TTPendingDPDecodeState:
     finalized, matching the pre-split DP overlap behavior.
     """
 
-    submission: Any  # TTDecodeSubmission
+    submission: TTDecodeSubmission
     model_input: TTModelInput
 
 
@@ -385,7 +386,7 @@ class TTModelRunner:
             deque()
         )
         self._dp_forward_state_queue: deque[
-            TTForwardOutput | TTPendingDPDecodeState
+            TTPendingDPDecodeState | TTForwardOutput
         ] = deque()
 
         # Sampler for sampling on host when device sampling is not supported.
@@ -1243,13 +1244,11 @@ class TTModelRunner:
         self,
         model_input: TTModelInput | None,
         max_blocks_decode_batch: int,
-        any_structured_inputs: bool,
         any_penalties_inputs: bool,
     ) -> dict[str, Any]:
         """
         Called by each DP rank to build tensorized gather input for decode.
         max_blocks_decode_batch: max blocks in the global DP batch.
-        any_structured_inputs: whether the global batch has structured inputs.
         any_penalties_inputs: whether the global batch has penalties.
         Returns dict[str, Any] with keys:
           - "int_inputs": flattened int tensor of constant size.
@@ -1449,8 +1448,6 @@ class TTModelRunner:
             # Ints: [toks(B), positions(B), block_tables(B*W),
             #        bs(1), top_k(B), seed(B), num_logprobs(B),
             #        enable_log_probs(B)]
-            #   - If any_structured_inputs, also has at the end of the list:
-            #     [has_structured_inputs(1), bitmasks(B*bitmask_size)]
             # Floats: [temperature(B), top_p(B), presence_penalty(B),
             #          frequency_penalty(B), repetition_penalty(B)]
             assert max_blocks_decode_batch is not None, (
@@ -2030,8 +2027,6 @@ class TTModelRunner:
         return True
 
     def _can_defer_device_sampling(self, is_decode: bool) -> bool:
-        # Temp: return False for now
-        return False
         if not is_decode and self.request_specific_rope:
             return False
         return (
@@ -2084,7 +2079,6 @@ class TTModelRunner:
         device_sampling_deferred = (
             model_input.perform_device_sampling
             and self._can_defer_device_sampling(is_decode=False)
-            and not self.request_specific_rope
         )
         model_sampling_params = None
         if model_input.perform_device_sampling:
@@ -2375,13 +2369,14 @@ class TTModelRunner:
     ) -> Any:
         """Execute one merged DP forward and enqueue its sampling payload.
 
-        Pushes the ``TTForwardOutput`` onto ``_dp_forward_state_queue`` rather
-        than storing it in a single mutable slot.  This is what makes the DP
-        overlap path safe: when ``concat_and_execute_dp(K+1)`` is sent to the
-        worker *before* ``sample_dp_forward_output(K)`` (as happens in
-        ``step_dp_with_batch_queue`` with ``finalize_before_submit=False``),
-        both forwards are queued in FIFO order and each ``sample`` call pops
-        the correct entry regardless of RPC ordering.
+        Pushes the forward state onto ``_dp_forward_state_queue`` (a FIFO)
+        rather than a single mutable slot. This keeps the producer/consumer
+        decoupled: if a later ``concat_and_execute_dp`` is submitted before the
+        previous step's ``sample_dp_forward_output`` runs, both entries sit in
+        the queue and each ``sample`` call pops the matching one in submit
+        order, regardless of RPC interleaving. That ordering guarantee is the
+        precondition for overlapping the next DP forward with the previous
+        step's sampling/bookkeeping.
         """
         merged = self.concat_dp_model_inputs(
             inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
@@ -2399,7 +2394,17 @@ class TTModelRunner:
         self,
         grammar_outputs: list[Any] | None,
     ) -> tuple[torch.Tensor, list]:
-        """Sample the oldest gathered-DP forward output and pack results."""
+        """Sample the oldest gathered-DP forward output and pack results.
+
+        Pops the front of ``_dp_forward_state_queue``, which holds one of two
+        shapes per step (the DP counterpart of ``sample_tokens``):
+
+        * ``TTPendingDPDecodeState``: async decode whose device read was not
+          yet finalised at submit time. Its DMA wait and host processing run
+          here, lazily, once grammar outputs are available.
+        * ``TTForwardOutput``: a forward already finalised at submit time
+          (sync decode / prefill), sampled directly.
+        """
         assert self._dp_forward_state_queue, (
             "sample_dp_forward_output called with no pending DP forward state"
         )
@@ -2965,6 +2970,13 @@ class TTModelRunner:
 
         Updates persistent runner state from sampled tokens and returns the
         `ModelRunnerOutput` consumed by the rest of vLLM.
+
+        ``request_states`` is the submit-time snapshot of the per-request
+        states. Only the async overlap path passes it: there, slots can be
+        recycled between submit and apply, so each token is dropped if the slot
+        no longer holds the same request object (see
+        ``_apply_sampled_tokens_to_state``). Sync and DP-gather paths apply
+        in-step with no such window, so they pass ``None``.
         """
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
