@@ -196,10 +196,6 @@ class TTModelInput:
     # known from SchedulerOutput before the concrete grammar bitmask is ready.
     has_structured_outputs: bool
 
-    # always lists: single-element for non-DP, multi-element for DP
-    # If not used, [None]
-    grammar_bitmask: list[torch.Tensor | None]
-
     # Host-only sampling params - lists for DP (one per rank), single-element
     # for non-DP. These are used for host sampling when device sampling is not
     # supported.
@@ -274,12 +270,17 @@ class TTPendingDPDecodeState:
 
 
 def _slot_remap_for_model_input(
-    input_batch: InputBatch, is_prompt: bool
+    input_batch: InputBatch,
+    is_prompt: bool,
+    *,
+    consume: bool,
 ) -> torch.Tensor | None:
-    """Consume slot remap only on decode, where TT applies it to sampler state."""
+    """Return the decode slot remap, consuming it only when requested."""
     if is_prompt:
         return None
-    return input_batch.pop_slot_remap()
+    if consume:
+        return input_batch.pop_slot_remap()
+    return input_batch.peek_slot_remap()
 
 
 class TTModelRunner:
@@ -1144,19 +1145,27 @@ class TTModelRunner:
                 : input_batch.num_reqs
             ].clone()
 
+        defer_host_generator_advance = (
+            self.parallel_config.data_parallel_size > 1 and not is_prompt
+        )
         generators = dict()
         if not perform_device_sampling:
             generators = input_batch.sampling.generators
-            # Technically this advances the generator before it is copied,
-            # but it's ok because this happens consistently.
-            # We're assuming that _prepare_model_inputs is called
-            # exactly once per step.
-            input_batch.advance_generators()
+            if not defer_host_generator_advance:
+                # Technically this advances the generator before it is copied,
+                # but it's ok because this happens consistently.
+                # We're assuming that _prepare_model_inputs is called
+                # exactly once per step.
+                input_batch.advance_generators()
             # NOTE: Our sampling paths are different between host and device.
             # Whether a request is sampled on device or host
             # depends also on other requests in the batch.
             # This means sampling is not perfectly deterministic
             # whenever device sampling is enabled.
+
+        consume_slot_remap = perform_device_sampling and not (
+            self.parallel_config.data_parallel_size > 1 and not is_prompt
+        )
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1170,11 +1179,14 @@ class TTModelRunner:
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
             has_structured_outputs=has_structured_outputs,
-            grammar_bitmask=[None],  # populated only during sampling
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
-            slot_remap=_slot_remap_for_model_input(input_batch, is_prompt),
+            slot_remap=_slot_remap_for_model_input(
+                input_batch,
+                is_prompt,
+                consume=consume_slot_remap,
+            ),
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
@@ -1245,11 +1257,13 @@ class TTModelRunner:
         model_input: TTModelInput | None,
         max_blocks_decode_batch: int,
         any_penalties_inputs: bool,
+        use_device_sampling: bool,
     ) -> dict[str, Any]:
         """
         Called by each DP rank to build tensorized gather input for decode.
         max_blocks_decode_batch: max blocks in the global DP batch.
         any_penalties_inputs: whether the global batch has penalties.
+        use_device_sampling: whether global DP negotiation selected device sampling.
         Returns dict[str, Any] with keys:
           - "int_inputs": flattened int tensor of constant size.
           - "float_inputs": flattened float tensor of constant size.
@@ -1380,12 +1394,18 @@ class TTModelRunner:
         # Host-only sampling params for host sampling
         host_only_sample_params = None
         if model_input is not None:
+            generators = model_input.generators_list[0]
+            if not use_device_sampling:
+                generators = self.input_batch.sampling.generators
+                self.input_batch.advance_generators()
             host_only_sample_params = {
                 "allowed_token_ids_mask": model_input.allowed_token_ids_mask_list[0],
                 "bad_words_token_ids": model_input.bad_words_token_ids_list[0],
                 "logitsprocs": model_input.logitsprocs_list[0],
-                "generators": model_input.generators_list[0],
+                "generators": generators,
             }
+            if use_device_sampling and model_input.slot_remap is not None:
+                self.input_batch.pop_slot_remap()
 
         result = {
             "int_inputs": int_inputs,
@@ -1534,8 +1554,6 @@ class TTModelRunner:
             slot_remap = raw_remap.reshape(total_B)
             off += B
 
-            grammar_bitmask_list = [None] * world
-
             # Extract host-only sampling params
             # from gathered inputs (per-rank lists)
             host_only_sample_params_list = inputs.get("host_only_sample_params")
@@ -1591,7 +1609,6 @@ class TTModelRunner:
             ] = []  # (prefix cache positions for prefill)
             prompt_lens_list: list[np.ndarray] = []
             batch_size_per_dp = []
-            grammar_bitmask_list = []
             # Sampling parameters
             temperature_list: list[torch.Tensor] = []
             top_k_list: list[torch.Tensor] = []
@@ -1668,8 +1685,6 @@ class TTModelRunner:
                     cast(int, mi.unpadded_batch_size) if mi else 0
                 )
                 batch_size_per_dp.append(unpadded_batch_size)
-                grammar_bitmask_list.append(None)
-
                 # Collect host-only sampling params per rank
                 if mi is not None:
                     allowed_token_ids_mask_list.append(
@@ -1813,7 +1828,6 @@ class TTModelRunner:
                 if not is_decode
                 else any_structured_inputs
             ),
-            grammar_bitmask=grammar_bitmask_list,
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
@@ -2021,6 +2035,8 @@ class TTModelRunner:
         if max_lp is not None:
             if num_devices not in (8, 32):
                 return False
+            if max_lp > MAX_K:
+                return False
             if max_lp > 0 and not self.supports_topk_logprobs:
                 return False
 
@@ -2108,26 +2124,6 @@ class TTModelRunner:
             self.model.prefill_forward(**kwargs),
             model_sampling_params,
             device_sampling_deferred,
-        )
-
-    def execute_sync_with_model_input(
-        self,
-        model_input: TTModelInput,
-    ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
-        """Run a fully synchronous TT execution for a prebuilt model input.
-
-        Executes a prebuilt TT input to completion, including prefill or decode
-        submission, decode finalization when needed, and per-DP token/logprob
-        extraction.
-
-        Returns:
-            Tuple of (sampled_token_ids_per_dp, logprobs_per_dp).
-            Each element in logprobs_per_dp is None if logprobs were not
-            requested for that DP rank.
-        """
-        forward_output = self.execute_forward_with_model_input(model_input)
-        return self.sample_forward_output(
-            forward_output, [None] * len(forward_output.batch_size_per_dp)
         )
 
     def _empty_forward_output(self, model_input: TTModelInput) -> TTForwardOutput:

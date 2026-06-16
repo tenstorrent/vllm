@@ -562,6 +562,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     local_input,
                     max_blocks_decode,
                     any_penalties_inputs,
+                    all_sample_device,
                 ),
             )[0]
 

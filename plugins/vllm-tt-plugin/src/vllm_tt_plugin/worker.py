@@ -350,6 +350,7 @@ class TTWorker(WorkerBase):
         model_input: TTModelInput | None,
         max_blocks_decode_batch: int,
         any_penalties_inputs: bool,
+        use_device_sampling: bool,
     ) -> dict[str, Any]:
         """Prepare the fixed-shape decode gather payload for DP orchestration.
 
@@ -360,6 +361,7 @@ class TTWorker(WorkerBase):
             model_input,
             max_blocks_decode_batch,
             any_penalties_inputs,
+            use_device_sampling,
         )
 
     def concat_and_execute_dp(
@@ -432,6 +434,10 @@ class TTWorker(WorkerBase):
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
+
+    def execute_dummy_batch(self) -> None:
+        """TT gathered-DP idle ranks synchronize in the engine, not the worker."""
+        return None
 
     # ---- Destructor (used to close devices) ----
 

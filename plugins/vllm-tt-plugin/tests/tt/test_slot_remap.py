@@ -15,8 +15,10 @@ import torch
 from vllm.sampling_params import SamplingParams
 
 input_batch_module = import_module("vllm_tt_plugin.input_batch")
+model_runner_module = import_module("vllm_tt_plugin.model_runner")
 InputBatch = input_batch_module.InputBatch
 CachedRequestState = input_batch_module.CachedRequestState
+_slot_remap_for_model_input = model_runner_module._slot_remap_for_model_input
 
 
 def _make_input_batch(max_num_reqs: int = 4) -> "InputBatch":
@@ -81,3 +83,34 @@ class TestSlotRemap:
         popped = batch.pop_slot_remap()
         assert popped[1].item() == 1
         assert torch.equal(popped, torch.tensor([3, 1, 1, 0], dtype=torch.int32))
+
+    def test_model_input_can_peek_remap_without_consuming(self):
+        batch = _make_input_batch(max_num_reqs=4)
+        batch._slot_remap = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+
+        remap = _slot_remap_for_model_input(
+            batch,
+            is_prompt=False,
+            consume=False,
+        )
+
+        assert remap is not None
+        assert torch.equal(remap, torch.tensor([3, 2, 1, 0], dtype=torch.int32))
+        assert torch.equal(
+            batch._slot_remap,
+            torch.tensor([3, 2, 1, 0], dtype=torch.int32),
+        )
+
+    def test_model_input_consumes_remap_only_when_requested(self):
+        batch = _make_input_batch(max_num_reqs=4)
+        batch._slot_remap = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+
+        remap = _slot_remap_for_model_input(
+            batch,
+            is_prompt=False,
+            consume=True,
+        )
+
+        assert remap is not None
+        assert torch.equal(remap, torch.tensor([3, 2, 1, 0], dtype=torch.int32))
+        assert torch.equal(batch._slot_remap, torch.arange(4, dtype=torch.int32))

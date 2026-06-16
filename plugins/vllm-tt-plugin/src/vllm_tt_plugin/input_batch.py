@@ -186,6 +186,10 @@ class InputBatch:
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
         return remap
 
+    def peek_slot_remap(self) -> torch.Tensor:
+        """Return pending slot remap without consuming it."""
+        return self._slot_remap.clone()
+
     def reset_slot_remap_for_new_request(self, req_index: int) -> None:
         """Clear stale sampler-state remap for a slot reused by a new request."""
         self._slot_remap[req_index] = req_index
