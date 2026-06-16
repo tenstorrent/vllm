@@ -372,6 +372,18 @@ def test_max_num_logprobs_over_gappy_layout():
     assert b.max_num_logprobs == 5  # found despite the gappy (row 0 + row 4) layout
 
 
+def test_merged_sampling_metadata_filters_generators_to_scheduled_rows():
+    b = _lane_batch(num_lanes=2, per_lane=4, with_custom=False)
+    row0 = _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.7), seed=11), 0)
+    row4 = _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.7), seed=22), 1)
+    assert (row0, row4) == (0, 4)
+
+    metadata = b.build_merged_sampling_metadata(scheduled_rows=[row4])
+
+    assert set(metadata.generators) == {row4}
+    assert metadata.generators[row4] is b.sampling.generators[row4]
+
+
 # --------------------------------------------------------------------------
 # Runner lane-mode selection (which persistent batch initialize_kv_cache builds)
 # --------------------------------------------------------------------------

@@ -17,7 +17,8 @@ from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm_tt_plugin.input_batch import CachedRequestState
-    from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+    from vllm_tt_plugin.model_input import TTModelInput
+    from vllm_tt_plugin.model_runner import TTModelRunner
 
 
 @dataclass(frozen=True)
@@ -501,7 +502,7 @@ class TTAsyncDecodeController:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
         else:
-            sampled_token_ids, logprobs = self.runner._extract_lane_step(
+            sampled_token_ids, logprobs = self.runner.lane_executor.extract_step(
                 finalized.tt_out,
                 finalized.tt_log_probs,
                 model_input,

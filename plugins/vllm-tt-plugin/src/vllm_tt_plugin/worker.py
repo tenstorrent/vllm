@@ -29,7 +29,8 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
     uses_tt_lane_coordinator,
 )
-from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+from vllm_tt_plugin.model_input import TTModelInput
+from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _should_pre_register_tt_test_models_from_cli,

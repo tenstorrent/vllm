@@ -354,7 +354,7 @@ At startup the backend logs that it is running single-process lane-DP.
 The plugin registers TT-prefixed model architectures backed by tt-metal model
 implementations. Current families:
 
-- Llama 3.1 / 3.2 text models (`TTLlamaForCausalLM`)
+- Llama 3.1 / 3.2 / 3.3 text models (`TTLlamaForCausalLM`)
 - Llama 3.2 vision models (`TTMllamaForConditionalGeneration`)
 - Qwen 2.5 and Qwen 3 text models (`TTQwen2ForCausalLM`, `TTQwen3ForCausalLM`)
 - Qwen 2.5-VL and Qwen 3-VL vision-language models

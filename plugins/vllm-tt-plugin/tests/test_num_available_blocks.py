@@ -86,24 +86,20 @@ def test_default_branch_no_sliding(cfg):
     assert n == 2080
 
 
-def test_lane_mode_kv_shape_matches_dev(cfg):
+def test_lane_mode_kv_shape_matches_per_lane_gathered_dp(cfg):
     """Enabling single-process lanes must not change ``num_blocks``.
 
     ``num_blocks`` is applied to each submesh KV cache un-divided, so the
     model -- plus its on-disk tensor cache -- must see the identical KV shape
     regardless of parallelism mode. A submesh serves only its *per-lane* slice
-    of requests, so the batch padding uses ``max_num_seqs // lanes``, matching
-    a gathered-DP rank that received ``max_num_seqs`` directly. dev/main ran
-    this config as ``--data_parallel_size 4 --max_num_seqs 8`` (per-rank batch
-    8); the single-process equivalent is 4 resolved lanes with the *global*
-    ``max_num_seqs=32`` (= 8 per lane). Padding with the global 32 here would
-    inflate ``num_blocks`` (2080 vs 2056) and break reuse of the read-only
-    tensor cache."""
+    of requests, so the batch padding uses ``max_num_seqs // lanes``. Padding
+    with the global batch size would inflate ``num_blocks`` and give the model
+    a different KV shape from a gathered-DP rank with the same per-lane
+    capacity."""
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.scheduler_config.max_num_seqs = 32
-    # Lane count is read from the resolved-lane-count key on additional_config
-    # (the user-facing tt_data_parallel_size knob was dropped).
+    # Lane count is read from the resolved-lane-count key on additional_config.
     cfg.additional_config = {tt_config._RESOLVED_LANE_COUNT_KEY: 4}
 
     with (
@@ -112,7 +108,7 @@ def test_lane_mode_kv_shape_matches_dev(cfg):
     ):
         n = get_num_available_blocks_tt(cfg)
 
-    # Per-lane batch is 32 // 4 = 8, identical to dev's per-rank batch of 8.
+    # Per-lane batch is 32 // 4 = 8.
     # Default tokens (131072) + batch padding (64 * 8 = 512) = 131584 tokens
     # -> ceil/64 = 2056.
     assert n == 2056
