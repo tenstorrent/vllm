@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import threading
 from collections import deque
@@ -2487,8 +2486,7 @@ class TTModelRunner:
             grammar_outputs=grammar_outputs,
         )
         if is_decode:
-            sampled = self._call_with_supported_kwargs(
-                self.model.sample_decode_on_device,
+            sampled = self.model.sample_decode_on_device(
                 tt_out,
                 model_sampling_params,
                 reset_batch=model_input.reset_batch,
@@ -2516,16 +2514,14 @@ class TTModelRunner:
             return tt_tokens, tt_log_probs
 
         if isinstance(tt_out, dict) and "deferred_sampling_tasks" in tt_out:
-            sampled = self._call_with_supported_kwargs(
-                self.model.sample_prefill_on_device,
+            sampled = self.model.sample_prefill_on_device(
                 tt_out["deferred_sampling_tasks"],
                 tt_out["batch_size"],
                 model_sampling_params,
                 bitmask=bitmask,
             )
         elif isinstance(tt_out, dict) and "tt_logits_batch" in tt_out:
-            sampled = self._call_with_supported_kwargs(
-                self.model.sample_prefill_on_device,
+            sampled = self.model.sample_prefill_on_device(
                 tt_logits_batch=tt_out["tt_logits_batch"],
                 sampling_params=model_sampling_params,
                 empty_slots=tt_out["empty_slots"],
@@ -2986,21 +2982,6 @@ class TTModelRunner:
             req_id_to_index=req_id_to_index,
         )
 
-    @staticmethod
-    def _call_with_supported_kwargs(method: Any, *args: Any, **kwargs: Any) -> Any:
-        signature = inspect.signature(method)
-        if any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        ):
-            return method(*args, **kwargs)
-        supported_kwargs = {
-            name: value
-            for name, value in kwargs.items()
-            if name in signature.parameters
-        }
-        return method(*args, **supported_kwargs)
-
     def warmup_model(self) -> None:
         # Two-phase warmup: compile first, then capture traces.
         #
@@ -3038,12 +3019,8 @@ class TTModelRunner:
         )
 
         # Phase 1: compile all code paths (no trace capture)
-        self._call_with_supported_kwargs(
-            self.model.warmup_model_prefill, enable_trace=False, **prefill_kwargs
-        )
-        self._call_with_supported_kwargs(
-            self.model.warmup_model_decode, enable_trace=False, **decode_kwargs
-        )
+        self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
+        self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
 
         # Reset prefill warmup flag so Phase 2 re-runs with tracing
         if hasattr(self.model, "already_warmed_up_prefill"):
@@ -3051,10 +3028,6 @@ class TTModelRunner:
 
         # Phase 2: capture traces (all ops already compiled)
         if trace_prefill_mode:
-            self._call_with_supported_kwargs(
-                self.model.warmup_model_prefill, enable_trace=True, **prefill_kwargs
-            )
+            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
         if trace_decode_mode:
-            self._call_with_supported_kwargs(
-                self.model.warmup_model_decode, enable_trace=True, **decode_kwargs
-            )
+            self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)

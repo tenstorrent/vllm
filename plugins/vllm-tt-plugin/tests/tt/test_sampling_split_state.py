@@ -5,6 +5,7 @@
 from importlib import import_module
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 model_runner_module = import_module("vllm_tt_plugin.model_runner")
@@ -135,6 +136,45 @@ class TestDeviceSamplingLogprobsFallback:
             is_decode=True,
             has_structured_outputs=False,
         )
+
+
+class TestDeviceSamplingContract:
+    def test_decode_sampling_does_not_filter_unsupported_kwargs(self):
+        class ModelWithoutBitmask:
+            def sample_decode_on_device(
+                self,
+                tt_logits,
+                sampling_params,
+                reset_batch=False,
+                prompt_tokens=None,
+                output_tokens=None,
+                slot_remap=None,
+                enable_trace=False,
+            ):
+                return torch.ones((1, 1), dtype=torch.int32)
+
+        runner = object.__new__(TTModelRunner)
+        runner.model = ModelWithoutBitmask()
+        runner.trace_mode = "all"
+        runner._device_sampling_bitmask = lambda **_: torch.zeros(
+            (1, 1), dtype=torch.int32
+        )
+        model_input = SimpleNamespace(
+            reset_batch=False,
+            prompt_tokens=torch.zeros((1, 1), dtype=torch.int32),
+            output_tokens=torch.zeros((1, 1), dtype=torch.int32),
+            slot_remap=None,
+        )
+
+        with pytest.raises(TypeError, match="bitmask"):
+            runner._sample_deferred_device_output(
+                tt_out=torch.zeros((1, 1), dtype=torch.float32),
+                model_sampling_params=SimpleNamespace(),
+                model_input=model_input,
+                batch_size_per_dp=[1],
+                is_decode=True,
+                grammar_outputs=[None],
+            )
 
 
 class TestWorkerUtilityHooks:
