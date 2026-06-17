@@ -10,10 +10,12 @@ import torch
 
 model_runner_module = import_module("vllm_tt_plugin.model_runner")
 worker_module = import_module("vllm_tt_plugin.worker")
+engine_module = import_module("vllm_tt_plugin.engine")
 
 TTModelRunner = model_runner_module.TTModelRunner
 TTSamplingParams = model_runner_module.TTSamplingParams
 TTWorker = worker_module.TTWorker
+TTDPEngineCoreProc = engine_module.TTDPEngineCoreProc
 
 
 class _RecordingBatch:
@@ -135,6 +137,40 @@ class TestDeviceSamplingLogprobsFallback:
         assert not runner.check_perform_device_sampling(
             is_decode=True,
             has_structured_outputs=False,
+        )
+
+
+class TestStructuredOutputSamplingFallback:
+    def test_scheduler_structured_flag_forces_runner_host_sampling(self):
+        runner = object.__new__(TTModelRunner)
+        runner.requests = {}
+
+        scheduler_output = SimpleNamespace(
+            has_structured_output_requests=True,
+            pending_structured_output_tokens=False,
+            num_scheduled_tokens={"req": 1},
+        )
+
+        assert runner._scheduler_output_has_structured_outputs(scheduler_output)
+
+    def test_engine_structured_flag_overrides_worker_device_sampling(self):
+        scheduler_output = SimpleNamespace(has_structured_output_requests=True)
+
+        has_structured, can_sample_device = (
+            TTDPEngineCoreProc._dp_decode_local_sampling_flags(
+                scheduler_output,
+                local_has_structured=0,
+                local_can_sample_device=1,
+            )
+        )
+
+        assert has_structured == 1
+        assert can_sample_device == 0
+
+    def test_engine_any_structured_input_disables_device_sampling(self):
+        assert not TTDPEngineCoreProc._dp_decode_all_sample_device(
+            any_structured_inputs=True,
+            any_rank_blocked_device_sampling=False,
         )
 
 

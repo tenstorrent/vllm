@@ -495,6 +495,30 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         self.dlog("steady_decode_overlap_ok=%s", overlap_ok)
         return overlap_ok
 
+    @staticmethod
+    def _dp_decode_local_sampling_flags(
+        scheduler_output: SchedulerOutput | None,
+        *,
+        local_has_structured: int,
+        local_can_sample_device: int,
+    ) -> tuple[int, int]:
+        if (
+            scheduler_output is not None
+            and scheduler_output.has_structured_output_requests
+        ):
+            return 1, 0
+        if local_has_structured:
+            return 1, 0
+        return local_has_structured, local_can_sample_device
+
+    @staticmethod
+    def _dp_decode_all_sample_device(
+        *,
+        any_structured_inputs: bool,
+        any_rank_blocked_device_sampling: bool,
+    ) -> bool:
+        return not any_structured_inputs and not any_rank_blocked_device_sampling
+
     def dp_gather_submit(
         self,
         scheduler_output: SchedulerOutput | None,
@@ -531,6 +555,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             req_ids,
             req_id_to_index,
         ) = all_local_inputs
+        local_has_structured, local_can_sample_device = (
+            self._dp_decode_local_sampling_flags(
+                scheduler_output,
+                local_has_structured=local_has_structured,
+                local_can_sample_device=local_can_sample_device,
+            )
+        )
         max_blocks_decode = None
         any_structured_inputs = False
         any_needs_logprobs = False
@@ -553,7 +584,10 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             any_structured_inputs = input_info_t[1].item() > 0
             any_penalties_inputs = input_info_t[2].item() > 0
             any_reset_batch = input_info_t[3].item() > 0
-            all_sample_device = input_info_t[4].item() == 0
+            all_sample_device = self._dp_decode_all_sample_device(
+                any_structured_inputs=any_structured_inputs,
+                any_rank_blocked_device_sampling=input_info_t[4].item() > 0,
+            )
             any_needs_logprobs = input_info_t[5].item() > 0
 
             decode_inputs: dict[str, Any] = self.model_executor.collective_rpc(
