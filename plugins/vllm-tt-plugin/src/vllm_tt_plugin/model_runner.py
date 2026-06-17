@@ -2488,6 +2488,10 @@ class TTModelRunner:
             grammar_outputs=grammar_outputs,
         )
         if is_decode:
+            assert bitmask is None, (
+                "Structured-output bitmasks require host sampling; "
+                "device decode sampling does not support grammar bitmasks."
+            )
             sampled = self.model.sample_decode_on_device(
                 tt_out,
                 model_sampling_params,
@@ -2495,12 +2499,7 @@ class TTModelRunner:
                 prompt_tokens=model_input.prompt_tokens,
                 output_tokens=model_input.output_tokens,
                 slot_remap=model_input.slot_remap,
-                # Grammar bitmasks change the logits tensor, so the sampling
-                # trace captured for the unmasked logits cannot be reused.
-                enable_trace=(
-                    bitmask is None and self.trace_mode in ["all", "decode_only"]
-                ),
-                bitmask=bitmask,
+                enable_trace=self.trace_mode in ["all", "decode_only"],
             )
             if hasattr(self.model, "process_decode_output_host"):
                 processed = self.model.process_decode_output_host(

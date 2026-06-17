@@ -175,7 +175,7 @@ class TestStructuredOutputSamplingFallback:
 
 
 class TestDeviceSamplingContract:
-    def test_decode_sampling_does_not_filter_unsupported_kwargs(self):
+    def test_decode_sampling_calls_model_without_absent_bitmask(self):
         class ModelWithoutBitmask:
             def sample_decode_on_device(
                 self,
@@ -187,10 +187,35 @@ class TestDeviceSamplingContract:
                 slot_remap=None,
                 enable_trace=False,
             ):
+                self.enable_trace = enable_trace
                 return torch.ones((1, 1), dtype=torch.int32)
 
         runner = object.__new__(TTModelRunner)
         runner.model = ModelWithoutBitmask()
+        runner.trace_mode = "all"
+        runner._device_sampling_bitmask = lambda **_: None
+        model_input = SimpleNamespace(
+            reset_batch=False,
+            prompt_tokens=torch.zeros((1, 1), dtype=torch.int32),
+            output_tokens=torch.zeros((1, 1), dtype=torch.int32),
+            slot_remap=None,
+        )
+
+        tt_tokens, tt_log_probs = runner._sample_deferred_device_output(
+            tt_out=torch.zeros((1, 1), dtype=torch.float32),
+            model_sampling_params=SimpleNamespace(),
+            model_input=model_input,
+            batch_size_per_dp=[1],
+            is_decode=True,
+            grammar_outputs=[None],
+        )
+
+        assert torch.equal(tt_tokens, torch.ones((1, 1), dtype=torch.int32))
+        assert tt_log_probs is None
+        assert runner.model.enable_trace is True
+
+    def test_decode_sampling_rejects_device_sampling_with_bitmask(self):
+        runner = object.__new__(TTModelRunner)
         runner.trace_mode = "all"
         runner._device_sampling_bitmask = lambda **_: torch.zeros(
             (1, 1), dtype=torch.int32
@@ -202,7 +227,7 @@ class TestDeviceSamplingContract:
             slot_remap=None,
         )
 
-        with pytest.raises(TypeError, match="bitmask"):
+        with pytest.raises(AssertionError, match="device decode sampling"):
             runner._sample_deferred_device_output(
                 tt_out=torch.zeros((1, 1), dtype=torch.float32),
                 model_sampling_params=SimpleNamespace(),
