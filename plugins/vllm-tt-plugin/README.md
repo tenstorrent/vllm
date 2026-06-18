@@ -8,8 +8,9 @@ TT hardware is automatically available as a vLLM platform.
 
 The plugin is self-contained: model registration, platform detection, request
 validation, scheduling, worker execution, model loading, async decode, single-
-process multi-lane execution, and `tt-run` / MPI
-launch orchestration all live here. Nothing TT-specific needs to touch vLLM
+process standard and multi-lane execution, gathered data-parallel execution
+and `tt-run` / MPI launch orchestration all live here. Nothing TT-specific
+needs to touch vLLM
 core.
 
 ## Package Layout
