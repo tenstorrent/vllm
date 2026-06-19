@@ -71,7 +71,12 @@ class CompletedDecodeStep:
 
 
 class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
-    """Wrap a non-blocking TT decode submission plus async read submit."""
+    """Wrap a non-blocking single-process TT decode submission plus async read.
+
+    Handles both a plain single-process decode and a lane-DP decode: when
+    ``scheduled_rows`` is set the read-back goes through the merged lane batch
+    (``TTLaneInputBatch.extract_output``), otherwise through ``_get_output_tokens``.
+    """
 
     def __init__(
         self,
@@ -80,12 +85,14 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         model_input: TTModelInput,
         completion_event: threading.Event,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
         self._completion_event = completion_event
         self._context = context
+        self._scheduled_rows = scheduled_rows
 
     def get_output(self) -> ModelRunnerOutput:
         try:
@@ -94,10 +101,11 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
             self._completion_event.set()
 
     def _get_output_impl(self) -> ModelRunnerOutput:
-        completed = self._controller.complete_non_dp_decode_step(
+        completed = self._controller.complete_decode_step(
             submission=self._submission,
             model_input=self._model_input,
             context=self._context,
+            scheduled_rows=self._scheduled_rows,
         )
         self._controller.enqueue_completed_decode_step(completed)
         return self._controller.build_runner_output_from_completed_step(completed)
@@ -144,46 +152,6 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
             is_decode=True,
         )
         return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
-
-
-class AsyncTTLaneModelRunnerOutput(AsyncModelRunnerOutput):
-    """Finalize one async single-process multi-lane decode step.
-
-    The merged step already executed every lane's slot together, so this just
-    finalizes the device read, samples the merged batch once, and maps the
-    sampled tokens back to the scheduled requests -- there is no per-lane
-    stitching. State application is deferred (the step is enqueued) so steady
-    decode can overlap, exactly like the non-DP async path.
-    """
-
-    def __init__(
-        self,
-        controller: TTAsyncDecodeController,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-        completion_event: threading.Event,
-        context: SubmittedStepContext,
-        scheduled_rows: list[int],
-    ):
-        self._controller = controller
-        self._submission = submission
-        self._model_input = model_input
-        self._completion_event = completion_event
-        self._context = context
-        self._scheduled_rows = scheduled_rows
-
-    def get_output(self) -> ModelRunnerOutput:
-        try:
-            completed = self._controller.complete_lane_decode_step(
-                submission=self._submission,
-                model_input=self._model_input,
-                context=self._context,
-                scheduled_rows=self._scheduled_rows,
-            )
-            self._controller.enqueue_completed_decode_step(completed)
-            return self._controller.build_runner_output_from_completed_step(completed)
-        finally:
-            self._completion_event.set()
 
 
 class TTAsyncDecodeController:
@@ -359,16 +327,32 @@ class TTAsyncDecodeController:
                 not overlap_ok for overlap_ok in self.runner._pending_async_overlap_ok
             )
 
-    def complete_non_dp_decode_step(
+    def complete_decode_step(
         self,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ) -> CompletedDecodeStep:
+        """Finalize a single-process async decode read into sampled tokens.
+
+        When ``scheduled_rows`` is given this is a lane-DP step: the merged slot
+        batch is read back via ``TTLaneInputBatch.extract_output``. Otherwise it
+        is a plain single-process step read back via ``_get_output_tokens``.
+        """
         finalized = self.finalize_decode(submission)
         if finalized is None:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
+        elif scheduled_rows is not None:
+            sampled_token_ids, logprobs = self.runner.lane_batch.extract_output(
+                self.runner,
+                finalized.tt_out,
+                finalized.tt_log_probs,
+                model_input,
+                scheduled_rows,
+                is_decode=True,
+            )
         else:
             sampled_token_ids_per_dp, logprobs_per_dp = self.runner._get_output_tokens(
                 tt_out=finalized.tt_out,
@@ -470,7 +454,7 @@ class TTAsyncDecodeController:
         model_input: TTModelInput,
         context: SubmittedStepContext,
         scheduled_rows: list[int],
-    ) -> AsyncTTLaneModelRunnerOutput:
+    ) -> AsyncTTModelRunnerOutput:
         """Submit a non-blocking single-process multi-lane decode step."""
         overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
@@ -480,40 +464,13 @@ class TTAsyncDecodeController:
         self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
         if submission.tt_out is None:
             completion_event.set()
-        return AsyncTTLaneModelRunnerOutput(
+        return AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
             model_input=model_input,
             completion_event=completion_event,
             context=context,
             scheduled_rows=scheduled_rows,
-        )
-
-    def complete_lane_decode_step(
-        self,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-        context: SubmittedStepContext,
-        scheduled_rows: list[int],
-    ) -> CompletedDecodeStep:
-        """Finalize a lane decode read and sample the merged batch once."""
-        finalized = self.finalize_decode(submission)
-        if finalized is None:
-            sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
-            logprobs = None
-        else:
-            sampled_token_ids, logprobs = self.runner.lane_executor.extract_step(
-                finalized.tt_out,
-                finalized.tt_log_probs,
-                model_input,
-                scheduled_rows,
-                is_decode=True,
-            )
-        return CompletedDecodeStep(
-            sampled_token_ids=sampled_token_ids,
-            logprobs=logprobs,
-            context=context,
-            completion_time_ns=time.perf_counter_ns(),
         )
 
     def submit_decode(

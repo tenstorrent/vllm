@@ -27,7 +27,6 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
-    uses_tt_lane_coordinator,
 )
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
@@ -299,14 +298,15 @@ class TTWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | None:
-        """Execute a non-DP TT step with plugin-owned structured-output data."""
+        """Execute a single-process TT step with plugin-owned structured-output
+        data.
+
+        ``execute_model`` handles both plain single-process and lane-DP steps:
+        it dispatches on the lane scheduler's per-step plan, so the worker does
+        not need to know whether lane-DP is active.
+        """
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        if uses_tt_lane_coordinator(self.vllm_config):
-            return self.model_runner.execute_model_lanes(
-                scheduler_output, grammar_output
-            )
-        output = self.model_runner.execute_model(scheduler_output, grammar_output)
-        return output
+        return self.model_runner.execute_model(scheduler_output, grammar_output)
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.

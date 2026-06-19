@@ -147,7 +147,100 @@ def test_condense_is_noop():
     b.remove_request("a")  # gap at row 0
     b.condense([0])  # must not move "b" down into row 0
     assert b.req_id_to_index["b"] == 1
-    assert b.occupied_rows() == [1]
+
+
+# --------------------------------------------------------------------------
+# State update via apply_step_plan (moved here from the lane executor)
+# --------------------------------------------------------------------------
+
+
+def _new_req(req_id, prompt):
+    """A scheduled_new_reqs entry (the fields build_cached_request_state reads)."""
+    return SimpleNamespace(
+        req_id=req_id,
+        sampling_params=SamplingParams(temperature=0.0),
+        prompt_token_ids=list(prompt),
+        mm_features=None,
+        num_computed_tokens=len(prompt),
+        block_ids=([0],),
+        lora_request=None,
+        prompt_embeds=None,
+    )
+
+
+def _step_output(new_reqs=(), finished=(), plan_rows=None):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    out = SchedulerOutput.make_empty()
+    out.scheduled_new_reqs = list(new_reqs)
+    out.finished_req_ids = set(finished)
+    return out
+
+
+def test_apply_step_plan_places_new_requests_and_reports_layout_change():
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    b = _lane_batch(num_lanes=2, per_lane=2)  # rows 0,1 lane0; 2,3 lane1
+    requests: dict = {}
+    out = _step_output(new_reqs=[_new_req("a", [1, 2]), _new_req("b", [3])])
+    plan = TTStepPlan(
+        is_decode=False,
+        capacity=4,
+        scheduled_req_ids=("a", "b"),
+        scheduled_rows=(0, 2),
+        input_rows=(0, 2),
+        req_id_to_row={"a": 0, "b": 2},
+        batch_size_per_dp=(1, 1),
+        prefill_empty_slots=(0, 2),
+    )
+
+    changed = b.apply_step_plan(out, plan, requests, encoder_cache={})
+
+    assert changed is True
+    assert set(requests) == {"a", "b"}
+    assert b.req_id_to_index == {"a": 0, "b": 2}
+    assert b.occupied_rows() == [0, 2]
+
+
+def test_apply_step_plan_finished_request_releases_slot():
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    b = _lane_batch(num_lanes=1, per_lane=4)
+    requests: dict = {}
+    empty_plan = TTStepPlan(
+        is_decode=False,
+        capacity=4,
+        scheduled_req_ids=("a",),
+        scheduled_rows=(0,),
+        input_rows=(0,),
+        req_id_to_row={"a": 0},
+        batch_size_per_dp=(1,),
+        prefill_empty_slots=(0,),
+    )
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("a", [1])]), empty_plan, requests, {}
+    )
+    assert "a" in requests and b.occupied_rows() == [0]
+
+    # A later step finishes "a": its row is freed and the request map cleaned.
+    changed = b.apply_step_plan(
+        _step_output(finished=["a"]),
+        TTStepPlan(
+            is_decode=True,
+            capacity=4,
+            scheduled_req_ids=(),
+            scheduled_rows=(),
+            input_rows=(),
+            req_id_to_row={},
+            batch_size_per_dp=(0,),
+            prefill_empty_slots=None,
+        ),
+        requests,
+        {},
+    )
+    assert changed is True
+    assert "a" not in requests
+    assert b.occupied_rows() == []
 
 
 def test_lane_full_raises():
@@ -382,6 +475,68 @@ def test_merged_sampling_metadata_filters_generators_to_scheduled_rows():
 
     assert set(metadata.generators) == {row4}
     assert metadata.generators[row4] is b.sampling.generators[row4]
+
+
+def test_scheduled_seeded_row_isolated_from_unscheduled_random_row():
+    """A scheduled seeded request samples identically whether or not an
+    unscheduled (slot-occupying, not in ``scheduled_rows``) random request
+    shares the merged batch, and the unscheduled request's RNG is not advanced.
+
+    Guards the concern that filtering generators to the scheduled rows makes
+    ``len(generators) != batch_size``, so the sampler takes the global
+    ``exponential_`` path over every row. That is safe here because the merged
+    batch is ALWAYS the full, constant-size slot grid (decode = full logits,
+    prefill = scattered onto the full grid), so each row's randomness is
+    independent and seeded rows are overwritten by their own filtered generator
+    -- an unscheduled row can neither change the global RNG draw count nor
+    another row's value.
+    """
+    torch.manual_seed(99)
+    seed = 4321
+    sampler = Sampler()
+
+    # Reference: the seeded request sampled alone (batch of 1).
+    ref_batch = _plain_batch_of_one(
+        _make_req("a", [1], [], dict(temperature=0.8, top_k=5), seed=seed),
+        with_custom=False,
+    )
+    logits_a = torch.randn(1, VOCAB)
+    ref = (
+        sampler(
+            logits=logits_a.clone(),
+            sampling_metadata=_ref_sampling_metadata(ref_batch, 1),
+        )
+        .sampled_token_ids.reshape(-1)
+        .tolist()[0]
+    )
+
+    # Lane: seeded "a" at row 0 (scheduled) + unscheduled random "b" at row 4.
+    b = _lane_batch(num_lanes=2, per_lane=4, with_custom=False)
+    row_a = _add_to_lane(
+        b, _make_req("a", [1], [], dict(temperature=0.8, top_k=5), seed=seed), 0
+    )
+    row_b = _add_to_lane(b, _make_req("b", [2], [], dict(temperature=0.9), seed=777), 1)
+    b.refresh_logitsprocs()
+    assert (row_a, row_b) == (0, 4)
+
+    logits = torch.randn(b.max_num_reqs, VOCAB)
+    logits[row_a] = logits_a[0]  # same logits row as the reference
+
+    gen_b_before = b.sampling.generators[row_b].get_state().clone()
+    merged = (
+        sampler(
+            logits=logits.clone(),
+            sampling_metadata=b.build_merged_sampling_metadata(scheduled_rows=[row_a]),
+        )
+        .sampled_token_ids.reshape(-1)
+        .tolist()
+    )
+
+    # The scheduled seeded request matches its batch-of-1 reference: neither the
+    # unscheduled row nor the global exponential draw perturbs it.
+    assert merged[row_a] == ref
+    # The unscheduled request's generator was not advanced (it is excluded).
+    assert torch.equal(b.sampling.generators[row_b].get_state(), gen_b_before)
 
 
 # --------------------------------------------------------------------------

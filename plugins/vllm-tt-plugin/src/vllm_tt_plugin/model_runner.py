@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, cast
@@ -16,7 +17,6 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -33,6 +33,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
+    SubmittedStepContext,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.config import (
@@ -46,8 +47,10 @@ from vllm_tt_plugin.input_batch import (
     CachedRequestState,
     InputBatch,
     TTLaneInputBatch,
+    apply_cached_req_state_update,
+    build_cached_request_state,
 )
-from vllm_tt_plugin.lane_execution import TTLaneStepExecutor
+from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logprobs import build_logprobs_from_topk
 from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
@@ -190,15 +193,14 @@ class TTModelRunner:
             is_pooling_model=False,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
-        self.lane_executor = TTLaneStepExecutor(self)
 
     @property
     def lane_batch(self) -> TTLaneInputBatch:
         """The persistent batch as its lane-DP type.
 
         Valid only in lane mode, where ``initialize_kv_cache`` builds a
-        ``TTLaneInputBatch``. Lane-only code (``TTLaneStepExecutor``) reads this
-        instead of re-casting ``input_batch`` at every use site.
+        ``TTLaneInputBatch``. The lane step orchestration (``_execute_lane_step``)
+        reads this instead of re-casting ``input_batch`` at every use site.
         """
         return cast(TTLaneInputBatch, self.input_batch)
 
@@ -578,36 +580,8 @@ class TTModelRunner:
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
-            assert new_req_data.sampling_params is not None, (
-                "Pooling is not supported for TT yet"
-            )
-            if new_req_data.prompt_token_ids is None:
-                raise NotImplementedError(
-                    "TT backend does not support prompt_embeds yet"
-                )
             req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-
-            if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device="cpu")
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
-
-            self.requests[req_id] = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=None,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-                prompt_embeds=new_req_data.prompt_embeds,
-            )
-
+            self.requests[req_id] = build_cached_request_state(new_req_data)
             req_ids_to_add.append(req_id)
 
         # Update the states of the running/resumed requests.
@@ -619,17 +593,9 @@ class TTModelRunner:
             resumed_from_preemption = req_id in req_data.resumed_req_ids
 
             # Update the cached states.
-            req_state.num_computed_tokens = num_computed_tokens
-            if not resumed_from_preemption:
-                if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
-            else:
-                assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
+            apply_cached_req_state_update(
+                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+            )
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
@@ -1922,6 +1888,144 @@ class TTModelRunner:
         )
         return merged
 
+    # ------------------------------------------------------------------
+    # Single-process lane-DP step orchestration
+    # ------------------------------------------------------------------
+    #
+    # All lane-specific input/output shaping lives in ``TTLaneInputBatch``
+    # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the
+    # merge/redistribute in ``TTLaneCoordinator``; this orchestration only wires
+    # the device submission, async decode, and deferred state application -- the
+    # genuinely runner/model-owned parts.
+
+    @torch.no_grad()
+    def _execute_lane_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Execute one merged single-process multi-lane (lane-DP) step.
+
+        Invoked by ``execute_model`` when the lane scheduler attached a step
+        plan, so the plan is always present here.
+        """
+        plan = get_tt_step_plan(scheduler_output)
+        assert plan is not None, "lane step requires a scheduler-attached plan"
+
+        # Lane-DP lays requests out at sparse stable slots. Request-specific
+        # RoPE (mrope/vision models) instead assumes front-packed request rows,
+        # so the two are incompatible until the RoPE delta mapping is made
+        # slot-aware. No lane-DP model needs it.
+        if self.request_specific_rope:
+            raise NotImplementedError(
+                "lane-DP does not support request-specific RoPE "
+                "(mrope/vision models) yet"
+            )
+
+        lane_batch = self.lane_batch
+        self.async_decode.apply_ready_completed_decode_steps()
+        steady_decode_candidate = (
+            self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
+                scheduler_output, grammar_output
+            )
+        )
+        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+            self.async_decode.wait_for_all_pending_async_steps()
+
+        layout_changed = lane_batch.apply_step_plan(
+            scheduler_output, plan, self.requests, self.encoder_cache
+        )
+        if layout_changed:
+            self._decode_layout_changed_since_last_decode = True
+
+        if not scheduler_output.total_num_scheduled_tokens:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        scheduled_rows = list(plan.scheduled_rows)
+        if not scheduled_rows:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        model_input = lane_batch.build_model_input(
+            self, scheduler_output, grammar_output, plan
+        )
+        if plan.is_decode:
+            if self.non_dp_async_scheduling:
+                context = self._capture_lane_step_context(scheduled_rows)
+                return self.async_decode.submit_async_lane_decode(
+                    model_input, context, scheduled_rows
+                )
+            submission = self.async_decode.submit_decode(
+                model_input, read_from_device=True, async_read=False
+            )
+            finalized = self.async_decode.finalize_decode(submission)
+            assert finalized is not None
+            sampled, logprobs = lane_batch.extract_output(
+                self,
+                finalized.tt_out,
+                finalized.tt_log_probs,
+                model_input,
+                scheduled_rows,
+                is_decode=True,
+            )
+        else:
+            tt_out = self.submit_prefill(model_input, model_input.unpadded_batch_size)
+            tt_log_probs = None
+            assert isinstance(
+                model_input.tt_sampling_params.enable_log_probs, torch.Tensor
+            )
+            if (
+                model_input.perform_device_sampling
+                and model_input.tt_sampling_params.enable_log_probs.any()
+            ):
+                assert isinstance(tt_out, tuple) and len(tt_out) == 2
+                tt_out, tt_log_probs = tt_out
+            elif isinstance(tt_out, tuple):
+                tt_out, _ = tt_out
+            sampled, logprobs = lane_batch.extract_output(
+                self, tt_out, tt_log_probs, model_input, scheduled_rows, is_decode=False
+            )
+
+        return self._finalize_lane_output(sampled, logprobs, scheduled_rows)
+
+    def _capture_lane_step_context(
+        self, scheduled_rows: list[int]
+    ) -> SubmittedStepContext:
+        """Snapshot the scheduled requests for deferred async lane state apply.
+
+        ``req_ids`` are the scheduled rows' requests in row order, which is the
+        canonical merged output order.
+        """
+        req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        return SubmittedStepContext(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            request_states=tuple(self.requests[rid] for rid in req_ids),
+            submit_time_ns=time.perf_counter_ns(),
+        )
+
+    def _finalize_lane_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None,
+        scheduled_rows: list[int],
+    ) -> ModelRunnerOutput:
+        """Apply sampled tokens to batch state and build the merged lane output.
+
+        ``scheduled_rows`` are the persistent rows (== device slots) of the
+        requests sampled this step; ``req_ids`` are taken from those rows, in
+        order, giving the canonical merged ``req_id_to_index``.
+        """
+        req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        self._apply_sampled_tokens_to_state(
+            sampled_token_ids=sampled_token_ids, req_ids=req_ids
+        )
+        return self._build_runner_output(
+            sampled_token_ids=sampled_token_ids,
+            logprobs=logprobs,
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        )
+
     @torch.no_grad()
     def execute_model(
         self,
@@ -1939,6 +2043,15 @@ class TTModelRunner:
         # tt_worker.py uses the dedicated DP facade instead.
         # With DP, the actual model pass happens on a batch
         # produced by concatenating the inputs from all DP ranks.
+
+        # Single-process lane-DP: the lane scheduler attaches a per-step plan to
+        # the scheduler output. When present, the step runs over the merged lane
+        # batch (``TTLaneInputBatch`` owns all the lane-specific input/output
+        # shaping); the generic path below stays lane-agnostic.
+        if get_tt_step_plan(scheduler_output) is not None:
+            return self._execute_lane_step(
+                scheduler_output, grammar_output, intermediate_tensors
+            )
 
         # Apply any decode steps that have already completed on the async
         # thread. In steady decode mode we intentionally allow one step of
@@ -1977,21 +2090,6 @@ class TTModelRunner:
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
         output = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
         return output
-
-    @torch.no_grad()
-    def execute_model_lanes(
-        self,
-        scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
-        """Worker entry point for a lane-DP step; delegates to
-        ``TTLaneStepExecutor``. See ``lane_execution.py`` for the lane model."""
-        return self.lane_executor.execute_model(
-            scheduler_output=scheduler_output,
-            grammar_output=grammar_output,
-            intermediate_tensors=intermediate_tensors,
-        )
 
     def pack_dp_results(
         self,
