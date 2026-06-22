@@ -1,9 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+
+def has_structured_outputs(
+    requests: Mapping[str, CachedRequestState],
+    scheduler_output: SchedulerOutput,
+    bitmask: torch.Tensor | None,
+) -> bool:
+    """True if any request scheduled this step constrains its tokens via
+    structured outputs: a grammar bitmask, pending structured tokens, or a
+    scheduled request carrying ``structured_outputs`` sampling params."""
+    if bitmask is not None or scheduler_output.pending_structured_output_tokens:
+        return True
+    return any(
+        (req := requests.get(req_id)) is not None
+        and req.sampling_params is not None
+        and req.sampling_params.structured_outputs is not None
+        for req_id in scheduler_output.num_scheduled_tokens
+    )
 
 
 def reorder_grammar_bitmask_for_tt_batch(

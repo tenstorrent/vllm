@@ -57,7 +57,10 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
+from vllm_tt_plugin.structured_output import (
+    has_structured_outputs,
+    reorder_grammar_bitmask_for_tt_batch,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -920,18 +923,8 @@ class TTModelRunner:
 
         # If we're not using structured outputs, grammar_bitmask is None.
         bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
-        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        scheduled_structured_req_ids = [
-            req_id
-            for req_id in scheduled_req_ids
-            if (req := self.requests.get(req_id)) is not None
-            and req.sampling_params is not None
-            and req.sampling_params.structured_outputs is not None
-        ]
-        has_structured_outputs = (
-            bitmask is not None
-            or scheduler_output.pending_structured_output_tokens
-            or bool(scheduled_structured_req_ids)
+        has_structured = has_structured_outputs(
+            self.requests, scheduler_output, bitmask
         )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
@@ -958,7 +951,7 @@ class TTModelRunner:
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
-            has_structured_outputs=has_structured_outputs,
+            has_structured_outputs=has_structured,
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed

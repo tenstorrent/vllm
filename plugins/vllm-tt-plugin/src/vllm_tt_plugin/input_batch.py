@@ -27,7 +27,10 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
+from vllm_tt_plugin.structured_output import (
+    has_structured_outputs,
+    reorder_grammar_bitmask_for_tt_batch,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -1092,21 +1095,6 @@ class TTLaneInputBatch(InputBatch):
             )
         return self._build_prefill_input(runner, scheduler_output, grammar_output, plan)
 
-    def _has_structured_outputs(
-        self,
-        runner: "TTModelRunner",
-        scheduler_output: "SchedulerOutput",
-        bitmask: torch.Tensor | None,
-    ) -> bool:
-        if bitmask is not None or scheduler_output.pending_structured_output_tokens:
-            return True
-        return any(
-            (req := runner.requests.get(req_id)) is not None
-            and req.sampling_params is not None
-            and req.sampling_params.structured_outputs is not None
-            for req_id in scheduler_output.num_scheduled_tokens
-        )
-
     def _build_decode_input(
         self,
         runner: "TTModelRunner",
@@ -1138,7 +1126,9 @@ class TTLaneInputBatch(InputBatch):
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
 
         bitmask = lane_batch.slot_grammar_bitmask(grammar_output, total)
-        has_structured = self._has_structured_outputs(runner, scheduler_output, bitmask)
+        has_structured = has_structured_outputs(
+            runner.requests, scheduler_output, bitmask
+        )
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=True, has_structured_outputs=has_structured
         )
@@ -1216,7 +1206,9 @@ class TTLaneInputBatch(InputBatch):
         bitmask = lane_batch.slot_grammar_bitmask(
             grammar_output, lane_batch.max_num_reqs
         )
-        has_structured = self._has_structured_outputs(runner, scheduler_output, bitmask)
+        has_structured = has_structured_outputs(
+            runner.requests, scheduler_output, bitmask
+        )
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=False, has_structured_outputs=has_structured
         )
