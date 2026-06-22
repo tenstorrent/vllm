@@ -468,6 +468,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     cache_config = vllm_config.cache_config
 
     # region Get default or model- and device-specific `max_tokens_all_users`
+    model_class = None
     try:
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         model_class, _ = get_model_architecture(model_config)
@@ -524,16 +525,20 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # per-group block tables, so each request consumes
     # ``full_blocks_per_request + Σ sliding_blocks_per_request`` block IDs.
     #
-    # Hybrid groups are temporarily disabled on the model side by emitting
-    # FullAttentionSpec for every layer. While that is true, this token budget
-    # must stay on the pre-hybrid formula; adding sliding-window headroom here
-    # allocates too many full-size KV blocks and can OOM Gemma3-27B on T3K.
-    #
-    # When SlidingWindowSpec is restored in HybridAttentionForCausalLM, flip
-    # _HYBRID_KV_CACHE_GROUPS_ENABLED at the same time so both the spec shape
-    # and token calculation change together.
+    # Whether a given model actually emits SlidingWindowSpec (and therefore
+    # needs this sliding-window headroom) is decided per model class via
+    # ``_HYBRID_KV_CACHE_GROUPS_ENABLED``. Gemma4 re-enables it (it ships the
+    # bounded sliding-window decode fix); Gemma3 / GPT-OSS keep it ``False`` and
+    # emit FullAttentionSpec for every layer, so adding headroom for them would
+    # over-allocate full-size KV blocks and can OOM Gemma3-27B on T3K. Read the
+    # resolved model class's flag rather than a single global so re-enabling for
+    # one model doesn't regress the others; fall back to the module default when
+    # the class can't be resolved.
+    hybrid_kv_cache_groups_enabled = getattr(
+        model_class, "_HYBRID_KV_CACHE_GROUPS_ENABLED", _HYBRID_KV_CACHE_GROUPS_ENABLED
+    )
     sliding_window = model_config.get_sliding_window()
-    if _HYBRID_KV_CACHE_GROUPS_ENABLED and sliding_window is not None:
+    if hybrid_kv_cache_groups_enabled and sliding_window is not None:
         # Conservative cap: assume up to a few sliding groups per buffer
         # (typical for Gemma3 5:1 / GPT-OSS 1:1 hybrid patterns) and add
         # ``sliding_window * max_batch`` worth of tokens per group as
