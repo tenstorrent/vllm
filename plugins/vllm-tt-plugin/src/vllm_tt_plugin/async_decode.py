@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -13,6 +13,7 @@ import ttnn
 
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -93,6 +94,15 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         self._completion_event = completion_event
         self._context = context
         self._scheduled_rows = scheduled_rows
+
+    def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
+        """Attach a sample-time grammar bitmask before the deferred read.
+
+        The runner reorders the bitmask on the engine thread (where the batch
+        layout still matches this step's forward) and calls this; the read on
+        the output thread then applies it through ``model_input``.
+        """
+        self._model_input = replace(self._model_input, grammar_bitmask=[bitmask])
 
     def get_output(self) -> ModelRunnerOutput:
         try:
@@ -210,9 +220,15 @@ class TTAsyncDecodeController:
         )
         if is_prompt or runner._decode_layout_changed_since_last_decode:
             return False
+        # Structured outputs are detected from the scheduler state, not from a
+        # prepared bitmask: the non-DP/lane paths now defer grammar to sample
+        # time and pass ``grammar_output=None`` here, while gathered DP still
+        # passes a bitmask. Either signal disables steady decode so the grammar
+        # constraint is never skipped by an overlapped step.
         if (
             scheduler_output.pending_structured_output_tokens
             or grammar_output is not None
+            or has_structured_outputs(runner.requests, scheduler_output, None)
         ):
             return False
         input_batch = runner.input_batch

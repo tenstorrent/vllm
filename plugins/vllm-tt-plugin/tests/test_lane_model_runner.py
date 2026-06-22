@@ -83,7 +83,7 @@ def test_lane_step_rejects_request_specific_rope():
     )
 
     with pytest.raises(NotImplementedError, match="request-specific RoPE"):
-        TTModelRunner._execute_lane_step(runner, output, grammar_output=None)
+        TTModelRunner._execute_lane_step(runner, output)
 
 
 # --------------------------------------------------------------------------
