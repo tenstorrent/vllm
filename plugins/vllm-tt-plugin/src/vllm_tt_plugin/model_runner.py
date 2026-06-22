@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from collections import deque
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, cast
@@ -33,7 +32,6 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
-    SubmittedStepContext,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.config import (
@@ -52,8 +50,12 @@ from vllm_tt_plugin.input_batch import (
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
-from vllm_tt_plugin.logprobs import build_logprobs_from_topk
-from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
+from vllm_tt_plugin.logprobs import build_device_logprobs
+from vllm_tt_plugin.model_input import (
+    TTModelInput,
+    TTSamplingParams,
+    slice_tt_sampling_params,
+)
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
 
@@ -792,21 +794,10 @@ class TTModelRunner:
         # ``ceil(max_model_len / block_size)``, and padding handles
         # under-wide ones from hybrid kv-cache groups whose native
         # block-table widths differ after upstream page-size unification.
-        # Constant shape is required for ttnn tracing to work, so runtime
-        # block tables must match that width even when their underlying
-        # group is narrower.
         target_width = self.max_num_blocks_per_req
-        block_tables_per_group = []
-        for bt in input_batch.block_table.block_tables:
-            bt_cpu = bt.get_cpu_tensor()[req_indices, :target_width].clone()
-            if bt_cpu.shape[1] < target_width:
-                pad = torch.zeros(
-                    bt_cpu.shape[0],
-                    target_width - bt_cpu.shape[1],
-                    dtype=bt_cpu.dtype,
-                )
-                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
-            block_tables_per_group.append(bt_cpu)
+        block_tables_per_group = input_batch.block_tables_for_rows(
+            req_indices, target_width
+        )
 
         # DP optimization: don't send padding blocks if possible to reduce
         # overhead from gathering inputs to rank 0 and rely on DP concat
@@ -912,20 +903,7 @@ class TTModelRunner:
                 # defaults. The persistent ``input_batch.sampling`` tail is
                 # never read, so there is nothing to default in place.
 
-        # Convert num_logprobs (int tensor) to enable_log_probs (bool tensor):
-        # -2 means no logprobs, 0 means sampled token only.
-        enable_log_probs = sample_params.num_logprobs[req_indices] >= 0
-        tt_sampling_params = TTSamplingParams(
-            temperature=sample_params.temperature[req_indices],
-            top_k=sample_params.top_k[req_indices],
-            top_p=sample_params.top_p[req_indices],
-            presence_penalty=sample_params.presence_penalty[req_indices],
-            frequency_penalty=sample_params.frequency_penalty[req_indices],
-            repetition_penalty=sample_params.repetition_penalty[req_indices],
-            seed=sample_params.seed[req_indices],
-            num_logprobs=sample_params.num_logprobs[req_indices],
-            enable_log_probs=enable_log_probs,
-        )
+        tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
         if not is_prompt and input_tokens.shape[0] > len(req_indices):
             # Decode inputs are padded to the rank batch size; pad the sampling
             # params to match, right-filling padding rows with neutral defaults.
@@ -1950,7 +1928,8 @@ class TTModelRunner:
         )
         if plan.is_decode:
             if self.non_dp_async_scheduling:
-                context = self._capture_lane_step_context(scheduled_rows)
+                req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+                context = self.async_decode.capture_submitted_step_context(req_ids)
                 return self.async_decode.submit_async_lane_decode(
                     model_input, context, scheduled_rows
                 )
@@ -1985,46 +1964,10 @@ class TTModelRunner:
                 self, tt_out, tt_log_probs, model_input, scheduled_rows, is_decode=False
             )
 
-        return self._finalize_lane_output(sampled, logprobs, scheduled_rows)
-
-    def _capture_lane_step_context(
-        self, scheduled_rows: list[int]
-    ) -> SubmittedStepContext:
-        """Snapshot the scheduled requests for deferred async lane state apply.
-
-        ``req_ids`` are the scheduled rows' requests in row order, which is the
-        canonical merged output order.
-        """
+        # ``scheduled_rows`` are persistent slots; their req_ids in row order are
+        # the canonical merged output order.
         req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
-        return SubmittedStepContext(
-            req_ids=req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-            request_states=tuple(self.requests[rid] for rid in req_ids),
-            submit_time_ns=time.perf_counter_ns(),
-        )
-
-    def _finalize_lane_output(
-        self,
-        sampled_token_ids: torch.Tensor,
-        logprobs: LogprobsLists | None,
-        scheduled_rows: list[int],
-    ) -> ModelRunnerOutput:
-        """Apply sampled tokens to batch state and build the merged lane output.
-
-        ``scheduled_rows`` are the persistent rows (== device slots) of the
-        requests sampled this step; ``req_ids`` are taken from those rows, in
-        order, giving the canonical merged ``req_id_to_index``.
-        """
-        req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
-        self._apply_sampled_tokens_to_state(
-            sampled_token_ids=sampled_token_ids, req_ids=req_ids
-        )
-        return self._build_runner_output(
-            sampled_token_ids=sampled_token_ids,
-            logprobs=logprobs,
-            req_ids=req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-        )
+        return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
     def execute_model(
@@ -2596,34 +2539,14 @@ class TTModelRunner:
                     assert tt_log_probs is not None, (
                         "model should return logprobs when requested"
                     )
-                    if isinstance(tt_log_probs, tuple):
-                        # New path: top-K logprobs from device
-                        # (gpt-oss-120b). Device returns already-sorted
-                        # (top_k_logprobs[B,32], top_k_indices[B,32]).
-                        top_k_logprobs, top_k_indices = tt_log_probs
-                        logprobs_tensors = build_logprobs_from_topk(
-                            top_k_logprobs=_take(top_k_logprobs),
-                            top_k_indices=_take(top_k_indices),
+                    logprobs_per_dp.append(
+                        build_device_logprobs(
+                            tt_log_probs=tt_log_probs,
                             sampled_token_ids=next_token_ids,
-                            max_num_logprobs=rank_max_num_logprobs
-                            if rank_max_num_logprobs is not None
-                            else 0,
+                            rows=rows,
+                            max_num_logprobs=rank_max_num_logprobs or 0,
                         )
-                    else:
-                        # Old path: single sampled-token logprob
-                        # (all other models). Device returns [B] tensor.
-                        sampled_log_probs = _take(tt_log_probs).reshape(sz)
-                        logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
-                        logprobs_values = sampled_log_probs.unsqueeze(-1).to(
-                            torch.float32
-                        )
-                        selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
-                        logprobs_tensors = LogprobsTensors(
-                            logprob_token_ids=logprob_token_ids,
-                            logprobs=logprobs_values,
-                            selected_token_ranks=selected_token_ranks,
-                        )
-                    logprobs_per_dp.append(logprobs_tensors)
+                    )
                 else:
                     logprobs_per_dp.append(None)
 

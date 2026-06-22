@@ -160,13 +160,26 @@ class TTAsyncDecodeController:
     def __init__(self, runner: TTModelRunner):
         self.runner = runner
 
-    def capture_submitted_step_context(self) -> SubmittedStepContext:
+    def capture_submitted_step_context(
+        self, req_ids: list[str] | None = None
+    ) -> SubmittedStepContext:
+        """Snapshot the submitted requests for deferred async state apply.
+
+        ``req_ids`` is the merged output order: the lane path passes its
+        scheduled slots' requests (sparse rows), so the index map is built from
+        their position. ``None`` takes the condensed front-packed batch, whose
+        ``req_id_to_index`` already equals that position map.
+        """
         runner = self.runner
-        num_reqs = runner.input_batch.num_reqs
-        req_ids = list(runner.input_batch.req_ids[:num_reqs])
+        if req_ids is None:
+            num_reqs = runner.input_batch.num_reqs
+            req_ids = list(runner.input_batch.req_ids[:num_reqs])
+            req_id_to_index = dict(runner.input_batch.req_id_to_index)
+        else:
+            req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         return SubmittedStepContext(
             req_ids=req_ids,
-            req_id_to_index=dict(runner.input_batch.req_id_to_index),
+            req_id_to_index=req_id_to_index,
             request_states=tuple(runner.requests[req_id] for req_id in req_ids),
             submit_time_ns=time.perf_counter_ns(),
         )

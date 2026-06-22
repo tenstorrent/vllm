@@ -38,6 +38,28 @@ class TTSamplingParams:
     enable_log_probs: torch.Tensor | list[bool] | None = None
 
 
+def slice_tt_sampling_params(
+    sampling: TTSamplingParams, rows: torch.Tensor | list[int]
+) -> TTSamplingParams:
+    """Select ``rows`` from the per-row sampling tensors of ``sampling``.
+
+    ``num_logprobs >= 0`` encodes ``enable_log_probs`` (-2 means no logprobs, 0
+    means the sampled token only).
+    """
+    num_logprobs = sampling.num_logprobs[rows]
+    return TTSamplingParams(
+        temperature=sampling.temperature[rows],
+        top_k=sampling.top_k[rows],
+        top_p=sampling.top_p[rows],
+        presence_penalty=sampling.presence_penalty[rows],
+        frequency_penalty=sampling.frequency_penalty[rows],
+        repetition_penalty=sampling.repetition_penalty[rows],
+        seed=sampling.seed[rows],
+        num_logprobs=num_logprobs,
+        enable_log_probs=num_logprobs >= 0,
+    )
+
+
 @dataclass(frozen=True)
 class TTModelInput:
     input_tokens: torch.Tensor

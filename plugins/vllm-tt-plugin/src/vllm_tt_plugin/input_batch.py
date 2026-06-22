@@ -21,8 +21,12 @@ from vllm.v1.sample.logits_processor.builtin import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm_tt_plugin.logprobs import build_logprobs_from_topk
-from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
+from vllm_tt_plugin.logprobs import build_device_logprobs
+from vllm_tt_plugin.model_input import (
+    TTModelInput,
+    TTSamplingParams,
+    slice_tt_sampling_params,
+)
 from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
 
 if TYPE_CHECKING:
@@ -626,6 +630,27 @@ class InputBatch:
                 ]
         return output_token_ids_tensor
 
+    def block_tables_for_rows(
+        self, rows: torch.Tensor | list[int], width: int
+    ) -> list[torch.Tensor]:
+        """Per-group block tables sliced to ``rows`` and right-padded on the
+        block dimension to ``width``.
+
+        Constant ``width`` (``max_num_blocks_per_req``) is required for ttnn
+        tracing: runtime block tables must match the traced width even when
+        their underlying group is narrower.
+        """
+        out: list[torch.Tensor] = []
+        for bt in self.block_table.block_tables:
+            bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            if bt_cpu.shape[1] < width:
+                pad = torch.zeros(
+                    bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
+                )
+                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
+            out.append(bt_cpu)
+        return out
+
     def advance_generators(self, req_indices: list[int] | None = None) -> None:
         # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied,
@@ -1008,37 +1033,19 @@ class TTLaneInputBatch(InputBatch):
         rows of ``range(total)`` not in ``rows`` are zeroed (empty decode slots
         carry no blocks)."""
         occupied = set(rows)
-        out: list[torch.Tensor] = []
-        for bt in self.block_table.block_tables:
-            sel = list(range(total)) if zero_gaps else rows
-            bt_cpu = bt.get_cpu_tensor()[sel, :width].clone()
-            if bt_cpu.shape[1] < width:
-                pad = torch.zeros(
-                    bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
-                )
-                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
-            if zero_gaps and len(occupied) < total:
-                gap = torch.ones(total, dtype=torch.bool)
-                gap[list(occupied)] = False
+        sel = list(range(total)) if zero_gaps else rows
+        out = self.block_tables_for_rows(sel, width)
+        if zero_gaps and len(occupied) < total:
+            gap = torch.ones(total, dtype=torch.bool)
+            gap[list(occupied)] = False
+            for bt_cpu in out:
                 bt_cpu[gap] = 0
-            out.append(bt_cpu.contiguous())
-        return out
+        return [bt.contiguous() for bt in out]
 
     def slot_sampling_params(self, rows: list[int]) -> TTSamplingParams:
         """Slice the slot-ordered sampling tensors to ``rows``."""
-        sp = self.sampling
-        idx = torch.as_tensor(rows, dtype=torch.long)
-        num_logprobs = sp.num_logprobs[idx]
-        return TTSamplingParams(
-            temperature=sp.temperature[idx],
-            top_k=sp.top_k[idx],
-            top_p=sp.top_p[idx],
-            presence_penalty=sp.presence_penalty[idx],
-            frequency_penalty=sp.frequency_penalty[idx],
-            repetition_penalty=sp.repetition_penalty[idx],
-            seed=sp.seed[idx],
-            num_logprobs=num_logprobs,
-            enable_log_probs=num_logprobs >= 0,
+        return slice_tt_sampling_params(
+            self.sampling, torch.as_tensor(rows, dtype=torch.long)
         )
 
     def slot_grammar_bitmask(
@@ -1355,21 +1362,9 @@ class TTLaneInputBatch(InputBatch):
         if not enable[sel].any():
             return None
         assert tt_log_probs is not None, "model should return logprobs when requested"
-        max_lp = model_input.max_num_logprobs[0] or 0
-        next_token_ids = sampled.reshape(n)
-        if isinstance(tt_log_probs, tuple):
-            top_k_logprobs, top_k_indices = tt_log_probs
-            logprobs_tensors = build_logprobs_from_topk(
-                top_k_logprobs=top_k_logprobs[sel],
-                top_k_indices=top_k_indices[sel],
-                sampled_token_ids=next_token_ids,
-                max_num_logprobs=max_lp,
-            )
-        else:
-            sampled_log_probs = tt_log_probs.reshape(-1)[sel].reshape(n)
-            logprobs_tensors = LogprobsTensors(
-                logprob_token_ids=next_token_ids.unsqueeze(-1).to(torch.int32),
-                logprobs=sampled_log_probs.unsqueeze(-1).to(torch.float32),
-                selected_token_ranks=torch.full((n,), -1, dtype=torch.int32),
-            )
-        return logprobs_tensors.tolists()
+        return build_device_logprobs(
+            tt_log_probs=tt_log_probs,
+            sampled_token_ids=sampled.reshape(n),
+            rows=sel,
+            max_num_logprobs=model_input.max_num_logprobs[0] or 0,
+        ).tolists()

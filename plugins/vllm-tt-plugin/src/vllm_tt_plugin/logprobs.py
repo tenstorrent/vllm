@@ -50,3 +50,33 @@ def build_logprobs_from_topk(
         logprobs_values,
         selected_token_ranks,
     )
+
+
+def build_device_logprobs(
+    tt_log_probs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    sampled_token_ids: torch.Tensor,
+    rows: torch.Tensor,
+    max_num_logprobs: int,
+) -> LogprobsTensors:
+    """Pack logprobs for device-sampled tokens at ``rows``.
+
+    ``sampled_token_ids`` is the already-selected ``[n]`` sampled tokens (one
+    per row); ``rows`` indexes the device output's batch dimension. Covers the
+    top-K device path (gpt-oss returns a sorted top-32 set) and the
+    single-sampled-logprob path (one logprob per row).
+    """
+    n = sampled_token_ids.shape[0]
+    if isinstance(tt_log_probs, tuple):
+        top_k_logprobs, top_k_indices = tt_log_probs
+        return build_logprobs_from_topk(
+            top_k_logprobs=top_k_logprobs[rows],
+            top_k_indices=top_k_indices[rows],
+            sampled_token_ids=sampled_token_ids,
+            max_num_logprobs=max_num_logprobs,
+        )
+    sampled_log_probs = tt_log_probs[rows].reshape(n)
+    return LogprobsTensors(
+        logprob_token_ids=sampled_token_ids.reshape(n, 1).to(torch.int32),
+        logprobs=sampled_log_probs.reshape(n, 1).to(torch.float32),
+        selected_token_ranks=torch.full((n,), -1, dtype=torch.int32),
+    )
