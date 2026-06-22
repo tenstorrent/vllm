@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
+from vllm.sampling_params import SamplingType
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
     LogitsProcessors,
@@ -16,8 +18,24 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
 )
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
+from vllm_tt_plugin.logprobs import build_device_logprobs
+from vllm_tt_plugin.model_input import (
+    TTModelInput,
+    TTSamplingParams,
+    slice_tt_sampling_params,
+)
+from vllm_tt_plugin.structured_output import (
+    has_structured_outputs,
+    reorder_grammar_bitmask_for_tt_batch,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+    from vllm_tt_plugin.model_runner import TTModelRunner
 
 # Sentinel value for None seed. vLLM treats -1 as equivalent to None
 # (see SamplingParams.__post_init__), so we use -1 as the sentinel.
@@ -28,6 +46,62 @@ SEED_NONE_SENTINEL = -1
 # Can't use -1 because SamplingParams.logprobs=-1 means "all vocab logprobs".
 # although -1 gets remapped before writing to SamplingInputBatch.num_logprobs
 LOGPROBS_NONE_SENTINEL = -2
+
+
+def build_cached_request_state(new_req_data) -> CachedRequestState:
+    """Build a ``CachedRequestState`` for one newly-scheduled request.
+
+    Shared by the front-packed (``TTModelRunner._update_states``) and lane-DP
+    (``TTLaneInputBatch.apply_step_plan``) state updates so request-cache
+    construction -- prompt validation and per-request generator seeding -- lives
+    in exactly one place.
+    """
+    assert new_req_data.sampling_params is not None, (
+        "Pooling is not supported for TT yet"
+    )
+    if new_req_data.prompt_token_ids is None:
+        raise NotImplementedError("TT backend does not support prompt_embeds yet")
+    sampling_params = new_req_data.sampling_params
+    if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(sampling_params.seed)
+    else:
+        generator = None
+    return CachedRequestState(
+        req_id=new_req_data.req_id,
+        prompt_token_ids=new_req_data.prompt_token_ids,
+        mm_features=new_req_data.mm_features,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        generator=generator,
+        block_ids=new_req_data.block_ids,
+        num_computed_tokens=new_req_data.num_computed_tokens,
+        output_token_ids=[],
+        lora_request=new_req_data.lora_request,
+        prompt_embeds=new_req_data.prompt_embeds,
+    )
+
+
+def apply_cached_req_state_update(
+    req_state: CachedRequestState,
+    num_computed_tokens: int,
+    new_block_ids,
+    resumed_from_preemption: bool,
+) -> None:
+    """Apply a ``scheduled_cached_reqs`` update to a request's cached state.
+
+    Identical for front-packed and lane-DP: a request resumed from preemption
+    had its KV freed and rebuilt (replace block IDs), otherwise the newly
+    allocated blocks are appended. Persistent-batch row bookkeeping is left to
+    the caller.
+    """
+    req_state.num_computed_tokens = num_computed_tokens
+    if resumed_from_preemption:
+        assert new_block_ids is not None
+        req_state.block_ids = new_block_ids
+    elif new_block_ids is not None:
+        for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+            block_ids.extend(new_ids)
 
 
 class SamplingInputBatch:
@@ -61,7 +135,6 @@ class SamplingInputBatch:
             assert hasattr(self, name), (
                 f"Missing attribute '{name}' in SamplingInputBatch"
             )
-        self.sampling_param_names = list(self.DEFAULTS.keys())
 
         # req_index -> generator
         # NOTE: The indices of the requests that do not have their own
@@ -96,14 +169,6 @@ class SamplingInputBatch:
             if isinstance(proc, MinTokensLogitsProcessor) and proc.min_toks:
                 return True
         return False
-
-    def pad_with_defaults(self, num_reqs: int) -> None:
-        """Pad sampling parameters with default values for indices >=
-        num_reqs."""
-        for name in self.sampling_param_names:
-            param_tensor = getattr(self, name)
-            default_value = self.DEFAULTS[name]
-            param_tensor[num_reqs:] = default_value
 
     def create_default_tensors(self) -> dict[str, torch.Tensor]:
         """Create tensors filled with default values for all parameters in
@@ -338,6 +403,13 @@ class InputBatch:
             self.sampling.allowed_token_ids_mask[req_index][
                 sampling_params.allowed_token_ids
             ] = False
+        elif self.sampling.allowed_token_ids_mask is not None:
+            # This request has no allowlist. The slot may have been reused from
+            # a previous request that did, so its mask row could hold stale
+            # "disallowed" bits. The mask is read as ``mask[req_indices]``
+            # whenever *any* batched request has an allowlist, so a stale row
+            # would wrongly constrain this request. Reset it.
+            self.sampling.allowed_token_ids_mask[req_index] = False
 
         # Bad words
         if sampling_params.bad_words_token_ids:
@@ -365,6 +437,10 @@ class InputBatch:
         self.sampling.generators.pop(req_index, None)
         self.sampling.has_allowed_token_ids.discard(req_id)
         self.sampling.bad_words_token_ids.pop(req_index, None)
+        # Clear the allowlist mask row so a stale "disallowed" set can never
+        # survive into a request that later reuses this slot.
+        if self.sampling.allowed_token_ids_mask is not None:
+            self.sampling.allowed_token_ids_mask[req_index] = False
 
         return req_index
 
@@ -488,66 +564,799 @@ class InputBatch:
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
 
-    def make_prompt_token_ids_tensor(self) -> torch.Tensor:
+    def make_prompt_token_ids_tensor(
+        self, req_indices: list[int] | None = None
+    ) -> torch.Tensor:
         """Create a tensor of prompt token IDs, padded with -1.
+
+        ``req_indices`` selects which rows of the persistent batch to emit (one
+        row per index, in order). ``None`` means the whole local batch
+        (``range(num_reqs)``). Lane-DP passes one lane's indices so the result
+        is attributed to that lane's requests rather than the merged batch's
+        leading rows.
 
         NOTE: TT device sampling relies on -1 as the padding sentinel.
         If these tokens are passed to the host sampler for penalties, they must
         be canonicalized (cast to int64 and -1 replaced with vocab_size) before
         scatter operations.
         """
-        max_prompt_len = (
-            self.num_prompt_tokens[: self.num_reqs].max() if self.num_reqs > 0 else 0
-        )
+        rows = list(range(self.num_reqs)) if req_indices is None else list(req_indices)
+        n = len(rows)
+        idx = np.asarray(rows, dtype=np.int64)
+        max_prompt_len = int(self.num_prompt_tokens[idx].max()) if n > 0 else 0
         prompt_token_ids_tensor = torch.full(
-            (self.num_reqs, max_prompt_len),
+            (n, max_prompt_len),
             -1,
             device="cpu",
             dtype=torch.int32,
         )
         prompt_token_ids = prompt_token_ids_tensor.numpy()
-        prompt_token_ids[:] = self.token_ids_cpu[: self.num_reqs, :max_prompt_len]
+        prompt_token_ids[:] = self.token_ids_cpu[idx, :max_prompt_len]
         # Pad with -1 for positions beyond actual prompt length
-        for i in range(self.num_reqs):
-            prompt_token_ids[i, self.num_prompt_tokens[i] :] = -1
+        for row, i in enumerate(rows):
+            prompt_token_ids[row, self.num_prompt_tokens[i] :] = -1
         return prompt_token_ids_tensor
 
-    def make_output_token_ids_tensor(self) -> torch.Tensor:
+    def make_output_token_ids_tensor(
+        self, req_indices: list[int] | None = None
+    ) -> torch.Tensor:
         """Create a tensor of output token IDs, padded with -1.
+
+        ``req_indices`` selects which rows of the persistent batch to emit (see
+        ``make_prompt_token_ids_tensor``).
 
         NOTE: TT device sampling relies on -1 as the padding sentinel.
         If these tokens are used by the host sampler penalties logic, -1 padding
         should be removed/handled before use.
         """
-        output_lens = (
-            self.num_tokens[: self.num_reqs] - self.num_prompt_tokens[: self.num_reqs]
-        )
-        max_output_len = int(output_lens.max()) if self.num_reqs > 0 else 0
+        rows = list(range(self.num_reqs)) if req_indices is None else list(req_indices)
+        n = len(rows)
+        idx = np.asarray(rows, dtype=np.int64)
+        output_lens = self.num_tokens[idx] - self.num_prompt_tokens[idx]
+        max_output_len = int(output_lens.max()) if n > 0 else 0
 
         output_token_ids_tensor = torch.full(
-            (self.num_reqs, max_output_len),
+            (n, max_output_len),
             -1,
             device="cpu",
             dtype=torch.int32,
         )
         output_token_ids = output_token_ids_tensor.numpy()
         # Copy output tokens from token_ids_cpu
-        for i in range(self.num_reqs):
+        for row, i in enumerate(rows):
             prompt_len = self.num_prompt_tokens[i]
             total_len = self.num_tokens[i]
             output_len = total_len - prompt_len
             if output_len > 0:
-                output_token_ids[i, :output_len] = self.token_ids_cpu[
+                output_token_ids[row, :output_len] = self.token_ids_cpu[
                     i, prompt_len:total_len
                 ]
         return output_token_ids_tensor
 
-    def advance_generators(self) -> None:
+    def block_tables_for_rows(
+        self, rows: torch.Tensor | list[int], width: int
+    ) -> list[torch.Tensor]:
+        """Per-group block tables sliced to ``rows`` and right-padded on the
+        block dimension to ``width``.
+
+        Constant ``width`` (``max_num_blocks_per_req``) is required for ttnn
+        tracing: runtime block tables must match the traced width even when
+        their underlying group is narrower.
+        """
+        out: list[torch.Tensor] = []
+        for bt in self.block_table.block_tables:
+            bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            if bt_cpu.shape[1] < width:
+                pad = torch.zeros(
+                    bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
+                )
+                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
+            out.append(bt_cpu)
+        return out
+
+    def advance_generators(self, req_indices: list[int] | None = None) -> None:
         # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied,
         # so the original object is not modified.
         # Otherwise, the generator at local_rank 0
         # would get out of sync with the others.
-        for generator in self.sampling.generators.values():
+        #
+        # ``req_indices`` restricts advancement to the build's own requests.
+        # Each generator belongs to a single request, so lane-DP (which calls
+        # this once per lane) passes the lane's indices to advance every
+        # generator exactly once per step rather than once per lane. ``None``
+        # advances all generators (whole-batch build, called once per step).
+        if req_indices is None:
+            generators = list(self.sampling.generators.values())
+        else:
+            generators = [
+                self.sampling.generators[i]
+                for i in req_indices
+                if i in self.sampling.generators
+            ]
+        for generator in generators:
             # Sample once from the generator to advance its state.
             torch.rand(1, generator=generator)
+
+
+class TTLaneInputBatch(InputBatch):
+    """Persistent input batch for single-process multi-lane (lane-DP) execution.
+
+    One engine process drives ``num_lanes`` data-parallel KV-cache replicas
+    ("lanes") that execute in lockstep against a single gathered device batch.
+    This batch owns the lane layout so the model runner does not: it lays the
+    persistent rows out as ``num_lanes`` contiguous chunks of ``per_lane`` rows
+    and binds each request to a stable row for its whole lifetime.
+
+    Layout: lane ``l`` owns rows ``[l * per_lane, (l + 1) * per_lane)``. A
+    request placed at lane-local slot ``s`` lives at persistent row
+    ``l * per_lane + s``. **That persistent row IS the request's device decode
+    slot**, so the merged device input is the batch's own row layout -- no
+    scatter, and no separate ``req_id -> slot`` map. ``max_num_reqs`` is
+    ``num_lanes * per_lane`` (the global ``max_num_seqs`` in lane mode).
+
+    Stable slots: a request never moves once placed. Removing a request leaves
+    its row as an empty gap to be reused by a later request in the same lane.
+    There is no condense (``condense`` is a no-op): keeping every live request
+    pinned to its row keeps the on-device per-slot seed RNG correct and makes
+    the seed manager's ``slot_remap`` the identity. Gaps are reset to neutral
+    sampling defaults so they cannot perturb batch-wide flags (``all_greedy`` /
+    ``no_penalties``) or sample an invalid value.
+
+    Merged host sampling: because rows are the device slots and gaps carry
+    neutral defaults, the runner samples the whole ``max_num_reqs`` slot batch
+    in one call against one :class:`SamplingMetadata` built here over every row
+    (``build_merged_sampling_metadata``). The builtin/custom logits processors
+    keep per-row state over this full slot batch (``refresh_logitsprocs`` passes
+    ``max_num_reqs`` as the batch size), exactly like a normal single-engine
+    vLLM batch -- so there is no per-lane slicing, no per-lane generator/penalty
+    remap, and custom logits processors work unchanged. Pad rows sample greedy
+    garbage that the runner drops when reading back the occupied rows.
+    """
+
+    def __init__(
+        self,
+        num_lanes: int,
+        per_lane: int,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        vocab_size: int,
+        block_sizes: list[int],
+        kernel_block_sizes: list[int],
+        logitsprocs: LogitsProcessors | None = None,
+    ):
+        if num_lanes < 1 or per_lane < 1:
+            raise ValueError(
+                f"num_lanes and per_lane must be >= 1, got num_lanes={num_lanes}, "
+                f"per_lane={per_lane}"
+            )
+        self.num_lanes = num_lanes
+        self.per_lane = per_lane
+        super().__init__(
+            max_num_reqs=num_lanes * per_lane,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            vocab_size=vocab_size,
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+            logitsprocs=logitsprocs,
+        )
+        # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
+        # pre-size so a request can occupy any slot in its lane's chunk, with
+        # gaps, instead of always appending at ``num_reqs``.
+        self._req_ids = [None] * self.max_num_reqs
+        self.req_output_token_ids = [None] * self.max_num_reqs
+
+    # ------------------------------------------------------------------
+    # Lane geometry / membership
+    # ------------------------------------------------------------------
+
+    def lane_of(self, req_id: str) -> int:
+        """Return the lane a request is bound to.
+
+        Derived from the request's row: lane ``l`` owns the contiguous chunk
+        ``[l * per_lane, (l + 1) * per_lane)``, so the row alone determines the
+        lane and no separate ``req_id -> lane`` map is needed.
+        """
+        return self.req_id_to_index[req_id] // self.per_lane
+
+    def occupied_rows(self) -> list[int]:
+        """Persistent rows holding a live request, in ascending (lane-major,
+        slot) order. This is the canonical merged order used for output."""
+        return [row for row, rid in enumerate(self._req_ids) if rid is not None]
+
+    # ------------------------------------------------------------------
+    # Placement (stable lane-local slots)
+    # ------------------------------------------------------------------
+
+    def add_request_to_row(self, request: "CachedRequestState", row: int) -> int:
+        """Materialize a scheduler-owned stable row assignment.
+
+        :class:`~vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` owns slot
+        allocation (which lane, which free row); this batch only places the
+        request at the row the coordinator already chose.
+        """
+        if not (0 <= row < self.max_num_reqs):
+            raise ValueError(f"row {row} out of range [0, {self.max_num_reqs})")
+        if self._req_ids[row] is not None and self._req_ids[row] != request.req_id:
+            raise ValueError(f"row {row} is already occupied")
+        # If this row was freed earlier in the same step it is still in the
+        # logitsproc batch-update ``removed`` list. Drop it so the reused row is
+        # recorded only as an ``added`` update, not both -- mirroring upstream
+        # ``gpu_input_batch._register_add_request``'s ``pop_removed()`` so the
+        # builtin logits processors do not first set then clear the new
+        # request's per-row state.
+        builder = self.sampling.batch_update_builder
+        if row in builder._removed:
+            builder._removed.remove(row)
+        super().add_request(request, row)
+        return row
+
+    def remove_request(self, req_id: str) -> int | None:
+        row = super().remove_request(req_id)
+        if row is not None:
+            self._reset_slot(row)
+        return row
+
+    def _reset_slot(self, row: int) -> None:
+        """Reset a freed row to neutral defaults so a gap never perturbs the
+        merged batch's sampling. ``super().remove_request`` already clears the
+        generator, bad-words and allowed-token-ids entries; this also resets the
+        per-row sampling tensors and token counts (so the row reads as an empty,
+        greedy, no-penalty request until it is reused)."""
+        sampling = self.sampling
+        for name, default in sampling.DEFAULTS.items():
+            getattr(sampling, name)[row] = default
+        self.num_tokens[row] = 0
+        self.num_prompt_tokens[row] = 0
+        self.num_computed_tokens_cpu[row] = 0
+
+    def condense(self, empty_req_indices: list[int]) -> None:
+        """No-op: lane slots are stable.
+
+        The base class condenses by moving the highest live request into the
+        lowest empty index. That would move requests across lane boundaries and
+        shift their device slots, corrupting the on-device per-slot seed RNG.
+        Lane mode instead leaves freed rows as gaps (reused in place by later
+        requests in the same lane), so live requests never move and the seed
+        manager's ``slot_remap`` stays the identity.
+        """
+        return
+
+    # ------------------------------------------------------------------
+    # State update (lane step plan -> batch + request map)
+    # ------------------------------------------------------------------
+
+    def apply_step_plan(
+        self,
+        scheduler_output: "SchedulerOutput",
+        plan: "TTStepPlan",
+        requests: dict[str, CachedRequestState],
+        encoder_cache: dict,
+    ) -> bool:
+        """Apply one lane step plan to this batch and the runner's request map.
+
+        This is the lane-DP variant of ``TTModelRunner._update_states``. Unlike
+        the front-packed batch it does **not** evict merely-unscheduled
+        requests: a prefill step can leave running decodes unscheduled, and
+        freeing their stable device slot would disturb the on-device per-slot
+        seed RNG. Only finished requests, and requests resumed from preemption
+        (whose KV was rebuilt), release their slot. There is no condense.
+
+        ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
+        map) and ``encoder_cache`` are mutated in place. Placement rows come
+        from ``plan.req_id_to_row`` -- the scheduler owns slot allocation, this
+        batch only materializes it. Returns whether the decode layout changed
+        (a placement or a freed slot), which the caller uses to reset the device
+        decode batch.
+        """
+        layout_changed = False
+
+        # Finished requests release their slot.
+        for req_id in scheduler_output.finished_req_ids:
+            requests.pop(req_id, None)
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
+        # Free cached encoder outputs.
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            encoder_cache.pop(mm_hash, None)
+
+        req_ids_to_add: list[str] = []
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_id = new_req_data.req_id
+            requests[req_id] = build_cached_request_state(new_req_data)
+            req_ids_to_add.append(req_id)
+
+        # Running / resumed requests.
+        req_data = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(req_data.req_ids):
+            req_state = requests[req_id]
+            num_computed_tokens = req_data.num_computed_tokens[i]
+            new_block_ids = req_data.new_block_ids[i]
+            resumed_from_preemption = req_id in req_data.resumed_req_ids
+            apply_cached_req_state_update(
+                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+            )
+            if resumed_from_preemption:
+                # KV was freed and is being rebuilt; re-add fresh (drop the
+                # stale slot first). The slot may differ afterwards --
+                # acceptable under the exceptional preemption path, which
+                # re-prefills the request anyway.
+                if self.remove_request(req_id) is not None:
+                    layout_changed = True
+                req_ids_to_add.append(req_id)
+                continue
+            req_index = self.req_id_to_index.get(req_id)
+            if req_index is None:
+                req_ids_to_add.append(req_id)
+                continue
+            self.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if new_block_ids is not None:
+                self.block_table.append_row(new_block_ids, req_index)
+
+        # Place new / resumed requests at scheduler-owned stable rows.
+        for req_id in req_ids_to_add:
+            self.add_request_to_row(requests[req_id], plan.req_id_to_row[req_id])
+            layout_changed = True
+
+        self.refresh_logitsprocs()
+        return layout_changed
+
+    # ------------------------------------------------------------------
+    # Sampling layout (merged, over the full slot batch)
+    # ------------------------------------------------------------------
+
+    @property
+    def max_num_logprobs(self) -> int | None:
+        """Max logprobs across live requests, or None if none need logprobs.
+
+        Computed over every slot row rather than ``[:num_reqs]`` because live
+        rows are not front-packed; gap rows carry the ``LOGPROBS_NONE_SENTINEL``
+        default (the minimum value), so the max over all rows equals the max
+        over the live rows.
+        """
+        if self.num_reqs == 0:
+            return None
+        max_val = int(self.sampling.num_logprobs[: self.max_num_reqs].max().item())
+        if max_val < 0:
+            return None
+        return max_val
+
+    def refresh_logitsprocs(self) -> None:
+        """Apply batch state changes to logits processors over the full slot
+        batch. Passes ``max_num_reqs`` (not ``num_reqs``) as the batch size so
+        each processor's per-row state spans every slot, matching the full slot
+        logits the runner samples."""
+        batch_update = self.sampling.batch_update_builder.get_and_reset(
+            self.max_num_reqs
+        )
+        for logit_proc in self.sampling.logitsprocs.all:
+            logit_proc.update_state(batch_update)
+
+    def build_merged_sampling_metadata(
+        self, scheduled_rows: list[int] | None = None
+    ) -> SamplingMetadata:
+        """Build one :class:`SamplingMetadata` over every slot row.
+
+        Mirrors a normal single-engine vLLM ``SamplingMetadata`` build, but over
+        the full ``max_num_reqs`` slot batch (live rows interleaved with neutral
+        gap rows) so it lines up row-for-row with the full slot logits the
+        runner hands the host sampler and with the per-row logits-processor
+        state. Gap rows carry neutral defaults (greedy, no penalties), so they
+        do not change ``all_greedy`` / ``no_penalties`` and sample harmless
+        greedy tokens the runner discards.
+
+        ``all_random`` is intentionally computed over the full tensor, so it is
+        False whenever any gap exists; that keeps the sampler's div-by-zero
+        guard active for the default-``temperature=0`` gap rows.
+
+        ``scheduled_rows`` are the rows actually producing a token this step. The
+        host sampler advances *every* per-request generator handed to it (one
+        ``exponential_`` draw per row in ``generators``), so only the scheduled
+        rows' generators are passed through: a seeded request occupying a slot
+        but not scheduled this step (e.g. a running decode request during a
+        prefill-only step) must not have its RNG advanced, or its token stream
+        would drift by one draw per step it sat out. ``None`` advances all live
+        generators (whole-batch fallback / tests).
+        """
+        n = self.max_num_reqs
+        sampling = self.sampling
+        temperature = sampling.temperature[:n]
+        all_greedy = bool((temperature == 0.0).all())
+        all_random = bool((temperature != 0.0).all())
+        presence = sampling.presence_penalty[:n]
+        frequency = sampling.frequency_penalty[:n]
+        repetition = sampling.repetition_penalty[:n]
+        no_penalties = bool(
+            (presence == 0.0).all()
+            and (frequency == 0.0).all()
+            and (repetition == 1.0).all()
+        )
+        rows = list(range(n))
+        if not no_penalties:
+            prompt_token_ids = self.make_prompt_token_ids_tensor(rows).to(torch.int64)
+            prompt_token_ids = prompt_token_ids.masked_fill(
+                prompt_token_ids == -1, self.vocab_size
+            )
+            output_rows = self.make_output_token_ids_tensor(rows)
+            output_token_ids = [
+                [tok for tok in row.tolist() if tok != -1] for row in output_rows
+            ]
+        else:
+            prompt_token_ids = None
+            output_token_ids = [[] for _ in range(n)]
+        # Only hand the sampler an allowlist mask when some live request
+        # actually constrains its tokens. The mask tensor is allocated lazily
+        # and never freed, and freed rows are reset to all-False, so once any
+        # request has ever used an allowlist the tensor lingers as an all-False
+        # no-op; passing it would just make the sampler do wasted masked_fill
+        # work. Gate on ``no_allowed_token_ids`` exactly like upstream.
+        if self.no_allowed_token_ids:
+            allowed_token_ids_mask = None
+        else:
+            allowed_token_ids_mask = sampling.allowed_token_ids_mask
+            if allowed_token_ids_mask is not None:
+                allowed_token_ids_mask = allowed_token_ids_mask[:n]
+        if scheduled_rows is None:
+            generators = dict(sampling.generators)
+        else:
+            scheduled = set(scheduled_rows)
+            generators = {
+                row: gen for row, gen in sampling.generators.items() if row in scheduled
+            }
+        return SamplingMetadata(
+            temperature=temperature if not all_greedy else None,
+            all_greedy=all_greedy,
+            all_random=all_random,
+            top_p=sampling.top_p[:n],
+            top_k=sampling.top_k[:n],
+            generators=generators,
+            max_num_logprobs=self.max_num_logprobs,
+            no_penalties=no_penalties,
+            prompt_token_ids=prompt_token_ids,
+            frequency_penalties=frequency,
+            presence_penalties=presence,
+            repetition_penalties=repetition,
+            output_token_ids=output_token_ids,
+            allowed_token_ids_mask=allowed_token_ids_mask,
+            bad_words_token_ids=dict(sampling.bad_words_token_ids),
+            logitsprocs=sampling.logitsprocs,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-row tensor views (the lane batch owns its own slicing/padding)
+    # ------------------------------------------------------------------
+
+    def slot_block_tables(
+        self, rows: list[int], zero_gaps: bool, total: int, width: int
+    ) -> list[torch.Tensor]:
+        """Per-group block tables for ``rows`` (one row per slot), each padded
+        to ``width`` (``max_num_blocks_per_req``). When ``zero_gaps`` is set,
+        rows of ``range(total)`` not in ``rows`` are zeroed (empty decode slots
+        carry no blocks)."""
+        occupied = set(rows)
+        sel = list(range(total)) if zero_gaps else rows
+        out = self.block_tables_for_rows(sel, width)
+        if zero_gaps and len(occupied) < total:
+            gap = torch.ones(total, dtype=torch.bool)
+            gap[list(occupied)] = False
+            for bt_cpu in out:
+                bt_cpu[gap] = 0
+        return [bt.contiguous() for bt in out]
+
+    def slot_sampling_params(self, rows: list[int]) -> TTSamplingParams:
+        """Slice the slot-ordered sampling tensors to ``rows``."""
+        return slice_tt_sampling_params(
+            self.sampling, torch.as_tensor(rows, dtype=torch.long)
+        )
+
+    def slot_grammar_bitmask(
+        self, grammar_output: "GrammarOutput | None", batch_length: int
+    ) -> torch.Tensor | None:
+        """Reorder the scheduler grammar bitmask into a full slot-batch tensor.
+
+        Each structured-output request's bitmask row is placed at its device
+        slot row; every other slot is left all-ones (all tokens allowed), so the
+        mask lines up with the full slot logits the host sampler reads.
+        """
+        if grammar_output is None or grammar_output.grammar_bitmask is None:
+            return None
+        bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
+        return reorder_grammar_bitmask_for_tt_batch(
+            bitmask=bitmask,
+            structured_output_request_ids=grammar_output.structured_output_request_ids,
+            req_id_to_index=self.req_id_to_index,
+            req_indices=list(range(batch_length)),
+            batch_length=batch_length,
+        )
+
+    # ------------------------------------------------------------------
+    # Merged model-input assembly (decode/prefill) and output extraction
+    # ------------------------------------------------------------------
+    #
+    # The lane batch materializes the whole merged device input from its own
+    # slot layout and reads the merged device output back into per-request
+    # tokens. ``runner`` is passed in for the genuinely runner/model-owned
+    # helpers (KV-layer block tables, device-sampling policy, multi-modal
+    # gather, the host sampler); everything row/slot-shaped lives here.
+
+    def build_model_input(
+        self,
+        runner: "TTModelRunner",
+        scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None",
+        plan: "TTStepPlan",
+    ) -> TTModelInput:
+        """Build the merged device input for one lane step (decode or prefill)."""
+        if plan.is_decode:
+            return self._build_decode_input(
+                runner, scheduler_output, grammar_output, plan
+            )
+        return self._build_prefill_input(runner, scheduler_output, grammar_output, plan)
+
+    def _build_decode_input(
+        self,
+        runner: "TTModelRunner",
+        scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None",
+        plan: "TTStepPlan",
+    ) -> TTModelInput:
+        """Build the merged decode input straight from the slot-ordered batch.
+
+        Every slot is present (gaps padded), so this is the device decode batch
+        with no scatter: row == device slot.
+        """
+        lane_batch = self
+        total = plan.capacity
+        occupied = lane_batch.occupied_rows()
+
+        num_tokens = lane_batch.num_tokens
+        positions_np = num_tokens[:total].astype(np.int32) - 1  # gaps -> -1
+        input_positions = torch.from_numpy(positions_np)
+        tokens_np = np.zeros((total, 1), dtype=np.int32)
+        for row in occupied:
+            tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
+        input_tokens = torch.from_numpy(tokens_np)
+
+        block_tables_per_group = lane_batch.slot_block_tables(
+            occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
+        )
+        rows_all = list(range(total))
+        tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
+
+        bitmask = lane_batch.slot_grammar_bitmask(grammar_output, total)
+        has_structured = has_structured_outputs(
+            runner.requests, scheduler_output, bitmask
+        )
+        perform_device_sampling = runner.check_perform_device_sampling(
+            is_decode=True, has_structured_outputs=has_structured
+        )
+
+        # The prompt/output token tensors feed device-side penalties only. Host
+        # sampling rebuilds them itself in ``build_merged_sampling_metadata``, so
+        # building them here too would be dead work on the host path.
+        prompt_tokens = output_tokens = None
+        if perform_device_sampling and not lane_batch.no_penalties:
+            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
+            output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
+        reset_batch = runner._decode_layout_changed_since_last_decode
+        runner._decode_layout_changed_since_last_decode = False
+        slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
+
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=None,
+            block_tables=block_tables_per_group[0],
+            block_tables_per_group=block_tables_per_group,
+            block_tables_per_layer=runner._block_tables_per_layer(
+                block_tables_per_group
+            ),
+            # Device decodes every slot; only used for the empty-batch guard.
+            unpadded_batch_size=list(plan.batch_size_per_dp),
+            tt_sampling_params=tt_sampling_params,
+            multi_modal_kwargs={},
+            perform_device_sampling=perform_device_sampling,
+            grammar_bitmask=[bitmask],
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            reset_batch=reset_batch,
+            slot_remap=slot_remap,
+            # Host sampling reads the merged batch directly (see
+            # ``extract_output``); the per-rank sidecars are unused here.
+            allowed_token_ids_mask_list=[None],
+            bad_words_token_ids_list=[{}],
+            max_num_logprobs=[lane_batch.max_num_logprobs],
+            logitsprocs_list=[None],
+            generators_list=[{}],
+            prefill_empty_slots=None,
+        )
+
+    def _build_prefill_input(
+        self,
+        runner: "TTModelRunner",
+        scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None",
+        plan: "TTStepPlan",
+    ) -> TTModelInput:
+        """Build the prefill input for the requests scheduled this step.
+
+        Prefill rows are front-packed in scheduler plan order. The plan carries
+        the stable slots (``prefill_empty_slots``) so ``submit_prefill`` seeds
+        each user at the device row decode will later read from. The output is
+        one token per prefilled request, in this same order.
+        """
+        lane_batch = self
+        rows = list(plan.input_rows)
+        rows_np = np.asarray(rows, dtype=np.int64)
+        input_positions = torch.from_numpy(
+            lane_batch.num_computed_tokens_cpu[rows_np].astype(np.int32)
+        )
+        prompt_lens = lane_batch.num_tokens[rows_np]
+        max_prefill = int(prompt_lens.max())
+        input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
+
+        block_tables_per_group = lane_batch.slot_block_tables(
+            rows, zero_gaps=False, total=0, width=runner.max_num_blocks_per_req
+        )
+        tt_sampling_params = lane_batch.slot_sampling_params(rows)
+        batch_size_per_dp = list(plan.batch_size_per_dp)
+
+        bitmask = lane_batch.slot_grammar_bitmask(
+            grammar_output, lane_batch.max_num_reqs
+        )
+        has_structured = has_structured_outputs(
+            runner.requests, scheduler_output, bitmask
+        )
+        perform_device_sampling = runner.check_perform_device_sampling(
+            is_decode=False, has_structured_outputs=has_structured
+        )
+
+        # Device-side penalties only; host sampling rebuilds these in
+        # ``build_merged_sampling_metadata`` (over the full slot batch), so
+        # building them here on the host path would be dead work.
+        prompt_tokens = output_tokens = None
+        if perform_device_sampling and not lane_batch.no_penalties:
+            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows)
+            output_tokens = lane_batch.make_output_token_ids_tensor(rows)
+
+        multi_modal_kwargs = (
+            runner._gather_multi_modal_inputs(req_indices=list(rows))
+            if runner.model_config.is_multimodal_model
+            else {}
+        )
+
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=prompt_lens,
+            block_tables=block_tables_per_group[0],
+            block_tables_per_group=block_tables_per_group,
+            block_tables_per_layer=runner._block_tables_per_layer(
+                block_tables_per_group
+            ),
+            unpadded_batch_size=batch_size_per_dp,
+            tt_sampling_params=tt_sampling_params,
+            multi_modal_kwargs=multi_modal_kwargs,
+            perform_device_sampling=perform_device_sampling,
+            grammar_bitmask=[bitmask],
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            reset_batch=False,
+            slot_remap=None,
+            allowed_token_ids_mask_list=[None],
+            bad_words_token_ids_list=[{}],
+            max_num_logprobs=[lane_batch.max_num_logprobs],
+            logitsprocs_list=[None],
+            generators_list=[{}],
+            prefill_empty_slots=(
+                list(plan.prefill_empty_slots)
+                if plan.prefill_empty_slots is not None
+                else None
+            ),
+        )
+
+    def extract_output(
+        self,
+        runner: "TTModelRunner",
+        tt_out: Any,
+        tt_log_probs: Any,
+        model_input: TTModelInput,
+        scheduled_rows: list[int],
+        is_decode: bool,
+    ) -> tuple[torch.Tensor, LogprobsLists | None]:
+        """Read back one merged lane step into per-request sampled tokens.
+
+        Returns ``(sampled_token_ids[n, 1], logprobs)`` for the ``n``
+        ``scheduled_rows`` in order. Device sampling reads the sampled tokens
+        directly from each slot; host sampling runs **one** sampler call over
+        the whole slot batch (so the builtin/custom logits processors stay
+        row-aligned, with no per-lane slicing) and then picks the scheduled
+        rows out of the result. Also called from ``TTAsyncDecodeController`` to
+        finalize an async lane-decode step.
+        """
+        n = len(scheduled_rows)
+        rows_t = torch.as_tensor(scheduled_rows, dtype=torch.long)
+        if model_input.perform_device_sampling:
+            tokens = tt_out.reshape(-1) if isinstance(tt_out, torch.Tensor) else tt_out
+            # Decode reads each scheduled slot; prefill returns one token per
+            # scheduled request, already in row order.
+            sampled = tokens[rows_t] if is_decode else tokens[:n]
+            sampled = sampled.reshape(n, 1).to(torch.int32)
+            logprobs = self._device_logprobs(
+                tt_log_probs, model_input, scheduled_rows, sampled, is_decode
+            )
+            return sampled, logprobs
+
+        # Host sampling over the full slot batch.
+        total = self.max_num_reqs
+        logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
+        bitmask = model_input.grammar_bitmask[0]
+        if bitmask is not None:
+            runner.apply_grammar_bitmask(logits, bitmask)
+        sampling_metadata = self.build_merged_sampling_metadata(scheduled_rows)
+        sampler_output = runner.host_sampler(
+            logits=logits, sampling_metadata=sampling_metadata
+        )
+        sampled = sampler_output.sampled_token_ids.reshape(-1)[rows_t].reshape(n, 1)
+        logprobs = self._host_logprobs(sampler_output.logprobs_tensors, scheduled_rows)
+        return sampled.to(torch.int32), logprobs
+
+    def _host_logits(
+        self, tt_out: Any, scheduled_rows: list[int], is_decode: bool, total: int
+    ) -> torch.Tensor:
+        """Full ``[total, vocab]`` slot logits for host sampling.
+
+        Decode logits already cover every slot. Prefill logits cover only the
+        scheduled requests (row order), so scatter them onto their slot rows;
+        the unscheduled / gap rows are sampled harmlessly and dropped.
+        """
+        logits = tt_out[:, -1, :] if tt_out.dim() == 3 else tt_out
+        if is_decode:
+            return logits
+        full = torch.zeros((total, logits.shape[-1]), dtype=logits.dtype)
+        full[torch.as_tensor(scheduled_rows, dtype=torch.long)] = logits[
+            : len(scheduled_rows)
+        ]
+        return full
+
+    def _host_logprobs(
+        self, logprobs_tensors: LogprobsTensors | None, scheduled_rows: list[int]
+    ) -> LogprobsLists | None:
+        if logprobs_tensors is None:
+            return None
+        rows_t = torch.as_tensor(scheduled_rows, dtype=torch.long)
+        return LogprobsTensors(
+            logprob_token_ids=logprobs_tensors.logprob_token_ids[rows_t],
+            logprobs=logprobs_tensors.logprobs[rows_t],
+            selected_token_ranks=logprobs_tensors.selected_token_ranks[rows_t],
+        ).tolists()
+
+    def _device_logprobs(
+        self,
+        tt_log_probs: Any,
+        model_input: TTModelInput,
+        scheduled_rows: list[int],
+        sampled: torch.Tensor,
+        is_decode: bool,
+    ) -> LogprobsLists | None:
+        """Build logprobs for device-sampled tokens, mirroring the gather-DP
+        device logprobs path but over the scheduled slot rows."""
+        n = len(scheduled_rows)
+        assert isinstance(model_input.tt_sampling_params.enable_log_probs, torch.Tensor)
+        enable = model_input.tt_sampling_params.enable_log_probs
+        sel = (
+            torch.as_tensor(scheduled_rows, dtype=torch.long)
+            if is_decode
+            else torch.arange(n, dtype=torch.long)
+        )
+        if not enable[sel].any():
+            return None
+        assert tt_log_probs is not None, "model should return logprobs when requested"
+        return build_device_logprobs(
+            tt_log_probs=tt_log_probs,
+            sampled_token_ids=sampled.reshape(n),
+            rows=sel,
+            max_num_logprobs=model_input.max_num_logprobs[0] or 0,
+        ).tolists()

@@ -17,7 +17,8 @@ from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm_tt_plugin.input_batch import CachedRequestState
-    from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+    from vllm_tt_plugin.model_input import TTModelInput
+    from vllm_tt_plugin.model_runner import TTModelRunner
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,16 @@ class TTFinalizedDecode:
     tt_log_probs: torch.Tensor | None
 
 
+def _is_host_decode_output(tt_out: Any) -> bool:
+    if isinstance(tt_out, torch.Tensor):
+        return True
+    if isinstance(tt_out, tuple):
+        return all(
+            tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        )
+    return False
+
+
 @dataclass(frozen=True)
 class SubmittedStepContext:
     """Immutable snapshot of the host state associated with one decode submit."""
@@ -46,7 +57,6 @@ class SubmittedStepContext:
     req_ids: list[str]
     req_id_to_index: dict[str, int]
     request_states: tuple[CachedRequestState, ...]
-    row_indices: tuple[int, ...]
     submit_time_ns: int
 
 
@@ -61,7 +71,12 @@ class CompletedDecodeStep:
 
 
 class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
-    """Wrap a non-blocking TT decode submission plus async read submit."""
+    """Wrap a non-blocking single-process TT decode submission plus async read.
+
+    Handles both a plain single-process decode and a lane-DP decode: when
+    ``scheduled_rows`` is set the read-back goes through the merged lane batch
+    (``TTLaneInputBatch.extract_output``), otherwise through ``_get_output_tokens``.
+    """
 
     def __init__(
         self,
@@ -70,12 +85,14 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         model_input: TTModelInput,
         completion_event: threading.Event,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
         self._completion_event = completion_event
         self._context = context
+        self._scheduled_rows = scheduled_rows
 
     def get_output(self) -> ModelRunnerOutput:
         try:
@@ -84,10 +101,11 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
             self._completion_event.set()
 
     def _get_output_impl(self) -> ModelRunnerOutput:
-        completed = self._controller.complete_non_dp_decode_step(
+        completed = self._controller.complete_decode_step(
             submission=self._submission,
             model_input=self._model_input,
             context=self._context,
+            scheduled_rows=self._scheduled_rows,
         )
         self._controller.enqueue_completed_decode_step(completed)
         return self._controller.build_runner_output_from_completed_step(completed)
@@ -101,12 +119,20 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
         controller: TTAsyncDecodeController,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
+        completion_event: threading.Event,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
+        self._completion_event = completion_event
 
     def get_output(self) -> tuple[torch.Tensor, list]:  # type: ignore[override]
+        try:
+            return self._get_output_impl()
+        finally:
+            self._completion_event.set()
+
+    def _get_output_impl(self) -> tuple[torch.Tensor, list]:
         finalized = self._controller.finalize_decode(self._submission)
         runner = self._controller.runner
         if finalized is None:
@@ -134,17 +160,27 @@ class TTAsyncDecodeController:
     def __init__(self, runner: TTModelRunner):
         self.runner = runner
 
-    def capture_submitted_step_context(self) -> SubmittedStepContext:
+    def capture_submitted_step_context(
+        self, req_ids: list[str] | None = None
+    ) -> SubmittedStepContext:
+        """Snapshot the submitted requests for deferred async state apply.
+
+        ``req_ids`` is the merged output order: the lane path passes its
+        scheduled slots' requests (sparse rows), so the index map is built from
+        their position. ``None`` takes the condensed front-packed batch, whose
+        ``req_id_to_index`` already equals that position map.
+        """
         runner = self.runner
-        num_reqs = runner.input_batch.num_reqs
-        req_ids = list(runner.input_batch.req_ids[:num_reqs])
+        if req_ids is None:
+            num_reqs = runner.input_batch.num_reqs
+            req_ids = list(runner.input_batch.req_ids[:num_reqs])
+            req_id_to_index = dict(runner.input_batch.req_id_to_index)
+        else:
+            req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         return SubmittedStepContext(
             req_ids=req_ids,
-            req_id_to_index=dict(runner.input_batch.req_id_to_index),
+            req_id_to_index=req_id_to_index,
             request_states=tuple(runner.requests[req_id] for req_id in req_ids),
-            row_indices=tuple(
-                runner.input_batch.req_id_to_index[req_id] for req_id in req_ids
-            ),
             submit_time_ns=time.perf_counter_ns(),
         )
 
@@ -304,16 +340,32 @@ class TTAsyncDecodeController:
                 not overlap_ok for overlap_ok in self.runner._pending_async_overlap_ok
             )
 
-    def complete_non_dp_decode_step(
+    def complete_decode_step(
         self,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ) -> CompletedDecodeStep:
+        """Finalize a single-process async decode read into sampled tokens.
+
+        When ``scheduled_rows`` is given this is a lane-DP step: the merged slot
+        batch is read back via ``TTLaneInputBatch.extract_output``. Otherwise it
+        is a plain single-process step read back via ``_get_output_tokens``.
+        """
         finalized = self.finalize_decode(submission)
         if finalized is None:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
+        elif scheduled_rows is not None:
+            sampled_token_ids, logprobs = self.runner.lane_batch.extract_output(
+                self.runner,
+                finalized.tt_out,
+                finalized.tt_log_probs,
+                model_input,
+                scheduled_rows,
+                is_decode=True,
+            )
         else:
             sampled_token_ids_per_dp, logprobs_per_dp = self.runner._get_output_tokens(
                 tt_out=finalized.tt_out,
@@ -350,7 +402,6 @@ class TTAsyncDecodeController:
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             request_states=completed.context.request_states,
-            row_indices=completed.context.row_indices,
         )
 
     def submit_async_non_dp_decode(
@@ -383,16 +434,56 @@ class TTAsyncDecodeController:
     def submit_async_dp_decode(
         self,
         model_input: TTModelInput,
+        *,
+        allow_decode_overlap: bool = True,
     ) -> AsyncTTDPGatherOutput:
-        submission = self.submit_decode(
-            model_input,
-            read_from_device=False,
-            async_read=True,
+        """Submit a non-blocking gathered-DP decode step.
+
+        ``allow_decode_overlap`` is the caller's veto on overlapping this step's
+        device work with the next scheduler step: it only sets ``overlap_ok``
+        when both it is True (the default) and ``can_use_steady_decode_fast_path``
+        holds. Passing False forces the next step to drain this one regardless of
+        the fast-path check.
+        """
+        overlap_ok = allow_decode_overlap and self.can_use_steady_decode_fast_path(
+            model_input
         )
+        completion_event = threading.Event()
+        submission = self.submit_decode(
+            model_input, read_from_device=False, async_read=True
+        )
+        self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
+        if submission.tt_out is None:
+            completion_event.set()
         return AsyncTTDPGatherOutput(
             controller=self,
             submission=submission,
             model_input=model_input,
+            completion_event=completion_event,
+        )
+
+    def submit_async_lane_decode(
+        self,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+        scheduled_rows: list[int],
+    ) -> AsyncTTModelRunnerOutput:
+        """Submit a non-blocking single-process multi-lane decode step."""
+        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+        completion_event = threading.Event()
+        submission = self.submit_decode(
+            model_input, read_from_device=False, async_read=True
+        )
+        self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
+        if submission.tt_out is None:
+            completion_event.set()
+        return AsyncTTModelRunnerOutput(
+            controller=self,
+            submission=submission,
+            model_input=model_input,
+            completion_event=completion_event,
+            context=context,
+            scheduled_rows=scheduled_rows,
         )
 
     def submit_decode(
@@ -517,21 +608,17 @@ class TTAsyncDecodeController:
         else:
             tt_out = submission.tt_out
 
-        if hasattr(runner.model, "process_decode_output_host"):
+        is_host_output = _is_host_decode_output(tt_out)
+        if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             tt_out = runner.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
             )
-        else:
-            is_host_tensor = isinstance(tt_out, torch.Tensor)
-            is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        elif not is_host_output:
+            raise AttributeError(
+                "TT model must implement process_decode_output_host() "
+                "unless decode output is already a torch tensor"
             )
-            if not (is_host_tensor or is_host_tensor_tuple):
-                raise AttributeError(
-                    "TT model must implement process_decode_output_host() "
-                    "unless decode output is already a torch tensor"
-                )
 
         tt_log_probs = None
         assert isinstance(submission.sampling_params.enable_log_probs, torch.Tensor)

@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import deque
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any, cast
 
 import regex as re
@@ -16,7 +16,6 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -35,14 +34,33 @@ from vllm_tt_plugin.async_decode import (
     CompletedDecodeStep,
     TTAsyncDecodeController,
 )
+from vllm_tt_plugin.config import (
+    get_tt_data_parallel_size,
+    get_tt_max_batch_size,
+    get_tt_per_lane_max_num_seqs,
+)
 from vllm_tt_plugin.input_batch import (
     LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
     CachedRequestState,
     InputBatch,
+    TTLaneInputBatch,
+    apply_cached_req_state_update,
+    build_cached_request_state,
 )
+from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
+from vllm_tt_plugin.logprobs import build_device_logprobs
+from vllm_tt_plugin.model_input import (
+    TTModelInput,
+    TTSamplingParams,
+    slice_tt_sampling_params,
+)
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.structured_output import (
+    has_structured_outputs,
+    reorder_grammar_bitmask_for_tt_batch,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -50,10 +68,6 @@ if TYPE_CHECKING:
 import numpy as np
 
 logger = init_logger(__name__)
-
-# Maximum top_k value for on-device sampling
-MAX_K = 32
-
 
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
@@ -77,147 +91,6 @@ def _parse_layer_index(layer_name: str) -> int:
             "TT spec hooks must use the '...layers.<idx>...' naming convention."
         )
     return int(match.group(1))
-
-
-def _build_logprobs_from_topk(
-    top_k_logprobs: torch.Tensor,
-    top_k_indices: torch.Tensor,
-    sampled_token_ids: torch.Tensor,
-    max_num_logprobs: int,
-) -> LogprobsTensors:
-    """Build LogprobsTensors from device top-K logprobs.
-
-    Device always computes top-32 (MAX_K) logprobs sorted descending.
-    This function trims to max_num_logprobs which is in range (0-20) to
-    match the OpenAI API limit, then packs into LogprobsTensors format
-    expected by the downstream vLLM pipeline.
-
-    Args:
-        top_k_logprobs: [sz, 32] sorted descending logprobs from device.
-        top_k_indices: [sz, 32] corresponding token IDs, same order.
-        sampled_token_ids: [sz, 1] or [sz] sampled token IDs.
-        max_num_logprobs: max top_logprobs requested across batch (clamped to 20).
-
-    Returns:
-        LogprobsTensors with shape [sz, N+1] where N = min(max_num_logprobs, 20).
-        Column 0 = sampled token, columns 1..N = top-N from sorted list.
-    """
-    sz = top_k_logprobs.shape[0]
-    N = max_num_logprobs
-
-    # Find sampled token rank in the already-sorted top-32
-    # Cast both to int64 to avoid uint32/int32 promotion error
-    # sampled_token_ids is [sz, 1], top_k_indices is [sz, 32] — broadcasts directly
-    if sampled_token_ids.dim() == 1:
-        sampled_token_ids = sampled_token_ids.unsqueeze(-1)
-    sampled_expanded = sampled_token_ids.to(torch.int64)
-    # The sampled token is guaranteed to be in top-32 because ttnn.sampling selects
-    # from the same top-32 (hardcoded in ttnn.sampling no matter the value of k)
-    # candidates returned here. If this constraint changes in ttnn.sampling to
-    # more than 32 candidates, match_mask may be all-False and argmax
-    # will return 0, giving an incorrect rank and logprob.
-    match_mask = top_k_indices.to(torch.int64) == sampled_expanded
-    # Convert mask to int since older versions of PyTorch don't support bool argmax.
-    ranks = match_mask.int().argmax(dim=-1)
-
-    if ranks.dim() < top_k_logprobs.dim():
-        ranks = ranks.unsqueeze(-1)
-    # Extract sampled token logprob
-    sampled_logprob = top_k_logprobs.gather(1, ranks.long())
-    # Build output: col 0 = sampled, cols 1..N = top-N from sorted
-    logprob_token_ids = torch.zeros(sz, N + 1, dtype=torch.int32)
-    logprobs_values = torch.zeros(sz, N + 1, dtype=torch.float32)
-
-    logprob_token_ids[:, 0] = sampled_token_ids.squeeze(-1)
-    logprobs_values[:, 0] = sampled_logprob.squeeze(-1)
-    logprob_token_ids[:, 1 : N + 1] = top_k_indices[:, :N].to(torch.int32)
-    logprobs_values[:, 1 : N + 1] = top_k_logprobs[:, :N].to(torch.float32)
-
-    selected_token_ranks = ranks.squeeze(-1).to(torch.int32)
-
-    return LogprobsTensors(logprob_token_ids, logprobs_values, selected_token_ranks)
-
-
-@dataclass(frozen=True)
-class TTSamplingParams:
-    """Sampling parameters for TT model execution.
-
-    Host sampling uses tensors, while on-device sampling uses lists.
-    """
-
-    temperature: torch.Tensor | list[float]
-    top_k: torch.Tensor | list[int]
-    top_p: torch.Tensor | list[float]
-    presence_penalty: torch.Tensor | list[float] | float = 0.0
-    frequency_penalty: torch.Tensor | list[float] | float = 0.0
-    repetition_penalty: torch.Tensor | list[float] | float = 1.0
-    seed: torch.Tensor | list[int | None] | int = 0
-    num_logprobs: torch.Tensor | list[int] | int | None = None
-    enable_log_probs: torch.Tensor | list[bool] | None = None
-
-
-@dataclass(frozen=True)
-class TTModelInput:
-    input_tokens: torch.Tensor
-    input_positions: torch.Tensor
-    prompt_lens: list[int] | None
-    # Group-0 block table, retained as a tensor for back-compat with the
-    # many DP padding/gather/pack paths that read it as ``block_tables``.
-    # Hybrid models must additionally consult ``block_tables_per_group``
-    # below; legacy single-group models can continue to use this field.
-    block_tables: torch.Tensor
-    # Per-group block tables in upstream's KVCacheConfig group order; one
-    # entry for uniform models, ``len(kv_cache_groups)`` entries for
-    # hybrid attention. Group g's tensor maps the model's layer-→group
-    # routing onto the right paged pool. We expand this into
-    # ``block_tables_per_layer`` (one entry per decoder layer) before
-    # handing it to hybrid models so they don't have to re-derive vLLM's
-    # group construction order.
-    block_tables_per_group: list[torch.Tensor]
-    # Per-layer block tables, one entry per decoder layer in model
-    # layer-index order. ``None`` for non-hybrid models (the runner only
-    # populates this when ``self._layer_to_group_idx`` was set at
-    # ``initialize_kv_cache`` time, which itself only fires when the
-    # model class exposes ``get_kv_cache_spec``).
-    block_tables_per_layer: list[torch.Tensor] | None
-    unpadded_batch_size: int | list[int]  # List is used for DP
-    tt_sampling_params: TTSamplingParams
-    multi_modal_kwargs: dict[str, Any]
-
-    # For DP gather, this is true only if all ranks can sample on device.
-    perform_device_sampling: bool
-
-    # always lists: single-element for non-DP, multi-element for DP
-    # If not used, [None]
-    grammar_bitmask: list[torch.Tensor | None]
-
-    # Host-only sampling params - lists for DP (one per rank), single-element
-    # for non-DP. These are used for host sampling when device sampling is not
-    # supported.
-    logitsprocs_list: list[LogitsProcessors | None]
-    # bad_words_token_ids: list of dicts mapping req_index -> token_ids
-    bad_words_token_ids_list: list[dict[int, list[list[int]]]]
-    # allowed_token_ids_mask: list of (num_reqs, vocab_size) bool tensors
-    allowed_token_ids_mask_list: list[torch.Tensor | None]
-    # list of dicts mapping req_index -> generator for each DP rank
-    # only gathered when host sampling
-    generators_list: list[dict[int, torch.Generator]]
-    # max_num_logprobs: per-DP-rank list of max logprobs values
-    # None means no logprobs, 0 means sampled token only
-    max_num_logprobs: list[int | None]
-
-    # Optional: tokens for sampling with penalties during decode
-    prompt_tokens: torch.Tensor | None = None
-    output_tokens: torch.Tensor | None = None
-
-    # Decode-only: indicates the padded decode-batch layout changed since the
-    # previous step (used by on-device sampling).
-    reset_batch: bool = False
-
-    # Per-rank slot remap from condense — remap[i]=j means slot i's data came
-    # from slot j.  Identity when nothing moved.  Shape: [total_B] (concat of
-    # per-rank [B] tensors for DP).
-    slot_remap: torch.Tensor | None = None
 
 
 class TTModelRunner:
@@ -306,6 +179,9 @@ class TTModelRunner:
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
+        self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
+        self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
+        self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -321,6 +197,35 @@ class TTModelRunner:
             is_pin_memory=False,
             is_pooling_model=False,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
+        )
+
+    @property
+    def lane_batch(self) -> TTLaneInputBatch:
+        """The persistent batch as its lane-DP type.
+
+        Valid only in lane mode, where ``initialize_kv_cache`` builds a
+        ``TTLaneInputBatch``. The lane step orchestration (``_execute_lane_step``)
+        reads this instead of re-casting ``input_batch`` at every use site.
+        """
+        return cast(TTLaneInputBatch, self.input_batch)
+
+    @property
+    def _is_lane_mode(self) -> bool:
+        """Single-process multi-lane (lane-DP) mode: one engine drives
+        ``tt_data_parallel_size`` in-process DP replicas. In this mode the
+        persistent batch is a ``TTLaneInputBatch`` that owns the lane layout
+        (stable per-lane device slots, merged sampling) and the runner only
+        orchestrates; gathered multi-process DP and non-DP keep the plain
+        ``InputBatch`` and the per-rank gather paths.
+
+        Derived (rather than cached in ``__init__``) so it depends only on
+        already-set runner state -- this mirrors ``uses_tt_lane_coordinator``:
+        vLLM sees a single engine (``data_parallel_size == 1``) while the TT
+        backend runs more than one lane.
+        """
+        return (
+            self.parallel_config.data_parallel_size == 1
+            and self.tt_data_parallel_size > 1
         )
 
     def load_model(self) -> None:
@@ -380,18 +285,36 @@ class TTModelRunner:
         # rows allocated, never indexed).
         per_group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
 
-        max_num_reqs = self.scheduler_config.max_num_seqs
+        max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
-        self.input_batch = InputBatch(
-            max_num_reqs=max_num_reqs,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            vocab_size=self.vocab_size,
-            block_sizes=per_group_block_sizes,
-            kernel_block_sizes=per_group_block_sizes,
-            logitsprocs=self._host_logitsprocs,
-        )
+        if self._is_lane_mode:
+            # Lane-chunked persistent batch: rows are partitioned into
+            # ``tt_data_parallel_size`` lanes of ``tt_per_lane_max_num_seqs``
+            # slots, so a request's persistent row is its stable device slot.
+            # ``num_lanes * per_lane == tt_max_batch_size`` (the global
+            # max_num_seqs in lane mode), so the slot count matches the device
+            # batch the merged step executes.
+            self.input_batch: InputBatch = TTLaneInputBatch(
+                num_lanes=self.tt_data_parallel_size,
+                per_lane=self.tt_per_lane_max_num_seqs,
+                max_model_len=max_model_len,
+                max_num_batched_tokens=max_num_batched_tokens,
+                vocab_size=self.vocab_size,
+                block_sizes=per_group_block_sizes,
+                kernel_block_sizes=per_group_block_sizes,
+                logitsprocs=self._host_logitsprocs,
+            )
+        else:
+            self.input_batch = InputBatch(
+                max_num_reqs=max_num_reqs,
+                max_model_len=max_model_len,
+                max_num_batched_tokens=max_num_batched_tokens,
+                vocab_size=self.vocab_size,
+                block_sizes=per_group_block_sizes,
+                kernel_block_sizes=per_group_block_sizes,
+                logitsprocs=self._host_logitsprocs,
+            )
 
         # The block tables in the persistent input batch have
         # max_num_blocks_per_req = cdiv(max_model_len, block_size) but this
@@ -458,9 +381,8 @@ class TTModelRunner:
         side for TT (caches are replicated per submesh and each device
         carries ``num_kv_heads // tp`` heads internally).
         """
-        data_parallel = self.parallel_config.data_parallel_size
         assert self.device_config.num_devices is not None
-        num_devices = self.device_config.num_devices // data_parallel
+        num_devices = self.device_config.num_devices // self.tt_data_parallel_size
         num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
@@ -521,9 +443,7 @@ class TTModelRunner:
         # tables push their content into those buffers. Padding rows with
         # zeros is harmless — the kernel only reads up to each layer's
         # active block count.
-        max_batch = int(self.scheduler_config.max_num_seqs) * int(
-            self.parallel_config.data_parallel_size
-        )
+        max_batch = self.tt_max_batch_size
         target_shape = (max_batch, self.max_num_blocks_per_req)
         padded = []
         for bt in result:
@@ -665,36 +585,8 @@ class TTModelRunner:
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
-            assert new_req_data.sampling_params is not None, (
-                "Pooling is not supported for TT yet"
-            )
-            if new_req_data.prompt_token_ids is None:
-                raise NotImplementedError(
-                    "TT backend does not support prompt_embeds yet"
-                )
             req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-
-            if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device="cpu")
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
-
-            self.requests[req_id] = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=None,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-                prompt_embeds=new_req_data.prompt_embeds,
-            )
-
+            self.requests[req_id] = build_cached_request_state(new_req_data)
             req_ids_to_add.append(req_id)
 
         # Update the states of the running/resumed requests.
@@ -706,17 +598,9 @@ class TTModelRunner:
             resumed_from_preemption = req_id in req_data.resumed_req_ids
 
             # Update the cached states.
-            req_state.num_computed_tokens = num_computed_tokens
-            if not resumed_from_preemption:
-                if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
-            else:
-                assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
+            apply_cached_req_state_update(
+                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+            )
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
@@ -758,7 +642,9 @@ class TTModelRunner:
         if mm_feature.modality != "image":
             raise NotImplementedError("Only images are supported for now")
 
-    def _gather_multi_modal_inputs(self) -> dict[str, Any]:
+    def _gather_multi_modal_inputs(
+        self, req_indices: list[int] | None = None
+    ) -> dict[str, Any]:
         """
         Gather and batch multi-modal inputs for the current persistent batch.
 
@@ -795,10 +681,12 @@ class TTModelRunner:
             "image_grid_thw": [],
         }
 
-        num_reqs = self.input_batch.num_reqs
+        if req_indices is None:
+            req_indices = list(range(self.input_batch.num_reqs))
         # The model input tensors are built in persistent batch order, so
         # multi-modal inputs must follow the same order (not just new reqs).
-        for req_id in self.input_batch.req_ids[:num_reqs]:
+        for batch_index in req_indices:
+            req_id = self.input_batch.req_ids[batch_index]
             req_state = self.requests[req_id]
 
             if not req_state.mm_features:
@@ -825,52 +713,100 @@ class TTModelRunner:
 
         return multi_modal_kwargs
 
+    def _sampling_params_for_padded_decode(
+        self,
+        sample_params,
+        req_indices: list[int],
+        pad_to: int,
+    ) -> TTSamplingParams:
+        """Build per-row sampling tensors padded to ``pad_to`` for DP gather."""
+        defaults = sample_params.create_default_tensors()
+
+        def take(name: str) -> torch.Tensor:
+            local = getattr(sample_params, name)[req_indices]
+            if local.shape[0] >= pad_to:
+                return local[:pad_to]
+            pad_count = pad_to - local.shape[0]
+            return torch.cat([local, defaults[name][:pad_count]])
+
+        num_logprobs = take("num_logprobs")
+        return TTSamplingParams(
+            temperature=take("temperature"),
+            top_k=take("top_k"),
+            top_p=take("top_p"),
+            presence_penalty=take("presence_penalty"),
+            frequency_penalty=take("frequency_penalty"),
+            repetition_penalty=take("repetition_penalty"),
+            seed=take("seed"),
+            num_logprobs=num_logprobs,
+            enable_log_probs=num_logprobs >= 0,
+        )
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
+        capture_slot_remap: bool = True,
     ) -> TTModelInput:
-        # In DP, called on each rank
-        # In non-DP, this is the only input preparation function
+        """Build a ``TTModelInput`` for one prefill or decode step.
 
+        Reads the current persistent ``self.input_batch`` and assembles the
+        padded, fixed-shape tensors a TT model needs (constant shapes are
+        required for ttnn tracing). This is the input builder shared by the
+        non-DP and gathered multi-process DP paths; each operates on its whole
+        local ``input_batch`` (gathered DP later gathers the per-rank results to
+        rank 0). Single-process lane mode does not use this builder -- it builds
+        its merged device input directly from ``TTLaneInputBatch``.
+
+        Args:
+            scheduler_output: Scheduler decisions for this step. Used to detect
+                prefill vs. decode and (for grammar) which requests carry
+                structured-output bitmasks.
+            grammar_output: Structured-output bitmasks for this step, or
+                ``None`` when no request uses guided decoding.
+            capture_slot_remap: Whether to pop and attach the input batch's
+                pending slot remap.
+
+        Returns:
+            A ``TTModelInput`` with tokens, positions, block tables, sampling
+            params and host-only metadata, padded to the appropriate wire
+            capacity. ``unpadded_batch_size`` records the real (pre-pad)
+            request count.
+        """
         assert scheduler_output.total_num_scheduled_tokens > 0
         input_batch = self.input_batch
-        num_reqs = input_batch.num_reqs
-        assert num_reqs > 0
+        batch_num_reqs = input_batch.num_reqs
+        assert batch_num_reqs > 0
+
+        # The whole local batch.
+        req_indices = list(range(batch_num_reqs))
+        num_reqs = len(req_indices)
+
+        # All modes pad decode to the per-rank/per-lane wire capacity. The
+        # DP-decode gather packs and unpacks each rank at
+        # ``tt_per_lane_max_num_seqs``; padding to ``input_batch.max_num_reqs``
+        # (the *global* gathered capacity ``max_num_seqs * dp_size`` for
+        # gathered multi-process DP) would carry too many rows in the
+        # never-trimmed tokens/positions/block_tables fields and desync the
+        # packed gather layout. For non-DP these two capacities are equal.
+        decode_pad_to = self.tt_per_lane_max_num_seqs
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
-        # Slice/pad to self.max_num_blocks_per_req: slicing handles
-        # over-wide tables (a group's native width can exceed the global
-        # cap when ``max_num_blocks_per_req`` is bound by total KV cache
-        # size rather than max_model_len), and padding handles
-        # under-wide ones (hybrid kv-cache-groups with unified page sizes
-        # produce per-group block_tables of different native widths —
-        # e.g. Gemma4-E2B with ``cache_config.block_size=64`` ends up
-        # with sliding's group at 128 block_size and full's at 64,
-        # giving widths cdiv(max_model_len, 128) and
-        # cdiv(max_model_len, 64) respectively). The TT side captures
-        # decode traces against ``max_num_blocks_per_req`` (see
-        # ``warmup_model_decode``) and ``copy_host_to_device`` asserts
-        # shape-equality on replay, so runtime block_tables must match
-        # that width even when their underlying group is narrower.
+        # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
+        # over-wide tables when the total KV-cache limit is tighter than
+        # ``ceil(max_model_len / block_size)``, and padding handles
+        # under-wide ones from hybrid kv-cache groups whose native
+        # block-table widths differ after upstream page-size unification.
         target_width = self.max_num_blocks_per_req
-        block_tables_per_group = []
-        for bt in input_batch.block_table.block_tables:
-            bt_cpu = bt.get_cpu_tensor()[:num_reqs, :target_width]
-            if bt_cpu.shape[1] < target_width:
-                pad = torch.zeros(
-                    bt_cpu.shape[0],
-                    target_width - bt_cpu.shape[1],
-                    dtype=bt_cpu.dtype,
-                )
-                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
-            block_tables_per_group.append(bt_cpu)
+        block_tables_per_group = input_batch.block_tables_for_rows(
+            req_indices, target_width
+        )
 
         # DP optimization: don't send padding blocks if possible to reduce
         # overhead from gathering inputs to rank 0 and rely on DP concat
         # function to pad to global max blocks.
-        if self.parallel_config.data_parallel_size > 1:
-            max_tokens_in_batch = max(input_batch.num_tokens[:num_reqs])
+        if self.tt_data_parallel_size > 1:
+            max_tokens_in_batch = max(input_batch.num_tokens[i] for i in req_indices)
             max_blocks_in_batch = cdiv(
                 max_tokens_in_batch, self.cache_config.block_size
             )
@@ -915,22 +851,23 @@ class TTModelRunner:
 
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
-            input_positions = input_batch.num_computed_tokens_cpu[:num_reqs]
+            input_positions = input_batch.num_computed_tokens_cpu[req_indices]
             # Prefill length in tokens for each request:
             # - For new requests: equals prompt length.
             # - For resumed-from-preemption requests: includes any generated
             #   output tokens so far, so we can replay the full sequence to
             #   rebuild KV after preemption freed the cache blocks.
-            prompt_lens = input_batch.num_tokens[:num_reqs]
+            prompt_lens = input_batch.num_tokens[req_indices]
             max_prefill_tokens = max(prompt_lens)
             input_tokens = input_batch.token_ids_cpu_tensor[
-                :num_reqs, :max_prefill_tokens
+                req_indices, :max_prefill_tokens
             ]
             reset_batch = False
         else:
-            input_positions = torch.from_numpy(input_batch.num_tokens[:num_reqs] - 1)
+            positions_np = input_batch.num_tokens[req_indices] - 1
+            input_positions = torch.from_numpy(positions_np)
             input_tokens = input_batch.token_ids_cpu_tensor[
-                torch.arange(num_reqs), input_positions
+                req_indices, positions_np
             ].view(-1, 1)
             prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
@@ -939,9 +876,9 @@ class TTModelRunner:
             self._decode_layout_changed_since_last_decode = False
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
-            # Pad batch to max_num_reqs.
-            if input_tokens.shape[0] < input_batch.max_num_reqs:
-                batch_pad = input_batch.max_num_reqs - input_tokens.shape[0]
+            # Pad decode to the lane/rank wire capacity.
+            if input_tokens.shape[0] < decode_pad_to:
+                batch_pad = decode_pad_to - input_tokens.shape[0]
                 input_tokens = torch.cat(
                     [input_tokens, torch.zeros(batch_pad, 1, dtype=torch.int32)]
                 )
@@ -962,61 +899,32 @@ class TTModelRunner:
                     for bt in block_tables_per_group
                 ]
                 block_tables = block_tables_per_group[0]
-                # Pad sampling parameters with default values
-                sample_params.pad_with_defaults(num_reqs)
+                # Sampling parameters are intentionally NOT padded here. The
+                # per-row wire tensors are built below by
+                # ``_sampling_params_for_padded_decode``, which gathers this
+                # build's ``req_indices`` rows and right-pads with fresh
+                # defaults. The persistent ``input_batch.sampling`` tail is
+                # never read, so there is nothing to default in place.
 
-        if is_prompt:
-            # Convert num_logprobs (int tensor)
-            # to enable_log_probs (bool tensor)
-            # -2 means no logprobs, 0 means sampled token only
-            enable_log_probs = sample_params.num_logprobs[:num_reqs] >= 0
-            tt_sampling_params = TTSamplingParams(
-                temperature=sample_params.temperature[:num_reqs],
-                top_k=sample_params.top_k[:num_reqs],
-                top_p=sample_params.top_p[:num_reqs],
-                presence_penalty=sample_params.presence_penalty[:num_reqs],
-                frequency_penalty=sample_params.frequency_penalty[:num_reqs],
-                repetition_penalty=sample_params.repetition_penalty[:num_reqs],
-                seed=sample_params.seed[:num_reqs],
-                num_logprobs=sample_params.num_logprobs[:num_reqs],
-                enable_log_probs=enable_log_probs,
-            )
-        else:
-            # Convert num_logprobs (int tensor)
-            # to enable_log_probs (bool tensor)
-            # -2 means no logprobs, 0 means sampled token only
-            enable_log_probs = sample_params.num_logprobs >= 0
-            tt_sampling_params = TTSamplingParams(
-                temperature=sample_params.temperature,
-                top_k=sample_params.top_k,
-                top_p=sample_params.top_p,
-                presence_penalty=sample_params.presence_penalty,
-                frequency_penalty=sample_params.frequency_penalty,
-                repetition_penalty=sample_params.repetition_penalty,
-                seed=sample_params.seed,
-                num_logprobs=sample_params.num_logprobs,
-                enable_log_probs=enable_log_probs,
+        tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
+        if not is_prompt and input_tokens.shape[0] > len(req_indices):
+            # Decode inputs are padded to the rank batch size; pad the sampling
+            # params to match, right-filling padding rows with neutral defaults.
+            tt_sampling_params = self._sampling_params_for_padded_decode(
+                sample_params, req_indices, input_tokens.shape[0]
             )
 
         if self.model_config.is_multimodal_model and is_prompt:
-            multi_modal_kwargs = self._gather_multi_modal_inputs()
+            multi_modal_kwargs = self._gather_multi_modal_inputs(
+                req_indices=req_indices
+            )
         else:
             multi_modal_kwargs = {}
 
         # If we're not using structured outputs, grammar_bitmask is None.
         bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
-        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        scheduled_structured_req_ids = [
-            req_id
-            for req_id in scheduled_req_ids
-            if (req := self.requests.get(req_id)) is not None
-            and req.sampling_params is not None
-            and req.sampling_params.structured_outputs is not None
-        ]
-        has_structured_outputs = (
-            bitmask is not None
-            or scheduler_output.pending_structured_output_tokens
-            or bool(scheduled_structured_req_ids)
+        has_structured = has_structured_outputs(
+            self.requests, scheduler_output, bitmask
         )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
@@ -1024,12 +932,6 @@ class TTModelRunner:
             bitmask = torch.from_numpy(bitmask)
             # unpadded for prefill, padded for decode
             batch_length = input_tokens.shape[0]
-            grammar_bitmask_length = bitmask.shape[1]
-            # Ones in the compressed bitmask represent tokens that are allowed.
-            reordered_bitmask = torch.zeros(
-                (batch_length, grammar_bitmask_length), dtype=torch.int32
-            )
-            reordered_bitmask = torch.bitwise_not(reordered_bitmask)
             # `structured_output_request_ids` comes from GrammarOutput as a list
             # of request IDs (bitmask rows are in this order). TT does not support
             # speculative decoding in this path, so we assume a single bitmask row
@@ -1039,20 +941,17 @@ class TTModelRunner:
                 if grammar_output is not None
                 else []
             )
-            req_id_to_bitmask_row: dict[str, int] = {
-                req_id: i for i, req_id in enumerate(structured_output_request_ids)
-            }
-            for req_id, persistent_batch_index in input_batch.req_id_to_index.items():
-                scheduler_bitmask_row = req_id_to_bitmask_row.get(req_id)
-                if scheduler_bitmask_row is not None:
-                    reordered_bitmask[persistent_batch_index, :] = bitmask[
-                        scheduler_bitmask_row, :
-                    ]
-            bitmask = reordered_bitmask
+            bitmask = reorder_grammar_bitmask_for_tt_batch(
+                bitmask=bitmask,
+                structured_output_request_ids=structured_output_request_ids,
+                req_id_to_index=input_batch.req_id_to_index,
+                req_indices=req_indices,
+                batch_length=batch_length,
+            )
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
-            has_structured_outputs=has_structured_outputs,
+            has_structured_outputs=has_structured,
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
@@ -1060,13 +959,18 @@ class TTModelRunner:
         prompt_tokens = None
         output_tokens = None
         if (not input_batch.no_penalties) and not is_prompt:
-            prompt_tokens = input_batch.make_prompt_token_ids_tensor()
-            output_tokens = input_batch.make_output_token_ids_tensor()
+            # Restrict to this build's requests. For lane builds ``req_indices``
+            # selects one lane's rows out of the merged batch; passing them
+            # keeps penalty history attributed to the right requests instead of
+            # the merged batch's leading rows. Non-DP / gathered-DP pass
+            # ``range(num_reqs)``, so this is a no-op there.
+            prompt_tokens = input_batch.make_prompt_token_ids_tensor(req_indices)
+            output_tokens = input_batch.make_output_token_ids_tensor(req_indices)
 
             # Pad batch to max_num_reqs for non-DP case (don't send padding for
             # DP to reduce overhead from gathering inputs to rank 0).
             if (
-                self.parallel_config.data_parallel_size == 1
+                self.tt_data_parallel_size == 1
                 and prompt_tokens.shape[0] < input_batch.max_num_reqs
             ):
                 batch_pad = input_batch.max_num_reqs - prompt_tokens.shape[0]
@@ -1087,29 +991,65 @@ class TTModelRunner:
                     ]
                 )
 
-        # Build host-only sampling params from input_batch
+        # Build host-only sampling params from input_batch. The host sampler
+        # interprets every per-request key/index as a row in the batch it is
+        # handed, so each of these must be reindexed to this build's rows
+        # (lane-local 0..num_reqs-1). ``req_indices`` is ``range(num_reqs)`` for
+        # non-DP / gathered-DP, so the remaps below are the identity there and
+        # only do real work for lane builds.
         allowed_token_ids_mask = None
         if (
             not input_batch.no_allowed_token_ids
             and input_batch.sampling.allowed_token_ids_mask is not None
         ):
+            # Gather already reindexes to lane-local rows.
             allowed_token_ids_mask = input_batch.sampling.allowed_token_ids_mask[
-                : input_batch.num_reqs
+                req_indices
             ].clone()
+
+        # Re-key the bad-words dict (req_index -> token id lists) to lane-local
+        # rows. ``condense`` keeps the source keys aligned with active rows.
+        src_bad_words = input_batch.sampling.bad_words_token_ids
+        bad_words_token_ids = {
+            local: src_bad_words[g]
+            for local, g in enumerate(req_indices)
+            if g in src_bad_words
+        }
+
+        # Builtin/custom logits processors hold per-row state over the whole
+        # local batch, so the host sampler reuses them as-is.
+        logitsprocs = input_batch.sampling.logitsprocs
 
         generators = dict()
         if not perform_device_sampling:
-            generators = input_batch.sampling.generators
+            # Re-key generators (req_index -> Generator) to lane-local rows.
+            # The values are the same Generator objects advanced just below, so
+            # advancing via the shared ``input_batch`` keeps them in step.
+            src_generators = input_batch.sampling.generators
+            generators = {
+                local: src_generators[g]
+                for local, g in enumerate(req_indices)
+                if g in src_generators
+            }
             # Technically this advances the generator before it is copied,
             # but it's ok because this happens consistently.
-            # We're assuming that _prepare_model_inputs is called
-            # exactly once per step.
-            input_batch.advance_generators()
+            #
+            # Each generator belongs to exactly one request (one lane), so we
+            # advance only this build's generators. Non-DP / gathered-DP build
+            # the whole batch once per step, so all generators advance exactly
+            # once; lane builds run once per lane, and passing the lane's
+            # ``req_indices`` keeps each generator advancing exactly once per
+            # step instead of once per lane.
+            input_batch.advance_generators(req_indices)
             # NOTE: Our sampling paths are different between host and device.
             # Whether a request is sampled on device or host
             # depends also on other requests in the batch.
             # This means sampling is not perfectly deterministic
             # whenever device sampling is enabled.
+
+        block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
+        block_tables = block_tables_per_group[0]
+        slot_remap = input_batch.pop_slot_remap() if capture_slot_remap else None
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1126,12 +1066,12 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
-            slot_remap=input_batch.pop_slot_remap(),
+            slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
-            bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
+            bad_words_token_ids_list=[bad_words_token_ids],
             max_num_logprobs=[input_batch.max_num_logprobs],
-            logitsprocs_list=[input_batch.sampling.logitsprocs],
+            logitsprocs_list=[logitsprocs],
             generators_list=[generators],
         )
 
@@ -1183,6 +1123,46 @@ class TTModelRunner:
             scheduler_output, grammar_output
         )
 
+    @staticmethod
+    def _pad_or_truncate_1d(
+        tensor: torch.Tensor,
+        max_batch: int,
+        pad_value: float | int | bool = 0,
+    ) -> torch.Tensor:
+        """Flatten ``tensor`` and pad or truncate it to ``max_batch`` elements.
+
+        Used to fit a per-row decode-gather field to the fixed per-rank wire
+        size. Padding elements are filled with the caller-supplied ``pad_value``
+        (default ``0``). Callers pass the sampling parameter's neutral default
+        (see ``SamplingInputBatch.DEFAULTS``) where a bare ``0`` would be an
+        invalid value (e.g. ``top_k``), so a padded row can never inject an
+        invalid sampling parameter if it is ever sampled.
+        """
+        flat = tensor.contiguous().view(-1)
+        n = int(flat.numel())
+        if n == max_batch:
+            return flat
+        if n > max_batch:
+            return flat[:max_batch]
+        pad = max_batch - n
+        return torch.cat(
+            [flat, torch.full((pad,), pad_value, dtype=flat.dtype, device=flat.device)]
+        )
+
+    def _decode_gather_slot_remap(
+        self, model_input: TTModelInput | None, max_batch: int
+    ) -> torch.Tensor:
+        if model_input is None or model_input.slot_remap is None:
+            return torch.arange(max_batch, dtype=torch.int32)
+        flat = model_input.slot_remap.contiguous().view(-1)
+        n = int(flat.numel())
+        if n == max_batch:
+            return flat
+        if n > max_batch:
+            return flat[:max_batch]
+        tail = torch.arange(n, max_batch, dtype=torch.int32, device=flat.device)
+        return torch.cat([flat, tail])
+
     def build_dp_decode_gather_input(
         self,
         model_input: TTModelInput | None,
@@ -1202,7 +1182,7 @@ class TTModelRunner:
             keys "prompt_tokens" and "output_tokens", or None if not needed.
         """
 
-        max_batch = int(self.scheduler_config.max_num_seqs)
+        max_batch = self.tt_per_lane_max_num_seqs
         num_groups = self._num_kv_cache_groups
         if model_input is None:
             tokens = torch.zeros((max_batch, 1), dtype=torch.int32)
@@ -1215,10 +1195,12 @@ class TTModelRunner:
                 for _ in range(num_groups)
             ]
             unpadded_batch_size = torch.tensor([0], dtype=torch.int32)
-            # Create default sampling parameter tensors (max_batch sized)
-            sampling_default_tensors = (
-                self.input_batch.sampling.create_default_tensors()
-            )
+            # Default sampling tensors must match the lane/rank wire capacity,
+            # not the merged input batch capacity.
+            sampling_defaults = self.input_batch.sampling.create_default_tensors()
+            sampling_default_tensors = {
+                name: tensor[:max_batch] for name, tensor in sampling_defaults.items()
+            }
             temperature = sampling_default_tensors["temperature"]
             top_k = sampling_default_tensors["top_k"]
             top_p = sampling_default_tensors["top_p"]
@@ -1233,12 +1215,34 @@ class TTModelRunner:
         else:
             tokens = model_input.input_tokens
             positions = model_input.input_positions
+            if tokens.shape[0] < max_batch:
+                batch_pad = max_batch - tokens.shape[0]
+                tokens = torch.cat(
+                    [
+                        tokens,
+                        torch.zeros(batch_pad, tokens.shape[1], dtype=tokens.dtype),
+                    ]
+                )
+                positions = torch.cat(
+                    [
+                        positions,
+                        torch.full((batch_pad,), -1, dtype=positions.dtype),
+                    ]
+                )
             # Pad each group's block_table out to ``max_blocks_decode_batch``
             # so the gather payload has a fixed shape regardless of which
             # group carries the most blocks for this rank.
             block_tables_per_group = []
             for bt in model_input.block_tables_per_group:
-                if bt.shape[1] < max_blocks_decode_batch:
+                if bt.shape[0] < max_batch:
+                    batch_pad = max_batch - bt.shape[0]
+                    bt = torch.cat(
+                        [bt, torch.zeros(batch_pad, bt.shape[1], dtype=bt.dtype)],
+                        dim=0,
+                    )
+                if bt.shape[1] > max_blocks_decode_batch:
+                    bt = bt[:, :max_blocks_decode_batch]
+                elif bt.shape[1] < max_blocks_decode_batch:
                     pad_w = max_blocks_decode_batch - bt.shape[1]
                     bt = torch.cat(
                         [
@@ -1256,26 +1260,51 @@ class TTModelRunner:
                 [cast(int, model_input.unpadded_batch_size)], dtype=torch.int32
             )
             sampling_params: TTSamplingParams = model_input.tt_sampling_params
-            temperature = sampling_params.temperature
-            top_k = sampling_params.top_k
-            top_p = sampling_params.top_p
-            presence_penalty = sampling_params.presence_penalty
-            frequency_penalty = sampling_params.frequency_penalty
-            repetition_penalty = sampling_params.repetition_penalty
-            seed = sampling_params.seed
-            num_logprobs = sampling_params.num_logprobs
-            enable_log_probs = sampling_params.enable_log_probs
+            defaults = self.input_batch.sampling.DEFAULTS
+            temperature = self._pad_or_truncate_1d(
+                sampling_params.temperature, max_batch, defaults["temperature"]
+            )
+            top_k = self._pad_or_truncate_1d(
+                sampling_params.top_k, max_batch, defaults["top_k"]
+            )
+            top_p = self._pad_or_truncate_1d(
+                sampling_params.top_p, max_batch, defaults["top_p"]
+            )
+            presence_penalty = self._pad_or_truncate_1d(
+                sampling_params.presence_penalty,
+                max_batch,
+                defaults["presence_penalty"],
+            )
+            frequency_penalty = self._pad_or_truncate_1d(
+                sampling_params.frequency_penalty,
+                max_batch,
+                defaults["frequency_penalty"],
+            )
+            repetition_penalty = self._pad_or_truncate_1d(
+                sampling_params.repetition_penalty,
+                max_batch,
+                defaults["repetition_penalty"],
+            )
+            seed = self._pad_or_truncate_1d(
+                sampling_params.seed, max_batch, defaults["seed"]
+            )
+            num_logprobs = self._pad_or_truncate_1d(
+                sampling_params.num_logprobs, max_batch, defaults["num_logprobs"]
+            )
+            # enable_log_probs has no DEFAULTS entry; its neutral default is
+            # "logprobs disabled" (num_logprobs default < 0 -> False).
+            enable_log_probs = self._pad_or_truncate_1d(
+                sampling_params.enable_log_probs, max_batch, False
+            )
             max_num_logprobs_val = (
                 model_input.max_num_logprobs[0]
                 if model_input.max_num_logprobs[0] is not None
                 else LOGPROBS_NONE_SENTINEL
             )
-        # Slot remap for seed manager reindexing after condense.
-        slot_remap = (
-            model_input.slot_remap
-            if model_input is not None and model_input.slot_remap is not None
-            else torch.arange(max_batch, dtype=torch.int32)
-        )
+        # Slot remap for seed manager reindexing after condense. The merged
+        # input batch uses global max_num_seqs, but the decode gather wire
+        # format is per-lane/per-rank.
+        slot_remap = self._decode_gather_slot_remap(model_input, max_batch)
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req, G = num kv_cache_groups.
         # Layout includes one block_table block per group (G*B*W ints) so
@@ -1283,7 +1312,10 @@ class TTModelRunner:
         # the legacy single-group case G == 1 and the layout is byte-
         # identical to the pre-hybrid format.
         block_tables_packed = torch.cat(
-            [bt.contiguous().view(-1) for bt in block_tables_per_group],
+            [
+                bt[:, :max_blocks_decode_batch].contiguous().view(-1)
+                for bt in block_tables_per_group
+            ],
             dim=0,
         )
         int_inputs = torch.cat(
@@ -1313,6 +1345,22 @@ class TTModelRunner:
             else:
                 has_structured_inputs = torch.tensor([1], dtype=torch.int32)
                 bitmasks = model_input.grammar_bitmask[0]
+            if bitmasks.shape[0] > max_batch:
+                bitmasks = bitmasks[:max_batch]
+            elif bitmasks.shape[0] < max_batch:
+                # Padding rows have no active request; fill with all-ones
+                # (all tokens allowed) to match the sentinel used everywhere
+                # else in the bitmask pipeline.
+                pad_rows = max_batch - bitmasks.shape[0]
+                bitmasks = torch.cat(
+                    [
+                        bitmasks,
+                        torch.full(
+                            (pad_rows, bitmasks.shape[1]), -1, dtype=bitmasks.dtype
+                        ),
+                    ],
+                    dim=0,
+                )
             bitmasks = bitmasks.contiguous().view(-1)  # B * bitmask_size
             int_inputs = torch.cat(
                 [int_inputs, has_structured_inputs, bitmasks], dim=0
@@ -1402,7 +1450,7 @@ class TTModelRunner:
         generators_list: list[dict[int, torch.Generator]] = []
         slot_remap = None
 
-        if is_decode:
+        if is_decode and isinstance(inputs, dict):
             # For decode, given gathered flattened tensors from all DP ranks.
             # Ints: [toks(B), positions(B), block_tables(B*W),
             #        bs(1), top_k(B), seed(B), num_logprobs(B),
@@ -1414,7 +1462,7 @@ class TTModelRunner:
             assert max_blocks_decode_batch is not None, (
                 "max_blocks_decode_batch must be provided for decode"
             )
-            B = int(self.scheduler_config.max_num_seqs)
+            B = self.tt_per_lane_max_num_seqs
             W = max_blocks_decode_batch
             reset_batch = inputs["reset_batch"]
             perform_device_sampling = inputs["all_sample_device"]
@@ -1553,7 +1601,7 @@ class TTModelRunner:
             off_f += B
 
             prompt_lens = None
-        else:
+        elif not is_decode:
             input_tokens_list: list[torch.Tensor] = []
             block_tables_list: list[torch.Tensor] = []
             # ``block_tables_per_group_list[g]`` holds one entry per active
@@ -1685,6 +1733,17 @@ class TTModelRunner:
             num_logprobs = torch.cat(num_logprobs_list, dim=0)
             enable_log_probs = torch.cat(enable_log_probs_list, dim=0)
 
+        else:
+            # Gathered-DP decode passes a dict (handled above) and prefill a
+            # list of per-rank inputs (the elif). Single-process lane mode no
+            # longer routes through this concat (the runner builds the merged
+            # device input directly from ``TTLaneInputBatch``), so a non-dict
+            # decode input here is unexpected.
+            raise AssertionError(
+                "concat_dp_model_inputs received a non-dict decode input; "
+                "lane mode builds its decode input via TTLaneInputBatch."
+            )
+
         tt_sampling_params = TTSamplingParams(
             temperature=temperature,
             top_k=top_k,
@@ -1739,8 +1798,8 @@ class TTModelRunner:
                             max_output_len, rank_output_tokens.shape[1]
                         )
 
-            # Create tensors with shape (max_num_reqs * DP_size, max_len)
-            max_num_reqs = int(self.scheduler_config.max_num_seqs)
+            # Create tensors with shape (per-rank batch * DP_size, max_len)
+            max_num_reqs = self.tt_per_lane_max_num_seqs
             total_batch_size = max_num_reqs * len(sampling_tokens_inputs)
 
             # Create prompt and output tokens tensors
@@ -1796,8 +1855,112 @@ class TTModelRunner:
             max_num_logprobs=max_num_logprobs,
             logitsprocs_list=logitsprocs_list,
             generators_list=generators_list,
+            prefill_empty_slots=None,
         )
         return merged
+
+    # ------------------------------------------------------------------
+    # Single-process lane-DP step orchestration
+    # ------------------------------------------------------------------
+    #
+    # All lane-specific input/output shaping lives in ``TTLaneInputBatch``
+    # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the
+    # merge/redistribute in ``TTLaneCoordinator``; this orchestration only wires
+    # the device submission, async decode, and deferred state application -- the
+    # genuinely runner/model-owned parts.
+
+    @torch.no_grad()
+    def _execute_lane_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Execute one merged single-process multi-lane (lane-DP) step.
+
+        Invoked by ``execute_model`` when the lane scheduler attached a step
+        plan, so the plan is always present here.
+        """
+        plan = get_tt_step_plan(scheduler_output)
+        assert plan is not None, "lane step requires a scheduler-attached plan"
+
+        # Lane-DP lays requests out at sparse stable slots. Request-specific
+        # RoPE (mrope/vision models) instead assumes front-packed request rows,
+        # so the two are incompatible until the RoPE delta mapping is made
+        # slot-aware. No lane-DP model needs it.
+        if self.request_specific_rope:
+            raise NotImplementedError(
+                "lane-DP does not support request-specific RoPE "
+                "(mrope/vision models) yet"
+            )
+
+        lane_batch = self.lane_batch
+        self.async_decode.apply_ready_completed_decode_steps()
+        steady_decode_candidate = (
+            self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
+                scheduler_output, grammar_output
+            )
+        )
+        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+            self.async_decode.wait_for_all_pending_async_steps()
+
+        layout_changed = lane_batch.apply_step_plan(
+            scheduler_output, plan, self.requests, self.encoder_cache
+        )
+        if layout_changed:
+            self._decode_layout_changed_since_last_decode = True
+
+        if not scheduler_output.total_num_scheduled_tokens:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        scheduled_rows = list(plan.scheduled_rows)
+        if not scheduled_rows:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        model_input = lane_batch.build_model_input(
+            self, scheduler_output, grammar_output, plan
+        )
+        if plan.is_decode:
+            if self.non_dp_async_scheduling:
+                req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+                context = self.async_decode.capture_submitted_step_context(req_ids)
+                return self.async_decode.submit_async_lane_decode(
+                    model_input, context, scheduled_rows
+                )
+            submission = self.async_decode.submit_decode(
+                model_input, read_from_device=True, async_read=False
+            )
+            finalized = self.async_decode.finalize_decode(submission)
+            assert finalized is not None
+            sampled, logprobs = lane_batch.extract_output(
+                self,
+                finalized.tt_out,
+                finalized.tt_log_probs,
+                model_input,
+                scheduled_rows,
+                is_decode=True,
+            )
+        else:
+            tt_out = self.submit_prefill(model_input, model_input.unpadded_batch_size)
+            tt_log_probs = None
+            assert isinstance(
+                model_input.tt_sampling_params.enable_log_probs, torch.Tensor
+            )
+            if (
+                model_input.perform_device_sampling
+                and model_input.tt_sampling_params.enable_log_probs.any()
+            ):
+                assert isinstance(tt_out, tuple) and len(tt_out) == 2
+                tt_out, tt_log_probs = tt_out
+            elif isinstance(tt_out, tuple):
+                tt_out, _ = tt_out
+            sampled, logprobs = lane_batch.extract_output(
+                self, tt_out, tt_log_probs, model_input, scheduled_rows, is_decode=False
+            )
+
+        # ``scheduled_rows`` are persistent slots; their req_ids in row order are
+        # the canonical merged output order.
+        req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
     def execute_model(
@@ -1816,6 +1979,15 @@ class TTModelRunner:
         # tt_worker.py uses the dedicated DP facade instead.
         # With DP, the actual model pass happens on a batch
         # produced by concatenating the inputs from all DP ranks.
+
+        # Single-process lane-DP: the lane scheduler attaches a per-step plan to
+        # the scheduler output. When present, the step runs over the merged lane
+        # batch (``TTLaneInputBatch`` owns all the lane-specific input/output
+        # shaping); the generic path below stays lane-agnostic.
+        if get_tt_step_plan(scheduler_output) is not None:
+            return self._execute_lane_step(
+                scheduler_output, grammar_output, intermediate_tensors
+            )
 
         # Apply any decode steps that have already completed on the async
         # thread. In steady decode mode we intentionally allow one step of
@@ -1868,8 +2040,8 @@ class TTModelRunner:
         logprobs_lists_per_dp = [
             lp.tolists() if lp is not None else None for lp in logprobs_per_dp
         ]
-        world = self.parallel_config.data_parallel_size
-        B = int(self.scheduler_config.max_num_seqs)
+        world = self.tt_data_parallel_size
+        B = self.tt_per_lane_max_num_seqs
         for dp_rank in range(world):
             token_ids = sampled_token_ids_per_dp[dp_rank].to(torch.int32)
             if token_ids.numel() == 0:
@@ -1904,9 +2076,7 @@ class TTModelRunner:
 
         # Calculate number of devices per DP rank
         assert self.device_config.num_devices is not None
-        num_devices = (
-            self.device_config.num_devices // self.parallel_config.data_parallel_size
-        )
+        num_devices = self.device_config.num_devices // self.tt_data_parallel_size
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
@@ -1986,14 +2156,16 @@ class TTModelRunner:
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
         if len(batch_size_per_dp) > 1:
-            # TODO: the model should only require DP ranks, but passing
-            # "global" user ids instead for backwards compatibility.
-            stride = int(self.scheduler_config.max_num_seqs)
-            empty_slots = []
-            for dp_rank, sz in enumerate(batch_size_per_dp):
-                for i in range(int(sz)):
-                    empty_slots.append(dp_rank * stride + i)
-            kwargs["empty_slots"] = empty_slots
+            empty_slots = model_input.prefill_empty_slots
+            if empty_slots is None:
+                # TODO: the model should only require DP ranks, but passing
+                # "global" user ids instead for backwards compatibility.
+                stride = self.tt_per_lane_max_num_seqs
+                empty_slots = []
+                for dp_rank, sz in enumerate(batch_size_per_dp):
+                    for i in range(int(sz)):
+                        empty_slots.append(dp_rank * stride + i)
+            kwargs["empty_slots"] = list(empty_slots)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
@@ -2034,24 +2206,29 @@ class TTModelRunner:
         # Execute model
         if not is_decode:
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
+            # Prefill returns the raw model output: an optional
+            # ``(tokens/logits, logprobs)`` tuple when device sampling ran.
+            # Unpack it here. The decode branch below is already unpacked by
+            # ``finalize_decode``, so re-running this would double-unpack and
+            # assert on an already-extracted tensor.
+            assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
+            if perform_device_sampling and sampling_params.enable_log_probs.any():
+                assert isinstance(tt_out, tuple) and len(tt_out) == 2
+                tt_out, tt_log_probs = tt_out
+            elif isinstance(tt_out, tuple):
+                tt_out, _ = tt_out
         else:
             submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
             finalized = self.async_decode.finalize_decode(submission)
             assert finalized is not None
+            # ``finalize_decode`` already unpacked ``(tt_out, tt_log_probs)``.
             tt_out = finalized.tt_out
             tt_log_probs = finalized.tt_log_probs
             batch_size_per_dp = submission.batch_size_per_dp
             sampling_params = submission.sampling_params
             perform_device_sampling = submission.perform_device_sampling
-
-        assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
-        if perform_device_sampling and sampling_params.enable_log_probs.any():
-            assert isinstance(tt_out, tuple) and len(tt_out) == 2
-            tt_out, tt_log_probs = tt_out
-        elif isinstance(tt_out, tuple):
-            tt_out, _ = tt_out
 
         return self._get_output_tokens(
             tt_out=tt_out,
@@ -2125,6 +2302,7 @@ class TTModelRunner:
         max_blocks_decode_batch: int | None,
         any_structured_inputs: bool,
         non_block: bool = False,
+        allow_decode_overlap: bool = True,
     ) -> Any:
         """Execute one merged DP batch and return the DP-facing result shape.
 
@@ -2132,11 +2310,16 @@ class TTModelRunner:
         returns the packed DP-facing result expected by the worker facade.
         """
         merged = self.concat_dp_model_inputs(
-            inputs, is_decode, max_blocks_decode_batch, any_structured_inputs
+            inputs,
+            is_decode,
+            max_blocks_decode_batch,
+            any_structured_inputs,
         )
 
         if non_block and is_decode:
-            return self.async_decode.submit_async_dp_decode(merged)
+            return self.async_decode.submit_async_dp_decode(
+                merged, allow_decode_overlap=allow_decode_overlap
+            )
 
         sampled_token_ids_per_dp, logprobs_per_dp = self.execute_sync_with_model_input(
             merged
@@ -2199,10 +2382,19 @@ class TTModelRunner:
                 logprobs_per_dp.append(None)
                 if is_decode:
                     # Fixed stride segments per DP rank for decode
-                    start += self.scheduler_config.max_num_seqs
+                    start += self.tt_per_lane_max_num_seqs
                 continue
+
+            # Gathered-DP / non-DP pack active requests at the front of each
+            # rank's segment, so this rank's rows are the contiguous
+            # ``[start, start + sz)`` range.
+            rows = torch.arange(start, start + sz, dtype=torch.long)
+
+            def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
+                return tensor[_rows]
+
             if not perform_device_sampling:
-                logits = tt_out[start : start + sz, -1, :]
+                logits = tt_out[rows, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
 
@@ -2220,16 +2412,12 @@ class TTModelRunner:
                 assert isinstance(sampling_params.frequency_penalty, torch.Tensor)
                 assert isinstance(sampling_params.repetition_penalty, torch.Tensor)
                 assert isinstance(sampling_params.seed, torch.Tensor)
-                temperature = sampling_params.temperature[start : start + sz]
-                top_k = sampling_params.top_k[start : start + sz]
-                top_p = sampling_params.top_p[start : start + sz]
-                presence_penalty = sampling_params.presence_penalty[start : start + sz]
-                frequency_penalty = sampling_params.frequency_penalty[
-                    start : start + sz
-                ]
-                repetition_penalty = sampling_params.repetition_penalty[
-                    start : start + sz
-                ]
+                temperature = _take(sampling_params.temperature)
+                top_k = _take(sampling_params.top_k)
+                top_p = _take(sampling_params.top_p)
+                presence_penalty = _take(sampling_params.presence_penalty)
+                frequency_penalty = _take(sampling_params.frequency_penalty)
+                repetition_penalty = _take(sampling_params.repetition_penalty)
 
                 # Determine if all greedy (temperature == 0.0) or all random
                 all_greedy = (temperature == 0.0).all().item()
@@ -2247,7 +2435,7 @@ class TTModelRunner:
                 # Output history as list[list[int]] (filter TT -1 padding).
                 output_token_ids: list[list[int]] = []
                 if is_decode and model_input.output_tokens is not None:
-                    output_tokens = model_input.output_tokens[start : start + sz]
+                    output_tokens = _take(model_input.output_tokens)
                     for i in range(sz):
                         output_tokens_i = output_tokens[i].tolist()
                         output_token_ids.append(
@@ -2261,9 +2449,9 @@ class TTModelRunner:
                 prompt_token_ids: torch.Tensor | None = None
                 if not no_penalties:
                     if is_decode and model_input.prompt_tokens is not None:
-                        prompt_token_ids = model_input.prompt_tokens[
-                            start : start + sz
-                        ].to(torch.int64)
+                        prompt_token_ids = _take(model_input.prompt_tokens).to(
+                            torch.int64
+                        )
                         prompt_token_ids = prompt_token_ids.masked_fill(
                             prompt_token_ids == -1, self.vocab_size
                         )
@@ -2332,46 +2520,26 @@ class TTModelRunner:
                 # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
                 # while decode may return [sz, 1]; downstream logprobs packing
                 # expects a flat vector here.
-                next_token_ids = tt_out[start : start + sz].reshape(sz)
+                next_token_ids = _take(tt_out).reshape(sz)
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
                 assert isinstance(sampling_params.enable_log_probs, torch.Tensor)
-                rank_enable_lp = sampling_params.enable_log_probs[start : start + sz]
+                rank_enable_lp = _take(sampling_params.enable_log_probs)
                 if rank_enable_lp.any():
                     # Sanity check for if we correctly detect
                     # when logprobs are supported.
                     assert tt_log_probs is not None, (
                         "model should return logprobs when requested"
                     )
-                    if isinstance(tt_log_probs, tuple):
-                        # New path: top-K logprobs from device
-                        # (gpt-oss-120b). Device returns already-sorted
-                        # (top_k_logprobs[B,32], top_k_indices[B,32]).
-                        top_k_logprobs, top_k_indices = tt_log_probs
-                        logprobs_tensors = _build_logprobs_from_topk(
-                            top_k_logprobs=top_k_logprobs[start : start + sz],
-                            top_k_indices=top_k_indices[start : start + sz],
+                    logprobs_per_dp.append(
+                        build_device_logprobs(
+                            tt_log_probs=tt_log_probs,
                             sampled_token_ids=next_token_ids,
-                            max_num_logprobs=rank_max_num_logprobs
-                            if rank_max_num_logprobs is not None
-                            else 0,
+                            rows=rows,
+                            max_num_logprobs=rank_max_num_logprobs or 0,
                         )
-                    else:
-                        # Old path: single sampled-token logprob
-                        # (all other models). Device returns [B] tensor.
-                        sampled_log_probs = tt_log_probs[start : start + sz].reshape(sz)
-                        logprob_token_ids = next_token_ids.unsqueeze(-1).to(torch.int32)
-                        logprobs_values = sampled_log_probs.unsqueeze(-1).to(
-                            torch.float32
-                        )
-                        selected_token_ranks = torch.full((sz,), -1, dtype=torch.int32)
-                        logprobs_tensors = LogprobsTensors(
-                            logprob_token_ids=logprob_token_ids,
-                            logprobs=logprobs_values,
-                            selected_token_ranks=selected_token_ranks,
-                        )
-                    logprobs_per_dp.append(logprobs_tensors)
+                    )
                 else:
                     logprobs_per_dp.append(None)
 
@@ -2379,7 +2547,7 @@ class TTModelRunner:
 
             if is_decode:
                 # Fixed stride segments per DP rank for decode
-                start += self.scheduler_config.max_num_seqs
+                start += self.tt_per_lane_max_num_seqs
             else:
                 # Prefill packed contiguously
                 start += sz
@@ -2459,8 +2627,13 @@ class TTModelRunner:
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
-        row_indices: tuple[int, ...] | None = None,
     ) -> None:
+        # When applying a deferred async step, the write row is resolved live
+        # from ``req_id_to_index`` (below), not from the row captured at submit
+        # time: lane mode pins each request to a stable slot for its lifetime
+        # and the ``request_states`` identity check guards slot reuse, so the
+        # live row equals the captured one. ``req_id_to_index`` is therefore the
+        # single source of truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         assert sampled_token_ids.shape[0] == num_reqs, (
@@ -2572,8 +2745,7 @@ class TTModelRunner:
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
-            max_batch_size=self.scheduler_config.max_num_seqs
-            * self.parallel_config.data_parallel_size,
+            max_batch_size=self.tt_max_batch_size,
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )

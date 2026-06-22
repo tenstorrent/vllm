@@ -23,8 +23,13 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm_tt_plugin.config import get_tt_config
-from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
+)
+from vllm_tt_plugin.model_input import TTModelInput
+from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _should_pre_register_tt_test_models_from_cli,
@@ -293,10 +298,15 @@ class TTWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | None:
-        """Execute a non-DP TT step with plugin-owned structured-output data."""
+        """Execute a single-process TT step with plugin-owned structured-output
+        data.
+
+        ``execute_model`` handles both plain single-process and lane-DP steps:
+        it dispatches on the lane scheduler's per-step plan, so the worker does
+        not need to know whether lane-DP is active.
+        """
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        output = self.model_runner.execute_model(scheduler_output, grammar_output)
-        return output
+        return self.model_runner.execute_model(scheduler_output, grammar_output)
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
@@ -409,7 +419,7 @@ class TTWorker(WorkerBase):
         do not execute the merged TT batch.
         """
         world = self.parallel_config.data_parallel_size
-        batch_size = int(self.model_runner.scheduler_config.max_num_seqs)
+        batch_size = self.model_runner.tt_per_lane_max_num_seqs
         return torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world
 
     def apply_dp_execution_result(
@@ -455,19 +465,25 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     model_config = vllm_config.model_config
     device_config = vllm_config.device_config
-    scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
     # region Get default or model- and device-specific `max_tokens_all_users`
     try:
-        data_parallel = vllm_config.parallel_config.data_parallel_size
+        tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         model_class, _ = get_model_architecture(model_config)
+        # Pass the per-submesh batch (the requests one submesh actually serves),
+        # not the global engine capacity, so a model that derives a per-user
+        # token budget from ``max_num_seqs`` computes the same value whether
+        # parallelism is expressed as gathered DP (each rank its own engine) or
+        # single-process lane mode. This matches the padding term below, which
+        # also uses ``get_tt_per_lane_max_num_seqs``, and keeps the KV shape
+        # identical across both modes.
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
             num_devices=device_config.num_devices,
-            tt_data_parallel=data_parallel,
+            tt_data_parallel=tt_data_parallel,
             max_model_len=model_config.max_model_len,
-            max_num_seqs=scheduler_config.max_num_seqs,
+            max_num_seqs=get_tt_per_lane_max_num_seqs(vllm_config),
         )
 
         logger.info(
@@ -490,7 +506,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-    max_batch = scheduler_config.max_num_seqs
+    #
+    # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
+    # padding must use the *per-lane/per-rank* batch -- the number of requests
+    # a single submesh actually serves -- not the global engine capacity. In
+    # gathered DP this is ``max_num_seqs`` (each rank is its own engine); in
+    # single-process lane mode it is ``max_num_seqs // lane count``.
+    # Both reduce to the same per-submesh value, keeping the KV shape identical
+    # regardless of how parallelism is expressed.
+    max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     max_tokens_all_users += cache_config.block_size * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers

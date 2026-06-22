@@ -75,6 +75,12 @@ def runner():
     r.cache_config.block_size = 64
     r.parallel_config.data_parallel_size = 1
     r.parallel_config.data_parallel_rank_local = 0
+    # Real ``__init__`` sets these from ``get_tt_data_parallel_size`` /
+    # ``get_tt_max_batch_size``; the synthetic runner skips ``__init__``, so
+    # set the single-lane defaults (max_num_seqs=32) that the KV-shape /
+    # initialize paths read.
+    r.tt_data_parallel_size = 1
+    r.tt_max_batch_size = 32
     r.device_config.num_devices = 2
     r.scheduler_config.max_num_seqs = 32
     r.scheduler_config.max_num_batched_tokens = 8192
@@ -362,12 +368,36 @@ def test_initialize_single_group_keeps_one_block_table(runner, monkeypatch):
     assert captured["block_sizes"] == [64]
 
 
-def test_initialize_mixed_block_sizes_rejected(runner):
-    """The persistent input batch currently only supports a single
-    block_size; uneven block sizes across groups must error early."""
-    g1 = KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=_full_spec(block_size=32))
-    g2 = KVCacheGroupSpec(layer_names=["l.1"], kv_cache_spec=_full_spec(block_size=64))
+def test_initialize_mixed_block_sizes_threaded_per_group(runner, monkeypatch):
+    """Uneven block sizes across groups are accepted: upstream equalises
+    *page size* (not block_size), so hybrid models can carry per-group
+    block sizes. Each group's own block_size must be threaded through to
+    the persistent input batch / MultiGroupBlockTable rather than collapsed
+    to a single value."""
+    import vllm_tt_plugin.model_runner as runner_module
+
+    captured = {}
+
+    def fake_input_batch(**kw):
+        captured["block_sizes"] = kw["block_sizes"]
+        captured["kernel_block_sizes"] = kw["kernel_block_sizes"]
+        return MagicMock(name="fake-input-batch")
+
+    monkeypatch.setattr(runner_module, "InputBatch", fake_input_batch)
+
+    runner.model_config.get_num_layers_by_block_type.return_value = 2
+    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
+    g1 = KVCacheGroupSpec(
+        layer_names=["model.layers.0.self_attn"],
+        kv_cache_spec=_full_spec(block_size=32),
+    )
+    g2 = KVCacheGroupSpec(
+        layer_names=["model.layers.1.self_attn"],
+        kv_cache_spec=_full_spec(block_size=64),
+    )
     config = _config([g1, g2])
 
-    with pytest.raises(AssertionError, match="block size"):
-        runner.initialize_kv_cache(config)
+    runner.initialize_kv_cache(config)
+
+    assert captured["block_sizes"] == [32, 64]
+    assert captured["kernel_block_sizes"] == [32, 64]

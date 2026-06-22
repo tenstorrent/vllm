@@ -8,7 +8,7 @@ The emphasis here is on the concepts:
 - non-DP vs gathered-DP
 - what is scheduled locally vs what is coordinated globally
 
-Code pointers are intentionally minimal. If you need them, the main entry points are `plugins/vllm-tt-plugin/src/vllm_tt_plugin/scheduler.py`, `plugins/vllm-tt-plugin/src/vllm_tt_plugin/engine.py`, and `plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py` in the TT vLLM tree.
+Code pointers are intentionally minimal. If you need them, the main entry points are `plugins/vllm-tt-plugin/src/vllm_tt_plugin/scheduler.py`, `plugins/vllm-tt-plugin/src/vllm_tt_plugin/engine.py`, `plugins/vllm-tt-plugin/src/vllm_tt_plugin/lane_scheduler.py`, and `plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py` in the TT vLLM tree.
 
 ## Short Version
 
@@ -18,7 +18,6 @@ The current TT path is more specialized than upstream vLLM:
 - TT does not support mixed prefill+decode batches.
 - TT does not support chunked prefill at the scheduling level.
 - CPU-device work overlap is a decode optimization.
-- Non-DP and gathered-DP use different execution paths.
 - Gathered-DP is not just "the same thing on more ranks"; it adds a global mode negotiation and a gather/execute/scatter step around every DP execution.
 
 Upstream vLLM is more general:
@@ -69,11 +68,12 @@ This is the main conceptual difference from upstream.
 
 ### 3. Engine step selection
 
-After scheduling, the engine uses one of three execution styles:
+After scheduling, the engine uses one of four execution styles:
 
 1. Synchronous path
 2. Non-DP async path
 3. Gathered-DP async path
+4. Single-process multi-lane path
 
 Which path is used depends mostly on:
 
@@ -242,6 +242,22 @@ Overlap is disabled and pending async work is drained when correctness would oth
 - logprobs or other features that force a more synchronous path
 
 So the TT async path is best understood as a fast path for steady decode, not as a universal async execution model.
+
+## Queueing in Single-Process Lane TT
+
+Single-process lane mode sits between non-DP and gathered-DP: still one vLLM
+engine process and one TT worker, but `TTLaneCoordinator` owns one independent
+`TTScheduler` per lane (each with its own `waiting`/`running` queues and
+prefill/decode admission) and merges their `SchedulerOutput` objects into one
+engine-facing batch. Unlike gathered-DP there is no MPI coordination or
+gather/scatter: one process computes the global forced mode, one worker builds
+the per-lane TT inputs, one merged TT launch runs across all submeshes, and the
+merged runner output is split back by lane in-process.
+
+Lane mode reuses the non-DP TT async queue depth, but each queued item is a
+merged multi-lane step; decode overlap uses the same steady-state checks, and
+if any lane breaks them pending async decode work is drained before the next
+step.
 
 ## Queueing in Gathered-DP TT
 
