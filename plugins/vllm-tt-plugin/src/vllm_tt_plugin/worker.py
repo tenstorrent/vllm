@@ -42,13 +42,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Keep this in sync with TT model-side KV cache specs. It is currently
-# disabled because HybridAttentionForCausalLM emits FullAttentionSpec for
-# every layer while the sliding-window decode fix is pending. When
-# SlidingWindowSpec is re-enabled for those models, flip this back with the
-# matching model-side change so the block budget includes sliding groups.
-_HYBRID_KV_CACHE_GROUPS_ENABLED = False
-
 # Ensure TT model architectures are registered in this process as early as
 # possible. `WorkerWrapperBase.init_worker` imports the worker class module
 # before initializing multimodal caches; without this, early architecture
@@ -532,10 +525,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # emit FullAttentionSpec for every layer, so adding headroom for them would
     # over-allocate full-size KV blocks and can OOM Gemma3-27B on T3K. Read the
     # resolved model class's flag rather than a single global so re-enabling for
-    # one model doesn't regress the others; fall back to the module default when
-    # the class can't be resolved.
+    # one model doesn't regress the others; default to ``False`` when the class
+    # can't be resolved.
     hybrid_kv_cache_groups_enabled = getattr(
-        model_class, "_HYBRID_KV_CACHE_GROUPS_ENABLED", _HYBRID_KV_CACHE_GROUPS_ENABLED
+        model_class, "_HYBRID_KV_CACHE_GROUPS_ENABLED", False
     )
     sliding_window = model_config.get_sliding_window()
     if hybrid_kv_cache_groups_enabled and sliding_window is not None:

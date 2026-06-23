@@ -325,12 +325,12 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
 
-    # Gemma4 â€” text-only TT bridge.
+    # Gemma4 — text-only TT bridge.
     #
     # Gemma4 isn't in vLLM's upstream registry, so without an entry here
     # the upstream architecture resolver falls back to
     # ``TransformersMultiModalForCausalLM`` (because ``hf_config !=
-    # hf_text_config`` for Gemma4's nested config â€” see
+    # hf_text_config`` for Gemma4's nested config — see
     # ``ModelConfig._get_transformers_backend_cls``) and crashes on the
     # ``_processor_factory`` assertion in the multimodal registry. The
     # plugin's later ``TT``-prefix logic runs after that resolution, so
@@ -340,7 +340,7 @@ def register_tt_models(register_test_models=False) -> None:
     # finds our class. Since ``Gemma4ForCausalLM`` (the TT class) does not
     # use ``SupportsMultiModal``, vLLM's ``_model_info.supports_multimodal``
     # is False, ``multimodal_config`` is not populated, and the request
-    # path stays text-only â€” which matches what the TT model implements.
+    # path stays text-only — which matches what the TT model implements.
     # The ``TT``-prefixed aliases satisfy the plugin's later validation
     # in ``check_and_update_config`` so no override is needed.
     #
@@ -423,7 +423,7 @@ class TTPlatform(Platform):
         # different attention groups can share DRAM tensors. Without this
         # override the base ``Platform`` returns ``False`` and HMA collapses
         # every ``SlidingWindowSpec`` back to ``FullAttentionSpec`` in
-        # ``unify_hybrid_kv_cache_specs`` â€” defeating the entire point.
+        # ``unify_hybrid_kv_cache_specs`` — defeating the entire point.
         return True
 
     @classmethod
@@ -574,7 +574,7 @@ class TTPlatform(Platform):
         )
 
         # A model either supports the full on-device sampling pipeline or it
-        # doesn't â€” there is no greedy-only mode. Models opt in by setting
+        # doesn't — there is no greedy-only mode. Models opt in by setting
         # `supports_sample_on_device` in their `model_capabilities` dict.
         supports_sample_on_device = (
             model_capabilities.get("supports_sample_on_device", False)
