@@ -15,14 +15,17 @@ AttributeError`` clause does not catch. Patching it lets each test pick a
 deterministic budget source:
 
 * ``_fallback_arch`` makes the call raise ``AttributeError`` so the
-  function uses the 131072 fallback.
+  function uses the 131072 fallback. ``model_class`` stays ``None``, so no
+  sliding-window headroom is added.
 * ``_model_budget`` returns a stub class whose ``get_max_tokens_all_users``
   yields a fixed per-model budget, isolating this function from the
   per-SKU tables that live on the model class.
 
-Sliding-window headroom is gated by ``_HYBRID_KV_CACHE_GROUPS_ENABLED``
-(currently ``False`` while hybrid KV groups are disabled model-side), so
-the sliding tests patch it ``True`` to exercise the headroom formula.
+Sliding-window headroom is gated per model class by the
+``_HYBRID_KV_CACHE_GROUPS_ENABLED`` attribute, read off the resolved model
+class. ``_model_budget`` sets it explicitly on the stub class (defaulting
+to ``False``), so the sliding tests pass ``hybrid_enabled=True`` to
+exercise the headroom formula.
 """
 
 from unittest.mock import MagicMock, patch
@@ -62,10 +65,18 @@ def _fallback_arch():
     )
 
 
-def _model_budget(max_tokens: int):
-    """Patch the model class to return a fixed ``max_tokens_all_users``."""
+def _model_budget(max_tokens: int, hybrid_enabled: bool = False):
+    """Patch the model class to return a fixed ``max_tokens_all_users``.
+
+    ``hybrid_enabled`` sets the ``_HYBRID_KV_CACHE_GROUPS_ENABLED`` flag on
+    the stub class, which the function reads via ``getattr`` to decide
+    whether to add sliding-window headroom. It is set explicitly (rather
+    than left to ``MagicMock``'s auto-attribute, which is always truthy) so
+    the flag defaults to ``False`` like a real model class that opts out.
+    """
     fake_model_class = MagicMock()
     fake_model_class.get_max_tokens_all_users.return_value = max_tokens
+    fake_model_class._HYBRID_KV_CACHE_GROUPS_ENABLED = hybrid_enabled
     return patch(
         "vllm_tt_plugin.worker.get_model_architecture",
         return_value=(fake_model_class, "arch"),
@@ -125,12 +136,11 @@ def test_sliding_window_adds_headroom(cfg):
 
     with (
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
-        patch("vllm_tt_plugin.worker._HYBRID_KV_CACHE_GROUPS_ENABLED", True),
-        _fallback_arch(),
+        _model_budget(131_072, hybrid_enabled=True),
     ):
         n = get_num_available_blocks_tt(cfg)
 
-    # Default tokens (131072) + batch padding (64*32=2048) +
+    # Model budget (131072) + batch padding (64*32=2048) +
     # sliding overhead (1024 * 32 * 8 = 262144) = 395264 tokens ->
     # ceil(395264 / 64) = 6176 blocks.
     assert n == 6176
@@ -165,8 +175,7 @@ def test_per_model_branch_with_sliding_window(cfg):
 
     with (
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
-        patch("vllm_tt_plugin.worker._HYBRID_KV_CACHE_GROUPS_ENABLED", True),
-        _model_budget(65536),
+        _model_budget(65_536, hybrid_enabled=True),
     ):
         n = get_num_available_blocks_tt(cfg)
 
