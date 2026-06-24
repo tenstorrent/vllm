@@ -21,7 +21,7 @@ from vllm.v1.engine import (
     ReconfigureDistributedRequest,
     ReconfigureRankType,
 )
-from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm_tt_plugin.config import get_tt_config, get_tt_per_lane_max_num_seqs
@@ -77,20 +77,6 @@ class DPGatherHandle:
     any_needs_logprobs: bool
     req_ids: list[str]
     req_id_to_index: dict[str, int]
-
-
-class TTEngineCore(EngineCore):
-    """In-process TT engine core.
-
-    Non-DP and single-process lane-DP execution follow the stock vLLM control
-    flow: ``execute_model`` runs the device forward and returns ``None``, the
-    scheduler computes the grammar bitmask while the forward is in flight, and
-    ``sample_tokens`` applies it. No TT-specific step override is needed.
-    """
-
-
-class TTEngineCoreProc(EngineCoreProc):
-    """Multiprocessing TT engine core; see :class:`TTEngineCore`."""
 
 
 class TTDPEngineCoreProc(DPEngineCoreProc):
