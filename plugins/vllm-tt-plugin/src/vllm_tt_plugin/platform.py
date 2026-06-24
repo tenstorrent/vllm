@@ -292,6 +292,7 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
     device_type: str = "tt"
+    device_control_env_var: str = "TT_VISIBLE_DEVICES"
     gathered_dp_mode: ClassVar[bool] = False
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal

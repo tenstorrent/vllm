@@ -431,8 +431,11 @@ class TTModelRunner:
                 )
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
-        # Only DP rank 0 allocates KV cache.
-        if self.parallel_config.data_parallel_rank_local != 0:
+        # In gathered-DP mode only rank 0 owns devices/KV cache.
+        # In standard DP mode every rank has its own submesh and needs KV cache.
+        if (TTPlatform.gathered_dp_mode
+            and self.parallel_config.data_parallel_rank_local != 0
+        ):
             return
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
@@ -528,6 +531,7 @@ class TTModelRunner:
         # active block count.
         max_batch = int(self.scheduler_config.max_num_seqs) * int(
             self.parallel_config.data_parallel_size
+            if TTPlatform.gathered_dp_mode else 1
         )
         target_shape = (max_batch, self.max_num_blocks_per_req)
         padded = []
@@ -874,7 +878,7 @@ class TTModelRunner:
         # DP optimization: don't send padding blocks if possible to reduce
         # overhead from gathering inputs to rank 0 and rely on DP concat
         # function to pad to global max blocks.
-        if self.parallel_config.data_parallel_size > 1:
+        if TTPlatform.gathered_dp_mode and self.parallel_config.data_parallel_size > 1:
             max_tokens_in_batch = max(input_batch.num_tokens[:num_reqs])
             max_blocks_in_batch = cdiv(
                 max_tokens_in_batch, self.cache_config.block_size
@@ -2581,8 +2585,13 @@ class TTModelRunner:
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
-            max_batch_size=self.scheduler_config.max_num_seqs
-            * self.parallel_config.data_parallel_size,
+            max_batch_size=(
+                self.scheduler_config.max_num_seqs
+                * (
+                    self.parallel_config.data_parallel_size
+                    if TTPlatform.gathered_dp_mode else 1
+                )
+            ),
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )

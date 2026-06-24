@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
+import fcntl
 import math
 import os
+import tempfile
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -119,12 +121,45 @@ class TTWorker(WorkerBase):
                 1 if gathered_dp_mode
                 else self.parallel_config.data_parallel_size
             )
-            self.mesh_device = open_mesh_device(
-                get_tt_config(self.vllm_config),
-                self.trace_mode,
-                mesh_rank,
-                dp_size,
-            )
+
+            # region Open mesh device
+            # Serialize device opening across DP ranks. The UMD Cluster
+            # constructor programs firmware on ALL physical devices and
+            # concurrent opens corrupt kernel binaries (see tt-metal
+            # risc_firmware_initializer.cpp: "Launch FW on each device
+            # sequentially, since a multithreaded launch leads to
+            # initialization hangs").
+            # Use a POSIX file lock so ranks open devices one at a time.
+            if not gathered_dp_mode and dp_size > 1:
+                lock_fd = tempfile.TemporaryFile(suffix=".tt_vllm_mesh_init.lock")
+
+                logger.info("DP rank %d: waiting for mesh device lock...", mesh_rank)
+
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+                logger.info(
+                    "DP rank %d: acquired mesh device lock, opening mesh",
+                    mesh_rank,
+                )
+            else:
+                lock_fd = None
+
+            try:
+                self.mesh_device = open_mesh_device(
+                    get_tt_config(self.vllm_config),
+                    self.trace_mode,
+                    mesh_rank,
+                    dp_size,
+                )
+            finally:
+                if lock_fd is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
+                    logger.info(
+                        "DP rank %d: released mesh device lock", mesh_rank
+                    )
+            # endregion
+
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
             self.device_config.num_devices = self.mesh_device.get_num_devices()
@@ -560,6 +595,16 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         )
     # endregion
 
+    # Cap max_tokens_all_users by max_model_len when explicitly configured,
+    # since the KV cache cannot hold more tokens than the model supports.
+    # ??? Is it only for Llama-3.2 or for all models?
+    if model_config.max_model_len < max_tokens_all_users:
+        max_tokens_all_users = model_config.max_model_len
+        logger.info(
+            "Capping max_tokens_all_users to max_model_len=%d",
+            max_tokens_all_users,
+        )
+
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
@@ -603,7 +648,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 # TT-NN utilities
 
 
-def get_dispatch_core_config(tt_config):
+def get_dispatch_core_config(tt_config, num_devices=1):
     dispatch_core_axis: ttnn.DispatchCoreAxis = None
     if tt_config is not None and "dispatch_core_axis" in tt_config:
         assert tt_config["dispatch_core_axis"] in ["row", "col"], (
@@ -617,6 +662,14 @@ def get_dispatch_core_config(tt_config):
             else ttnn.DispatchCoreAxis.ROW
         )
 
+    # For multi-chip clusters, explicitly set ETH dispatch core type to avoid
+    # triggering cluster discovery (and ETH heartbeat checks) in each process.
+    # This prevents race conditions when multiple DP rank processes initialize
+    # simultaneously.
+    if num_devices > 1:
+        return ttnn.DispatchCoreConfig(
+            type=ttnn.DispatchCoreType.ETH, axis=dispatch_core_axis
+        )
     return ttnn.DispatchCoreConfig(axis=dispatch_core_axis)
 
 
@@ -796,13 +849,16 @@ def compute_per_rank_mesh(mesh_grid, local_dp_rank, data_parallel_size):
     # 2D tiling: ranks fill columns first within each row strip
     row_idx = local_dp_rank // col_factor
     col_idx = local_dp_rank % col_factor
-    offset = ttnn.MeshCoordinate([row_idx * per_rank_rows,
-                                  col_idx * per_rank_cols])
+    offset = ttnn.MeshCoordinate([row_idx * per_rank_rows, col_idx * per_rank_cols])
 
     return per_rank_grid, offset
 
 
 def open_mesh_device(tt_config, trace_mode, local_dp_rank=0, data_parallel_size=1):
+    """Opens TT mesh device for the given DP config, applying TT config and trace mode.
+
+    Returns the opened mesh device.
+    """
     mesh_grid = get_mesh_grid(local_dp_rank)
     per_rank_grid, offset = compute_per_rank_mesh(
         mesh_grid, local_dp_rank, data_parallel_size
@@ -810,7 +866,11 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0, data_parallel_size=
 
     logger.info(
         "DP rank %d/%d: opening submesh %s at offset %s (full mesh %s)",
-        local_dp_rank, data_parallel_size, per_rank_grid, offset, mesh_grid,
+        local_dp_rank,
+        data_parallel_size,
+        per_rank_grid,
+        offset,
+        mesh_grid,
     )
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
@@ -823,7 +883,9 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0, data_parallel_size=
         set_fabric(tt_config, num_devices_requested)
 
     open_kwargs = dict(
-        dispatch_core_config=get_dispatch_core_config(tt_config),
+        dispatch_core_config=get_dispatch_core_config(
+            tt_config, per_rank_grid[0] * per_rank_grid[1]
+        ),
         **device_params,
     )
     if offset is not None:
