@@ -32,6 +32,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
+    DeferredDecodeOutput,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.config import (
@@ -199,7 +200,7 @@ class TTModelRunner:
             and self.parallel_config.data_parallel_size == 1
         )
         self._steady_decode_lock = threading.Lock()
-        self._pending_async_events: deque[threading.Event] = deque()
+        self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)

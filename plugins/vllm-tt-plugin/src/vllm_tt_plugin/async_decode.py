@@ -71,7 +71,47 @@ class CompletedDecodeStep:
     completion_time_ns: int
 
 
-class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
+class DeferredDecodeOutput(AsyncModelRunnerOutput):
+    """Run the deferred device readback exactly once, from whichever caller
+    reaches it first.
+
+    Two callers race for the same step on the single engine thread: the engine
+    resolves it via ``get_output`` when it pops the batch-queue future, and the
+    runner's drain (``TTAsyncDecodeController.wait_for_all_pending_async_steps``)
+    resolves it via ``ensure_finalized``. The completion event is set here, when
+    the readback actually runs, not only inside ``get_output``. That is the
+    invariant the drain depends on: vLLM 0.22's ``step_with_batch_queue``
+    schedules the next batch before resolving the prior future, so a drain that
+    merely ``event.wait()``-ed would block forever on an event the same thread
+    only sets after the drain returns.
+    """
+
+    _completion_event: threading.Event
+    _finalized: bool
+    _cached_output: Any
+
+    def _init_deferred(self) -> None:
+        self._finalized = False
+        self._cached_output = None
+
+    def ensure_finalized(self) -> Any:
+        if not self._finalized:
+            self._cached_output = self._get_output_impl()
+            self._finalized = True
+            self._completion_event.set()
+        return self._cached_output
+
+    def is_resolved(self) -> bool:
+        return self._completion_event.is_set()
+
+    def get_output(self) -> Any:
+        return self.ensure_finalized()
+
+    def _get_output_impl(self) -> Any:
+        raise NotImplementedError
+
+
+class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
     """Wrap a non-blocking single-process TT decode submission plus async read.
 
     Handles both a plain single-process decode and a lane-DP decode: when
@@ -94,6 +134,7 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         self._completion_event = completion_event
         self._context = context
         self._scheduled_rows = scheduled_rows
+        self._init_deferred()
 
     def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
         """Attach a sample-time grammar bitmask before the deferred read.
@@ -103,12 +144,6 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         the output thread then applies it through ``model_input``.
         """
         self._model_input = replace(self._model_input, grammar_bitmask=[bitmask])
-
-    def get_output(self) -> ModelRunnerOutput:
-        try:
-            return self._get_output_impl()
-        finally:
-            self._completion_event.set()
 
     def _get_output_impl(self) -> ModelRunnerOutput:
         completed = self._controller.complete_decode_step(
@@ -121,7 +156,7 @@ class AsyncTTModelRunnerOutput(AsyncModelRunnerOutput):
         return self._controller.build_runner_output_from_completed_step(completed)
 
 
-class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
+class AsyncTTDPGatherOutput(DeferredDecodeOutput):
     """Wrap a non-blocking DP decode submission plus async read submit."""
 
     def __init__(
@@ -135,12 +170,7 @@ class AsyncTTDPGatherOutput(AsyncModelRunnerOutput):
         self._submission = submission
         self._model_input = model_input
         self._completion_event = completion_event
-
-    def get_output(self) -> tuple[torch.Tensor, list]:  # type: ignore[override]
-        try:
-            return self._get_output_impl()
-        finally:
-            self._completion_event.set()
+        self._init_deferred()
 
     def _get_output_impl(self) -> tuple[torch.Tensor, list]:
         finalized = self._controller.finalize_decode(self._submission)
@@ -305,23 +335,23 @@ class TTAsyncDecodeController:
         with self.runner._steady_decode_lock:
             self.runner._completed_decode_steps.append(completed)
 
-    def register_pending_async_event(
+    def register_pending_async_step(
         self,
-        event: threading.Event,
+        step: DeferredDecodeOutput,
         *,
         overlap_ok: bool,
     ) -> None:
         with self.runner._steady_decode_lock:
-            self.runner._pending_async_events.append(event)
+            self.runner._pending_async_steps.append(step)
             self.runner._pending_async_overlap_ok.append(overlap_ok)
 
     def prune_finished_async_events(self) -> None:
         with self.runner._steady_decode_lock:
             while (
-                self.runner._pending_async_events
-                and self.runner._pending_async_events[0].is_set()
+                self.runner._pending_async_steps
+                and self.runner._pending_async_steps[0].is_resolved()
             ):
-                self.runner._pending_async_events.popleft()
+                self.runner._pending_async_steps.popleft()
                 self.runner._pending_async_overlap_ok.popleft()
 
     def drain_completed_decode_steps(self) -> list[CompletedDecodeStep]:
@@ -337,10 +367,15 @@ class TTAsyncDecodeController:
         self.prune_finished_async_events()
 
     def wait_for_all_pending_async_steps(self) -> None:
+        # Drive each pending readback to completion here rather than blocking on
+        # its event: the engine has not popped these futures yet (and on 0.22
+        # will not until after this returns), so nothing else will set the
+        # events. ``ensure_finalized`` is idempotent, so the engine's later
+        # ``get_output`` on the same step returns the cached result.
         with self.runner._steady_decode_lock:
-            events = list(self.runner._pending_async_events)
-        for event in events:
-            event.wait()
+            steps = list(self.runner._pending_async_steps)
+        for step in steps:
+            step.ensure_finalized()
         self.apply_ready_completed_decode_steps()
 
     def must_drain_pending_async_steps(
@@ -348,7 +383,7 @@ class TTAsyncDecodeController:
         steady_decode_candidate: bool,
     ) -> bool:
         with self.runner._steady_decode_lock:
-            if not self.runner._pending_async_events:
+            if not self.runner._pending_async_steps:
                 return False
             if not steady_decode_candidate:
                 return True
@@ -433,19 +468,17 @@ class TTAsyncDecodeController:
             read_from_device=False,
             async_read=True,
         )
-        self.register_pending_async_event(
-            event,
-            overlap_ok=steady_decode_fast_path,
-        )
         if submission.tt_out is None:
             event.set()
-        return AsyncTTModelRunnerOutput(
+        step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
             model_input=model_input,
             completion_event=event,
             context=context,
         )
+        self.register_pending_async_step(step, overlap_ok=steady_decode_fast_path)
+        return step
 
     def submit_async_dp_decode(
         self,
@@ -468,15 +501,16 @@ class TTAsyncDecodeController:
         submission = self.submit_decode(
             model_input, read_from_device=False, async_read=True
         )
-        self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
         if submission.tt_out is None:
             completion_event.set()
-        return AsyncTTDPGatherOutput(
+        step = AsyncTTDPGatherOutput(
             controller=self,
             submission=submission,
             model_input=model_input,
             completion_event=completion_event,
         )
+        self.register_pending_async_step(step, overlap_ok=overlap_ok)
+        return step
 
     def submit_async_lane_decode(
         self,
@@ -490,10 +524,9 @@ class TTAsyncDecodeController:
         submission = self.submit_decode(
             model_input, read_from_device=False, async_read=True
         )
-        self.register_pending_async_event(completion_event, overlap_ok=overlap_ok)
         if submission.tt_out is None:
             completion_event.set()
-        return AsyncTTModelRunnerOutput(
+        step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
             model_input=model_input,
@@ -501,6 +534,8 @@ class TTAsyncDecodeController:
             context=context,
             scheduled_rows=scheduled_rows,
         )
+        self.register_pending_async_step(step, overlap_ok=overlap_ok)
+        return step
 
     def submit_decode(
         self,
