@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -247,6 +247,7 @@ class TTLaneCoordinator(SchedulerInterface):
         kv_cache_config: KVCacheConfig,
         structured_output_manager: StructuredOutputManager,
         block_size: int,
+        hash_block_size: int | None = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
@@ -291,6 +292,7 @@ class TTLaneCoordinator(SchedulerInterface):
                 kv_cache_config,
                 structured_output_manager,
                 block_size,
+                hash_block_size,
                 mm_registry,
                 include_finished_set,
                 log_stats=False,
@@ -675,6 +677,16 @@ class TTLaneCoordinator(SchedulerInterface):
     def reset_encoder_cache(self) -> None:
         for sched in self.lanes:
             sched.reset_encoder_cache()
+
+    @property
+    def pause_state(self) -> PauseState:
+        # Lanes advance in lockstep on one negotiated step, so their pause
+        # state is uniform; report the first lane's.
+        return self.lanes[0].pause_state
+
+    def set_pause_state(self, pause_state: PauseState) -> None:
+        for sched in self.lanes:
+            sched.set_pause_state(pause_state)
 
     def make_stats(self) -> SchedulerStats | None:
         if not self.log_stats:

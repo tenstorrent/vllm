@@ -482,7 +482,8 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int) -> in
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
 
-    ``num_devices`` is the runtime-discovered physical device count.
+    ``num_devices`` is the runtime-discovered physical device count, passed in
+    from the worker rather than read from config; it is not a vLLM config value.
     """
 
     model_config = vllm_config.model_config

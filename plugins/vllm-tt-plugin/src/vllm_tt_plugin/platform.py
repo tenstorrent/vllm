@@ -20,9 +20,8 @@ from vllm_tt_plugin.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.inputs import ProcessorInputs, PromptType
+    from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
-    from vllm.renderers.inputs import DictPrompt, TokPrompt
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 else:
@@ -86,12 +85,12 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.data_parallel_external_lb = False
     parallel_config.data_parallel_hybrid_lb = False
 
-    # A single-process lane run owns one in-process worker, so pin the uniproc
-    # executor. Newer vLLM derives it from
-    # ``world_size_across_dp`` and latches "mp" from the user's
-    # --data_parallel_size before this hook runs; pinning "uni" keeps lane-DP
-    # single-process there too, so the worker's runtime
-    # ``num_gpu_blocks_override`` still reaches the engine's KV-cache sizing.
+    # ParallelConfig.__post_init__ latches distributed_executor_backend to "mp"
+    # whenever the original world_size_across_dp > 1 (from the user's
+    # --data_parallel_size N), and that runs before this hook. A single-process
+    # lane run owns one in-process worker, so force the uniproc executor;
+    # otherwise the worker runs in a separate process and its runtime
+    # ``num_gpu_blocks_override`` never reaches the engine's KV-cache sizing.
     parallel_config.distributed_executor_backend = "uni"
 
 
@@ -480,14 +479,6 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
-        parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
-        parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
-        parallel_config.dp_engine_core_proc_cls = (
-            "vllm_tt_plugin.engine.TTDPEngineCoreProc"
-        )
-        parallel_config.engine_core_launcher_cls = (
-            "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
-        )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -653,9 +644,8 @@ class TTPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: "PromptType | DictPrompt | TokPrompt",
+        processed_inputs: "EngineInput",
         params: "SamplingParams | PoolingParams",
-        processed_inputs: "ProcessorInputs",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
         from vllm.sampling_params import SamplingParams
