@@ -99,8 +99,7 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.data_parallel_hybrid_lb = False
 
     # A single-process lane run owns one in-process worker, so pin the uniproc
-    # executor. Today vLLM derives the backend from ``world_size`` (== 1 here),
-    # so this is the value it already resolves to. Newer vLLM derives it from
+    # executor. Newer vLLM derives it from
     # ``world_size_across_dp`` and latches "mp" from the user's
     # --data_parallel_size before this hook runs; pinning "uni" keeps lane-DP
     # single-process there too, so the worker's runtime
