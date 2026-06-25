@@ -75,30 +75,38 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
     """Run the deferred device readback exactly once, from whichever caller
     reaches it first.
 
-    Two callers race for the same step on the single engine thread: the engine
-    resolves it via ``get_output`` when it pops the batch-queue future, and the
-    runner's drain (``TTAsyncDecodeController.wait_for_all_pending_async_steps``)
-    resolves it via ``ensure_finalized``. The completion event is set here, when
-    the readback actually runs, not only inside ``get_output``. That is the
-    invariant the drain depends on: vLLM 0.22's ``step_with_batch_queue``
-    schedules the next batch before resolving the prior future, so a drain that
-    merely ``event.wait()``-ed would block forever on an event the same thread
-    only sets after the drain returns.
+    Two callers race for the same step from different threads: vLLM's
+    ``UniProcExecutor`` resolves it via ``get_output`` on its async-output
+    thread when async scheduling is on, while the runner's drain
+    (``TTAsyncDecodeController.wait_for_all_pending_async_steps``) resolves it
+    via ``ensure_finalized`` on the engine thread. ``_finalize_lock`` makes the
+    readback run exactly once across both threads; a second concurrent readback
+    of the same device submission corrupts the decode output. The completion
+    event is set here, when the readback actually runs, not only inside
+    ``get_output``. That is the invariant the drain depends on: vLLM 0.22's
+    ``step_with_batch_queue`` schedules the next batch before resolving the
+    prior future, so a drain that merely ``event.wait()``-ed would block forever
+    on an event nothing else has reached yet.
     """
 
     _completion_event: threading.Event
+    _finalize_lock: threading.Lock
     _finalized: bool
     _cached_output: Any
 
     def _init_deferred(self) -> None:
         self._finalized = False
         self._cached_output = None
+        self._finalize_lock = threading.Lock()
 
     def ensure_finalized(self) -> Any:
-        if not self._finalized:
-            self._cached_output = self._get_output_impl()
-            self._finalized = True
-            self._completion_event.set()
+        if self._finalized:
+            return self._cached_output
+        with self._finalize_lock:
+            if not self._finalized:
+                self._cached_output = self._get_output_impl()
+                self._finalized = True
+                self._completion_event.set()
         return self._cached_output
 
     def is_resolved(self) -> bool:
