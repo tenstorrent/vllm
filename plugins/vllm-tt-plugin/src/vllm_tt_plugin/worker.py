@@ -25,8 +25,14 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm_tt_plugin.config import get_tt_config, should_open_mesh_for_rank
-from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
+    should_open_mesh_for_rank,
+)
+from vllm_tt_plugin.model_input import TTModelInput
+from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _should_pre_register_tt_test_models_from_cli,
@@ -38,13 +44,6 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import LogprobsLists
 
 logger = init_logger(__name__)
-
-# Keep this in sync with TT model-side KV cache specs. It is currently
-# disabled because HybridAttentionForCausalLM emits FullAttentionSpec for
-# every layer while the sliding-window decode fix is pending. When
-# SlidingWindowSpec is re-enabled for those models, flip this back with the
-# matching model-side change so the block budget includes sliding groups.
-_HYBRID_KV_CACHE_GROUPS_ENABLED = False
 
 # Ensure TT model architectures are registered in this process as early as
 # possible. `WorkerWrapperBase.init_worker` imports the worker class module
@@ -392,15 +391,24 @@ class TTWorker(WorkerBase):
         self._pending_scheduler_output_for_sample = None
         return self.execute_model_with_grammar(pending, grammar_output)
 
+    def execute_dummy_batch(self) -> None:
+        """No-op for standard DP: each rank has an independent submesh with no
+        cross-rank collectives during model execution."""
+
     def execute_model_with_grammar(
         self,
         scheduler_output: "SchedulerOutput",
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | None:
-        """Execute a non-DP TT step with plugin-owned structured-output data."""
+        """Execute a single-process TT step with plugin-owned structured-output
+        data.
+
+        ``execute_model`` handles both plain single-process and lane-DP steps:
+        it dispatches on the lane scheduler's per-step plan, so the worker does
+        not need to know whether lane-DP is active.
+        """
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        output = self.model_runner.execute_model(scheduler_output, grammar_output)
-        return output
+        return self.model_runner.execute_model(scheduler_output, grammar_output)
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
@@ -513,7 +521,7 @@ class TTWorker(WorkerBase):
         do not execute the merged TT batch.
         """
         world = self.parallel_config.data_parallel_size
-        batch_size = int(self.model_runner.scheduler_config.max_num_seqs)
+        batch_size = self.model_runner.tt_per_lane_max_num_seqs
         return torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world
 
     def apply_dp_execution_result(
@@ -559,24 +567,26 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
 
     model_config = vllm_config.model_config
     device_config = vllm_config.device_config
-    scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
     # region Get default or model- and device-specific `max_tokens_all_users`
+    model_class = None
     try:
-        # In gathered-DP, one model spans all DP ranks;
-        # in standard DP each rank's model handles a single shard.
-        if TTPlatform.gathered_dp_mode:
-            data_parallel = vllm_config.parallel_config.data_parallel_size
-        else:
-            data_parallel = 1
+        tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         model_class, _ = get_model_architecture(model_config)
+        # Pass the per-submesh batch (the requests one submesh actually serves),
+        # not the global engine capacity, so a model that derives a per-user
+        # token budget from ``max_num_seqs`` computes the same value whether
+        # parallelism is expressed as gathered DP (each rank its own engine) or
+        # single-process lane mode. This matches the padding term below, which
+        # also uses ``get_tt_per_lane_max_num_seqs``, and keeps the KV shape
+        # identical across both modes.
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
             num_devices=device_config.num_devices,
-            tt_data_parallel=data_parallel,
+            tt_data_parallel=tt_data_parallel,
             max_model_len=model_config.max_model_len,
-            max_num_seqs=scheduler_config.max_num_seqs,
+            max_num_seqs=get_tt_per_lane_max_num_seqs(vllm_config),
         )
 
         logger.info(
@@ -598,8 +608,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # Cap max_tokens_all_users by max_model_len when explicitly configured,
     # since the KV cache cannot hold more tokens than the model supports.
     # ??? Is it only for Llama-3.2 or for all models?
-    if model_config.max_model_len < max_tokens_all_users:
-        max_tokens_all_users = model_config.max_model_len
+    max_model_len = getattr(model_config, "max_model_len", None)
+    if isinstance(max_model_len, int) and max_model_len < max_tokens_all_users:
+        max_tokens_all_users = max_model_len
         logger.info(
             "Capping max_tokens_all_users to max_model_len=%d",
             max_tokens_all_users,
@@ -609,7 +620,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-    max_batch = scheduler_config.max_num_seqs
+    #
+    # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
+    # padding must use the *per-lane/per-rank* batch -- the number of requests
+    # a single submesh actually serves -- not the global engine capacity. In
+    # gathered DP this is ``max_num_seqs`` (each rank is its own engine); in
+    # single-process lane mode it is ``max_num_seqs // lane count``.
+    # Both reduce to the same per-submesh value, keeping the KV shape identical
+    # regardless of how parallelism is expressed.
+    max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     max_tokens_all_users += cache_config.block_size * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers
@@ -619,16 +638,20 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # per-group block tables, so each request consumes
     # ``full_blocks_per_request + Σ sliding_blocks_per_request`` block IDs.
     #
-    # Hybrid groups are temporarily disabled on the model side by emitting
-    # FullAttentionSpec for every layer. While that is true, this token budget
-    # must stay on the pre-hybrid formula; adding sliding-window headroom here
-    # allocates too many full-size KV blocks and can OOM Gemma3-27B on T3K.
-    #
-    # When SlidingWindowSpec is restored in HybridAttentionForCausalLM, flip
-    # _HYBRID_KV_CACHE_GROUPS_ENABLED at the same time so both the spec shape
-    # and token calculation change together.
+    # Whether a given model actually emits SlidingWindowSpec (and therefore
+    # needs this sliding-window headroom) is decided per model class via
+    # ``_HYBRID_KV_CACHE_GROUPS_ENABLED``. Gemma4 re-enables it (it ships the
+    # bounded sliding-window decode fix); Gemma3 / GPT-OSS keep it ``False`` and
+    # emit FullAttentionSpec for every layer, so adding headroom for them would
+    # over-allocate full-size KV blocks and can OOM Gemma3-27B on T3K. Read the
+    # resolved model class's flag rather than a single global so re-enabling for
+    # one model doesn't regress the others; default to ``False`` when the class
+    # can't be resolved.
+    hybrid_kv_cache_groups_enabled = getattr(
+        model_class, "_HYBRID_KV_CACHE_GROUPS_ENABLED", False
+    )
     sliding_window = model_config.get_sliding_window()
-    if _HYBRID_KV_CACHE_GROUPS_ENABLED and sliding_window is not None:
+    if hybrid_kv_cache_groups_enabled and sliding_window is not None:
         # Conservative cap: assume up to a few sliding groups per buffer
         # (typical for Gemma3 5:1 / GPT-OSS 1:1 hybrid patterns) and add
         # ``sliding_window * max_batch`` worth of tokens per group as

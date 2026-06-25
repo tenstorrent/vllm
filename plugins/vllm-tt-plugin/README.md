@@ -7,9 +7,11 @@ plugin mechanism. Install it alongside vLLM and, when `ttnn` is importable,
 TT hardware is automatically available as a vLLM platform.
 
 The plugin is self-contained: model registration, platform detection, request
-validation, scheduling, worker execution, model loading, async decode, gathered
-data-parallel execution, and `tt-run` / MPI launch orchestration all live here.
-Nothing TT-specific needs to touch vLLM core.
+validation, scheduling, worker execution, model loading, async decode, single-
+process standard and multi-lane execution, gathered data-parallel execution
+and `tt-run` / MPI launch orchestration all live here. Nothing TT-specific
+needs to touch vLLM
+core.
 
 ## Package Layout
 
@@ -22,6 +24,7 @@ plugins/vllm-tt-plugin/
 |   +-- worker.py            # TT worker implementation
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
+|   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
 |   +-- engine.py            # TT engine core and DP engine processes
 |   +-- launcher.py          # tt-run / MPI launch integration
 |   +-- loader.py            # TT model loader
@@ -295,7 +298,7 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | `parallel_config.engine_core_proc_cls` | `vllm_tt_plugin.engine.TTEngineCoreProc` |
 | `parallel_config.dp_engine_core_proc_cls` | `vllm_tt_plugin.engine.TTDPEngineCoreProc` |
 | `parallel_config.engine_core_launcher_cls` | `vllm_tt_plugin.launcher.TTCoreEngineLauncher` |
-| `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` |
+| `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
 
 The execution model matches TT hardware characteristics:
 
@@ -303,20 +306,56 @@ The execution model matches TT hardware characteristics:
 - Chunked prefill is not used.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
-- Gathered DP collects local rank inputs, executes across the TT mesh, and
-  scatters outputs back to the participating ranks.
+- For Galaxy-generator models (Llama3 70B, Qwen3-32B), `--data_parallel_size N`
+  runs as `N` in-process TT lanes scheduled by `TTLaneCoordinator` (one engine,
+  one device mesh); see [Single-Process Galaxy Serving](#single-process-galaxy-serving).
+- For other models, `--data_parallel_size N` uses gathered multi-process DP:
+  local rank inputs are collected, executed across the TT mesh, and outputs
+  scattered back to the participating ranks.
 - Multi-host execution uses `tt-run` / MPI while vLLM sees a normal
   engine-client handshake.
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.
 
+## Single-Process Galaxy Serving
+
+Galaxy text models served by the single-execute Galaxy generator
+(Llama 3.3 70B via `TT_LLAMA_TEXT_VER=llama3_70b_galaxy`, Qwen3-32B via
+`TT_QWEN3_TEXT_VER=qwen3_32b_galaxy`) run on a single Galaxy device mesh, so
+they use single-process TT lanes: one vLLM engine process with internal TT
+lanes.
+
+Serve them with the familiar `--data_parallel_size N --max_num_seqs M` flags;
+the TT backend transparently maps them to `N` in-process lanes. No config
+changes are needed:
+
+```bash
+MESH_DEVICE=TG \
+TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
+VLLM_RPC_TIMEOUT=900000 \
+python plugins/vllm-tt-plugin/examples/server_example_tt.py \
+  --model "meta-llama/Llama-3.3-70B-Instruct" \
+  --data_parallel_size 4 \
+  --max_num_seqs 8 \
+  --async-scheduling \
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
+```
+
+`--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
+each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. For
+these single-execute Galaxy models this replaces the gathered DP=4 setup they
+used historically, so there is nothing to migrate. This conversion is specific
+to the Galaxy generators; other model families still run `--data_parallel_size`
+as gathered multi-process DP (see [Runtime Architecture](#runtime-architecture)).
+At startup the backend logs that it is running single-process lane-DP.
+
 ## Supported Model Families
 
 The plugin registers TT-prefixed model architectures backed by tt-metal model
 implementations. Current families:
 
-- Llama 3.1 / 3.2 text models (`TTLlamaForCausalLM`)
+- Llama 3.1 / 3.2 / 3.3 text models (`TTLlamaForCausalLM`)
 - Llama 3.2 vision models (`TTMllamaForConditionalGeneration`)
 - Qwen 2.5 and Qwen 3 text models (`TTQwen2ForCausalLM`, `TTQwen3ForCausalLM`)
 - Qwen 2.5-VL and Qwen 3-VL vision-language models
@@ -390,6 +429,13 @@ pytest plugins/vllm-tt-plugin/tests/tt -v \
 
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
+
+Plugin-local unit tests that do not require a running server live directly
+under `plugins/vllm-tt-plugin/tests/`, for example:
+
+```bash
+pytest plugins/vllm-tt-plugin/tests/test_lane_scheduler.py
+```
 
 ## Running On Multi-Host Systems
 

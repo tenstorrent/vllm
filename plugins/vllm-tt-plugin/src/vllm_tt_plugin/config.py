@@ -58,14 +58,22 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config if has_additional_config else plugin_config)
 
 
-def uses_tt_gathered_dp(vllm_config: "VllmConfig") -> bool:
-    """Returns whether TT gathered-DP mode is enabled."""
-    tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
-    return tt_data_parallel_size is not None
+# Internal key recording the resolved TT lane count. Stored at the top level of
+# additional_config -- deliberately outside the user "tt" namespace -- so it
+# never collides with user config and reads as platform-derived state rather
+# than user input. Written by store_tt_lane_count, read by
+# get_tt_data_parallel_size.
+_RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
+_STANDARD_DP_MODE_KEY = "_tt_standard_dp_mode"
 
 
-def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int | None:
-    """Returns the optional TT-specific gathered-DP size override."""
+def _get_tt_gathered_dp_size_override(vllm_config: "VllmConfig") -> int | None:
+    """Return optional gathered-DP override from user TT config.
+
+    Presence of ``tt.tt_data_parallel_size`` enables explicit TT gathered-DP
+    mode (the branch behavior introduced for standard-vs-gathered routing).
+    The value is used as a mode switch and validated for compatibility.
+    """
     tt_config = get_tt_config(vllm_config)
     raw = tt_config.get("tt_data_parallel_size")
     if raw is not None and (not isinstance(raw, int) or raw <= 0):
@@ -75,9 +83,141 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int | None:
     return raw
 
 
+def uses_tt_gathered_dp(vllm_config: "VllmConfig") -> bool:
+    """Return whether explicit TT gathered-DP mode is enabled."""
+    return _get_tt_gathered_dp_size_override(vllm_config) is not None
+
+
+def _has_tt_standard_dp_mode(vllm_config: "VllmConfig") -> bool:
+    additional = getattr(vllm_config, "additional_config", None)
+    return isinstance(additional, dict) and bool(additional.get(_STANDARD_DP_MODE_KEY))
+
+
+def store_tt_standard_dp_mode(vllm_config: "VllmConfig", enabled: bool) -> None:
+    """Record whether config should use TT standard-DP helper semantics."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_STANDARD_DP_MODE_KEY] = bool(enabled)
+
+
+def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
+    """Effective TT fanout used by TT model/KV sizing paths.
+
+    Modes:
+    - Explicit gathered-DP: return ``data_parallel_size`` so gathered execution
+      computes per-rank submesh sizes from a single full-mesh device handle.
+    - Default DP>1 contract (dev): return ``data_parallel_size``.
+    - TT standard DP override: return ``1`` because each rank owns one
+      submesh/model (set internally by ``platform.check_and_update_config``).
+    - Single-process lane mode: return the resolved in-process lane count
+      recorded by ``store_tt_lane_count`` (default ``1``).
+    """
+    parallel_config = vllm_config.parallel_config
+    if uses_tt_gathered_dp(vllm_config):
+        return parallel_config.data_parallel_size
+    if parallel_config.data_parallel_size > 1:
+        return (
+            1
+            if _has_tt_standard_dp_mode(vllm_config)
+            else parallel_config.data_parallel_size
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        return 1
+    return int(additional.get(_RESOLVED_LANE_COUNT_KEY, 1))
+
+
 def should_open_mesh_for_rank(
     local_dp_rank: int | None, gathered_dp_mode: bool
 ) -> bool:
-    """Returns whether this worker rank should own a TT mesh device."""
+    """Return whether this rank should own/open a TT mesh device."""
     rank = 0 if local_dp_rank is None else local_dp_rank
     return (not gathered_dp_mode) or rank == 0
+
+
+def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
+    """Record the resolved in-process TT lane count on the config.
+
+    Writes an internal, top-level key into ``additional_config`` (kept out of
+    the user "tt" namespace) so ``get_tt_data_parallel_size`` observes it both
+    here and in the worker subprocess -- ``additional_config`` is a declared
+    config field, so it survives the copy/pickle to that process. Internal
+    handoff from the Galaxy gather-DP-to-lanes conversion; not user-facing.
+    """
+    if lanes < 1:
+        raise ValueError(f"resolved TT lane count must be >= 1, got {lanes}")
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_RESOLVED_LANE_COUNT_KEY] = lanes
+
+
+def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
+    """Return global TT batch capacity for model and KV sizing.
+
+    Gathered multi-process DP keeps the historical contract: each rank sees
+    ``max_num_seqs`` requests and TT model init uses gathered global capacity.
+    The default DP>1 helper contract from dev keeps the same behavior unless
+    standard-DP mode is explicitly marked by the platform hook.
+    """
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    if uses_tt_gathered_dp(vllm_config):
+        return max_num_seqs * vllm_config.parallel_config.data_parallel_size
+    if (
+        vllm_config.parallel_config.data_parallel_size > 1
+        and not _has_tt_standard_dp_mode(vllm_config)
+    ):
+        return max_num_seqs * vllm_config.parallel_config.data_parallel_size
+    return max_num_seqs
+
+
+def get_tt_per_lane_max_num_seqs(vllm_config: "VllmConfig") -> int:
+    """Return the per-lane/per-rank scheduling and wire-format capacity.
+
+    Outside lane mode the global ``max_num_seqs`` is already the per-rank
+    capacity. In single-process lane mode it is the validated per-lane split
+    (see ``validate_tt_lane_config``).
+    """
+    if not uses_tt_lane_coordinator(vllm_config):
+        return int(vllm_config.scheduler_config.max_num_seqs)
+    return validate_tt_lane_config(vllm_config)
+
+
+def validate_tt_lane_config(vllm_config: "VllmConfig") -> int:
+    """Validate single-process lane-mode batch sizing; return per-lane capacity.
+
+    Lane mode partitions the global ``max_num_seqs`` evenly across the lanes
+    (one in-process DP replica each), so the global value must be a positive
+    multiple of the lane count; raises ``ValueError`` otherwise. Assumes lane
+    mode is active (callers gate on ``uses_tt_lane_coordinator``).
+
+    Exposed as a named helper so ``platform.check_and_update_config`` can run
+    this check at config time -- calling it for its raising side effect so a
+    misconfiguration fails fast with a clear message -- rather than calling the
+    per-lane getter and discarding its result.
+    """
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    lanes = get_tt_data_parallel_size(vllm_config)
+    if max_num_seqs % lanes != 0:
+        raise ValueError(
+            "max_num_seqs must be divisible by the TT lane count in "
+            f"single-process lane mode; got max_num_seqs={max_num_seqs}, "
+            f"lanes={lanes}."
+        )
+    per_lane = max_num_seqs // lanes
+    if per_lane < 1:
+        raise ValueError(
+            "max_num_seqs must provide at least one request per TT lane; got "
+            f"max_num_seqs={max_num_seqs}, lanes={lanes}."
+        )
+    return per_lane
+
+
+def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
+    return (
+        vllm_config.parallel_config.data_parallel_size == 1
+        and get_tt_data_parallel_size(vllm_config) > 1
+    )
