@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm_tt_plugin.config import (
     get_tt_config,
@@ -279,27 +279,29 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Expose the non-DP TT execution service to the executor layer.
+        """Run the device forward for a non-DP or lane-DP step.
 
-        Returns the runner's non-DP execution result for the provided
-        scheduler output.
-        """
-        return self.execute_model_with_grammar(scheduler_output, None)
-
-    def execute_model_with_grammar(
-        self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput | None",
-    ) -> ModelRunnerOutput | None:
-        """Execute a single-process TT step with plugin-owned structured-output
-        data.
-
-        ``execute_model`` handles both plain single-process and lane-DP steps:
-        it dispatches on the lane scheduler's per-step plan, so the worker does
-        not need to know whether lane-DP is active.
+        Returns ``None``: the forward leaves a pending sampler that the engine
+        finalizes via ``sample_tokens``. The runner dispatches plain
+        single-process vs lane-DP internally on the scheduler's step plan, so
+        the worker does not need to know which is active.
         """
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        return self.model_runner.execute_model(scheduler_output, grammar_output)
+        return self.model_runner.execute_model(scheduler_output)
+
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Sample the forward deferred by ``execute_model``.
+
+        Called by the engine exactly once after ``execute_model`` returns
+        ``None``, matching the vLLM V1 forward-then-sample flow. The grammar
+        bitmask is reordered and applied here, at sample time. Returns an async
+        wrapper for overlapped decode, otherwise a completed output.
+        """
+        assert self.is_driver_worker, "There should only be one Worker for TT"
+        return self.model_runner.sample_tokens(grammar_output)
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
