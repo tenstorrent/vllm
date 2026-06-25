@@ -259,8 +259,8 @@ TT options are passed through vLLM's generic additional config namespace:
 ```
 
 Plugin code reads this through `vllm_tt_plugin.config.get_tt_config()`, which
-returns `vllm_config.additional_config["tt"]`. The deprecated
-`--plugin-config '{"tt": {...}}'` form is still accepted with a warning.
+returns `vllm_config.additional_config["tt"]`. The `--plugin-config` flag has
+been removed; passing it errors out and directs you to `--additional-config`.
 
 Common options:
 

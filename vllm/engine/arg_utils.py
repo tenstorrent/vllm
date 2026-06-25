@@ -348,6 +348,25 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return copy.deepcopy(_compute_kwargs(cls))
 
 
+class _PluginConfigRemovedAction(argparse.Action):
+    """Reject --plugin-config: it was removed in favor of --additional-config.
+
+    Consumes an optional value so users who pass `--plugin-config '{...}'` hit
+    the directed error instead of argparse's generic "unrecognized arguments".
+    """
+
+    def __init__(self, option_strings, dest, **kwargs):
+        kwargs["nargs"] = "?"
+        kwargs["default"] = argparse.SUPPRESS
+        kwargs["help"] = argparse.SUPPRESS
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--plugin-config has been removed. Use --additional-config instead."
+        )
+
+
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
@@ -566,7 +585,6 @@ class EngineArgs:
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
-    plugin_config: dict[str, dict[str, Any]] = get_field(VllmConfig, "plugin_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -610,11 +628,6 @@ class EngineArgs:
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
             )
-        if not isinstance(self.plugin_config, dict) or any(
-            not isinstance(key, str) or not isinstance(value, dict)
-            for key, value in self.plugin_config.items()
-        ):
-            raise ValueError("plugin_config must map plugin names to object values")
         # Setup plugins
         from vllm.plugins import load_general_plugins
 
@@ -1217,7 +1230,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
-        vllm_group.add_argument("--plugin-config", **vllm_kwargs["plugin_config"])
+        vllm_group.add_argument("--plugin-config", action=_PluginConfigRemovedAction)
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
@@ -1825,7 +1838,6 @@ class EngineArgs:
             ec_transfer_config=self.ec_transfer_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
-            plugin_config=self.plugin_config,
             optimization_level=self.optimization_level,
             weight_transfer_config=self.weight_transfer_config,
         )

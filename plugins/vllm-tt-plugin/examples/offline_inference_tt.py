@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -24,6 +23,15 @@ from vllm.entrypoints.openai.api_server import (
 from vllm.inputs.data import TokensPrompt
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.v1.engine.async_llm import AsyncLLM
+
+
+class _PluginConfigRemovedAction(argparse.Action):
+    """Reject --plugin-config: it was removed in favor of --additional-config."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--plugin-config has been removed. Use --additional-config instead."
+        )
 
 
 def get_sample_multi_modal_llama_inputs():
@@ -248,7 +256,6 @@ def run_inference(
     multi_image=False,
     mm_processor_kwargs=None,
     test_increasing_seq_lens=False,
-    plugin_config=None,
     additional_config=None,
     max_model_len=None,
     max_num_batched_tokens=None,
@@ -302,34 +309,11 @@ def run_inference(
     }
 
     try:
-        parsed_additional_config = None
         if additional_config:
             parsed_additional_config = json.loads(additional_config)
             if not isinstance(parsed_additional_config, dict):
                 raise ValueError("additional_config must be a JSON object")
-
-        parsed_plugin_config = None
-        if plugin_config:
-            print(
-                "WARNING: --plugin-config is deprecated. "
-                "Use --additional-config '{\"tt\": {...}}' instead.",
-                file=sys.stderr,
-            )
-            parsed_plugin_config = json.loads(plugin_config)
-            if not isinstance(parsed_plugin_config, dict):
-                raise ValueError("plugin_config must be a JSON object")
-
-        if parsed_additional_config is not None and parsed_plugin_config is not None:
-            raise ValueError(
-                "Only one of additional_config or plugin_config may be provided. "
-                "Prefer additional_config."
-            )
-        if parsed_additional_config is not None or parsed_plugin_config is not None:
-            engine_kw_args["additional_config"] = (
-                parsed_additional_config
-                if parsed_additional_config is not None
-                else parsed_plugin_config
-            )
+            engine_kw_args["additional_config"] = parsed_additional_config
     except json.JSONDecodeError as err:
         raise ValueError(f"Invalid JSON config string: {err}") from err
 
@@ -696,13 +680,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--plugin-config",
-        dest="plugin_config",
-        type=str,
-        default=None,
-        help=(
-            "Deprecated alias; prefer --additional-config. "
-            "Value must use the same '{\"tt\": {...}}' JSON shape."
-        ),
+        nargs="?",
+        action=_PluginConfigRemovedAction,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--max_model_len", type=int, default=None, help="Max model len")
     parser.add_argument(
@@ -763,7 +743,6 @@ if __name__ == "__main__":
         mm_processor_kwargs=args.mm_processor_kwargs,
         test_increasing_seq_lens=args.test_increasing_seq_lens,
         additional_config=args.additional_config,
-        plugin_config=args.plugin_config,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         data_parallel_size=args.data_parallel_size,
