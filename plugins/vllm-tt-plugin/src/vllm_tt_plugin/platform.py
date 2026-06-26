@@ -501,9 +501,6 @@ class TTPlatform(Platform):
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
         parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
         parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
-        parallel_config.dp_engine_core_proc_cls = (
-            "vllm_tt_plugin.engine.TTDPEngineCoreProc"
-        )
         parallel_config.engine_core_launcher_cls = (
             "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
         )
@@ -615,7 +612,8 @@ class TTPlatform(Platform):
         # validation/routing below so the lane path is selected.
         _convert_galaxy_gather_dp_to_lanes(vllm_config)
 
-        if uses_tt_lane_coordinator(vllm_config):
+        is_lane_mode = uses_tt_lane_coordinator(vllm_config)
+        if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.
             validate_tt_lane_config(vllm_config)
@@ -626,6 +624,17 @@ class TTPlatform(Platform):
             )
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+
+        # region DP config
+        if is_lane_mode:
+            parallel_config.dp_engine_core_proc_cls = (
+                "vllm_tt_plugin.engine.TTDPEngineCoreProc"
+            )
+        else:
+            parallel_config.dp_engine_core_proc_cls = (
+                "vllm.v1.engine.core.DPEngineCoreProc"
+            )
+        # endregion
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
