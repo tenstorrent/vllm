@@ -348,25 +348,6 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return copy.deepcopy(_compute_kwargs(cls))
 
 
-class _PluginConfigRemovedAction(argparse.Action):
-    """Reject --plugin-config: it was removed in favor of --additional-config.
-
-    Consumes an optional value so users who pass `--plugin-config '{...}'` hit
-    the directed error instead of argparse's generic "unrecognized arguments".
-    """
-
-    def __init__(self, option_strings, dest, **kwargs):
-        kwargs["nargs"] = "?"
-        kwargs["default"] = argparse.SUPPRESS
-        kwargs["help"] = argparse.SUPPRESS
-        super().__init__(option_strings, dest, **kwargs)
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        parser.error(
-            "--plugin-config has been removed. Use --additional-config instead."
-        )
-
-
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
@@ -1230,7 +1211,6 @@ class EngineArgs:
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
-        vllm_group.add_argument("--plugin-config", action=_PluginConfigRemovedAction)
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )

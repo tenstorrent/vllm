@@ -25,15 +25,6 @@ from vllm.utils.async_utils import merge_async_iterators
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
-class _PluginConfigRemovedAction(argparse.Action):
-    """Reject --plugin-config: it was removed in favor of --additional-config."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        parser.error(
-            "--plugin-config has been removed. Use --additional-config instead."
-        )
-
-
 def get_sample_multi_modal_llama_inputs():
     """
     Prepare 4 sample multi-modal prompts for Llama3.2-11B
@@ -677,12 +668,6 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Additional vLLM options as JSON, for example '{\"tt\": {...}}'",
-    )
-    parser.add_argument(
-        "--plugin-config",
-        nargs="?",
-        action=_PluginConfigRemovedAction,
-        help=argparse.SUPPRESS,
     )
     parser.add_argument("--max_model_len", type=int, default=None, help="Max model len")
     parser.add_argument(
