@@ -58,6 +58,22 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config if has_additional_config else plugin_config)
 
 
+def validate_no_tt_gathered_dp_override(vllm_config: "VllmConfig") -> None:
+    """Reject the removed TT gathered-DP override.
+
+    Standard vLLM DP is now the only multi-process DP mode. Galaxy models keep
+    their transparent single-process lane conversion, so the old gathered-DP
+    override is no longer supported.
+    """
+    tt_config = get_tt_config(vllm_config)
+    if "tt_data_parallel_size" in tt_config:
+        raise ValueError(
+            "TT config key 'tt_data_parallel_size' is no longer supported. "
+            "Use --data_parallel_size for standard DP. Galaxy models are "
+            "converted to single-process lane-DP automatically."
+        )
+
+
 # Internal key recording the resolved TT lane count. Stored at the top level of
 # additional_config -- deliberately outside the user "tt" namespace -- so it
 # never collides with user config and reads as platform-derived state rather
@@ -69,10 +85,10 @@ _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     """Effective TT lane count for batching, KV sizing, and merged execution.
 
-    With gathered multi-process DP (``data_parallel_size > 1``) this is just
+    With standard multi-process DP (``data_parallel_size > 1``) this is just
     ``data_parallel_size`` (one engine per rank). With a single engine
     (``data_parallel_size == 1``) it is the lane count resolved by the Galaxy
-    gather-DP-to-lanes conversion (see ``platform.py``) and recorded via
+    DP-to-lanes conversion (see ``platform.py``) and recorded via
     ``store_tt_lane_count``; absent that, the count is 1. Not user-facing.
     """
     if vllm_config.parallel_config.data_parallel_size > 1:
@@ -102,7 +118,7 @@ def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
     """Return the global TT batch capacity for model/KV sizing.
 
-    Gathered multi-process DP keeps the historical contract: each rank receives
+    Standard multi-process DP keeps the historical contract: each rank receives
     ``max_num_seqs`` requests and the TT model is initialized for the gathered
     DP batch. Single-process lane mode is different: vLLM sees one engine, so
     ``max_num_seqs`` is already the global engine capacity and lanes are only an

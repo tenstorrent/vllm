@@ -15,6 +15,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     store_tt_lane_count,
     uses_tt_lane_coordinator,
+    validate_no_tt_gathered_dp_override,
     validate_tt_lane_config,
 )
 
@@ -496,6 +497,7 @@ class TTPlatform(Platform):
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
         tt_config = get_tt_config(vllm_config)
+        validate_no_tt_gathered_dp_override(vllm_config)
         register_test_models = False
         if tt_config and "register_test_models" in tt_config:
             register_test_models = tt_config["register_test_models"]
@@ -633,16 +635,7 @@ class TTPlatform(Platform):
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
-        # region DP config
-        if is_lane_mode:
-            parallel_config.dp_engine_core_proc_cls = (
-                "vllm_tt_plugin.engine.TTDPEngineCoreProc"
-            )
-        else:
-            parallel_config.dp_engine_core_proc_cls = (
-                "vllm.v1.engine.core.DPEngineCoreProc"
-            )
-        # endregion
+        parallel_config.dp_engine_core_proc_cls = "vllm.v1.engine.core.DPEngineCoreProc"
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

@@ -11,8 +11,11 @@ def _vllm_config(
     data_parallel_size: int = 1,
     max_num_seqs: int = 8,
     lane_count: int | None = None,
+    tt_cfg: dict | None = None,
 ):
     additional_config: dict = {}
+    if tt_cfg is not None:
+        additional_config["tt"] = dict(tt_cfg)
     if lane_count is not None:
         additional_config[tt_config._RESOLVED_LANE_COUNT_KEY] = lane_count
 
@@ -47,6 +50,17 @@ def test_get_tt_max_batch_size_keeps_gathered_dp_contract():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
     assert tt_config.get_tt_max_batch_size(config) == 32
+
+
+def test_validate_no_tt_gathered_dp_override_accepts_normal_configs():
+    tt_config.validate_no_tt_gathered_dp_override(_vllm_config(data_parallel_size=4))
+
+
+def test_validate_no_tt_gathered_dp_override_rejects_removed_override():
+    config = _vllm_config(tt_cfg={"tt_data_parallel_size": 4})
+
+    with pytest.raises(ValueError, match="no longer supported"):
+        tt_config.validate_no_tt_gathered_dp_override(config)
 
 
 def test_uses_tt_lane_coordinator_only_for_single_process_lanes():

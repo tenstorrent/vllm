@@ -20,7 +20,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.system_utils import kill_process_tree
 from vllm.v1.engine.utils import CoreEngine, CoreEngineLauncher, EngineLaunchPlan
 from vllm.v1.executor.abstract import UniProcExecutor
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import get_tt_config, validate_no_tt_gathered_dp_override
 
 logger = init_logger(__name__)
 
@@ -183,12 +183,24 @@ def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
     logger.info("Validated launching from MPI rank 0 host %s", rank0_host)
 
 
+def _resolve_remote_dp_rank(vllm_config: VllmConfig, mpi_world: int) -> None:
+    pc = vllm_config.parallel_config
+    if pc.data_parallel_size != mpi_world:
+        raise RuntimeError(
+            "Standard DP mode requires one TT MPI rank per DP rank: "
+            f"data_parallel_size ({pc.data_parallel_size}) must equal "
+            f"MPI world size ({mpi_world})"
+        )
+
+
 def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
     parallel_config = vllm_config.parallel_config
     assert parallel_config.data_parallel_backend != "ray", (
         "TT does not support ray-based data parallel backend"
     )
-    dp_size = parallel_config.data_parallel_size
+
+    validate_no_tt_gathered_dp_override(vllm_config)
+
     tt_config = get_tt_config(vllm_config)
     rank_binding_file = tt_config.get("rank_binding")
     non_device_dp_ranks: set[int] = set()
@@ -200,21 +212,18 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         try:
             with open(rank_binding_file) as f:
                 rb = yaml.safe_load(f)
-            mpi_world = len(rb.get("rank_bindings", []))
+            rank_bindings = rb.get("rank_bindings", [])
+            mpi_world = len(rank_bindings)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to read rank binding '{rank_binding_file}': {e}"
             ) from e
-        if mpi_world <= 0 or dp_size % mpi_world != 0:
-            raise RuntimeError(
-                f"data_parallel_size ({dp_size}) must be divisible by number "
-                f"of device MPI ranks ({mpi_world})"
-            )
-        # Only the first DP rank in each MPI segment owns a TT device process.
-        # The other DP ranks stay local and participate as non-device ranks.
-        dp_size_per_mpi_rank = dp_size // mpi_world
-        device_dp_ranks = {i * dp_size_per_mpi_rank for i in range(mpi_world)}
-        non_device_dp_ranks = {i for i in range(dp_size) if i not in device_dp_ranks}
+        if mpi_world <= 0:
+            raise RuntimeError("rank_binding must contain at least one MPI rank")
+
+        _resolve_remote_dp_rank(vllm_config, mpi_world)
+        non_device_dp_ranks = set()
+
     return rank_binding_file, non_device_dp_ranks
 
 
@@ -367,11 +376,13 @@ def main() -> None:
     if not has_mpi:
         raise RuntimeError("TT engine core must be launched under MPI")
 
+    validate_no_tt_gathered_dp_override(vllm_config)
+
     pc = vllm_config.parallel_config
-    assert pc.data_parallel_size % mpi_world == 0
-    segment = pc.data_parallel_size // mpi_world
-    pc.data_parallel_rank = mpi_rank * segment
+    _resolve_remote_dp_rank(vllm_config, mpi_world)
+    pc.data_parallel_rank = mpi_rank
     pc.data_parallel_rank_local = 0
+
     assert pc.distributed_executor_backend == "uni", (
         "TT MPI must be used with uniproc executor backend"
     )

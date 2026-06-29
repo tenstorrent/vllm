@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unittests for the standard vLLM data parallelism."""
+"""Unit tests for TT DP mode selection and TT MPI launch semantics."""
 
 import pathlib
 from types import SimpleNamespace
@@ -99,13 +99,13 @@ class TestDPModes:
             "for TT models."
         )
 
-    def test_lane_mode_dp_engine_core_is_set(
+    def test_lane_mode_keeps_upstream_dp_engine_core(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
-        """Setting TT lane count should route TT to the TT DP core proc."""
+        """Lane mode should not select the removed TT DP core proc."""
         vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
         vllm_config.parallel_config.data_parallel_size = 1
 
@@ -126,11 +126,24 @@ class TestDPModes:
 
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
-            == "vllm_tt_plugin.engine.TTDPEngineCoreProc"
+            == "vllm.v1.engine.core.DPEngineCoreProc"
         ), (
-            "Expected `TTDPEngineCoreProc` to be the default DP engine core proc class "
-            "for TT models."
+            "Expected lane mode to leave `DPEngineCoreProc` on the upstream "
+            "default path."
         )
+
+    def test_removed_gathered_override_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        """The removed TT gathered-DP override should fail fast."""
+        vllm_config.additional_config = {"tt": {"tt_data_parallel_size": 4}}
+        vllm_config.parallel_config.data_parallel_size = 4
+
+        with pytest.raises(ValueError, match="no longer supported"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_standard_dp_uses_all_device_ranks(
         self,
@@ -175,12 +188,12 @@ class TestDPModes:
             "Expected no non-device DP ranks in standard DP mode."
         )
 
-    def test_lane_dp_has_non_device_dp_ranks(
+    def test_standard_dp_rejects_mismatched_mpi_world(
         self,
         tmp_path: pathlib.Path,
         vllm_config: SimpleNamespace,
     ) -> None:
-        """Lane DP should have non-device DP ranks."""
+        """Standard DP must map one TT MPI rank to one DP rank."""
         rank_binding = tmp_path / "rank_binding.json"
         rank_binding.write_text(
             "rank_bindings:\n"
@@ -195,17 +208,54 @@ class TestDPModes:
             '      TT_VISIBLE_DEVICES: "2, 3"\n'
         )
 
+        vllm_config.additional_config = {"tt": {"rank_binding": str(rank_binding)}}
+        vllm_config.parallel_config.data_parallel_backend = "mp"
+        vllm_config.parallel_config.data_parallel_size = 4
+
+        with pytest.raises(
+            RuntimeError,
+            match="Standard DP mode requires one TT MPI rank per DP rank",
+        ):
+            parse_tt_mpi_params(vllm_config)
+
+    def test_removed_gathered_override_is_rejected_by_launcher(
+        self,
+        tmp_path: pathlib.Path,
+        vllm_config: SimpleNamespace,
+    ) -> None:
+        """Launcher should reject the removed TT gathered-DP override too."""
+        rank_binding = tmp_path / "rank_binding.json"
+        rank_binding.write_text(
+            "rank_bindings:\n"
+            "  - rank: 0\n"
+            "    mesh_id: 0\n"
+            "    env_overrides:\n"
+            '      TT_VISIBLE_DEVICES: "0"\n'
+            "\n"
+            "  - rank: 1\n"
+            "    mesh_id: 1\n"
+            "    env_overrides:\n"
+            '      TT_VISIBLE_DEVICES: "1"\n'
+            "\n"
+            "  - rank: 2\n"
+            "    mesh_id: 2\n"
+            "    env_overrides:\n"
+            '      TT_VISIBLE_DEVICES: "2"\n'
+            "\n"
+            "  - rank: 3\n"
+            "    mesh_id: 3\n"
+            "    env_overrides:\n"
+            '      TT_VISIBLE_DEVICES: "3"\n'
+        )
+
         vllm_config.additional_config = {
-            "tt": {"rank_binding": str(rank_binding)},
+            "tt": {
+                "rank_binding": str(rank_binding),
+                "tt_data_parallel_size": 4,
+            }
         }
         vllm_config.parallel_config.data_parallel_backend = "mp"
         vllm_config.parallel_config.data_parallel_size = 4
 
-        parsed_rank_binding, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
-
-        assert parsed_rank_binding == str(rank_binding), (
-            "Expected rank binding to be returned correctly."
-        )
-        assert non_device_dp_ranks == {1, 3}, (
-            "Expected non-device DP ranks in lane DP mode."
-        )
+        with pytest.raises(ValueError, match="no longer supported"):
+            parse_tt_mpi_params(vllm_config)
