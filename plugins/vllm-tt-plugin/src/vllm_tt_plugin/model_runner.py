@@ -19,7 +19,11 @@ from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     LogprobsLists,
@@ -393,10 +397,19 @@ class TTModelRunner:
         if not kv_cache_groups:
             raise ValueError("kv_cache_config has no groups")
         for group in kv_cache_groups:
-            if not isinstance(group.kv_cache_spec, AttentionSpec):
+            # ``UniformTypeKVCacheSpecs`` wraps several same-type (e.g. all
+            # FullAttentionSpec) layer specs that differ only in shape. vLLM
+            # emits it when a hybrid model disables hybrid kv-cache groups and
+            # exposes heterogeneous per-layer KV shapes (e.g. Gemma4 with
+            # ``_HYBRID_KV_CACHE_GROUPS_ENABLED = False``: sliding layers 8x256,
+            # full layers 1x512). We unwrap it to per-layer specs in
+            # ``_build_per_layer_specs``, so accept it here too.
+            if not isinstance(
+                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs)
+            ):
                 raise TypeError(
-                    f"Expected AttentionSpec for group {group.layer_names}, "
-                    f"got {type(group.kv_cache_spec).__name__}"
+                    f"Expected AttentionSpec/UniformTypeKVCacheSpecs for group "
+                    f"{group.layer_names}, got {type(group.kv_cache_spec).__name__}"
                 )
 
     def _kv_cache_shape(
@@ -511,11 +524,36 @@ class TTModelRunner:
 
         if len(kv_cache_groups) == 1:
             spec = kv_cache_groups[0].kv_cache_spec
-            # Already enforced by ``_validate_kv_cache_groups`` at the
-            # top of ``initialize_kv_cache``; assert for mypy.
-            assert isinstance(spec, AttentionSpec)
-            shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
-            return [(shape, spec.dtype, i) for i in range(num_layers)]
+            if isinstance(spec, AttentionSpec):
+                shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
+                return [(shape, spec.dtype, i) for i in range(num_layers)]
+            # ``UniformTypeKVCacheSpecs``: one group / one block table, but the
+            # wrapped per-layer specs have heterogeneous shapes (e.g. Gemma4
+            # with hybrid groups disabled: sliding 8x256 vs full 1x512). Every
+            # layer indexes the same ``num_blocks`` block table but gets its own
+            # DRAM buffer sized to its own spec, so ``tensor_idx == layer_idx``
+            # (matching the uniform single-group convention above).
+            assert isinstance(spec, UniformTypeKVCacheSpecs)
+            per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
+                None
+            ] * num_layers
+            for layer_name, layer_spec in spec.kv_cache_specs.items():
+                assert isinstance(layer_spec, AttentionSpec)
+                idx = _parse_layer_index(layer_name)
+                if not 0 <= idx < num_layers:
+                    raise ValueError(
+                        f"Layer index {idx} parsed from '{layer_name}' is out "
+                        f"of range for {num_layers} attention layers"
+                    )
+                shape = self._kv_cache_shape(layer_spec, kv_cache_config.num_blocks)
+                per_layer[idx] = (shape, layer_spec.dtype, idx)
+            missing = [i for i, e in enumerate(per_layer) if e is None]
+            if missing:
+                raise ValueError(
+                    f"UniformTypeKVCacheSpecs missing per-layer specs for "
+                    f"layer indices {missing}"
+                )
+            return per_layer  # type: ignore[return-value]
 
         # Multi-group: walk ``kv_cache_tensors`` (one entry per unique DRAM
         # buffer) and assign every layer in ``shared_by`` the same
