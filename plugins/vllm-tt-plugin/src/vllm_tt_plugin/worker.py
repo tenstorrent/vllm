@@ -4,6 +4,7 @@
 import ast
 import math
 import os
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -23,6 +24,20 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+
+try:
+    # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
+    # the executor reduces into compilation_config. Older vLLM lacks the type;
+    # fall back to a local definition so the return value is still well-formed.
+    from vllm.v1.worker.worker_base import CompilationTimes
+except ImportError:  # pragma: no cover - older vLLM without the timing contract
+    from typing import NamedTuple
+
+    class CompilationTimes(NamedTuple):
+        language_model: float
+        encoder: float
+
+
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
@@ -99,18 +114,19 @@ class TTWorker(WorkerBase):
             )
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
-            self.device_config.num_devices = self.mesh_device.get_num_devices()
+            self.num_devices = self.mesh_device.get_num_devices()
         else:
             mesh_grid = get_mesh_grid(local_dp_rank)
             self.mesh_device = None
             # Num devices is required for determining num blocks in KV cache.
-            self.device_config.num_devices = mesh_grid[0] * mesh_grid[1]
+            self.num_devices = mesh_grid[0] * mesh_grid[1]
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
             enable_model_warmup=self.enable_model_warmup,
+            num_devices=self.num_devices,
         )
 
     def load_model(self):
@@ -252,7 +268,7 @@ class TTWorker(WorkerBase):
 
         # TODO: Once we can run profiling, return real available memory
         # instead of overriding the number of blocks.
-        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)
+        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return 1 << 64
 
@@ -267,13 +283,22 @@ class TTWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Newer vLLM reduces per-worker timings returned here into
+        # compilation_config.compilation_time; older vLLM ignores the return.
+        # TT does device warmup rather than graph compilation, so report the
+        # warmup wall time as the language-model figure and zero for the
+        # (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return
+            return CompilationTimes(language_model=0.0, encoder=0.0)
         local_rank = self.parallel_config.data_parallel_rank_local
+        elapsed = 0.0
         if local_rank == 0:
+            start = time.perf_counter()
             self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
+        return CompilationTimes(language_model=elapsed, encoder=0.0)
 
     def execute_model(
         self,
@@ -452,14 +477,15 @@ class TTWorker(WorkerBase):
             super().__del__()  # type: ignore
 
 
-def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
+def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
+
+    ``num_devices`` is the runtime-discovered physical device count.
     """
 
     model_config = vllm_config.model_config
-    device_config = vllm_config.device_config
     cache_config = vllm_config.cache_config
 
     # region Get default or model- and device-specific `max_tokens_all_users`
@@ -476,7 +502,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         # identical across both modes.
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
-            num_devices=device_config.num_devices,
+            num_devices=num_devices,
             tt_data_parallel=tt_data_parallel,
             max_model_len=model_config.max_model_len,
             max_num_seqs=get_tt_per_lane_max_num_seqs(vllm_config),

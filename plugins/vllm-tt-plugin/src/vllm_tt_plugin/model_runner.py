@@ -118,6 +118,7 @@ class TTModelRunner:
         mesh_device: ttnn.MeshDevice,
         trace_mode: str,
         enable_model_warmup: bool,
+        num_devices: int,
     ):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -145,6 +146,8 @@ class TTModelRunner:
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
+        # Runtime-discovered physical device count, supplied by the worker.
+        self.num_devices = num_devices
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
@@ -406,8 +409,7 @@ class TTModelRunner:
         side for TT (caches are replicated per submesh and each device
         carries ``num_kv_heads // tp`` heads internally).
         """
-        assert self.device_config.num_devices is not None
-        num_devices = self.device_config.num_devices // self.tt_data_parallel_size
+        num_devices = self.num_devices // self.tt_data_parallel_size
         num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
@@ -2237,8 +2239,7 @@ class TTModelRunner:
             return False
 
         # Calculate number of devices per DP rank
-        assert self.device_config.num_devices is not None
-        num_devices = self.device_config.num_devices // self.tt_data_parallel_size
+        num_devices = self.num_devices // self.tt_data_parallel_size
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
