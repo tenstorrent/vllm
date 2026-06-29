@@ -19,7 +19,9 @@ runtime = [
     "torchaudio==2.10.0",
     # Pinned to exact version to match tt-metal's pyproject.toml and prevent numpy 2.x upgrades.
     "numpy==1.26.4",
-    "transformers<=4.57.1",
+    # Qwen3.5/3.6 (Qwen3_5Config) requires transformers 5.x; align with
+    # requirements/common.txt (transformers >= 5.5.3, merged in 7402941df).
+    "transformers>=5.5.3",
     "qwen-vl-utils",
     "tblib==3.1.0",
 ]
