@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from vllm_tt_plugin.launcher import parse_tt_mpi_params
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.worker import _rank_owns_mesh, _resolve_mesh_grid
 
 
 class TestDPModes:
@@ -131,6 +132,26 @@ class TestDPModes:
             "Expected lane mode to leave `DPEngineCoreProc` on the upstream "
             "default path."
         )
+
+    def test_standard_dp_all_ranks_own_mesh(self) -> None:
+        parallel_config = SimpleNamespace(
+            data_parallel_size=4,
+            data_parallel_rank_local=3,
+        )
+
+        assert _rank_owns_mesh(parallel_config)
+
+    def test_single_process_only_rank_zero_owns_mesh(self) -> None:
+        assert _rank_owns_mesh(
+            SimpleNamespace(data_parallel_size=1, data_parallel_rank_local=0)
+        )
+        assert not _rank_owns_mesh(
+            SimpleNamespace(data_parallel_size=1, data_parallel_rank_local=1)
+        )
+
+    def test_visible_devices_override_full_machine_mesh_preset(self) -> None:
+        assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)
+        assert _resolve_mesh_grid("TG", 8, "0,1,2,3,4,5,6,7") == (1, 8)
 
     def test_removed_gathered_override_is_rejected(
         self,

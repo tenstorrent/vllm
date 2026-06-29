@@ -85,14 +85,13 @@ _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     """Effective TT lane count for batching, KV sizing, and merged execution.
 
-    With standard multi-process DP (``data_parallel_size > 1``) this is just
-    ``data_parallel_size`` (one engine per rank). With a single engine
-    (``data_parallel_size == 1``) it is the lane count resolved by the Galaxy
-    DP-to-lanes conversion (see ``platform.py``) and recorded via
-    ``store_tt_lane_count``; absent that, the count is 1. Not user-facing.
+    Standard multi-process DP runs one independent TT mesh per rank, so the TT
+    model itself sees no internal DP and the effective TT lane count remains 1.
+    With a single engine (``data_parallel_size == 1``) the value is the lane
+    count resolved by the Galaxy DP-to-lanes conversion (see ``platform.py``)
+    and recorded via ``store_tt_lane_count``; absent that, the count is 1.
+    Not user-facing.
     """
-    if vllm_config.parallel_config.data_parallel_size > 1:
-        return vllm_config.parallel_config.data_parallel_size
     additional = getattr(vllm_config, "additional_config", None) or {}
     return int(additional.get(_RESOLVED_LANE_COUNT_KEY, 1))
 
@@ -118,16 +117,11 @@ def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
     """Return the global TT batch capacity for model/KV sizing.
 
-    Standard multi-process DP keeps the historical contract: each rank receives
-    ``max_num_seqs`` requests and the TT model is initialized for the gathered
-    DP batch. Single-process lane mode is different: vLLM sees one engine, so
-    ``max_num_seqs`` is already the global engine capacity and lanes are only an
-    internal partition.
+    Standard DP is per-rank and single-process lane mode already stores the
+    global engine capacity in ``max_num_seqs`` after the Galaxy conversion, so
+    the TT model should always size itself to the visible engine-local batch.
     """
-    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
-    if vllm_config.parallel_config.data_parallel_size > 1:
-        return max_num_seqs * vllm_config.parallel_config.data_parallel_size
-    return max_num_seqs
+    return int(vllm_config.scheduler_config.max_num_seqs)
 
 
 def get_tt_per_lane_max_num_seqs(vllm_config: "VllmConfig") -> int:

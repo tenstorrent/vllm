@@ -211,10 +211,9 @@ class TTModelRunner:
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
 
-        # Sampler for sampling on host when device sampling is not supported.
-        # Only used by device ranks (local dp rank 0).
-        if self.parallel_config.data_parallel_rank_local == 0:
-            self.host_sampler = Sampler()
+        # Every standard-DP rank owns its own mesh and therefore its own host
+        # sampler state. Single-process modes also instantiate exactly one.
+        self.host_sampler = Sampler()
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
@@ -381,10 +380,6 @@ class TTModelRunner:
                     "in some group's layer_names."
                 )
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
-
-        # Only DP rank 0 allocates KV cache.
-        if self.parallel_config.data_parallel_rank_local != 0:
-            return
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
 

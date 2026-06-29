@@ -46,10 +46,16 @@ def test_get_tt_max_batch_size_uses_global_cap_for_single_process_lanes():
     assert tt_config.get_tt_max_batch_size(config) == 32
 
 
-def test_get_tt_max_batch_size_keeps_gathered_dp_contract():
+def test_get_tt_data_parallel_size_is_one_for_standard_dp():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
-    assert tt_config.get_tt_max_batch_size(config) == 32
+    assert tt_config.get_tt_data_parallel_size(config) == 1
+
+
+def test_get_tt_max_batch_size_keeps_local_cap_for_standard_dp():
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
+
+    assert tt_config.get_tt_max_batch_size(config) == 8
 
 
 def test_validate_no_tt_gathered_dp_override_accepts_normal_configs():

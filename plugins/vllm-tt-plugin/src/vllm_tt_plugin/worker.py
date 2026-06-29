@@ -5,6 +5,7 @@ import ast
 import math
 import os
 import time
+import warnings
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -64,6 +65,60 @@ logger = init_logger(__name__)
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
 
 
+def _rank_owns_mesh(parallel_config: Any) -> bool:
+    """Return whether this worker process should own a TT mesh device.
+
+    Standard DP runs one independent TT mesh per rank, while single-process
+    modes only have the rank-0 worker.
+    """
+    local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
+    return data_parallel_size > 1 or local_dp_rank in (None, 0)
+
+
+def _resolve_mesh_grid(
+    mesh_device_env: str | None,
+    num_devices_available: int,
+    visible_devices_env: str | None,
+) -> tuple[int, int]:
+    mesh_grid_dict = {
+        "N150": (1, 1),
+        "P100": (1, 1),
+        "P150": (1, 1),
+        "P150x2": (1, 2),
+        "N300": (1, 2),
+        "P300": (1, 2),
+        "N150x4": (1, 4),
+        "P150x4": (1, 4),
+        "T3K": (1, 8),
+        "P150x8": (1, 8),
+        "P300x2": (1, 4),
+        "TG": (8, 4),
+    }
+    if mesh_device_env is not None:
+        try:
+            parsed_value = ast.literal_eval(mesh_device_env)
+            if isinstance(parsed_value, tuple) and len(parsed_value) == 2:
+                mesh_grid = parsed_value
+            else:
+                raise ValueError("Not a valid tuple")
+        except (ValueError, SyntaxError):
+            assert mesh_device_env in mesh_grid_dict, (
+                f"Invalid MESH_DEVICE: {mesh_device_env}"
+            )
+            mesh_grid = mesh_grid_dict[mesh_device_env]
+    else:
+        mesh_grid = (1, num_devices_available)
+
+    # In standard local DP, upstream constrains each rank through
+    # TT_VISIBLE_DEVICES. Prefer the visible-device count over the full-machine
+    # preset so each rank opens only its local shard.
+    if visible_devices_env and mesh_grid[0] * mesh_grid[1] != num_devices_available:
+        mesh_grid = (1, num_devices_available)
+
+    return mesh_grid
+
+
 class TTWorker(WorkerBase):
     def __init__(
         self,
@@ -106,20 +161,19 @@ class TTWorker(WorkerBase):
         # subprocess) before runner init.
         TTPlatform.check_and_update_config(self.vllm_config)
 
-        local_dp_rank = self.parallel_config.data_parallel_rank_local
-        # Open mesh only on local DP rank 0 (device ranks).
-        if local_dp_rank == 0:
-            self.mesh_device = open_mesh_device(
-                get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+        if not _rank_owns_mesh(self.parallel_config):
+            raise RuntimeError(
+                "TT worker reached an unsupported non-device rank state under "
+                "the standard-DP-only runtime path"
             )
-            self.device_config.device = self.mesh_device
-            assert self.mesh_device is not None
-            self.num_devices = self.mesh_device.get_num_devices()
-        else:
-            mesh_grid = get_mesh_grid(local_dp_rank)
-            self.mesh_device = None
-            # Num devices is required for determining num blocks in KV cache.
-            self.num_devices = mesh_grid[0] * mesh_grid[1]
+
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
+        self.mesh_device = open_mesh_device(
+            get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+        )
+        self.device_config.device = self.mesh_device
+        assert self.mesh_device is not None
+        self.num_devices = self.mesh_device.get_num_devices()
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -130,9 +184,7 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        # Only local DP rank 0 (device rank) loads the model
-        if self.parallel_config.data_parallel_rank_local == 0:
-            self.model_runner.load_model()
+        self.model_runner.load_model()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
@@ -598,14 +650,14 @@ def get_dispatch_core_config(tt_config):
 
 def get_fabric_config(tt_config, num_devices):
     if num_devices == 1:
-        # No fabric config for single device
-        fabric_config = None
-    else:
-        # Set the most common value as default
-        is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
-        fabric_config = (
-            ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
-        )
+        # Ignore any explicit fabric request for single-device meshes.
+        return None
+
+    # Set the most common value as default
+    is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
+    fabric_config = (
+        ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
+    )
 
     # Override fabric_config if specified in TT plugin config.
     if tt_config is not None and "fabric_config" in tt_config:
@@ -688,49 +740,24 @@ def device_params_from_tt_config(tt_config, trace_mode):
     return device_params
 
 
-def get_mesh_grid(local_dp_rank=0):
-    if local_dp_rank == 0:
-        # Only DP rank 0 should query devices.
-        num_devices_available = ttnn.get_num_devices()
-    mesh_grid_dict = {
-        "N150": (1, 1),
-        "P100": (1, 1),
-        "P150": (1, 1),
-        "P150x2": (1, 2),
-        "N300": (1, 2),
-        "P300": (1, 2),
-        "N150x4": (1, 4),
-        "P150x4": (1, 4),
-        "T3K": (1, 8),
-        "P150x8": (1, 8),
-        "P300x2": (1, 4),
-        "TG": (8, 4),
-    }
-    mesh_device_env = os.environ.get("MESH_DEVICE")
-    if mesh_device_env is not None:
-        try:
-            # Try to parse as a literal tuple first
-            parsed_value = ast.literal_eval(mesh_device_env)
-            if isinstance(parsed_value, tuple) and len(parsed_value) == 2:
-                mesh_grid = parsed_value
-            else:
-                raise ValueError("Not a valid tuple")
-        except (ValueError, SyntaxError):
-            # If parsing fails, treat as a string key for mesh_grid_dict
-            assert mesh_device_env in mesh_grid_dict, (
-                f"Invalid MESH_DEVICE: {mesh_device_env}"
-            )
-            mesh_grid = mesh_grid_dict[mesh_device_env]
-    else:
-        assert local_dp_rank == 0, (
-            "MESH_DEVICE must be set when running with data_parallel_size > 1"
+def get_mesh_grid(*args: Any, **kwargs: Any):
+    if args or kwargs.get("local_dp_rank") is not None:
+        warnings.warn(
+            "get_mesh_grid() ignores deprecated local_dp_rank; mesh selection "
+            "now derives from MESH_DEVICE and TT_VISIBLE_DEVICES",
+            UserWarning,
+            stacklevel=2,
         )
-        mesh_grid = (1, num_devices_available)
 
-    assert (
-        local_dp_rank != 0
-        or ttnn.using_distributed_env()
-        or (mesh_grid[0] * mesh_grid[1] <= num_devices_available)
+    num_devices_available = ttnn.get_num_devices()
+    mesh_grid = _resolve_mesh_grid(
+        os.environ.get("MESH_DEVICE"),
+        num_devices_available,
+        os.environ.get(TTPlatform.device_control_env_var),
+    )
+
+    assert ttnn.using_distributed_env() or (
+        mesh_grid[0] * mesh_grid[1] <= num_devices_available
     ), (
         f"Requested mesh grid shape {mesh_grid} is larger than "
         f"number of available devices {num_devices_available}"
@@ -740,8 +767,7 @@ def get_mesh_grid(local_dp_rank=0):
 
 
 def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
-    assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
-    mesh_grid = get_mesh_grid(local_dp_rank)
+    mesh_grid = get_mesh_grid()
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
