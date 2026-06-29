@@ -1,23 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for _build_logprobs_from_topk helper in tt_model_runner.
+"""Unit tests for build_logprobs_from_topk.
 
 These tests use synthetic data only (no device required) to verify
 that the helper correctly packs top-K logprobs into LogprobsTensors
 for the downstream vLLM pipeline.
 """
 
-from importlib import import_module
-
 import torch
-
-_build_logprobs_from_topk = import_module(
-    "vllm_tt_plugin.model_runner"
-)._build_logprobs_from_topk
+from vllm_tt_plugin.logprobs import build_logprobs_from_topk
 
 
 class TestBuildLogprobsFromTopk:
-    """Tests for _build_logprobs_from_topk."""
+    """Tests for build_logprobs_from_topk."""
 
     def _make_sorted_topk(self, sz: int, k: int = 32):
         """Create synthetic sorted top-K data.
@@ -37,7 +32,7 @@ class TestBuildLogprobsFromTopk:
         logprobs, indices = self._make_sorted_topk(sz)
         sampled = indices[:, 0]  # sampled = top-1 token
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, N)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, N)
 
         assert result.logprob_token_ids.shape == (sz, N + 1)
         assert result.logprobs.shape == (sz, N + 1)
@@ -50,7 +45,7 @@ class TestBuildLogprobsFromTopk:
         # Sampled token is at rank 3 in the sorted list
         sampled = indices[:, 3].clone()
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, 5)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, 5)
 
         assert torch.equal(result.logprob_token_ids[:, 0], sampled)
         expected_lps = logprobs[:, 3]
@@ -62,7 +57,7 @@ class TestBuildLogprobsFromTopk:
         logprobs, indices = self._make_sorted_topk(sz)
         sampled = indices[:, 0]
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, N)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, N)
 
         assert torch.equal(
             result.logprob_token_ids[:, 1 : N + 1],
@@ -81,7 +76,7 @@ class TestBuildLogprobsFromTopk:
 
         for rank in [0, 1, 5, 31]:
             sampled = indices[:, rank].clone()
-            result = _build_logprobs_from_topk(logprobs, indices, sampled, 5)
+            result = build_logprobs_from_topk(logprobs, indices, sampled, 5)
             assert torch.all(result.selected_token_ranks == rank)
 
     def test_sampled_at_rank0(self):
@@ -90,7 +85,7 @@ class TestBuildLogprobsFromTopk:
         logprobs, indices = self._make_sorted_topk(sz)
         sampled = indices[:, 0]
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, 10)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, 10)
 
         assert torch.all(result.selected_token_ranks == 0)
         assert torch.equal(result.logprob_token_ids[:, 0], sampled)
@@ -101,7 +96,7 @@ class TestBuildLogprobsFromTopk:
         logprobs, indices = self._make_sorted_topk(sz)
         sampled = indices[:, 2]
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, 0)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, 0)
 
         assert result.logprob_token_ids.shape == (sz, 1)
         assert result.logprobs.shape == (sz, 1)
@@ -112,7 +107,7 @@ class TestBuildLogprobsFromTopk:
         logprobs, indices = self._make_sorted_topk(4)
         sampled = indices[:, 0]
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, 5)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, 5)
 
         assert result.logprob_token_ids.dtype == torch.int32
         assert result.logprobs.dtype == torch.float32
@@ -128,7 +123,7 @@ class TestBuildLogprobsFromTopk:
             [indices[i, r].item() for i, r in enumerate(ranks)], dtype=torch.int32
         )
 
-        result = _build_logprobs_from_topk(logprobs, indices, sampled, 10)
+        result = build_logprobs_from_topk(logprobs, indices, sampled, 10)
 
         for i, r in enumerate(ranks):
             assert result.selected_token_ranks[i].item() == r

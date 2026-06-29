@@ -4,6 +4,7 @@
 import ast
 import math
 import os
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -21,10 +22,29 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm_tt_plugin.config import get_tt_config
-from vllm_tt_plugin.model_runner import TTModelInput, TTModelRunner
+
+try:
+    # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
+    # the executor reduces into compilation_config. Older vLLM lacks the type;
+    # fall back to a local definition so the return value is still well-formed.
+    from vllm.v1.worker.worker_base import CompilationTimes
+except ImportError:  # pragma: no cover - older vLLM without the timing contract
+    from typing import NamedTuple
+
+    class CompilationTimes(NamedTuple):
+        language_model: float
+        encoder: float
+
+
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
+)
+from vllm_tt_plugin.model_input import TTModelInput
+from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _should_pre_register_tt_test_models_from_cli,
@@ -36,13 +56,6 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import LogprobsLists
 
 logger = init_logger(__name__)
-
-# Keep this in sync with TT model-side KV cache specs. It is currently
-# disabled because HybridAttentionForCausalLM emits FullAttentionSpec for
-# every layer while the sliding-window decode fix is pending. When
-# SlidingWindowSpec is re-enabled for those models, flip this back with the
-# matching model-side change so the block budget includes sliding groups.
-_HYBRID_KV_CACHE_GROUPS_ENABLED = False
 
 # Ensure TT model architectures are registered in this process as early as
 # possible. `WorkerWrapperBase.init_worker` imports the worker class module
@@ -101,18 +114,19 @@ class TTWorker(WorkerBase):
             )
             self.device_config.device = self.mesh_device
             assert self.mesh_device is not None
-            self.device_config.num_devices = self.mesh_device.get_num_devices()
+            self.num_devices = self.mesh_device.get_num_devices()
         else:
             mesh_grid = get_mesh_grid(local_dp_rank)
             self.mesh_device = None
             # Num devices is required for determining num blocks in KV cache.
-            self.device_config.num_devices = mesh_grid[0] * mesh_grid[1]
+            self.num_devices = mesh_grid[0] * mesh_grid[1]
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
             enable_model_warmup=self.enable_model_warmup,
+            num_devices=self.num_devices,
         )
 
     def load_model(self):
@@ -254,7 +268,7 @@ class TTWorker(WorkerBase):
 
         # TODO: Once we can run profiling, return real available memory
         # instead of overriding the number of blocks.
-        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)
+        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return 1 << 64
 
@@ -269,34 +283,50 @@ class TTWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Newer vLLM reduces per-worker timings returned here into
+        # compilation_config.compilation_time; older vLLM ignores the return.
+        # TT does device warmup rather than graph compilation, so report the
+        # warmup wall time as the language-model figure and zero for the
+        # (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return
+            return CompilationTimes(language_model=0.0, encoder=0.0)
         local_rank = self.parallel_config.data_parallel_rank_local
+        elapsed = 0.0
         if local_rank == 0:
+            start = time.perf_counter()
             self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
+        return CompilationTimes(language_model=elapsed, encoder=0.0)
 
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Expose the non-DP TT execution service to the executor layer.
+        """Run the device forward for a non-DP or lane-DP step.
 
-        Returns the runner's non-DP execution result for the provided
-        scheduler output.
+        Returns ``None``: the forward leaves a pending sampler that the engine
+        finalizes via ``sample_tokens``. The runner dispatches plain
+        single-process vs lane-DP internally on the scheduler's step plan, so
+        the worker does not need to know which is active.
         """
-        return self.execute_model_with_grammar(scheduler_output, None)
-
-    def execute_model_with_grammar(
-        self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput | None",
-    ) -> ModelRunnerOutput | None:
-        """Execute a non-DP TT step with plugin-owned structured-output data."""
         assert self.is_driver_worker, "There should only be one Worker for TT"
-        output = self.model_runner.execute_model(scheduler_output, grammar_output)
-        return output
+        return self.model_runner.execute_model(scheduler_output)
+
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Sample the forward deferred by ``execute_model``.
+
+        Called by the engine exactly once after ``execute_model`` returns
+        ``None``, matching the vLLM V1 forward-then-sample flow. The grammar
+        bitmask is reordered and applied here, at sample time. Returns an async
+        wrapper for overlapped decode, otherwise a completed output.
+        """
+        assert self.is_driver_worker, "There should only be one Worker for TT"
+        return self.model_runner.sample_tokens(grammar_output)
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
@@ -409,7 +439,7 @@ class TTWorker(WorkerBase):
         do not execute the merged TT batch.
         """
         world = self.parallel_config.data_parallel_size
-        batch_size = int(self.model_runner.scheduler_config.max_num_seqs)
+        batch_size = self.model_runner.tt_per_lane_max_num_seqs
         return torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world
 
     def apply_dp_execution_result(
@@ -447,27 +477,35 @@ class TTWorker(WorkerBase):
             super().__del__()  # type: ignore
 
 
-def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
+def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
+
+    ``num_devices`` is the runtime-discovered physical device count.
     """
 
     model_config = vllm_config.model_config
-    device_config = vllm_config.device_config
-    scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
 
     # region Get default or model- and device-specific `max_tokens_all_users`
+    model_class = None
     try:
-        data_parallel = vllm_config.parallel_config.data_parallel_size
+        tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         model_class, _ = get_model_architecture(model_config)
+        # Pass the per-submesh batch (the requests one submesh actually serves),
+        # not the global engine capacity, so a model that derives a per-user
+        # token budget from ``max_num_seqs`` computes the same value whether
+        # parallelism is expressed as gathered DP (each rank its own engine) or
+        # single-process lane mode. This matches the padding term below, which
+        # also uses ``get_tt_per_lane_max_num_seqs``, and keeps the KV shape
+        # identical across both modes.
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
-            num_devices=device_config.num_devices,
-            tt_data_parallel=data_parallel,
+            num_devices=num_devices,
+            tt_data_parallel=tt_data_parallel,
             max_model_len=model_config.max_model_len,
-            max_num_seqs=scheduler_config.max_num_seqs,
+            max_num_seqs=get_tt_per_lane_max_num_seqs(vllm_config),
         )
 
         logger.info(
@@ -490,7 +528,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
     # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
-    max_batch = scheduler_config.max_num_seqs
+    #
+    # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
+    # padding must use the *per-lane/per-rank* batch -- the number of requests
+    # a single submesh actually serves -- not the global engine capacity. In
+    # gathered DP this is ``max_num_seqs`` (each rank is its own engine); in
+    # single-process lane mode it is ``max_num_seqs // lane count``.
+    # Both reduce to the same per-submesh value, keeping the KV shape identical
+    # regardless of how parallelism is expressed.
+    max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     max_tokens_all_users += cache_config.block_size * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers
@@ -500,16 +546,20 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     # per-group block tables, so each request consumes
     # ``full_blocks_per_request + Σ sliding_blocks_per_request`` block IDs.
     #
-    # Hybrid groups are temporarily disabled on the model side by emitting
-    # FullAttentionSpec for every layer. While that is true, this token budget
-    # must stay on the pre-hybrid formula; adding sliding-window headroom here
-    # allocates too many full-size KV blocks and can OOM Gemma3-27B on T3K.
-    #
-    # When SlidingWindowSpec is restored in HybridAttentionForCausalLM, flip
-    # _HYBRID_KV_CACHE_GROUPS_ENABLED at the same time so both the spec shape
-    # and token calculation change together.
+    # Whether a given model actually emits SlidingWindowSpec (and therefore
+    # needs this sliding-window headroom) is decided per model class via
+    # ``_HYBRID_KV_CACHE_GROUPS_ENABLED``. Gemma4 re-enables it (it ships the
+    # bounded sliding-window decode fix); Gemma3 / GPT-OSS keep it ``False`` and
+    # emit FullAttentionSpec for every layer, so adding headroom for them would
+    # over-allocate full-size KV blocks and can OOM Gemma3-27B on T3K. Read the
+    # resolved model class's flag rather than a single global so re-enabling for
+    # one model doesn't regress the others; default to ``False`` when the class
+    # can't be resolved.
+    hybrid_kv_cache_groups_enabled = getattr(
+        model_class, "_HYBRID_KV_CACHE_GROUPS_ENABLED", False
+    )
     sliding_window = model_config.get_sliding_window()
-    if _HYBRID_KV_CACHE_GROUPS_ENABLED and sliding_window is not None:
+    if hybrid_kv_cache_groups_enabled and sliding_window is not None:
         # Conservative cap: assume up to a few sliding groups per buffer
         # (typical for Gemma3 5:1 / GPT-OSS 1:1 hybrid patterns) and add
         # ``sliding_window * max_batch`` worth of tokens per group as

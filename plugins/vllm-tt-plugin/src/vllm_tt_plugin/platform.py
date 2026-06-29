@@ -10,7 +10,13 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
-from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.config import (
+    get_tt_config,
+    get_tt_data_parallel_size,
+    store_tt_lane_count,
+    uses_tt_lane_coordinator,
+    validate_tt_lane_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -25,18 +31,117 @@ else:
 logger = init_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
-_warned_cli_plugin_config = False
+TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
+
+# TT model versions backed by the single-execute Galaxy generator
+# (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these, gathered
+# multi-process DP is deprecated in favor of single-process TT lanes. Maps the
+# selecting env var to the version value that routes through that generator.
+_GALAXY_GENERATOR_VERSIONS = {
+    "TT_LLAMA_TEXT_VER": "llama3_70b_galaxy",
+    "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
+}
 
 
-def _warn_cli_plugin_config() -> None:
-    global _warned_cli_plugin_config
-    if _warned_cli_plugin_config:
+def _galaxy_generator_version() -> str | None:
+    """Return the active Galaxy-generator model version, or None.
+
+    Both ``llama3_70b_galaxy`` (Llama3 70B) and ``qwen3_32b_galaxy`` (Qwen3-32B)
+    are served by ``models.demos.llama3_70b_galaxy.tt.generator:Generator``.
+    """
+    for env_var, version in _GALAXY_GENERATOR_VERSIONS.items():
+        if os.getenv(env_var) == version:
+            return version
+    return None
+
+
+def _collapse_parallel_config_to_single_process(parallel_config) -> None:
+    """Reset DP-derived ParallelConfig fields to single-process values.
+
+    ``ParallelConfig.__post_init__`` has already derived multi-process DP state
+    (rank, local size, master port, LB mode) from ``data_parallel_size`` by the
+    time the platform hook runs. When we fold gathered DP into single-process TT
+    lanes we must undo that so vLLM does not stand up multi-process DP
+    coordination. ``world_size`` stays 1 because the TT backend requires
+    ``tensor_parallel_size == pipeline_parallel_size == 1`` and DP does not
+    multiply it (no external launcher), so ``world_size_across_dp`` collapses to
+    1 automatically once ``data_parallel_size`` is reset.
+
+    ``data_parallel_rank_local`` must be ``0`` here. The TT plugin gates device
+    bring-up on ``data_parallel_rank_local == 0``: that rank opens the mesh,
+    loads the model, and allocates the KV cache (see
+    ``worker.init_device``/``load_model`` and
+    ``TTModelRunner.initialize_kv_cache``). A single-process lane run owns the
+    one device mesh, so it is that device rank and must be ``0`` for those gates
+    to fire and bring the device up. ``0`` is also the value a genuine
+    single-process run resolves to (``ParallelConfig.__post_init__`` defaults
+    ``data_parallel_rank_local`` from ``VLLM_DP_RANK_LOCAL`` / ``VLLM_DP_RANK``,
+    both ``0``).
+    """
+    parallel_config.data_parallel_size = 1
+    parallel_config.data_parallel_size_local = 1
+    parallel_config.data_parallel_rank = 0
+    parallel_config.data_parallel_rank_local = 0
+    parallel_config.data_parallel_index = 0
+    parallel_config.data_parallel_external_lb = False
+    parallel_config.data_parallel_hybrid_lb = False
+
+    # A single-process lane run owns one in-process worker, so pin the uniproc
+    # executor. Newer vLLM derives it from
+    # ``world_size_across_dp`` and latches "mp" from the user's
+    # --data_parallel_size before this hook runs; pinning "uni" keeps lane-DP
+    # single-process there too, so the worker's runtime
+    # ``num_gpu_blocks_override`` still reaches the engine's KV-cache sizing.
+    parallel_config.distributed_executor_backend = "uni"
+
+
+def _convert_galaxy_gather_dp_to_lanes(vllm_config: "VllmConfig") -> None:
+    """Transparently convert gathered multi-process DP into in-process TT lanes.
+
+    Galaxy-generator models (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``) are
+    served by a single Galaxy device mesh. Gathered multi-process DP is
+    deprecated in favor of single-process TT lanes. Rather than asking users to
+    migrate flags, we run ``--data_parallel_size N`` as ``N`` in-process lanes:
+    record the resolved lane count and reset ``data_parallel_size`` to 1.
+
+    To preserve the historical capacity contract -- where each of the ``N``
+    gathered DP ranks handled ``max_num_seqs`` requests -- the global
+    ``max_num_seqs`` is scaled by the lane count. Lane mode then partitions that
+    global capacity evenly across lanes, so the per-lane capacity stays at the
+    value the user requested (e.g. ``--data_parallel_size 4 --max_num_seqs 8``
+    becomes 4 lanes, each with max 8 seqs, for a global max of 32).
+
+    No-op unless a Galaxy-generator model is active with
+    ``data_parallel_size > 1``. Idempotent: after conversion
+    ``data_parallel_size == 1``, so re-entry short-circuits.
+    """
+    parallel_config = vllm_config.parallel_config
+    data_parallel_size = parallel_config.data_parallel_size
+    if data_parallel_size <= 1:
         return
-    logger.warning(
-        "TT config passed through --plugin-config is deprecated. "
-        "Use --additional-config '{\"tt\": {...}}' instead."
+    galaxy_version = _galaxy_generator_version()
+    if galaxy_version is None:
+        return
+
+    lanes = data_parallel_size
+    scheduler_config = vllm_config.scheduler_config
+    per_lane_max_num_seqs = int(scheduler_config.max_num_seqs)
+    global_max_num_seqs = per_lane_max_num_seqs * lanes
+
+    store_tt_lane_count(vllm_config, lanes)
+    scheduler_config.max_num_seqs = global_max_num_seqs
+    _collapse_parallel_config_to_single_process(parallel_config)
+
+    logger.info(
+        "Galaxy model %s requested DP "
+        "(--data_parallel_size=%d); running single-process TT lane-DP instead "
+        "(%d lanes, per-lane max_num_seqs=%d, global max_num_seqs=%d).",
+        galaxy_version,
+        lanes,
+        lanes,
+        per_lane_max_num_seqs,
+        global_max_num_seqs,
     )
-    _warned_cli_plugin_config = True
 
 
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
@@ -64,30 +169,15 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    canonical_flags = {"--additional-config", "--plugin-config"}
-    parsed_configs: dict[str, dict] = {}
+    cfg = None
     for i, arg in enumerate(argv):
         if "=" in arg:
             flag, value = arg.split("=", 1)
-            normalized_flag = flag.replace("_", "-")
-            if normalized_flag in canonical_flags:
-                if normalized_flag == "--plugin-config":
-                    _warn_cli_plugin_config()
-                cfg = _parse_namespaced_config(value)
-                if cfg:
-                    parsed_configs[normalized_flag] = cfg
-        else:
-            normalized_arg = arg.replace("_", "-")
-            if normalized_arg in canonical_flags and i + 1 < len(argv):
-                if normalized_arg == "--plugin-config":
-                    _warn_cli_plugin_config()
-                cfg = _parse_namespaced_config(argv[i + 1])
-                if cfg:
-                    parsed_configs[normalized_arg] = cfg
+            if flag.replace("_", "-") == "--additional-config":
+                cfg = _parse_namespaced_config(value) or cfg
+        elif arg.replace("_", "-") == "--additional-config" and i + 1 < len(argv):
+            cfg = _parse_namespaced_config(argv[i + 1]) or cfg
 
-    cfg = parsed_configs.get("--additional-config") or parsed_configs.get(
-        "--plugin-config"
-    )
     tt_config = cfg.get("tt", {}) if cfg else {}
     return bool(
         isinstance(tt_config, dict) and tt_config.get("register_test_models") is True
@@ -260,12 +350,22 @@ def register_tt_models(register_test_models=False) -> None:
     # path stays text-only — which matches what the TT model implements.
     # The ``TT``-prefixed aliases satisfy the plugin's later validation
     # in ``check_and_update_config`` so no override is needed.
+    #
+    # The 12B checkpoint is the "unified" multimodal variant: its config
+    # declares ``architectures: ['Gemma4UnifiedForConditionalGeneration']``
+    # with ``model_type: gemma4_unified`` and nested text/vision/audio
+    # configs. Without the unified arch registered, the same nested-config
+    # fallback resolves it to ``TransformersMultiModalForCausalLM``. We map
+    # the unified arch (and its ``TT`` alias) to the same text-only TT class
+    # so text-only inference runs on the unified checkpoint.
     _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
     for arch in (
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
         "TTGemma4ForCausalLM",
         "TTGemma4ForConditionalGeneration",
+        "TTGemma4UnifiedForConditionalGeneration",
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
@@ -427,8 +527,8 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
-        parallel_config.engine_core_cls = "vllm_tt_plugin.engine.TTEngineCore"
-        parallel_config.engine_core_proc_cls = "vllm_tt_plugin.engine.TTEngineCoreProc"
+        parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
+        parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
         parallel_config.dp_engine_core_proc_cls = (
             "vllm_tt_plugin.engine.TTDPEngineCoreProc"
         )
@@ -496,29 +596,26 @@ class TTPlatform(Platform):
 
         model_class, _ = get_model_architecture(vllm_config.model_config)
 
-        # infer if non-greedy decoding is supported on-device
-        # based on model implementation, and update platform
-        # TODO: this should come from the class itself as an attribute
-        cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
-        if model_class.__module__.startswith(
-            "models.demos.llama3_70b_galaxy.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if model_class.__module__.startswith(
-            "models.tt_transformers.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
-        if model_class.__module__.startswith(
-            "models.demos.deepseek_v3.tt.generator_vllm"
-        ):
-            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
-
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # A model either supports the full on-device sampling pipeline or it
+        # doesn't — there is no greedy-only mode. Models opt in by setting
+        # `supports_sample_on_device` in their `model_capabilities` dict.
+        supports_sample_on_device = (
+            model_capabilities.get("supports_sample_on_device", False)
+            if model_capabilities
+            else False
+        )
+        if sample_on_device_mode is not None and not supports_sample_on_device:
+            raise ValueError(
+                f"sample_on_device_mode={sample_on_device_mode!r} was requested, "
+                f"but model {model_class.__name__} "
+                f"({model_class.__module__}) does not support on-device sampling. "
+                "Unset sample_on_device_mode or use a model that supports it."
+            )
 
         # Model-gated async scheduling. Async overlap requires generators that
         # support split decode submission via `decode_forward(...,
@@ -539,9 +636,24 @@ class TTPlatform(Platform):
             )
             vllm_config.scheduler_config.async_scheduling = False
 
-        # TT uses a single scheduler implementation for both sync and async
-        # execution modes; async_scheduling only controls execution overlap.
-        vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+        # Galaxy-generator models (Llama3 70B, Qwen3-32B) are served by a single
+        # device mesh. Convert
+        # it transparently into single-process TT lanes so users keep passing
+        # --data_parallel_size with no other flag changes. Must run before the
+        # validation/routing below so the lane path is selected.
+        _convert_galaxy_gather_dp_to_lanes(vllm_config)
+
+        if uses_tt_lane_coordinator(vllm_config):
+            # Fail fast on misconfiguration: lane mode requires max_num_seqs to
+            # split evenly across the internal TT lanes.
+            validate_tt_lane_config(vllm_config)
+            vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
+            logger.info(
+                "Using TTLaneCoordinator with %d in-process TT lanes",
+                get_tt_data_parallel_size(vllm_config),
+            )
+        else:
+            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
