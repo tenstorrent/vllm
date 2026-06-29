@@ -18,7 +18,6 @@ def _vllm_config(
 
     return SimpleNamespace(
         additional_config=additional_config,
-        plugin_config={},
         parallel_config=SimpleNamespace(data_parallel_size=data_parallel_size),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
     )
@@ -73,7 +72,6 @@ def test_store_tt_lane_count_round_trips_through_get():
 def test_store_tt_lane_count_creates_additional_config_when_missing():
     config = SimpleNamespace(
         additional_config=None,
-        plugin_config={},
         parallel_config=SimpleNamespace(data_parallel_size=1),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )

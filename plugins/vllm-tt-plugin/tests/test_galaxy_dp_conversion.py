@@ -16,7 +16,6 @@ from vllm_tt_plugin import platform as tt_platform
 def _vllm_config(*, data_parallel_size, max_num_seqs):
     return SimpleNamespace(
         additional_config={"tt": {}},
-        plugin_config={},
         parallel_config=SimpleNamespace(
             data_parallel_size=data_parallel_size,
             data_parallel_size_local=data_parallel_size,

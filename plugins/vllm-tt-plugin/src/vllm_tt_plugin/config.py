@@ -10,8 +10,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_warned_plugin_config = False
-
 
 def _extract_tt_config(
     config: dict[str, Any], config_name: str
@@ -26,36 +24,12 @@ def _extract_tt_config(
     return tt_config, True
 
 
-def _warn_plugin_config() -> None:
-    global _warned_plugin_config
-    if _warned_plugin_config:
-        return
-    logger.warning(
-        "TT config passed through --plugin-config is deprecated. "
-        "Use --additional-config '{\"tt\": {...}}' instead."
-    )
-    _warned_plugin_config = True
-
-
 def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     """Return TT config from vLLM's generic additional config namespace."""
-    additional_config, has_additional_config = _extract_tt_config(
+    additional_config, _ = _extract_tt_config(
         getattr(vllm_config, "additional_config", {}) or {}, "additional_config"
     )
-    plugin_config, has_plugin_config = _extract_tt_config(
-        getattr(vllm_config, "plugin_config", {}) or {}, "plugin_config"
-    )
-
-    if has_plugin_config:
-        _warn_plugin_config()
-
-    if has_additional_config and has_plugin_config:
-        raise ValueError(
-            "Only one of additional_config or plugin_config may contain TT config. "
-            "Prefer additional_config. plugin_config is deprecated."
-        )
-
-    return dict(additional_config if has_additional_config else plugin_config)
+    return dict(additional_config)
 
 
 # Internal key recording the resolved TT lane count. Stored at the top level of

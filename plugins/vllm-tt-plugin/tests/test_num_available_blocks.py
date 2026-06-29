@@ -41,9 +41,9 @@ def cfg():
     Mocks ttnn.get_arch_name so the wormhole check passes; otherwise we'd
     need a real device to land on the per-SKU branches.
 
-    additional_config and plugin_config are set to empty dicts so that
-    get_tt_config's isinstance(config, dict) guard doesn't raise on
-    the auto-generated MagicMock attributes.
+    additional_config is set to an empty dict so that get_tt_config's
+    isinstance(config, dict) guard doesn't raise on the auto-generated
+    MagicMock attribute.
     """
     c = MagicMock()
     c.model_config.model = "unknown-model-falls-into-default-branch"
@@ -53,7 +53,6 @@ def cfg():
     c.scheduler_config.max_num_seqs = 32
     c.cache_config.block_size = 64
     c.additional_config = {}
-    c.plugin_config = {}
     return c
 
 
