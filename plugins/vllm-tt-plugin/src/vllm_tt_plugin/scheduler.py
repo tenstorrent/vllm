@@ -64,39 +64,39 @@ class TTScheduler(AsyncScheduler):
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         has_waiting = bool(self.waiting)
         has_running = bool(self.running)
         mode = self._forced_mode
 
         if mode == TTSchedulingMode.PREFILL_ONLY:
             # If waiting is empty, this intentionally returns an empty batch.
-            result = self._schedule_prefill_only()
+            result = self._schedule_prefill_only(throttle_prefills)
             return self._finalize_scheduler_output(result)
         if mode == TTSchedulingMode.DECODE_ONLY:
             if has_waiting:
                 # Hide waiting so base scheduler cannot admit prefill.
-                result = self._schedule_decode_only()
+                result = self._schedule_decode_only(throttle_prefills)
                 return self._finalize_scheduler_output(result)
             # No waiting requests: base scheduler naturally runs decode-only.
-            result = super().schedule()
+            result = super().schedule(throttle_prefills)
             return self._finalize_scheduler_output(result)
 
         # Default mode:
         # Prefer prefill whenever waiting is non-empty to admit new requests.
         if has_waiting:
-            prefill_result = self._schedule_prefill_only()
+            prefill_result = self._schedule_prefill_only(throttle_prefills)
             # If waiting is non-empty but prefill cannot be admitted (e.g. KV
             # pressure and no chunked prefill), do not stall decode progress.
             # Fall back to decode-only so running requests can advance and free
             # capacity for later full-prefill admission.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running:
-                result = self._schedule_decode_only()
+                result = self._schedule_decode_only(throttle_prefills)
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
         # No waiting requests in default mode: run decode-only naturally.
-        result = super().schedule()
+        result = super().schedule(throttle_prefills)
         return self._finalize_scheduler_output(result)
 
     def _finalize_scheduler_output(
@@ -104,7 +104,9 @@ class TTScheduler(AsyncScheduler):
     ) -> SchedulerOutput:
         return scheduler_output
 
-    def _schedule_prefill_only(self) -> SchedulerOutput:
+    def _schedule_prefill_only(
+        self, throttle_prefills: bool = False
+    ) -> SchedulerOutput:
         """Schedule only waiting (prefill) requests.
 
         Temporarily hides the running (decode) requests so the base
@@ -117,13 +119,13 @@ class TTScheduler(AsyncScheduler):
         self.running = cast(list[Request], [])
         self.max_num_running_reqs = max(0, saved_max - len(saved_running))
         try:
-            result = super().schedule()
+            result = super().schedule(throttle_prefills)
         finally:
             self.running = saved_running + self.running
             self.max_num_running_reqs = saved_max
         return result
 
-    def _schedule_decode_only(self) -> SchedulerOutput:
+    def _schedule_decode_only(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Schedule only running (decode) requests.
 
         Temporarily hides the waiting queue so the base scheduler's
@@ -134,7 +136,7 @@ class TTScheduler(AsyncScheduler):
         saved_waiting = self.waiting
         self.waiting = create_request_queue(self.policy)
         try:
-            result = super().schedule()
+            result = super().schedule(throttle_prefills)
         finally:
             if self.waiting:
                 saved_waiting.prepend_requests(self.waiting)

@@ -490,7 +490,7 @@ class TTLaneCoordinator(SchedulerInterface):
             prefill_empty_slots=prefill_empty_slots,
         )
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         forced_mode = self._negotiate_forced_mode()
         lane_outputs = self._schedule_all_lanes(forced_mode)
         merged = merge_lane_scheduler_outputs(lane_outputs)
