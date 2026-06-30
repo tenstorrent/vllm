@@ -359,9 +359,10 @@ class TTModelRunner:
         # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
         # without re-deriving vLLM's group construction order. Non-hybrid
         # configurations (single group) skip the expansion entirely. The
-        # check is on ``len(kv_cache_groups)`` rather than the model class
-        # so it works on every DP rank — only ``data_parallel_rank_local
-        # == 0`` actually loads ``self.model``.
+        # check is on ``len(kv_cache_groups)`` rather than the model class so
+        # it works on every DP rank, including standard-DP subprocesses whose
+        # local parallel config is collapsed to DP=1 by upstream before the TT
+        # worker loads the model.
         self._layer_to_group_idx: list[int] | None = None
         if len(kv_cache_groups) > 1:
             num_layers = self.model_config.get_num_layers_by_block_type(

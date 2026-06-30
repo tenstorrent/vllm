@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from vllm_tt_plugin.launcher import parse_tt_mpi_params
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.worker import _rank_owns_mesh, _resolve_mesh_grid
+from vllm_tt_plugin.worker import TTWorker, _rank_owns_mesh, _resolve_mesh_grid
 
 
 class TestDPModes:
@@ -141,6 +141,15 @@ class TestDPModes:
 
         assert _rank_owns_mesh(parallel_config)
 
+    def test_collapsed_standard_dp_rank_still_owns_mesh(self) -> None:
+        parallel_config = SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank_local=3,
+            data_parallel_index=3,
+        )
+
+        assert _rank_owns_mesh(parallel_config)
+
     def test_single_process_only_rank_zero_owns_mesh(self) -> None:
         assert _rank_owns_mesh(
             SimpleNamespace(data_parallel_size=1, data_parallel_rank_local=0)
@@ -148,6 +157,24 @@ class TestDPModes:
         assert not _rank_owns_mesh(
             SimpleNamespace(data_parallel_size=1, data_parallel_rank_local=1)
         )
+
+    def test_collapsed_standard_dp_rank_warms_up_model(self) -> None:
+        worker = TTWorker.__new__(TTWorker)
+        worker.enable_model_warmup = True
+        worker.parallel_config = SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank_local=7,
+            data_parallel_index=7,
+        )
+        warmup_calls: list[str] = []
+        worker.model_runner = SimpleNamespace(
+            warmup_model=lambda: warmup_calls.append("warmup")
+        )
+
+        timings = TTWorker.compile_or_warm_up_model(worker)
+
+        assert warmup_calls == ["warmup"]
+        assert timings.language_model >= 0.0
 
     def test_visible_devices_override_full_machine_mesh_preset(self) -> None:
         assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)

@@ -68,12 +68,19 @@ register_tt_models(register_test_models=_should_pre_register_tt_test_models_from
 def _rank_owns_mesh(parallel_config: Any) -> bool:
     """Return whether this worker process should own a TT mesh device.
 
-    Standard DP runs one independent TT mesh per rank, while single-process
-    modes only have the rank-0 worker.
+    Standard DP runs one independent TT mesh per rank. Upstream rewrites each
+    dense DP subprocess to look like a local DP=1 engine
+    (``data_parallel_size == 1``) while preserving the original shard identity
+    in ``data_parallel_index`` and ``data_parallel_rank_local``; treat those
+    collapsed ranks as mesh-owning too. True single-process modes still only
+    have the rank-0 worker.
     """
     local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
     data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
-    return data_parallel_size > 1 or local_dp_rank in (None, 0)
+    data_parallel_index = getattr(parallel_config, "data_parallel_index", 0)
+    return (
+        data_parallel_size > 1 or data_parallel_index > 0 or local_dp_rank in (None, 0)
+    )
 
 
 def _resolve_mesh_grid(
@@ -328,8 +335,10 @@ class TTWorker(WorkerBase):
         return 1 << 64
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate TT KV cache (only DP rank 0) and initialize persistent
-        input batch (all DP ranks) with the specified kv_cache_config.
+        """Allocate TT KV cache and initialize persistent input batch.
+
+        Every standard-DP rank owns its own TT mesh/KV cache, while
+        single-process lane mode has only one rank.
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
@@ -347,9 +356,8 @@ class TTWorker(WorkerBase):
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return CompilationTimes(language_model=0.0, encoder=0.0)
-        local_rank = self.parallel_config.data_parallel_rank_local
         elapsed = 0.0
-        if local_rank == 0:
+        if _rank_owns_mesh(self.parallel_config):
             start = time.perf_counter()
             self.model_runner.warmup_model()
             elapsed = time.perf_counter() - start
