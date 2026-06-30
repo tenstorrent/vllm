@@ -9,19 +9,25 @@ description = "Tenstorrent backend plugin for vLLM"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
-dependencies = ["vllm"]
+# vLLM is intentionally absent: it must be the locally built TT `empty` target,
+# which is not the (CUDA) `vllm` on PyPI. Declaring it as a resolvable dependency
+# lets a version conflict silently uninstall the TT build and pull the PyPI wheel.
+# The install order (build vLLM, then this plugin) guarantees it is present.
+# tblib is required at runtime for cross-process traceback serialization and is
+# not provided by the tt-metal env or by vLLM core's runtime requirements.
+dependencies = ["tblib>=3.1.0"]
 
 [project.optional-dependencies]
+# Standalone-dev convenience: provisions a CPU torch + HF stack when the plugin
+# is installed outside a tt-metal env. Installed into a tt-metal python_env (the
+# production path), that env already owns these and pins exact versions, so these
+# are floors that never downgrade or conflict with it and survive its version bumps.
 runtime = [
-    # TT-NN works with older torch versions, but vLLM requires torch >= 2.7.0.
-    "torch==2.10.0+cpu",
-    "torchvision==0.25.0",
-    "torchaudio==2.10.0",
-    # Pinned to exact version to match tt-metal's pyproject.toml and prevent numpy 2.x upgrades.
-    "numpy==1.26.4",
-    "transformers<=4.57.1",
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "numpy>=1.24.4,<2",
+    "transformers>=5.5.3",
     "qwen-vl-utils",
-    "tblib==3.1.0",
 ]
 
 [project.entry-points."vllm.general_plugins"]
