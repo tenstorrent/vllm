@@ -7,10 +7,27 @@ logger = init_logger(__name__)
 
 
 def register() -> None:
-    """Register TT models in every vLLM process."""
+    """Register TT models and reasoning parsers in every vLLM process."""
     from vllm_tt_plugin.model_registry import register_tt_models_from_plugin
 
     register_tt_models_from_plugin()
+    _register_tt_reasoning_parsers()
+
+
+def _register_tt_reasoning_parsers() -> None:
+    """Register reasoning parsers for TT-served models that aren't upstream.
+
+    Kept in the plugin (rather than patched into ``vllm.reasoning``) so it
+    carries over unchanged when switching to upstream vLLM. Registered lazily so
+    the parser module is only imported when ``--reasoning-parser`` selects it.
+    """
+    from vllm.reasoning import ReasoningParserManager
+
+    ReasoningParserManager.register_lazy_module(
+        "gemma4",
+        "vllm_tt_plugin.gemma4_reasoning_parser",
+        "Gemma4ReasoningParser",
+    )
 
 
 def platform_plugin() -> str | None:
