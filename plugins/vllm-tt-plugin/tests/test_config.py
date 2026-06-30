@@ -52,21 +52,22 @@ def test_get_tt_data_parallel_size_is_one_for_standard_dp():
     assert tt_config.get_tt_data_parallel_size(config) == 1
 
 
+def test_legacy_tt_data_parallel_size_is_ignored_for_standard_dp():
+    config = _vllm_config(
+        data_parallel_size=4,
+        max_num_seqs=8,
+        tt_cfg={"tt_data_parallel_size": 99},
+    )
+
+    assert tt_config.get_tt_data_parallel_size(config) == 1
+    assert tt_config.get_tt_max_batch_size(config) == 8
+    assert not tt_config.uses_tt_lane_coordinator(config)
+
+
 def test_get_tt_max_batch_size_keeps_local_cap_for_standard_dp():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
     assert tt_config.get_tt_max_batch_size(config) == 8
-
-
-def test_validate_no_tt_gathered_dp_override_accepts_normal_configs():
-    tt_config.validate_no_tt_gathered_dp_override(_vllm_config(data_parallel_size=4))
-
-
-def test_validate_no_tt_gathered_dp_override_rejects_removed_override():
-    config = _vllm_config(tt_cfg={"tt_data_parallel_size": 4})
-
-    with pytest.raises(ValueError, match="no longer supported"):
-        tt_config.validate_no_tt_gathered_dp_override(config)
 
 
 def test_uses_tt_lane_coordinator_only_for_single_process_lanes():

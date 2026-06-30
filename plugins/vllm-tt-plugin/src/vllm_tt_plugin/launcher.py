@@ -20,7 +20,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.system_utils import kill_process_tree
 from vllm.v1.engine.utils import CoreEngine, CoreEngineLauncher, EngineLaunchPlan
 from vllm.v1.executor.abstract import UniProcExecutor
-from vllm_tt_plugin.config import get_tt_config, validate_no_tt_gathered_dp_override
+from vllm_tt_plugin.config import get_tt_config
 
 logger = init_logger(__name__)
 
@@ -199,8 +199,6 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
         "TT does not support ray-based data parallel backend"
     )
 
-    validate_no_tt_gathered_dp_override(vllm_config)
-
     tt_config = get_tt_config(vllm_config)
     rank_binding_file = tt_config.get("rank_binding")
     non_device_dp_ranks: set[int] = set()
@@ -375,9 +373,6 @@ def main() -> None:
     )
     if not has_mpi:
         raise RuntimeError("TT engine core must be launched under MPI")
-
-    validate_no_tt_gathered_dp_override(vllm_config)
-
     pc = vllm_config.parallel_config
     _resolve_remote_dp_rank(vllm_config, mpi_world)
     pc.data_parallel_rank = mpi_rank

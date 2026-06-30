@@ -153,18 +153,27 @@ class TestDPModes:
         assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)
         assert _resolve_mesh_grid("TG", 8, "0,1,2,3,4,5,6,7") == (1, 8)
 
-    def test_removed_gathered_override_is_rejected(
+    def test_legacy_gathered_override_is_ignored_by_platform(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
-        """The removed TT gathered-DP override should fail fast."""
+        """Legacy TT gathered-DP config should not affect platform routing."""
         vllm_config.additional_config = {"tt": {"tt_data_parallel_size": 4}}
         vllm_config.parallel_config.data_parallel_size = 4
 
-        with pytest.raises(ValueError, match="no longer supported"):
-            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert vllm_config.parallel_config.data_parallel_size == 4
+        assert (
+            vllm_config.parallel_config.dp_engine_core_proc_cls
+            == "vllm.v1.engine.core.DPEngineCoreProc"
+        )
+        assert (
+            vllm_config.scheduler_config.scheduler_cls
+            == "vllm_tt_plugin.scheduler.TTScheduler"
+        )
 
     def test_standard_dp_uses_all_device_ranks(
         self,
@@ -239,12 +248,12 @@ class TestDPModes:
         ):
             parse_tt_mpi_params(vllm_config)
 
-    def test_removed_gathered_override_is_rejected_by_launcher(
+    def test_legacy_gathered_override_is_ignored_by_launcher(
         self,
         tmp_path: pathlib.Path,
         vllm_config: SimpleNamespace,
     ) -> None:
-        """Launcher should reject the removed TT gathered-DP override too."""
+        """Launcher should ignore the legacy TT gathered-DP override."""
         rank_binding = tmp_path / "rank_binding.json"
         rank_binding.write_text(
             "rank_bindings:\n"
@@ -278,5 +287,7 @@ class TestDPModes:
         vllm_config.parallel_config.data_parallel_backend = "mp"
         vllm_config.parallel_config.data_parallel_size = 4
 
-        with pytest.raises(ValueError, match="no longer supported"):
-            parse_tt_mpi_params(vllm_config)
+        parsed_rank_binding, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+
+        assert parsed_rank_binding == str(rank_binding)
+        assert non_device_dp_ranks == set()

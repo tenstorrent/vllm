@@ -58,22 +58,6 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config if has_additional_config else plugin_config)
 
 
-def validate_no_tt_gathered_dp_override(vllm_config: "VllmConfig") -> None:
-    """Reject the removed TT gathered-DP override.
-
-    Standard vLLM DP is now the only multi-process DP mode. Galaxy models keep
-    their transparent single-process lane conversion, so the old gathered-DP
-    override is no longer supported.
-    """
-    tt_config = get_tt_config(vllm_config)
-    if "tt_data_parallel_size" in tt_config:
-        raise ValueError(
-            "TT config key 'tt_data_parallel_size' is no longer supported. "
-            "Use --data_parallel_size for standard DP. Galaxy models are "
-            "converted to single-process lane-DP automatically."
-        )
-
-
 # Internal key recording the resolved TT lane count. Stored at the top level of
 # additional_config -- deliberately outside the user "tt" namespace -- so it
 # never collides with user config and reads as platform-derived state rather

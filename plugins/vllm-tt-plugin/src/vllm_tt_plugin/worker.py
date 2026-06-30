@@ -102,10 +102,13 @@ def _resolve_mesh_grid(
                 mesh_grid = parsed_value
             else:
                 raise ValueError("Not a valid tuple")
-        except (ValueError, SyntaxError):
-            assert mesh_device_env in mesh_grid_dict, (
-                f"Invalid MESH_DEVICE: {mesh_device_env}"
-            )
+        except (ValueError, SyntaxError) as err:
+            if mesh_device_env not in mesh_grid_dict:
+                raise ValueError(
+                    f"Invalid MESH_DEVICE: {mesh_device_env}. "
+                    f"Expected one of: {list(mesh_grid_dict.keys())}"
+                ) from err
+
             mesh_grid = mesh_grid_dict[mesh_device_env]
     else:
         mesh_grid = (1, num_devices_available)
