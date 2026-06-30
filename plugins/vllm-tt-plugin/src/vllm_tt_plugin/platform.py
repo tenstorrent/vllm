@@ -271,6 +271,7 @@ def register_tt_models(register_test_models=False) -> None:
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
+    # Qwen3.5 - Text
     qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
     if qwen35_text_version == "qwen36_blackhole":
         path_qwen35_text = (
@@ -282,8 +283,6 @@ def register_tt_models(register_test_models=False) -> None:
             "pick one of [qwen36_blackhole]"
         )
 
-    # Only register the "TT"-prefixed alias that check_and_update_config produces;
-    # the bare arch stays mapped to the upstream class for the runner gate.
     _register_model_if_missing(
         ModelRegistry, "TTQwen3_5ForConditionalGeneration", path_qwen35_text
     )
