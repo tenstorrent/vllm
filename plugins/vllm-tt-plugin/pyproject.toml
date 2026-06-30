@@ -18,10 +18,10 @@ license = "Apache-2.0"
 dependencies = ["tblib>=3.1.0"]
 
 [project.optional-dependencies]
-# Standalone-dev convenience: provisions a CPU torch + HF stack when the plugin
-# is installed outside a tt-metal env. Installed into a tt-metal python_env (the
-# production path), that env already owns these and pins exact versions, so these
-# are floors that never downgrade or conflict with it and survive its version bumps.
+# Standalone-dev convenience: provisions a torch + HF stack when the plugin
+# is installed outside a tt-metal env. On Linux, `pip install torch` from PyPI
+# may select a CUDA wheel; use the PyTorch CPU index if you need CPU-only.
+# In a tt-metal python_env (production), that env owns exact pins; these are floors (numpy capped <2) to avoid downgrades.
 runtime = [
     "torch>=2.7.0",
     "torchvision>=0.22.0",
