@@ -18,17 +18,12 @@ license = "Apache-2.0"
 dependencies = ["tblib>=3.1.0"]
 
 [project.optional-dependencies]
-# Standalone-dev convenience: provisions a torch + HF stack when the plugin
-# is installed outside a tt-metal env. On Linux, `pip install torch` from PyPI
-# may select a CUDA wheel; use the PyTorch CPU index if you need CPU-only.
-# In a tt-metal python_env (production), that env owns exact pins; these are floors (numpy capped <2) to avoid downgrades.
-runtime = [
-    "torch>=2.7.0",
-    "torchvision>=0.22.0",
-    "numpy>=1.24.4,<2",
-    "transformers>=5.5.3",
-    "qwen-vl-utils",
-]
+# The plugin runs only inside a tt-metal python_env, which already owns torch,
+# transformers, numpy, and torchvision; restating them here only risks conflicts.
+# qwen-vl-utils is used solely by the offline Qwen-VL example
+# (examples/offline_inference_tt.py), not by the serving path, and the tt-metal
+# env does not provide it.
+examples = ["qwen-vl-utils"]
 
 [project.entry-points."vllm.general_plugins"]
 tt_model_registry = "vllm_tt_plugin.entrypoints:register"
