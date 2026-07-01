@@ -61,21 +61,19 @@ source plugins/vllm-tt-plugin/docs/install-vllm-tt.sh
 
 The script installs base vLLM with `VLLM_TARGET_DEVICE=empty` because `tt` is
 provided by this plugin at runtime, not by the base vLLM build. It then installs
-the plugin with its runtime dependencies.
+the plugin with a few dependencies. Most dependencies come from the
+active tt-metal env.
 
-To install or refresh only the plugin package with runtime dependencies:
+To install or refresh only the plugin package:
 
 ```bash
-uv pip install -e "plugins/vllm-tt-plugin[runtime]" \
-  --extra-index-url https://download.pytorch.org/whl/cpu \
-  --index-strategy unsafe-best-match
+uv pip install -e plugins/vllm-tt-plugin
 ```
 
-If the active tt-metal environment already owns the runtime dependencies, use a
-no-dependency editable install:
+To run the offline Qwen-VL example, also install its extra:
 
 ```bash
-uv pip install -e plugins/vllm-tt-plugin --no-deps
+uv pip install -e "plugins/vllm-tt-plugin[examples]"
 ```
 
 After the first setup, activate the same environment before running vLLM:
