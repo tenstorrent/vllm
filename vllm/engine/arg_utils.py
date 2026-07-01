@@ -566,7 +566,6 @@ class EngineArgs:
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
-    plugin_config: dict[str, dict[str, Any]] = get_field(VllmConfig, "plugin_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -610,11 +609,6 @@ class EngineArgs:
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
             )
-        if not isinstance(self.plugin_config, dict) or any(
-            not isinstance(key, str) or not isinstance(value, dict)
-            for key, value in self.plugin_config.items()
-        ):
-            raise ValueError("plugin_config must map plugin names to object values")
         # Setup plugins
         from vllm.plugins import load_general_plugins
 
@@ -1217,7 +1211,6 @@ class EngineArgs:
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
-        vllm_group.add_argument("--plugin-config", **vllm_kwargs["plugin_config"])
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
@@ -1825,7 +1818,6 @@ class EngineArgs:
             ec_transfer_config=self.ec_transfer_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
-            plugin_config=self.plugin_config,
             optimization_level=self.optimization_level,
             weight_transfer_config=self.weight_transfer_config,
         )
