@@ -122,9 +122,16 @@ def _resolve_mesh_grid(
 
     # In standard local DP, upstream constrains each rank through
     # TT_VISIBLE_DEVICES. Prefer the visible-device count over the full-machine
-    # preset so each rank opens only its local shard.
-    if visible_devices_env and mesh_grid[0] * mesh_grid[1] != num_devices_available:
-        mesh_grid = (1, num_devices_available)
+    # preset so each rank opens only its local shard, even if
+    # ``ttnn.get_num_devices()`` reports the full machine size.
+    if visible_devices_env:
+        visible_count = len([d for d in visible_devices_env.split(",") if d.strip()])
+        if visible_count > 0 and mesh_grid[0] * mesh_grid[1] != visible_count:
+            mesh_grid = (1, visible_count)
+        elif (
+            visible_count == 0 and mesh_grid[0] * mesh_grid[1] != num_devices_available
+        ):
+            mesh_grid = (1, num_devices_available)
 
     return mesh_grid
 

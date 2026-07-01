@@ -179,6 +179,7 @@ class TestDPModes:
     def test_visible_devices_override_full_machine_mesh_preset(self) -> None:
         assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)
         assert _resolve_mesh_grid("TG", 8, "0,1,2,3,4,5,6,7") == (1, 8)
+        assert _resolve_mesh_grid("P150x8", 8, "3") == (1, 1)
 
     def test_legacy_gathered_override_is_ignored_by_platform(
         self,
