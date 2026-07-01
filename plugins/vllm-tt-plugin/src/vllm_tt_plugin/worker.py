@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import ast
 import math
 import os
 import time
@@ -48,6 +47,7 @@ from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
+    _parse_mesh_grid,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
@@ -88,37 +88,11 @@ def _resolve_mesh_grid(
     num_devices_available: int,
     visible_devices_env: str | None,
 ) -> tuple[int, int]:
-    mesh_grid_dict = {
-        "N150": (1, 1),
-        "P100": (1, 1),
-        "P150": (1, 1),
-        "P150x2": (1, 2),
-        "N300": (1, 2),
-        "P300": (1, 2),
-        "N150x4": (1, 4),
-        "P150x4": (1, 4),
-        "T3K": (1, 8),
-        "P150x8": (1, 8),
-        "P300x2": (1, 4),
-        "TG": (8, 4),
-    }
-    if mesh_device_env is not None:
-        try:
-            parsed_value = ast.literal_eval(mesh_device_env)
-            if isinstance(parsed_value, tuple) and len(parsed_value) == 2:
-                mesh_grid = parsed_value
-            else:
-                raise ValueError("Not a valid tuple")
-        except (ValueError, SyntaxError) as err:
-            if mesh_device_env not in mesh_grid_dict:
-                raise ValueError(
-                    f"Invalid MESH_DEVICE: {mesh_device_env}. "
-                    f"Expected one of: {list(mesh_grid_dict.keys())}"
-                ) from err
-
-            mesh_grid = mesh_grid_dict[mesh_device_env]
-    else:
-        mesh_grid = (1, num_devices_available)
+    mesh_grid = _parse_mesh_grid(
+        mesh_device_env,
+        num_devices_available,
+        tg_mesh_grid=(8, 4),
+    )
 
     # In standard local DP, upstream constrains each rank through
     # TT_VISIBLE_DEVICES. Prefer the visible-device count over the full-machine

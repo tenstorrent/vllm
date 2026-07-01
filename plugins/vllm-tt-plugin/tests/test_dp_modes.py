@@ -11,6 +11,8 @@ from vllm_tt_plugin.launcher import parse_tt_mpi_params
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.worker import TTWorker, _rank_owns_mesh, _resolve_mesh_grid
 
+import vllm.v1.engine.utils as engine_utils
+
 
 class TestDPModes:
     """Tests how successfully we set DP mode."""
@@ -55,10 +57,15 @@ class TestDPModes:
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
+        visible_device_groups: list[str] | None = None,
     ) -> None:
         """Registers a dummy model class for testing."""
         with monkeypatch.context() as m:
             m.setattr("vllm_tt_plugin.platform.register_tt_models", lambda _: None)
+            m.setattr(
+                "vllm_tt_plugin.platform._discover_standard_dp_visible_device_groups",
+                lambda _cfg: visible_device_groups,
+            )
             m.setattr(
                 "vllm.model_executor.models.registry.ModelRegistry.get_supported_archs",
                 lambda: ["TTDummyModel"],
@@ -180,6 +187,71 @@ class TestDPModes:
         assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)
         assert _resolve_mesh_grid("TG", 8, "0,1,2,3,4,5,6,7") == (1, 8)
         assert _resolve_mesh_grid("P150x8", 8, "3") == (1, 1)
+
+    def test_single_host_standard_dp_uses_upstream_launcher(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.parallel_config.data_parallel_size = 4
+
+        self.register_dummy_model(
+            monkeypatch,
+            vllm_config,
+            dummy_model_class,
+            visible_device_groups=["24,25", "26,27", "3,2", "1,0"],
+        )
+
+        assert (
+            vllm_config.parallel_config.engine_core_launcher_cls
+            == "vllm.v1.engine.utils.CoreEngineLauncher"
+        )
+        assert TTPlatform._standard_dp_visible_device_groups == [
+            "24,25",
+            "26,27",
+            "3,2",
+            "1,0",
+        ]
+
+    def test_rank_binding_keeps_tt_launcher(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.additional_config = {
+            "tt": {"rank_binding": "/tmp/rank_binding.yaml"}
+        }
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert (
+            vllm_config.parallel_config.engine_core_launcher_cls
+            == "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
+        )
+        assert TTPlatform._standard_dp_visible_device_groups is None
+
+    def test_standard_dp_visible_device_groups_feed_upstream_env_assignment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(engine_utils, "current_platform", TTPlatform)
+        monkeypatch.setattr(
+            TTPlatform,
+            "_standard_dp_visible_device_groups",
+            ["24,25,26,27,3,2,1,0", "16,17,18,19,20,21,22,23"],
+        )
+
+        assert (
+            engine_utils.get_device_indices(
+                TTPlatform.device_control_env_var,
+                local_dp_rank=1,
+                world_size=1,
+            )
+            == "16,17,18,19,20,21,22,23"
+        )
 
     def test_legacy_gathered_override_is_ignored_by_platform(
         self,

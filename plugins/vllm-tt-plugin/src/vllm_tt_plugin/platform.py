@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
 import json
 import os
 import sys
+from contextlib import suppress
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
+import ttnn
+from models.tt_transformers.tt.generator import create_submeshes
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -53,6 +57,121 @@ def _galaxy_generator_version() -> str | None:
         if os.getenv(env_var) == version:
             return version
     return None
+
+
+def _uses_explicit_tt_mpi_launch(vllm_config: "VllmConfig") -> bool:
+    tt_config = get_tt_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        tt_config.get("rank_binding")
+        or tt_config.get("mpi_args")
+        or getattr(parallel_config, "nnodes", 1) > 1
+        or getattr(parallel_config, "node_rank", 0) > 0
+    )
+
+
+_MESH_GRID_PRESETS = {
+    "N150": (1, 1),
+    "P100": (1, 1),
+    "P150": (1, 1),
+    "P150x2": (1, 2),
+    "N300": (1, 2),
+    "P300": (1, 2),
+    "N150x4": (1, 4),
+    "P150x4": (1, 4),
+    "T3K": (1, 8),
+    "P150x8": (1, 8),
+    "P300x2": (1, 4),
+}
+
+
+def _parse_mesh_grid(
+    mesh_device_env: str | None,
+    num_devices_available: int,
+    *,
+    tg_mesh_grid: tuple[int, int],
+) -> tuple[int, int]:
+    mesh_grid_dict = dict(_MESH_GRID_PRESETS)
+    mesh_grid_dict["TG"] = tg_mesh_grid
+
+    if mesh_device_env is None:
+        return (1, num_devices_available)
+
+    try:
+        parsed_value = ast.literal_eval(mesh_device_env)
+        if isinstance(parsed_value, (tuple, list)) and len(parsed_value) == 2:
+            return tuple(int(dim) for dim in parsed_value)
+        raise ValueError("Not a valid tuple")
+    except (ValueError, SyntaxError, TypeError):
+        mesh_grid = mesh_grid_dict.get(mesh_device_env)
+        if mesh_grid is None:
+            raise ValueError(
+                f"Invalid MESH_DEVICE: {mesh_device_env}. "
+                f"Expected one of: {list(mesh_grid_dict.keys())}"
+            ) from None
+        return mesh_grid
+
+
+def _resolve_parent_mesh_grid(
+    mesh_device_env: str | None,
+    num_devices_available: int,
+) -> tuple[int, int]:
+    mesh_grid = _parse_mesh_grid(
+        mesh_device_env,
+        num_devices_available,
+        tg_mesh_grid=(4, 8),
+    )
+
+    if mesh_grid[0] * mesh_grid[1] != num_devices_available:
+        mesh_grid = (1, num_devices_available)
+
+    return mesh_grid
+
+
+def _discover_standard_dp_visible_device_groups(
+    vllm_config: "VllmConfig",
+) -> list[str] | None:
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.data_parallel_size <= 1 or _uses_explicit_tt_mpi_launch(
+        vllm_config
+    ):
+        return None
+
+    mesh_device = None
+    submeshes = []
+    try:
+        num_devices_available = ttnn.get_num_devices()
+        mesh_grid = _resolve_parent_mesh_grid(
+            os.environ.get("MESH_DEVICE"), num_devices_available
+        )
+        mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*mesh_grid))
+        submeshes = create_submeshes(mesh_device, parallel_config.data_parallel_size)
+        if len(submeshes) != parallel_config.data_parallel_size:
+            raise RuntimeError(
+                "TT create_submeshes returned "
+                f"{len(submeshes)} groups for data_parallel_size="
+                f"{parallel_config.data_parallel_size}"
+            )
+
+        device_groups = []
+        for dp_rank, submesh in enumerate(submeshes):
+            device_ids = list(submesh.get_device_ids())
+            if not device_ids:
+                raise RuntimeError(f"TT DP rank {dp_rank} resolved to an empty submesh")
+            device_groups.append(",".join(str(device_id) for device_id in device_ids))
+
+        logger.info(
+            "Resolved TT single-host DP device groups: %s",
+            device_groups,
+        )
+        return device_groups
+    finally:
+        for submesh in submeshes:
+            with suppress(Exception):
+                ttnn.close_mesh_device(submesh)
+        if mesh_device is not None:
+            with suppress(Exception):
+                ttnn.close_mesh_device(mesh_device)
 
 
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
@@ -391,10 +510,18 @@ class TTPlatform(Platform):
     device_name: str = "tt"
     device_type: str = "tt"
     device_control_env_var: str = "TT_VISIBLE_DEVICES"
+    _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
+
+    @classmethod
+    def device_id_to_physical_device_id(cls, device_id: int):
+        groups = cls._standard_dp_visible_device_groups
+        if groups is not None:
+            return groups[device_id]
+        return super().device_id_to_physical_device_id(device_id)
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
@@ -435,6 +562,7 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
+        cls._standard_dp_visible_device_groups = None
         if vllm_config.scheduler_config.enable_chunked_prefill:
             logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
@@ -482,7 +610,7 @@ class TTPlatform(Platform):
         parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
         parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
         parallel_config.engine_core_launcher_cls = (
-            "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
+            "vllm.v1.engine.utils.CoreEngineLauncher"
         )
 
         # For TT models, prepend "TT" to the architecture name,
@@ -606,6 +734,15 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         parallel_config.dp_engine_core_proc_cls = "vllm.v1.engine.core.DPEngineCoreProc"
+
+        if not is_lane_mode:
+            cls._standard_dp_visible_device_groups = (
+                _discover_standard_dp_visible_device_groups(vllm_config)
+            )
+        if _uses_explicit_tt_mpi_launch(vllm_config):
+            parallel_config.engine_core_launcher_cls = (
+                "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
+            )
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
