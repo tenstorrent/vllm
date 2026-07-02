@@ -63,7 +63,7 @@ class TestDPModes:
         with monkeypatch.context() as m:
             m.setattr("vllm_tt_plugin.platform.register_tt_models", lambda _: None)
             m.setattr(
-                "vllm_tt_plugin.platform._discover_standard_dp_visible_device_groups",
+                "vllm_tt_plugin.platform._resolve_standard_dp_visible_device_groups",
                 lambda _cfg: visible_device_groups,
             )
             m.setattr(

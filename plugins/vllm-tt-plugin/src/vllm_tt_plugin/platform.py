@@ -3,6 +3,7 @@
 
 import ast
 import json
+import multiprocessing
 import os
 import sys
 from contextlib import suppress
@@ -129,28 +130,20 @@ def _resolve_parent_mesh_grid(
 
 
 def _discover_standard_dp_visible_device_groups(
-    vllm_config: "VllmConfig",
-) -> list[str] | None:
-    parallel_config = vllm_config.parallel_config
-    if parallel_config.data_parallel_size <= 1 or _uses_explicit_tt_mpi_launch(
-        vllm_config
-    ):
-        return None
-
+    mesh_device_env: str | None,
+    data_parallel_size: int,
+) -> list[str]:
     mesh_device = None
     submeshes = []
     try:
         num_devices_available = ttnn.get_num_devices()
-        mesh_grid = _resolve_parent_mesh_grid(
-            os.environ.get("MESH_DEVICE"), num_devices_available
-        )
+        mesh_grid = _resolve_parent_mesh_grid(mesh_device_env, num_devices_available)
         mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*mesh_grid))
-        submeshes = create_submeshes(mesh_device, parallel_config.data_parallel_size)
-        if len(submeshes) != parallel_config.data_parallel_size:
+        submeshes = create_submeshes(mesh_device, data_parallel_size)
+        if len(submeshes) != data_parallel_size:
             raise RuntimeError(
                 "TT create_submeshes returned "
-                f"{len(submeshes)} groups for data_parallel_size="
-                f"{parallel_config.data_parallel_size}"
+                f"{len(submeshes)} groups for data_parallel_size={data_parallel_size}"
             )
 
         device_groups = []
@@ -172,6 +165,71 @@ def _discover_standard_dp_visible_device_groups(
         if mesh_device is not None:
             with suppress(Exception):
                 ttnn.close_mesh_device(mesh_device)
+
+
+def _run_standard_dp_visible_device_group_discovery(
+    conn,
+    mesh_device_env: str | None,
+    data_parallel_size: int,
+) -> None:
+    try:
+        conn.send(
+            (
+                "ok",
+                _discover_standard_dp_visible_device_groups(
+                    mesh_device_env, data_parallel_size
+                ),
+            )
+        )
+    except Exception as exc:
+        conn.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        conn.close()
+
+
+def _resolve_standard_dp_visible_device_groups(
+    vllm_config: "VllmConfig",
+) -> list[str] | None:
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.data_parallel_size <= 1 or _uses_explicit_tt_mpi_launch(
+        vllm_config
+    ):
+        return None
+
+    mp_ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+    proc = mp_ctx.Process(
+        target=_run_standard_dp_visible_device_group_discovery,
+        args=(
+            child_conn,
+            os.environ.get("MESH_DEVICE"),
+            parallel_config.data_parallel_size,
+        ),
+        name="TTVisibleDevicesDiscovery",
+    )
+    proc.start()
+    child_conn.close()
+
+    try:
+        status, payload = parent_conn.recv()
+    except EOFError as exc:
+        proc.join()
+        raise RuntimeError(
+            "TT standard-DP device discovery subprocess exited before returning "
+            "device groups"
+        ) from exc
+    finally:
+        parent_conn.close()
+
+    proc.join()
+    if proc.exitcode not in (0, None):
+        raise RuntimeError(
+            "TT standard-DP device discovery subprocess failed with exit code "
+            f"{proc.exitcode}"
+        )
+    if status != "ok":
+        raise RuntimeError(f"TT standard-DP device discovery failed: {payload}")
+    return payload
 
 
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
@@ -737,7 +795,7 @@ class TTPlatform(Platform):
 
         if not is_lane_mode:
             cls._standard_dp_visible_device_groups = (
-                _discover_standard_dp_visible_device_groups(vllm_config)
+                _resolve_standard_dp_visible_device_groups(vllm_config)
             )
         if _uses_explicit_tt_mpi_launch(vllm_config):
             parallel_config.engine_core_launcher_cls = (
