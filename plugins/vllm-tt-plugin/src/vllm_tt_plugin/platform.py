@@ -271,6 +271,22 @@ def register_tt_models(register_test_models=False) -> None:
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
+    # Qwen3.5 - Text
+    qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
+    if qwen35_text_version == "qwen36_blackhole":
+        path_qwen35_text = (
+            "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM"
+        )
+    else:
+        raise ValueError(
+            f"Unsupported TT Qwen3.5 version: {qwen35_text_version}, "
+            "pick one of [qwen36_blackhole]"
+        )
+
+    _register_model_if_missing(
+        ModelRegistry, "TTQwen3_5ForConditionalGeneration", path_qwen35_text
+    )
+
     # Qwen2.5 - Vision
     _register_model_if_missing(
         ModelRegistry,
