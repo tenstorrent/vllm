@@ -129,6 +129,32 @@ def _resolve_parent_mesh_grid(
     return mesh_grid
 
 
+def _maybe_reorder_standard_dp_visible_device_groups(
+    device_groups: list[str],
+    mesh_grid: tuple[int, int],
+    data_parallel_size: int,
+) -> list[str]:
+    # ``MeshDevice.create_submeshes`` stamps submeshes in logical row-major
+    # order. On WH Galaxy DP=4, the known-good runtime mapping uses mesh-id
+    # order 0,2,3,1 instead of row-major 0,1,2,3 for the four 1x8 submeshes.
+    if (
+        ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
+        and mesh_grid == (4, 8)
+        and data_parallel_size == 4
+        and len(device_groups) == 4
+    ):
+        reordered_groups = [device_groups[index] for index in (0, 2, 3, 1)]
+        logger.info(
+            "Reordered TT single-host DP device groups for WH Galaxy DP=4 "
+            "from row-major %s to mesh-id order %s",
+            device_groups,
+            reordered_groups,
+        )
+        return reordered_groups
+
+    return device_groups
+
+
 def _discover_standard_dp_visible_device_groups(
     mesh_device_env: str | None,
     data_parallel_size: int,
@@ -152,6 +178,12 @@ def _discover_standard_dp_visible_device_groups(
             if not device_ids:
                 raise RuntimeError(f"TT DP rank {dp_rank} resolved to an empty submesh")
             device_groups.append(",".join(str(device_id) for device_id in device_ids))
+
+        device_groups = _maybe_reorder_standard_dp_visible_device_groups(
+            device_groups,
+            mesh_grid,
+            data_parallel_size,
+        )
 
         logger.info(
             "Resolved TT single-host DP device groups: %s",

@@ -159,6 +159,15 @@ class TTWorker(WorkerBase):
             )
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
+        logger.info(
+            "TT worker standard-DP binding: data_parallel_index=%s "
+            "data_parallel_rank_local=%s %s=%s MESH_DEVICE=%s",
+            getattr(self.parallel_config, "data_parallel_index", None),
+            local_dp_rank,
+            TTPlatform.device_control_env_var,
+            os.environ.get(TTPlatform.device_control_env_var),
+            os.environ.get("MESH_DEVICE"),
+        )
         self.mesh_device = open_mesh_device(
             get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
         )

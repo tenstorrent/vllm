@@ -7,8 +7,12 @@ import pathlib
 from types import SimpleNamespace
 
 import pytest
+import vllm_tt_plugin.platform as tt_platform
 from vllm_tt_plugin.launcher import parse_tt_mpi_params
-from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _maybe_reorder_standard_dp_visible_device_groups,
+)
 from vllm_tt_plugin.worker import TTWorker, _rank_owns_mesh, _resolve_mesh_grid
 
 import vllm.v1.engine.utils as engine_utils
@@ -212,6 +216,34 @@ class TestDPModes:
             "26,27",
             "3,2",
             "1,0",
+        ]
+
+    def test_wh_galaxy_dp4_groups_follow_known_good_mesh_order(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tt_platform.ttnn.cluster,
+            "get_cluster_type",
+            lambda: tt_platform.ttnn.cluster.ClusterType.GALAXY,
+        )
+
+        groups = [
+            "0,1,2,3,4,5,6,7",
+            "8,9,10,11,12,13,14,15",
+            "16,17,18,19,20,21,22,23",
+            "24,25,26,27,28,29,30,31",
+        ]
+
+        assert _maybe_reorder_standard_dp_visible_device_groups(
+            groups,
+            (4, 8),
+            4,
+        ) == [
+            "0,1,2,3,4,5,6,7",
+            "16,17,18,19,20,21,22,23",
+            "24,25,26,27,28,29,30,31",
+            "8,9,10,11,12,13,14,15",
         ]
 
     def test_rank_binding_keeps_tt_launcher(
