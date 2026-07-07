@@ -455,6 +455,11 @@ class TTPlatform(Platform):
         if vllm_config.scheduler_config.enable_chunked_prefill:
             logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
+            # Check that config is valid with chunked prefill disabled,
+            # for example that full max_model_len prefill can be scheduled.
+            vllm_config.scheduler_config.verify_max_model_len(
+                vllm_config.model_config.max_model_len
+            )
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
