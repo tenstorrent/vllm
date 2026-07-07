@@ -455,11 +455,25 @@ class TTPlatform(Platform):
         if vllm_config.scheduler_config.enable_chunked_prefill:
             logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
-            # Check that config is valid with chunked prefill disabled,
-            # for example that full max_model_len prefill can be scheduled.
-            vllm_config.scheduler_config.verify_max_model_len(
-                vllm_config.model_config.max_model_len
-            )
+            # vLLM does this bump silently earlier
+            # if chunked prefill is already disabled,
+            # and max_num_batched_tokens is not explicitly set.
+            # We can't know if it was specified
+            # or the default, hence the warning.
+            if (
+                vllm_config.scheduler_config.max_num_batched_tokens
+                < vllm_config.model_config.max_model_len
+            ):
+                logger.warning(
+                    "max_num_batched_tokens=%d < max_model_len=%d with chunked prefill "
+                    "disabled, bumping max_num_batched_tokens to match.",
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.model_config.max_model_len,
+                )
+                vllm_config.scheduler_config.max_num_batched_tokens = (
+                    vllm_config.model_config.max_model_len
+                )
+
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
@@ -659,6 +673,10 @@ class TTPlatform(Platform):
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
+        )
+        # Check that all invariants are satisfied after all rewriting
+        vllm_config.scheduler_config.verify_max_model_len(
+            vllm_config.model_config.max_model_len
         )
 
     @classmethod
