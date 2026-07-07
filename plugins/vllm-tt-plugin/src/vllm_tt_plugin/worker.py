@@ -81,16 +81,13 @@ def _validate_tt_kv_cache_capacity(
         return
 
     model_config = vllm_config.model_config
-    scheduler_config = vllm_config.scheduler_config
     raise ValueError(
         "TT KV cache cannot hold one request at max_model_len. "
         f"Maximum concurrency for {model_config.max_model_len:,} tokens per "
         f"request is {max_concurrency:.2f}x, but must be at least 1.00x. "
-        f"num_blocks={kv_cache_config.num_blocks}, "
-        f"max_num_batched_tokens={scheduler_config.max_num_batched_tokens}, "
-        f"enable_chunked_prefill={scheduler_config.enable_chunked_prefill}. "
-        "Increase the TT KV-cache token budget, reduce max_model_len, or use "
-        "a supported scheduler configuration with a lower max_num_batched_tokens."
+        f"num_blocks={kv_cache_config.num_blocks}, corresponding to approximately "
+        f"{kv_cache_config.num_blocks * vllm_config.cache_config.block_size:,} tokens, "
+        "Increase max_tokens_all_users or reduce max_model_len."
     )
 
 
