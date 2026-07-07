@@ -15,7 +15,6 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm_tt_plugin.logger import init_tt_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -55,6 +54,7 @@ from vllm_tt_plugin.input_batch import (
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,

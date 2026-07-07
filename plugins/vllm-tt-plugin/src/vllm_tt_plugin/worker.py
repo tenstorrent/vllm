@@ -12,7 +12,6 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm_tt_plugin.logger import init_tt_logger
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -24,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm_tt_plugin.logger import init_tt_logger
 
 try:
     # Newer vLLM has compile_or_warm_up_model return per-worker timings, which

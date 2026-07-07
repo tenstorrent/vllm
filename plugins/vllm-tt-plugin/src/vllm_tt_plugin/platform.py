@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
-from vllm_tt_plugin.logger import init_tt_logger
 from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_tt_plugin.config import (
     get_tt_config,
@@ -17,6 +16,7 @@ from vllm_tt_plugin.config import (
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

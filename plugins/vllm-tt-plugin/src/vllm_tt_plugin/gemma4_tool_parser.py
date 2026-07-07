@@ -15,9 +15,9 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
-from vllm_tt_plugin.logger import init_tt_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
+from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
 
