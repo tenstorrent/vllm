@@ -4,13 +4,13 @@
 from enum import Enum
 from typing import cast
 
-from vllm.logger import init_logger
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 class TTSchedulingMode(Enum):

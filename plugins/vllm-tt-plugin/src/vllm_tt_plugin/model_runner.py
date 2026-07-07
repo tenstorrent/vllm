@@ -15,7 +15,7 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -72,7 +72,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as

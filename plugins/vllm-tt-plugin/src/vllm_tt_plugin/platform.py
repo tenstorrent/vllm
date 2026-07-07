@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
-from vllm.logger import init_logger
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_tt_plugin.config import (
     get_tt_config,
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 else:
     FlexibleArgumentParser = object
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"

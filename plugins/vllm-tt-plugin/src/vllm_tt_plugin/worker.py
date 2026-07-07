@@ -12,7 +12,7 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import LogprobsLists
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Ensure TT model architectures are registered in this process as early as
 # possible. `WorkerWrapperBase.init_worker` imports the worker class module
