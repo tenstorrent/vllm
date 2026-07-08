@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_tt_plugin.config import (
     get_tt_config,
@@ -17,6 +16,7 @@ from vllm_tt_plugin.config import (
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 else:
     FlexibleArgumentParser = object
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
@@ -455,6 +455,25 @@ class TTPlatform(Platform):
         if vllm_config.scheduler_config.enable_chunked_prefill:
             logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
+            # vLLM does this bump silently earlier
+            # if chunked prefill is already disabled,
+            # and max_num_batched_tokens is not explicitly set.
+            # We can't know if it was specified
+            # or the default, hence the warning.
+            if (
+                vllm_config.scheduler_config.max_num_batched_tokens
+                < vllm_config.model_config.max_model_len
+            ):
+                logger.warning(
+                    "max_num_batched_tokens=%d < max_model_len=%d with chunked prefill "
+                    "disabled, bumping max_num_batched_tokens to match.",
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.model_config.max_model_len,
+                )
+                vllm_config.scheduler_config.max_num_batched_tokens = (
+                    vllm_config.model_config.max_model_len
+                )
+
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
@@ -654,6 +673,10 @@ class TTPlatform(Platform):
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
+        )
+        # Check that all invariants are satisfied after all rewriting
+        vllm_config.scheduler_config.verify_max_model_len(
+            vllm_config.model_config.max_model_len
         )
 
     @classmethod
