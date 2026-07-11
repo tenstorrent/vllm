@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm_tt_plugin import config as tt_config
+from vllm_tt_plugin import platform as tt_platform
 
 
 def _vllm_config(
@@ -86,3 +87,35 @@ def test_store_tt_lane_count_rejects_zero():
 
     with pytest.raises(ValueError, match="lane count must be >= 1"):
         tt_config.store_tt_lane_count(config, 0)
+
+
+def test_register_tt_models_selects_tt_transformers_v2(monkeypatch):
+    registered = {}
+
+    def fake_register_model_if_missing(_registry, model_arch, model_path):
+        registered[model_arch] = model_path
+
+    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "tt_transformers_v2")
+    monkeypatch.setattr(
+        tt_platform,
+        "_register_model_if_missing",
+        fake_register_model_if_missing,
+    )
+
+    tt_platform.register_tt_models()
+
+    assert (
+        registered["TTLlamaForCausalLM"]
+        == "models.common.models.generator:Llama3Generator"
+    )
+
+
+def test_model_capability_overrides_required_block_size():
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
+
+    tt_platform._apply_model_capability_config_overrides(
+        config,
+        {"required_block_size": 32},
+    )
+
+    assert config.cache_config.block_size == 32

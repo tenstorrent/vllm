@@ -227,6 +227,8 @@ def register_tt_models(register_test_models=False) -> None:
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
         path_llama_text = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
+    elif llama_text_version == "tt_transformers_v2":
+        path_llama_text = "models.common.models.generator:Llama3Generator"
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:LlamaForCausalLM"
@@ -238,7 +240,8 @@ def register_tt_models(register_test_models=False) -> None:
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]"
+            "pick one of [tt_transformers, tt_transformers_v2, "
+            "llama3_70b_galaxy, llama2_70b]"
         )
 
     # Llama3.1/3.2 - Text
@@ -402,6 +405,27 @@ def register_tt_test_models():
         "TTDummyDualGlxModel",
         "models.vllm_test_utils.dual_glx_ccl_test.test_model:DummyDualGlxModel",
     )
+
+
+def _apply_model_capability_config_overrides(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+) -> None:
+    if not model_capabilities:
+        return
+
+    required_block_size = model_capabilities.get("required_block_size")
+    if required_block_size is None:
+        return
+
+    cache_config = vllm_config.cache_config
+    if cache_config.block_size != required_block_size:
+        logger.warning(
+            "TT model requires block_size=%d; overriding requested block_size=%d",
+            required_block_size,
+            cache_config.block_size,
+        )
+        cache_config.block_size = required_block_size
 
 
 class TTPlatform(Platform):
@@ -588,6 +612,7 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+        _apply_model_capability_config_overrides(vllm_config, model_capabilities)
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting

@@ -345,7 +345,7 @@ class TTWorker(WorkerBase):
     def sample_tokens(
         self,
         grammar_output: "GrammarOutput | None",
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Sample the forward deferred by ``execute_model``.
 
         Called by the engine exactly once after ``execute_model`` returns
