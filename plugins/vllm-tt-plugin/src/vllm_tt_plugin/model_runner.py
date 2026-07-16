@@ -61,6 +61,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin import logit_dump
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
@@ -2748,6 +2749,22 @@ class TTModelRunner:
                     sampling_metadata=sampling_metadata,
                 )
                 next_token_ids = sampler_output.sampled_token_ids
+                # Grammar-masked host logits are in scope here; dump the closer
+                # tokens' rank vs the sampled token for structured rows.
+                if logit_dump.enabled() and grammar_bitmask is not None:
+                    try:
+                        _req_ids = list(self.input_batch.req_ids)[start : start + sz]
+                    except Exception:
+                        _req_ids = None
+                    _pt = model_input.prompt_tokens
+                    _ot = model_input.output_tokens
+                    logit_dump.dump_rows(
+                        logits,
+                        next_token_ids,
+                        _req_ids,
+                        _pt[rows] if _pt is not None else None,
+                        _ot[rows] if _ot is not None else None,
+                    )
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
