@@ -599,6 +599,19 @@ class TTModelRunner:
             )
         return per_layer  # type: ignore[return-value]
 
+    def _release_finished_model_request(self, req_id: str) -> None:
+        """Let stateful TT models release row-owned resources before removal.
+
+        Most autoregressive models have no per-request model state and therefore
+        expose no callback. Block-diffusion models can own Metal traces and
+        persistent buffers keyed by the current batch row; release them before
+        ``InputBatch.remove_request`` invalidates that row mapping.
+        """
+        req_index = self.input_batch.req_id_to_index.get(req_id)
+        release_request = getattr(self.model, "release_request", None)
+        if req_index is not None and callable(release_request):
+            release_request(req_index)
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
         scheduler output.
@@ -620,6 +633,7 @@ class TTModelRunner:
         # and handling the second as a new request.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
+            self._release_finished_model_request(req_id)
             req_index = self.input_batch.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
