@@ -3,12 +3,12 @@
 
 from typing import TYPE_CHECKING, Any
 
-from vllm.logger import init_logger
+from vllm_tt_plugin.logger import init_tt_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 def _extract_tt_config(

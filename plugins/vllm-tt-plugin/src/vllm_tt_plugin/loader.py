@@ -4,7 +4,6 @@
 from torch import nn
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm_tt_plugin.config import (
@@ -12,8 +11,9 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 class TTModelLoader(BaseModelLoader):

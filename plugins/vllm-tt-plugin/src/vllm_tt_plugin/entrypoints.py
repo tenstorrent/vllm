@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.logger import init_logger
+from vllm_tt_plugin.logger import init_tt_logger
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 def register() -> None:

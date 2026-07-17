@@ -12,10 +12,10 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm_tt_plugin.logger import init_tt_logger
 
 try:
     # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
@@ -56,7 +57,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import LogprobsLists
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Ensure TT model architectures are registered in this process as early as
 # possible. `WorkerWrapperBase.init_worker` imports the worker class module
@@ -112,6 +113,32 @@ def _resolve_mesh_grid(
             mesh_grid = (1, num_devices_available)
 
     return mesh_grid
+
+
+def _validate_tt_kv_cache_capacity(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Reject TT KV configs that cannot serve one max_model_len request."""
+    # When rebased to include https://github.com/vllm-project/vllm/pull/41069
+    # verify and remove this check.
+    if not kv_cache_config.kv_cache_groups:
+        return
+
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    if max_concurrency >= 1.0:
+        return
+
+    model_config = vllm_config.model_config
+    raise ValueError(
+        "TT KV cache cannot hold one request at max_model_len. "
+        f"Maximum concurrency for {model_config.max_model_len:,} tokens per "
+        f"request is {max_concurrency:.2f}x, but must be at least 1.00x. "
+        f"num_blocks={kv_cache_config.num_blocks}, corresponding to approximately "
+        f"{kv_cache_config.num_blocks * vllm_config.cache_config.block_size:,} tokens, "
+        "Increase max_tokens_all_users or reduce max_model_len."
+    )
 
 
 class TTWorker(WorkerBase):
@@ -334,6 +361,7 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank.
         """
+        _validate_tt_kv_cache_capacity(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:

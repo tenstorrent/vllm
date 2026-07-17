@@ -15,11 +15,11 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
-from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
+from vllm_tt_plugin.logger import init_tt_logger
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Gemma4 tool-call wire format (emitted by the model, see the chat template):
 #

@@ -33,7 +33,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -47,6 +46,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
 if TYPE_CHECKING:
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.structured_output import StructuredOutputManager
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 @dataclass(frozen=True)
