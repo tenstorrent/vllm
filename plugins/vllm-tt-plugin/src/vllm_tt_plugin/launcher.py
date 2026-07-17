@@ -23,6 +23,7 @@ from vllm.v1.executor.abstract import UniProcExecutor
 from vllm_tt_plugin.config import get_tt_config
 
 logger = init_logger(__name__)
+_TT_VISIBLE_DEVICES_ENV = "TT_VISIBLE_DEVICES"
 
 
 class TTLaunchPlan(EngineLaunchPlan):
@@ -193,6 +194,105 @@ def _resolve_remote_dp_rank(vllm_config: VllmConfig, mpi_world: int) -> None:
         )
 
 
+def _requires_tt_mpi_rank_binding(vllm_config: VllmConfig) -> bool:
+    tt_config = get_tt_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        tt_config.get("mpi_args")
+        or getattr(parallel_config, "nnodes", 1) > 1
+        or getattr(parallel_config, "node_rank", 0) > 0
+    )
+
+
+def _parse_rank_binding_visible_devices(raw_value: object, rank: int) -> set[int]:
+    if not isinstance(raw_value, str):
+        raise RuntimeError(
+            f"rank_binding rank {rank} must set env_overrides."
+            f"{_TT_VISIBLE_DEVICES_ENV} to a non-empty string"
+        )
+
+    device_tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+    if not device_tokens:
+        raise RuntimeError(
+            f"rank_binding rank {rank} must set env_overrides."
+            f"{_TT_VISIBLE_DEVICES_ENV} to a non-empty device list"
+        )
+
+    device_ids: set[int] = set()
+    for token in device_tokens:
+        try:
+            device_id = int(token)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"rank_binding rank {rank} contains non-integer "
+                f"{_TT_VISIBLE_DEVICES_ENV} entry {token!r}"
+            ) from exc
+        if device_id in device_ids:
+            raise RuntimeError(
+                f"rank_binding rank {rank} assigns duplicate "
+                f"{_TT_VISIBLE_DEVICES_ENV} device {device_id}"
+            )
+        device_ids.add(device_id)
+
+    return device_ids
+
+
+def _validate_rank_bindings(rank_bindings: object) -> int:
+    if not isinstance(rank_bindings, list):
+        raise RuntimeError("rank_binding field 'rank_bindings' must be a list")
+
+    if not rank_bindings:
+        raise RuntimeError("rank_binding must contain at least one MPI rank")
+
+    seen_ranks: set[int] = set()
+    device_owners: dict[int, int] = {}
+    for entry in rank_bindings:
+        if not isinstance(entry, dict):
+            raise RuntimeError("rank_binding entries must be mappings")
+
+        rank = entry.get("rank")
+        if not isinstance(rank, int):
+            raise RuntimeError("rank_binding entries must define an integer rank")
+        if rank in seen_ranks:
+            raise RuntimeError(f"rank_binding contains duplicate rank {rank}")
+        seen_ranks.add(rank)
+
+        env_overrides = entry.get("env_overrides")
+        if not isinstance(env_overrides, dict):
+            raise RuntimeError(
+                f"rank_binding rank {rank} must define env_overrides with "
+                f"{_TT_VISIBLE_DEVICES_ENV}"
+            )
+
+        device_ids = _parse_rank_binding_visible_devices(
+            env_overrides.get(_TT_VISIBLE_DEVICES_ENV),
+            rank,
+        )
+        overlapping_devices = sorted(
+            device_id for device_id in device_ids if device_id in device_owners
+        )
+        if overlapping_devices:
+            owners = ", ".join(
+                f"{device_id} (already owned by rank {device_owners[device_id]})"
+                for device_id in overlapping_devices
+            )
+            raise RuntimeError(
+                f"rank_binding rank {rank} overlaps {_TT_VISIBLE_DEVICES_ENV} "
+                f"assignments: {owners}"
+            )
+        for device_id in device_ids:
+            device_owners[device_id] = rank
+
+    expected_ranks = set(range(len(rank_bindings)))
+    if seen_ranks != expected_ranks:
+        raise RuntimeError(
+            "rank_binding ranks must form a contiguous 0..N-1 range; "
+            f"got {sorted(seen_ranks)}"
+        )
+
+    return len(rank_bindings)
+
+
 def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
     parallel_config = vllm_config.parallel_config
     assert parallel_config.data_parallel_backend != "ray", (
@@ -201,23 +301,27 @@ def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
 
     tt_config = get_tt_config(vllm_config)
     rank_binding_file = tt_config.get("rank_binding")
+    if not rank_binding_file and _requires_tt_mpi_rank_binding(vllm_config):
+        raise RuntimeError(
+            "TT explicit MPI launch requires tt.rank_binding when mpi_args, "
+            "nnodes > 1, or node_rank > 0 are set"
+        )
+
     non_device_dp_ranks: set[int] = set()
     if rank_binding_file:
-        if not isinstance(rank_binding_file, str):
+        if not isinstance(rank_binding_file, str) or not rank_binding_file.strip():
             raise RuntimeError(
                 "TT plugin config key 'rank_binding' must be a non-empty string"
             )
         try:
             with open(rank_binding_file) as f:
-                rb = yaml.safe_load(f)
+                rb = yaml.safe_load(f) or {}
             rank_bindings = rb.get("rank_bindings", [])
-            mpi_world = len(rank_bindings)
+            mpi_world = _validate_rank_bindings(rank_bindings)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to read rank binding '{rank_binding_file}': {e}"
             ) from e
-        if mpi_world <= 0:
-            raise RuntimeError("rank_binding must contain at least one MPI rank")
 
         _resolve_remote_dp_rank(vllm_config, mpi_world)
         non_device_dp_ranks = set()

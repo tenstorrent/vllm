@@ -99,6 +99,10 @@ def _resolve_mesh_grid(
     # preset so each rank opens only its local shard, even if
     # ``ttnn.get_num_devices()`` reports the full machine size.
     if visible_devices_env:
+        stored_mesh_grid = TTPlatform._standard_dp_mesh_grids.get(visible_devices_env)
+        if stored_mesh_grid is not None:
+            return stored_mesh_grid
+
         visible_count = len([d for d in visible_devices_env.split(",") if d.strip()])
         if visible_count > 0 and mesh_grid[0] * mesh_grid[1] != visible_count:
             mesh_grid = (1, visible_count)
