@@ -96,6 +96,7 @@ def test_register_tt_models_selects_tt_transformers_v2(monkeypatch):
         registered[model_arch] = model_path
 
     monkeypatch.setenv("TT_LLAMA_TEXT_VER", "tt_transformers_v2")
+    monkeypatch.setenv("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     monkeypatch.setattr(
         tt_platform,
         "_register_model_if_missing",
@@ -106,8 +107,21 @@ def test_register_tt_models_selects_tt_transformers_v2(monkeypatch):
 
     assert (
         registered["TTLlamaForCausalLM"]
-        == "models.common.models.generator:Llama3Generator"
+        == "models.common.models.llama3_8b.generator:Llama3Generator"
     )
+
+
+def test_register_tt_models_rejects_unsupported_tt_transformers_v2_model(
+    monkeypatch,
+):
+    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "tt_transformers_v2")
+    monkeypatch.setenv("HF_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
+
+    with pytest.raises(
+        ValueError,
+        match="Unsupported tt_transformers_v2 model: meta-llama/Llama-3.2-1B-Instruct",
+    ):
+        tt_platform.register_tt_models()
 
 
 def test_model_capability_overrides_required_block_size():
