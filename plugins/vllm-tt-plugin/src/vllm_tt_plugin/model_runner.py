@@ -1891,8 +1891,6 @@ class TTModelRunner:
                             rank_output_tokens
                         )
 
-        if os.environ.get("DP_GATHER_DEBUG") == "1":
-            logger.info("batch_size_per_dp=%s", batch_size_per_dp)
         merged = TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -1974,6 +1972,19 @@ class TTModelRunner:
         )
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
+            # A layout change makes this a ``reset_batch`` step: ``build_model_input``
+            # below will reload host-authoritative tokens/positions onto the device
+            # for every slot. Under async overlap the just-submitted decode step is
+            # still pending here, so the host tokens/positions for CONTINUING
+            # device-resident slots lag by one and are stale. Reloading them would
+            # clobber the device's correct ``plus_one``-advanced ``current_pos`` and
+            # make those slots re-decode their previous token (the greedy
+            # "doubling"). The drain decision above (``steady_decode_candidate``) was
+            # made from the *previous* step's layout flag, so a transition step slips
+            # through without draining. Drain the pending step(s) now -- before the
+            # reload -- so the host state is current. This costs the overlap only on
+            # the rare layout-change step; steady decode keeps full overlap.
+            self.async_decode.wait_for_all_pending_async_steps()
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
