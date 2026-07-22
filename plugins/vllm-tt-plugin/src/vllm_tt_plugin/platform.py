@@ -444,6 +444,24 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
+    # Janus-Pro — multimodal (image+text -> text) TT bridge.
+    #
+    # Same nested-config pitfall as Gemma4: HF ``deepseek-community/Janus-Pro-7B``
+    # declares ``architectures: ['JanusForConditionalGeneration']`` with
+    # ``model_type: janus`` and nested ``text_config`` / ``vision_config`` /
+    # ``vq_config``. Without a registry entry, upstream falls back to
+    # ``TransformersMultiModalForCausalLM`` and crashes on the missing
+    # processor factory. The TT class lives in tt-metal and registers the
+    # ``janus_pro`` MultiModalProcessor (in this vLLM fork) at import time.
+    _janus_pro_target = (
+        "models.experimental.janus_pro.tt.generator_vllm:JanusForConditionalGeneration"
+    )
+    for arch in (
+        "JanusForConditionalGeneration",
+        "TTJanusForConditionalGeneration",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _janus_pro_target)
+
     # DeepseekV3
     _register_model_if_missing(
         ModelRegistry,
