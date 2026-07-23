@@ -121,6 +121,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             if start_idx >= 0:
                 delta_text = delta_text[start_idx + len(self.start_token) :]
 
+        # Cherrypick of https://github.com/vllm-project/vllm/pull/38864
         # Stop-string buffering can delay the visible text for </think> until a
         # later chunk, so detect the end marker from text first rather than
         # relying solely on the token ids from the current delta.
@@ -144,6 +145,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         if not delta_text:
             # Nothing left after stripping start token.
             return None
+        # Cherrypick of https://github.com/vllm-project/vllm/pull/38864
         elif self.end_token_id in previous_token_ids or self.end_token in previous_text:
             # End token already passed: everything is content now.
             return DeltaMessage(content=delta_text)
