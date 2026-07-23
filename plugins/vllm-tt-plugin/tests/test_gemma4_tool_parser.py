@@ -136,3 +136,86 @@ def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
 
     assert name == "get_weather"
     assert json.loads(args_acc) == {"location": "Paris", "units": "c"}
+
+
+def _stream(chunks: list[str]) -> tuple[str, list[tuple[str | None, str | None]]]:
+    """Feed ``chunks`` through the streaming parser (fresh state) and return the
+    accumulated ``(content, [(name, arguments), ...])``."""
+    parser = Gemma4ToolParser(tokenizer=None)
+    content = ""
+    calls: list[tuple[str | None, str | None]] = []
+    prev = ""
+    for chunk in chunks:
+        cur = prev + chunk
+        delta = parser.extract_tool_calls_streaming(
+            prev, cur, chunk, [], [], [], request=None
+        )
+        if delta is not None:
+            if delta.content:
+                content += delta.content
+            for tc in delta.tool_calls or []:
+                fn = tc.function
+                calls.append((fn.name if fn else None, fn.arguments if fn else None))
+        prev = cur
+    return content, calls
+
+
+def test_streaming_plain_prose_is_content():
+    content, calls = _stream(["Yes, ", "the sky ", "is blue."])
+    assert content == "Yes, the sky is blue."
+    assert calls == []
+
+
+def test_streaming_prose_after_tool_token_is_not_swallowed():
+    # Regression: with tools present the model emits the tool-call START token and
+    # then produces PROSE instead of a real "call:" body. Previously every token
+    # after the marker was dropped (nonzero completion_tokens, empty content, no
+    # tool_calls). All the prose must now surface as content, the stray control
+    # token is dropped, and no spurious tool call is emitted.
+    content, calls = _stream(
+        [
+            "I think I should ",
+            "<|tool_call>",
+            "...actually let me just explain: ",
+            "all gates are green.",
+        ]
+    )
+    assert "I think I should " in content
+    assert "all gates are green." in content
+    assert "<|tool_call>" not in content
+    assert [n for n, _ in calls if n] == []
+
+
+def test_streaming_prose_around_a_call():
+    content, calls = _stream(
+        [
+            "Working on it. ",
+            '<|tool_call>call:run{cmd:<|"|>ls<|"|>}<tool_call|>',
+            " Done.",
+        ]
+    )
+    assert "Working on it. " in content and " Done." in content
+    assert [n for n, _ in calls if n] == ["run"]
+
+
+def test_streaming_two_calls_across_deltas():
+    content, calls = _stream(
+        [
+            "<|tool_call>",
+            "call:a{x:1}",
+            "<tool_call|>",
+            "<|tool_call>",
+            "call:b{y:2}",
+            "<tool_call|>",
+        ]
+    )
+    assert content == ""
+    assert [n for n, _ in calls if n] == ["a", "b"]
+
+
+def test_streaming_prose_with_angle_brackets_is_not_a_marker():
+    content, calls = _stream(
+        ["The condition x < 5 and y > 3 holds; ", "no tool needed."]
+    )
+    assert content == "The condition x < 5 and y > 3 holds; no tool needed."
+    assert calls == []

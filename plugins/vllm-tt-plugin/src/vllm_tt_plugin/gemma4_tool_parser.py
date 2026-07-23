@@ -50,6 +50,13 @@ class Gemma4ToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
+        # Number of CONFIRMED tool-call regions ("<|tool_call>call:") for which
+        # we have opened per-call state, and how many chars of prose content we
+        # have already surfaced. Tracked so prose in a tools-present request is
+        # streamed as content instead of being swallowed when the model emits a
+        # bare "<|tool_call>" token and then does NOT produce a real call.
+        self.confirmed_calls: int = 0
+        self.streamed_content_len: int = 0
 
         self.tool_call_start_token: str = TOOL_CALL_START
         self.tool_call_end_token: str = TOOL_CALL_END
@@ -245,6 +252,53 @@ class Gemma4ToolParser(ToolParser):
         self.buffered_delta_text = ""
         return combined
 
+    def _open_call_state(self) -> None:
+        self.current_tool_id += 1
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool.append("")
+        self.prev_tool_call_arr.append({})
+
+    def _content_view(self, text: str) -> str:
+        """The prose-content projection of ``text``: everything the client should
+        see as ``content``, with confirmed tool-call regions removed.
+
+        A ``<|tool_call>`` marker only starts a call region if it is immediately
+        followed by ``call:`` (the wire format). A bare marker that turns out to be
+        prose is dropped as a stray control token; the surrounding prose is kept.
+        An *open* region that is still a growing prefix of ``call:`` is held back
+        (dropped from the tail) until the next delta decides it.
+        """
+        out: list[str] = []
+        i = 0
+        n = len(text)
+        while i <= n:
+            j = text.find(TOOL_CALL_START, i)
+            if j == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:j])  # text before the marker is always content
+            after = text[j + len(TOOL_CALL_START) :]
+            if after.startswith(CALL_PREFIX):
+                # Confirmed call region: skip to its close (or to end if open).
+                k = text.find(TOOL_CALL_END, j)
+                if k == -1:
+                    break  # open confirmed call: drop the rest (goes to tool_calls)
+                i = k + len(TOOL_CALL_END)
+            elif CALL_PREFIX.startswith(after):
+                # Undecided open region at the tail: hold back for now.
+                break
+            else:
+                # Prose: the marker was not a real call. Drop the stray control
+                # token, keep going so the prose after it still surfaces.
+                i = j + len(TOOL_CALL_START)
+        return "".join(out)
+
+    def _emit_content(self, current_text: str) -> DeltaMessage | None:
+        visible = self._content_view(current_text)
+        new = visible[self.streamed_content_len :]
+        self.streamed_content_len = len(visible)
+        return DeltaMessage(content=new) if new else None
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -258,37 +312,42 @@ class Gemma4ToolParser(ToolParser):
         delta_text = self._buffer_delta_text(delta_text)
         current_text = previous_text + delta_text
 
-        # No tool call yet: stream as plain content.
-        if TOOL_CALL_START not in current_text:
-            return DeltaMessage(content=delta_text) if delta_text else None
-
         try:
+            # Open per-call state for any newly-confirmed ("<|tool_call>call:") calls.
+            confirmed = current_text.count(TOOL_CALL_START + CALL_PREFIX)
+            while self.confirmed_calls < confirmed:
+                self._open_call_state()
+                self.confirmed_calls += 1
+
             start_count = current_text.count(TOOL_CALL_START)
             end_count = current_text.count(TOOL_CALL_END)
-            prev_start_count = previous_text.count(TOOL_CALL_START)
             prev_end_count = previous_text.count(TOOL_CALL_END)
 
-            # A new tool call opened in this delta: set up per-call state.
-            if start_count > prev_start_count:
-                self.current_tool_id += 1
-                self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr.append({})
-
-            # The current tool call just closed: emit the complete arguments in a
-            # single delta (concatenated deltas must form valid JSON, so we never
-            # stream a partial object that already carries a closing brace).
-            if end_count > prev_end_count:
+            # A confirmed call just closed: emit its arguments in one delta
+            # (concatenated deltas must form valid JSON).
+            if end_count > prev_end_count and self.current_tool_id >= 0:
                 return self._emit_completed_call(current_text)
 
-            # Mid open call: emit the function name as soon as it is known.
-            if start_count > end_count and not self.current_tool_name_sent:
-                return self._maybe_emit_name(current_text)
+            # An unclosed "<|tool_call>" region: decide call vs prefix vs prose.
+            if start_count > end_count:
+                last_start = current_text.rfind(TOOL_CALL_START)
+                body = current_text[last_start + len(TOOL_CALL_START) :]
+                if body.startswith(CALL_PREFIX):
+                    # Confirmed open call: emit the name once, hold args to close.
+                    if self.current_tool_id >= 0 and not self.current_tool_name_sent:
+                        return self._maybe_emit_name(current_text)
+                    return None
+                if CALL_PREFIX.startswith(body):
+                    # Still a growing prefix of "call:": wait for the next delta.
+                    return None
+                # else: prose that merely contains the marker -> fall through.
 
-            return None
+            # Everything else is prose content.
+            return self._emit_content(current_text)
         except Exception:
             logger.exception("Error in Gemma4 streaming tool call extraction")
-            return None
+            # Never silently drop text: surface whatever prose we can.
+            return self._emit_content(current_text)
 
     def _maybe_emit_name(self, current_text: str) -> DeltaMessage | None:
         start = current_text.rfind(TOOL_CALL_START) + len(TOOL_CALL_START)
