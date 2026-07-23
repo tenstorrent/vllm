@@ -124,11 +124,14 @@ def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
             prev, cur, chunk, [], [], [], request=None
         )
         if delta is not None and delta.tool_calls:
-            fn = delta.tool_calls[0].function or {}
-            if fn.get("name"):
-                name = fn["name"]
-            if fn.get("arguments"):
-                args_acc += fn["arguments"]
+            # DeltaToolCall.function is a DeltaFunctionCall model (pydantic coerces
+            # the dict we build), so read fields by attribute, not dict access.
+            fn = delta.tool_calls[0].function
+            if fn is not None:
+                if fn.name:
+                    name = fn.name
+                if fn.arguments:
+                    args_acc += fn.arguments
         prev = cur
 
     assert name == "get_weather"
