@@ -2217,7 +2217,7 @@ class TTModelRunner:
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput | None:
         """Sample the forward deferred by a preceding ``execute_model``.
 
         Pops the oldest pending forward (FIFO, matching the engine's
@@ -2225,7 +2225,16 @@ class TTModelRunner:
         produces its output (or an async wrapper for overlapped decode). The
         engine calls this exactly once per ``execute_model`` that returned
         ``None``.
+
+        If the preceding ``execute_model`` failed it enqueued no pending
+        forward, so return ``None`` instead of raising ``IndexError`` on an
+        empty deque. The engine treats ``None`` here as "the original
+        execute_model failed" and re-raises that real exception (see
+        ``EngineCore``'s ``if model_output is None`` path), so the true cause
+        surfaces instead of being masked by the empty-popleft error.
         """
+        if not self._pending_samples:
+            return None
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
