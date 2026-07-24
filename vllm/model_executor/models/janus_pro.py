@@ -118,11 +118,14 @@ class JanusProMultiModalProcessor(BaseMultiModalProcessor[JanusProProcessingInfo
             tokenizer = self.info.get_tokenizer()
             return tokenizer(prompt, add_special_tokens=True, return_tensors="pt")
 
-        return super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
+        # HF JanusProcessor does `for sample in text` when prepending the default
+        # system prompt. A bare str is iterated as characters → batch size
+        # len(prompt) and BaseMultiModalProcessor's
+        # `(prompt_ids,) = input_ids.tolist()` raises. Always pass a 1-element list.
+        return self.info.ctx.call_hf_processor(
+            self.info.get_hf_processor(**mm_kwargs),
+            dict(text=[prompt], **mm_data),
+            dict(**mm_kwargs, **tok_kwargs),
         )
 
     def _get_mm_fields_config(
