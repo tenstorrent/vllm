@@ -2345,7 +2345,14 @@ class TTModelRunner:
         produces its output (or an async wrapper for overlapped decode). The
         engine calls this exactly once per ``execute_model`` that returned
         ``None``.
+
+        If the deque is empty, ``execute_model`` must have raised an exception
+        that was captured by the executor; return ``None`` so the engine can
+        surface the original error from the execute future.
         """
+        if not self._pending_samples:
+            return None  # type: ignore[return-value]
+
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
