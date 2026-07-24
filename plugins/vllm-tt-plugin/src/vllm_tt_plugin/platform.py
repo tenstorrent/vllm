@@ -537,27 +537,6 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
-        if vllm_config.scheduler_config.enable_chunked_prefill:
-            logger.info("Chunked prefill is not yet supported for TT backend")
-            vllm_config.scheduler_config.enable_chunked_prefill = False
-            # vLLM does this bump silently earlier
-            # if chunked prefill is already disabled,
-            # and max_num_batched_tokens is not explicitly set.
-            # We can't know if it was specified
-            # or the default, hence the warning.
-            if (
-                vllm_config.scheduler_config.max_num_batched_tokens
-                < vllm_config.model_config.max_model_len
-            ):
-                logger.warning(
-                    "max_num_batched_tokens=%d < max_model_len=%d with chunked prefill "
-                    "disabled, bumping max_num_batched_tokens to match.",
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    vllm_config.model_config.max_model_len,
-                )
-                vllm_config.scheduler_config.max_num_batched_tokens = (
-                    vllm_config.model_config.max_model_len
-                )
 
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
