@@ -144,9 +144,6 @@ class TTModelRunner:
         if self.request_specific_rope:
             self.previous_req_ids: set[str] = set()
 
-        # Currently, TT model runner doesn't support chunked prefill.
-        assert self.scheduler_config.enable_chunked_prefill is False
-
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
@@ -891,39 +888,61 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
+        num_sched = scheduler_output.num_scheduled_tokens
         # A "prefill" step can contain:
         # - brand new requests (scheduled_new_reqs), and/or
         # - resumed-from-preemption requests (scheduled_cached_reqs with
-        #   resumed_req_ids set) that need to replay tokens to rebuild KV.
-        is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
-            cached_reqs.resumed_req_ids
+        #   resumed_req_ids set) that need to replay tokens to rebuild KV,
+        #   and/or
+        # - chunked-prefill continuations (cached requests with >1 token
+        #   scheduled that are neither new nor resumed).
+        has_chunked_continuation = any(
+            num_sched.get(req_id, 0) > 1
+            for req_id in cached_reqs.req_ids
+            if req_id not in cached_reqs.resumed_req_ids
+        )
+        is_prompt = (
+            len(scheduler_output.scheduled_new_reqs) > 0
+            or bool(cached_reqs.resumed_req_ids)
+            or has_chunked_continuation
         )
         sample_params = input_batch.sampling
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
             # cached on the worker", not necessarily "decode". During a prefill
             # step we can legitimately see cached requests if they are resumed
-            # from preemption (still prefill work).
+            # from preemption (still prefill work) or are chunked-prefill
+            # continuations (>1 token scheduled).
             if cached_reqs.num_reqs > 0:
-                any_running = any(
+                any_decode_in_prefill = any(
                     req_id not in cached_reqs.resumed_req_ids
+                    and num_sched.get(req_id, 0) <= 1
                     for req_id in cached_reqs.req_ids
                 )
-                assert not any_running, (
-                    "Prefill batch should not include decode/running cached "
-                    "requests (req_id not in resumed_req_ids)."
+                assert not any_decode_in_prefill, (
+                    "Prefill batch should not include decode cached requests "
+                    "(cached req_id that is neither resumed nor chunked-prefill)."
                 )
 
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[req_indices]
-            # Prefill length in tokens for each request:
-            # - For new requests: equals prompt length.
-            # - For resumed-from-preemption requests: includes any generated
-            #   output tokens so far, so we can replay the full sequence to
-            #   rebuild KV after preemption freed the cache blocks.
-            prompt_lens = input_batch.num_tokens[req_indices]
-            max_prefill_tokens = max(prompt_lens)
+            # Chunk-aware `prompt_lens`: for each request, the "prompt length"
+            # the generator sees is `start_pos` + `chunk_len`, i.e., the position
+            # up to which tokens should be processed.  The generator slices
+            # `tokens[start_pos : prompt_lens]` and processes that chunk.
+            # - Full prefill (no chunking): `start_pos=0`, `chunk_len=prompt_len`
+            #   => `prompt_lens = prompt_len` (same as before).
+            # - APC hit: `start_pos=cached`, `chunk_len=prompt_len-cached`
+            #   => `prompt_lens = prompt_len` (same as before).
+            # - Chunked continuation: `start_pos=computed`, `chunk_len=budget`
+            #   => `prompt_lens = computed + budget` (the chunk end position).
+            chunk_lens = np.array(
+                [num_sched[input_batch.req_ids[i]] for i in req_indices],
+                dtype=np.int64,
+            )
+            prompt_lens = input_positions + chunk_lens
+            max_prefill_tokens = int(max(prompt_lens))
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
