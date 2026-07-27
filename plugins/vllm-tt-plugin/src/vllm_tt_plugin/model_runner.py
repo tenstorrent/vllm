@@ -894,10 +894,11 @@ class TTModelRunner:
         # - resumed-from-preemption requests (scheduled_cached_reqs with
         #   resumed_req_ids set) that need to replay tokens to rebuild KV,
         #   and/or
-        # - chunked-prefill continuations (cached requests with >1 token
-        #   scheduled that are neither new nor resumed).
+        # - chunked-prefill continuations (cached requests that haven't
+        #   finished computing all their prompt tokens yet).
         has_chunked_continuation = any(
-            num_sched.get(req_id, 0) > 1
+            input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
+            < input_batch.num_prompt_tokens[input_batch.req_id_to_index[req_id]]
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
         )
@@ -912,16 +913,21 @@ class TTModelRunner:
             # cached on the worker", not necessarily "decode". During a prefill
             # step we can legitimately see cached requests if they are resumed
             # from preemption (still prefill work) or are chunked-prefill
-            # continuations (>1 token scheduled).
+            # continuations (`num_computed < num_prompt_tokens` - still prefilling).
             if cached_reqs.num_reqs > 0:
                 any_decode_in_prefill = any(
                     req_id not in cached_reqs.resumed_req_ids
-                    and num_sched.get(req_id, 0) <= 1
+                    and input_batch.num_computed_tokens_cpu[
+                        input_batch.req_id_to_index[req_id]
+                    ]
+                    >= input_batch.num_prompt_tokens[
+                        input_batch.req_id_to_index[req_id]
+                    ]
                     for req_id in cached_reqs.req_ids
                 )
                 assert not any_decode_in_prefill, (
                     "Prefill batch should not include decode cached requests "
-                    "(cached req_id that is neither resumed nor chunked-prefill)."
+                    "(cached req_id that has finished its prompt)."
                 )
 
             # num_computed_tokens for each request is the input position
@@ -2095,11 +2101,11 @@ class TTModelRunner:
         if not is_decode and model_input.prompt_lens is not None:
             lane_batch = self.lane_batch
             prompt_lens = np.asarray(model_input.prompt_lens)
-            total_tokens = np.array(
-                [lane_batch.num_tokens[row] for row in scheduled_rows],
+            num_prompt_tokens = np.array(
+                [lane_batch.num_prompt_tokens[row] for row in scheduled_rows],
                 dtype=np.int64,
             )
-            intermediate_mask = prompt_lens < total_tokens
+            intermediate_mask = prompt_lens < num_prompt_tokens
 
             if intermediate_mask.any():
                 num_rows = len(scheduled_rows)
@@ -2288,8 +2294,8 @@ class TTModelRunner:
         if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
             num_reqs = self.input_batch.num_reqs
             prompt_lens = np.asarray(fwd.model_input.prompt_lens)
-            total_tokens = self.input_batch.num_tokens[:num_reqs]
-            intermediate_mask = prompt_lens < total_tokens
+            num_prompt_tokens = self.input_batch.num_prompt_tokens[:num_reqs]
+            intermediate_mask = prompt_lens < num_prompt_tokens
             if intermediate_mask.any():
                 # Apply sampled tokens to state only for final-chunk requests.
                 final_indices = np.where(~intermediate_mask)[0]
