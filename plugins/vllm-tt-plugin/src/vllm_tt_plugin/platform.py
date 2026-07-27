@@ -411,27 +411,6 @@ def register_tt_test_models():
     )
 
 
-def _apply_model_capability_config_overrides(
-    vllm_config: "VllmConfig",
-    model_capabilities: dict | None,
-) -> None:
-    if not model_capabilities:
-        return
-
-    required_block_size = model_capabilities.get("required_block_size")
-    if required_block_size is None:
-        return
-
-    cache_config = vllm_config.cache_config
-    if cache_config.block_size != required_block_size:
-        logger.warning(
-            "TT model requires block_size=%d; overriding requested block_size=%d",
-            required_block_size,
-            cache_config.block_size,
-        )
-        cache_config.block_size = required_block_size
-
-
 class TTPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
@@ -616,7 +595,6 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
-        _apply_model_capability_config_overrides(vllm_config, model_capabilities)
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting

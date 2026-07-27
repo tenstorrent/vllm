@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from vllm_tt_plugin import config as tt_config
@@ -89,12 +90,23 @@ def test_store_tt_lane_count_rejects_zero():
         tt_config.store_tt_lane_count(config, 0)
 
 
+def _install_fake_model_registry(monkeypatch):
+    registry_module = ModuleType("vllm.model_executor.models.registry")
+    registry_module.ModelRegistry = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.models.registry",
+        registry_module,
+    )
+
+
 def test_register_tt_models_selects_tt_transformers_v2(monkeypatch):
     registered = {}
 
     def fake_register_model_if_missing(_registry, model_arch, model_path):
         registered[model_arch] = model_path
 
+    _install_fake_model_registry(monkeypatch)
     monkeypatch.setenv("TT_LLAMA_TEXT_VER", "tt_transformers_v2")
     monkeypatch.setenv("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     monkeypatch.setattr(
@@ -114,6 +126,7 @@ def test_register_tt_models_selects_tt_transformers_v2(monkeypatch):
 def test_register_tt_models_rejects_unsupported_tt_transformers_v2_model(
     monkeypatch,
 ):
+    _install_fake_model_registry(monkeypatch)
     monkeypatch.setenv("TT_LLAMA_TEXT_VER", "tt_transformers_v2")
     monkeypatch.setenv("HF_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
 
@@ -122,14 +135,3 @@ def test_register_tt_models_rejects_unsupported_tt_transformers_v2_model(
         match="Unsupported tt_transformers_v2 model: meta-llama/Llama-3.2-1B-Instruct",
     ):
         tt_platform.register_tt_models()
-
-
-def test_model_capability_overrides_required_block_size():
-    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
-
-    tt_platform._apply_model_capability_config_overrides(
-        config,
-        {"required_block_size": 32},
-    )
-
-    assert config.cache_config.block_size == 32

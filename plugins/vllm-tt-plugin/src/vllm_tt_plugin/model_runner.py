@@ -2217,7 +2217,7 @@ class TTModelRunner:
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         """Sample the forward deferred by a preceding ``execute_model``.
 
         Pops the oldest pending forward (FIFO, matching the engine's
@@ -2226,12 +2226,6 @@ class TTModelRunner:
         engine calls this exactly once per ``execute_model`` that returned
         ``None``.
         """
-        if not self._pending_samples:
-            logger.error(
-                "sample_tokens called with no pending TT sampler; "
-                "execute_model likely failed before enqueue"
-            )
-            return None
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
@@ -2757,6 +2751,9 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
+                # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
+                # while decode may return [sz, 1]; downstream logprobs packing
+                # expects a flat vector here.
                 next_token_ids = _take(tt_out).reshape(sz)
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling

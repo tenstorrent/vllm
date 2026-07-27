@@ -107,7 +107,6 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
                 self._cached_output = self._get_output_impl()
                 self._finalized = True
                 self._completion_event.set()
-                self._on_finalized()
         return self._cached_output
 
     def is_resolved(self) -> bool:
@@ -118,9 +117,6 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
 
     def _get_output_impl(self) -> Any:
         raise NotImplementedError
-
-    def _on_finalized(self) -> None:
-        pass
 
 
 class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
@@ -185,33 +181,25 @@ class AsyncTTDPGatherOutput(DeferredDecodeOutput):
         self._init_deferred()
 
     def _get_output_impl(self) -> tuple[torch.Tensor, list]:
-        submission = self._submission
-        model_input = self._model_input
-        finalized = self._controller.finalize_decode(submission)
+        finalized = self._controller.finalize_decode(self._submission)
         runner = self._controller.runner
         if finalized is None:
-            output = runner.pack_dp_results(
+            return runner.pack_dp_results(
                 [torch.tensor([], dtype=torch.int32)]
-                * len(submission.batch_size_per_dp),
-                [None] * len(submission.batch_size_per_dp),
+                * len(self._submission.batch_size_per_dp),
+                [None] * len(self._submission.batch_size_per_dp),
             )
-        else:
-            sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
-                tt_out=finalized.tt_out,
-                tt_log_probs=finalized.tt_log_probs,
-                sampling_params=submission.sampling_params,
-                model_input=model_input,
-                batch_size_per_dp=submission.batch_size_per_dp,
-                perform_device_sampling=submission.perform_device_sampling,
-                is_decode=True,
-            )
-            output = runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
-        self._submission = None
-        self._model_input = None
-        return output
 
-    def _on_finalized(self) -> None:
-        self._controller.prune_finished_async_events()
+        sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
+            tt_out=finalized.tt_out,
+            tt_log_probs=finalized.tt_log_probs,
+            sampling_params=self._submission.sampling_params,
+            model_input=self._model_input,
+            batch_size_per_dp=self._submission.batch_size_per_dp,
+            perform_device_sampling=self._submission.perform_device_sampling,
+            is_decode=True,
+        )
+        return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
 
 
 class TTAsyncDecodeController:

@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import multiprocessing
 import queue
-import signal
 import sys
 import uuid
 import weakref
@@ -616,36 +615,12 @@ class MPClient(EngineCoreClient):
             if not _self or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
-            dead_proc = next(
-                proc for proc in engine_processes if proc.sentinel == died[0]
-            )
-            for proc in engine_processes:
-                proc.join(timeout=0)
-
-            def get_exit_signal(exitcode: int | None) -> str | None:
-                if exitcode is None or exitcode >= 0:
-                    return None
-                try:
-                    return signal.Signals(-exitcode).name
-                except ValueError:
-                    return f"signal {-exitcode}"
-
-            exit_signal = get_exit_signal(dead_proc.exitcode)
-            process_status = ", ".join(
-                f"{proc.name}(pid={proc.pid}, exitcode={proc.exitcode}, "
-                f"signal={get_exit_signal(proc.exitcode)}, "
-                f"alive={proc.is_alive()})"
-                for proc in engine_processes
+            proc_name = next(
+                proc.name for proc in engine_processes if proc.sentinel == died[0]
             )
             logger.error(
-                "Engine core proc %s died unexpectedly "
-                "(pid=%s, exitcode=%s, signal=%s), shutting down client. "
-                "All engine process status: %s",
-                dead_proc.name,
-                dead_proc.pid,
-                dead_proc.exitcode,
-                exit_signal,
-                process_status,
+                "Engine core proc %s died unexpectedly, shutting down client.",
+                proc_name,
             )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism
