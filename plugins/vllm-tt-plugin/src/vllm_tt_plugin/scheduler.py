@@ -78,7 +78,7 @@ class TTScheduler(AsyncScheduler):
 
     def schedule(self) -> SchedulerOutput:
         has_pending_prefill = self._has_pending_prefill()
-        has_running = bool(self.running)
+        has_running = any(not r.is_prefill_chunk for r in self.running)
         mode = self._forced_mode
 
         if mode == TTSchedulingMode.PREFILL_ONLY:
