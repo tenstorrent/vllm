@@ -2094,10 +2094,6 @@ class TTModelRunner:
         # the canonical merged output order.
         req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
 
-        # region Lane-DP prefill contract
-        # Chunked prefill in lane mode: intermediate chunks produce no valid
-        # output. Same contract as the non-DP path: return `[]` for those
-        # requests and skip applying their tokens to state.
         if not is_decode and model_input.prompt_lens is not None:
             lane_batch = self.lane_batch
             prompt_lens = np.asarray(model_input.prompt_lens)
@@ -2108,36 +2104,12 @@ class TTModelRunner:
             intermediate_mask = prompt_lens < num_prompt_tokens
 
             if intermediate_mask.any():
-                num_rows = len(scheduled_rows)
-                final_indices = np.where(~intermediate_mask)[0]
-                if len(final_indices) > 0:
-                    idx_tensor = torch.from_numpy(final_indices.astype(np.int64))
-                    final_tokens = sampled[idx_tensor]
-                    final_req_ids = [req_ids[int(i)] for i in final_indices]
-                    self._apply_sampled_tokens_to_state(
-                        final_tokens, req_ids=final_req_ids
-                    )
-
-                sampled_np = sampled.view(num_rows).numpy()
-                if sampled_np.dtype != np.int32:
-                    sampled_np = sampled_np.astype(np.int32, copy=False)
-
-                sampled_token_id_lists: list[list[int]] = []
-                for i in range(num_rows):
-                    if intermediate_mask[i]:
-                        sampled_token_id_lists.append([])
-                    else:
-                        sampled_token_id_lists.append([int(sampled_np[i])])
-
-                return ModelRunnerOutput(
+                return self._build_chunked_prefill_output(
                     req_ids=req_ids,
-                    req_id_to_index={rid: idx for idx, rid in enumerate(req_ids)},
-                    sampled_token_ids=sampled_token_id_lists,
+                    sampled_token_ids=sampled,
                     logprobs=logprobs,
-                    prompt_logprobs_dict=dict.fromkeys(req_ids, None),
-                    pooler_output=[],
+                    intermediate_mask=intermediate_mask,
                 )
-        # endregion
 
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
@@ -2283,63 +2255,57 @@ class TTModelRunner:
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
+        logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
 
-        # region Non-DP prefill contract
-        # Chunked prefill: intermediate chunks (non-final) write KV but
-        # produce no valid output token.  Per the upstream scheduler contract
-        # (`Scheduler._update_request_with_output`), the model runner must return
-        # empty token ids (`[]`) for partial-prefill requests.  We also skip
-        # applying the spurious sampled token to persistent state for those
-        # positions.
         if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
             num_reqs = self.input_batch.num_reqs
             prompt_lens = np.asarray(fwd.model_input.prompt_lens)
             num_prompt_tokens = self.input_batch.num_prompt_tokens[:num_reqs]
             intermediate_mask = prompt_lens < num_prompt_tokens
+
             if intermediate_mask.any():
-                # Apply sampled tokens to state only for final-chunk requests.
-                final_indices = np.where(~intermediate_mask)[0]
-                if len(final_indices) > 0:
-                    idx_tensor = torch.from_numpy(final_indices.astype(np.int64))
-                    final_tokens = sampled_token_ids[idx_tensor]
-                    final_req_ids = [
-                        self.input_batch.req_ids[int(i)] for i in final_indices
-                    ]
-                    self._apply_sampled_tokens_to_state(
-                        final_tokens, req_ids=final_req_ids
-                    )
-
-                # Build output: [] for intermediate chunks, [token] for final.
-                sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
-                if sampled_token_ids_np.dtype != np.int32:
-                    sampled_token_ids_np = sampled_token_ids_np.astype(
-                        np.int32, copy=False
-                    )
-
-                sampled_token_id_lists: list[list[int]] = []
-                for i in range(num_reqs):
-                    if intermediate_mask[i]:
-                        sampled_token_id_lists.append([])
-                    else:
-                        sampled_token_id_lists.append([int(sampled_token_ids_np[i])])
-
-                logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
                 output_req_ids = list(self.input_batch.req_ids[:num_reqs])
-
-                return ModelRunnerOutput(
+                return self._build_chunked_prefill_output(
                     req_ids=output_req_ids,
-                    req_id_to_index={
-                        rid: idx for idx, rid in enumerate(output_req_ids)
-                    },
-                    sampled_token_ids=sampled_token_id_lists,
+                    sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs,
-                    prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
-                    pooler_output=[],
+                    intermediate_mask=intermediate_mask,
                 )
-        # endregion
 
-        logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
         return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+
+    def _build_chunked_prefill_output(
+        self,
+        req_ids: list[str],
+        sampled_token_ids: torch.Tensor,
+        logprobs: list | None,
+        intermediate_mask: np.ndarray,
+    ) -> ModelRunnerOutput:
+        """Builds output with ``[]`` for intermediate, ``[tokens]`` for final chunks."""
+        final_idx_np = np.where(~intermediate_mask)[0]
+        if final_idx_np.shape[0] > 0:
+            final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
+            final_tokens = sampled_token_ids[final_idx_tensor]
+            final_req_ids = [req_ids[int(i)] for i in final_idx_np]
+            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+
+        num_reqs = len(req_ids)
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if sampled_token_ids_np.dtype != np.int32:
+            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+        sampled_token_id_lists = [
+            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            for i in range(num_reqs)
+        ]
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={r_id: idx for idx, r_id in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_id_lists,
+            logprobs=logprobs,
+            prompt_logprobs_dict=dict.fromkeys(req_ids, None),
+            pooler_output=[],
+        )
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
