@@ -42,6 +42,9 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
+# TT model types that have been validated with real chunked prefill.
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4"}
+
 
 def _galaxy_generator_version() -> str | None:
     """Return the active Galaxy-generator model version, or None.
@@ -538,18 +541,18 @@ class TTPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
 
-        # NOTE: Token-chunked prefill: upstream vLLM defaults enable_chunked_prefill
+        # NOTE: Token-chunked prefill: upstream vLLM defaults `enable_chunked_prefill`
         # to True and `max_num_batched_tokens` to 2048. The scheduler and model
         # runner support chunking, but most Metal-side models have only been
-        # validated with full-prompt prefill. Preserve safe defaults by
-        # bumping `max_num_batched_tokens` to `max_model_len` when the user did
-        # not explicitly set it; this makes every prompt fit in a single
-        # step (no chunking). Users who want chunking (e.g., Gemma 4 long-
-        # context) opt in via `--max_num_batched_tokens <budget>`.
+        # validated with full-prompt prefill. Models that have been validated
+        # with real chunking keep the user/default budget as-is; all others get
+        # bumped to `max_model_len` so every prompt fits in one step (no
+        # chunking). Users can always override via `--max_num_batched_tokens`.
         sched = vllm_config.scheduler_config
+        model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
         if (
             sched.enable_chunked_prefill
-            and sched.max_num_batched_tokens == sched.DEFAULT_MAX_NUM_BATCHED_TOKENS
+            and model_type not in _CHUNKED_PREFILL_MODEL_TYPES
             and sched.max_num_batched_tokens < vllm_config.model_config.max_model_len
         ):
             sched.max_num_batched_tokens = vllm_config.model_config.max_model_len
