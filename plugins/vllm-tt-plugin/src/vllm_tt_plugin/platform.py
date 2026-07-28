@@ -554,6 +554,11 @@ class TTPlatform(Platform):
         ):
             sched.max_num_batched_tokens = vllm_config.model_config.max_model_len
 
+        # Never split a chunk boundary inside an image's token span. The vision encoder
+        # produces embeddings for the full image atomically; splitting corrupts the
+        # embedding/position alignment.
+        sched.disable_chunked_mm_input = True
+
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
