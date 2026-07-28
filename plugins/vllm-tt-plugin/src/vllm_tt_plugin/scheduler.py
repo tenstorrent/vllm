@@ -133,7 +133,7 @@ class TTScheduler(AsyncScheduler):
         try:
             result = super().schedule()
         finally:
-            self.running = pure_decodes + self.running
+            self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
 
@@ -158,6 +158,6 @@ class TTScheduler(AsyncScheduler):
                 saved_waiting.prepend_requests(self.waiting)
             self.waiting = saved_waiting
             if partial_prefills:
-                self.running = partial_prefills + self.running
+                self.running.extend(partial_prefills)
 
         return result
