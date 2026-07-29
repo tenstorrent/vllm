@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import deque
 from dataclasses import dataclass, fields, replace
