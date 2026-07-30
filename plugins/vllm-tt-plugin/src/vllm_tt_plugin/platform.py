@@ -708,10 +708,10 @@ class TTPlatform(Platform):
                 "Unset sample_on_device_mode or use a model that supports it."
             )
 
-        # Model-gated async scheduling. Async overlap requires generators that
-        # support split decode submission via `decode_forward(...,
-        # read_from_device=False)` followed by `read_decode_output(...,
-        # async_read=True)`.
+        # Model-gated async scheduling. The capability certifies both split
+        # decode submission/readback and device-resident sampled-token feedback
+        # between decode steps. Models without it use conservative full input
+        # reloads and cannot enable scheduler overlap.
         supports_async_decode = (
             model_capabilities.get("supports_async_decode", False)
             if model_capabilities

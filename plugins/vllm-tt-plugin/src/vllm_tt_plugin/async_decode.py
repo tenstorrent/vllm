@@ -263,6 +263,14 @@ class TTAsyncDecodeController:
         from vllm_tt_plugin.model_input import TTDecodeReloadPlan
 
         device_sampling = model_input.perform_device_sampling
+        model_capabilities = getattr(
+            getattr(self.runner, "model", None),
+            "model_capabilities",
+            {},
+        ) or {}
+        supports_resident_decode = bool(
+            model_capabilities.get("supports_async_decode", False)
+        )
         sampling_mode_changed = (
             self._previous_device_sampling is not None
             and self._previous_device_sampling != device_sampling
@@ -272,7 +280,11 @@ class TTAsyncDecodeController:
             or model_input.reset_batch
             or sampling_mode_changed
         )
-        reload_inputs = (not device_sampling) or transition
+        reload_inputs = (
+            not device_sampling
+            or transition
+            or not supports_resident_decode
+        )
         sampling_reset = device_sampling and transition
         return TTDecodeReloadPlan(
             reload_inputs=reload_inputs,
@@ -337,25 +349,6 @@ class TTAsyncDecodeController:
 
     def steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
         runner = self.runner
-        contract_version = int(
-            getattr(
-                getattr(runner, "model", None),
-                "decode_input_update_contract",
-                0,
-            )
-        )
-        is_non_device_dp_rank = (
-            dp_gather
-            and runner.parallel_config.data_parallel_rank_local != 0
-        )
-        if contract_version < 1 and not is_non_device_dp_rank:
-            # Legacy generators may still run asynchronously, but must drain
-            # each result before building the next host input because their
-            # model-local reload heuristics cannot be proven host-stale-safe.
-            # Gathered non-device ranks deliberately have no model; their vote
-            # covers scheduler/layout state while each device-local rank 0
-            # supplies the capability vote.
-            return False
         if dp_gather:
             if not runner.scheduler_config.async_scheduling:
                 return False
@@ -760,21 +753,17 @@ class TTAsyncDecodeController:
             if model_input.slot_remap is not None:
                 kwargs["slot_remap"] = model_input.slot_remap
 
-        # Versioned compatibility seam. New tt-metal generators advertise the
-        # explicit contract; old generators keep their existing reset_batch
-        # heuristics and never see unknown kwargs.
-        contract_version = int(
-            getattr(runner.model, "decode_input_update_contract", 0)
+        # vLLM owns reload decisions because it alone knows when host tensors
+        # are authoritative under async scheduling. The paired tt-metal
+        # revision is therefore required and receives all four commands on
+        # every non-empty decode submission.
+        reload_plan = self.plan_decode_reload(model_input)
+        kwargs.update(
+            reload_inputs=reload_plan.reload_inputs,
+            reload_page_table=reload_plan.reload_page_table,
+            reload_sampling_params=reload_plan.reload_sampling_params,
+            reset_sampling_state=reload_plan.reset_sampling_state,
         )
-        reload_plan = None
-        if contract_version >= 1:
-            reload_plan = self.plan_decode_reload(model_input)
-            kwargs.update(
-                reload_inputs=reload_plan.reload_inputs,
-                reload_page_table=reload_plan.reload_page_table,
-                reload_sampling_params=reload_plan.reload_sampling_params,
-                reset_sampling_state=reload_plan.reset_sampling_state,
-            )
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
@@ -799,8 +788,7 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
-        if reload_plan is not None:
-            self.commit_decode_submission(model_input, reload_plan)
+        self.commit_decode_submission(model_input, reload_plan)
         if (
             perform_device_sampling
             and runner.parallel_config.data_parallel_size == 1
