@@ -21,6 +21,38 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
 @dataclass(frozen=True)
+class TTDecodeReloadPlan:
+    """Explicit host-to-device updates for one decode submission.
+
+    The TT runner is the sole owner of these decisions because it knows whether
+    the host token/position tensors are authoritative or intentionally one step
+    behind an overlapped device-sampling decode. Contract-aware generators must
+    execute these flags as commands and must not infer additional reloads from
+    tensor equality, sampling mode, or their own previous-call state.
+
+    ``reload_inputs`` is a full forward-input copy (tokens, positions, RoPE
+    inputs and page tables). ``reload_page_table`` is the cheaper page-table-only
+    copy and is only meaningful when ``reload_inputs`` is false. Sampling
+    parameters and mutable sampling state are separate so forward and sampling
+    can be split without coupling either update to the batch-layout hint.
+    """
+
+    reload_inputs: bool
+    reload_page_table: bool
+    reload_sampling_params: bool
+    reset_sampling_state: bool
+
+    @property
+    def overlap_safe(self) -> bool:
+        """Whether a device-resident decode may be submitted host-stale."""
+        return not (
+            self.reload_inputs
+            or self.reload_sampling_params
+            or self.reset_sampling_state
+        )
+
+
+@dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
 
