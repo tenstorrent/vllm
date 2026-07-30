@@ -215,6 +215,10 @@ class TTModelRunner:
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
 
+        # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed RNG, decode
+        # trace buffers). Needed because evict/re-add and condense move a request's ROW, not its state.
+        self._req_state_slot: dict[str, int] = {}
+
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
         if self.parallel_config.data_parallel_rank_local == 0:
@@ -611,6 +615,9 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            # Only a FINISHED request releases its slot; an unscheduled one still owns its state
+            # even though the lines below drop it from the persistent batch.
+            self._req_state_slot.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -806,6 +813,57 @@ class TTModelRunner:
             num_logprobs=num_logprobs,
             enable_log_probs=num_logprobs >= 0,
         )
+
+    # --- Per-request device state slots (see ``self._req_state_slot``) ---
+
+    def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
+        """Pick each prefilling request's state slot, skipping slots live off-batch requests own.
+        Prefers its own row (the row it decodes at), so the steady state moves nothing."""
+        n_slots = self.tt_per_lane_max_num_seqs
+        prefilling = set(row_req_ids)
+        held = {
+            slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id not in prefilling and req_id in self.requests
+        }
+        slots: list[int] = []
+        for row, req_id in enumerate(row_req_ids):
+            if row < n_slots and row not in held:
+                slot = row
+            else:
+                free = [s for s in range(n_slots) if s not in held]
+                assert free, (
+                    f"no free device state slot for {len(row_req_ids)} prefill(s): "
+                    f"held={sorted(held)}, capacity={n_slots}"
+                )
+                slot = free[0]
+            held.add(slot)
+            self._req_state_slot[req_id] = slot
+            slots.append(slot)
+        return slots
+
+    def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
+        """Gather permutation taking each request's state to its decode row: row ``i`` reads slot
+        ``remap[i]``. Always full slot width (no OOB gather); None means identity, so skip it."""
+        n_slots = self.tt_per_lane_max_num_seqs
+        row_req_ids = row_req_ids[:n_slots]
+        want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
+        settled = {r: row for row, r in enumerate(row_req_ids)}  # post-gather: state sits at its row
+        if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
+            # Never hand a non-permutation to a gather: one incoherent response beats an
+            # out-of-bounds device read.
+            logger.warning(
+                f"TT decode state slots are not a permutation ({want}); skipping the state "
+                "remap for this step -- one response may be incoherent."
+            )
+            self._req_state_slot.update(settled)
+            return None
+        taken = set(want)
+        remap = want + [s for s in range(n_slots) if s not in taken]
+        self._req_state_slot.update(settled)
+        if all(remap[i] == i for i in range(n_slots)):
+            return None
+        return torch.tensor(remap, dtype=torch.int32)
 
     def _prepare_model_inputs(
         self,
@@ -1114,7 +1172,18 @@ class TTModelRunner:
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
-        slot_remap = input_batch.pop_slot_remap() if capture_slot_remap else None
+        # State follows the request, not the row (``self._req_state_slot``). That subsumes the
+        # batch's condense-move remap, so pop and discard it.
+        input_batch.pop_slot_remap()
+        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        if is_prompt:
+            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
+            slot_remap = None
+        else:
+            prefill_empty_slots = None
+            slot_remap = self._decode_state_slot_remap(row_req_ids)
+        if not capture_slot_remap:
+            slot_remap = None
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1138,6 +1207,9 @@ class TTModelRunner:
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[logitsprocs],
             generators_list=[generators],
+            # Destination state slot per row. Without it a stateful model falls back to
+            # ``range(N)`` and a prefill overwrites a decoding request's state. Stateless: ignored.
+            prefill_empty_slots=prefill_empty_slots,
         )
 
     def build_model_input(
@@ -2356,16 +2428,18 @@ class TTModelRunner:
                 for s in sampling_param_dict["seed"]
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
-        if len(batch_size_per_dp) > 1:
-            empty_slots = model_input.prefill_empty_slots
-            if empty_slots is None:
-                # TODO: the model should only require DP ranks, but passing
-                # "global" user ids instead for backwards compatibility.
-                stride = self.tt_per_lane_max_num_seqs
-                empty_slots = []
-                for dp_rank, sz in enumerate(batch_size_per_dp):
-                    for i in range(int(sz)):
-                        empty_slots.append(dp_rank * stride + i)
+        # Send the slots whenever the build supplied them. Multi-rank-only before, so a DP=1
+        # prefill sent nothing and the model's ``range(N)`` default clobbered live state.
+        empty_slots = model_input.prefill_empty_slots
+        if empty_slots is None and len(batch_size_per_dp) > 1:
+            # TODO: the model should only require DP ranks, but passing
+            # "global" user ids instead for backwards compatibility.
+            stride = self.tt_per_lane_max_num_seqs
+            empty_slots = []
+            for dp_rank, sz in enumerate(batch_size_per_dp):
+                for i in range(int(sz)):
+                    empty_slots.append(dp_rank * stride + i)
+        if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
 
         if self.request_specific_rope:
