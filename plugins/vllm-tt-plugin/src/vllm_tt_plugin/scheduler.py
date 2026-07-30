@@ -6,10 +6,17 @@ from enum import Enum
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.request import Request
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
+
+# Side-channel on Request: number of in-flight async output frames to drop
+# after TT KV-preemption. Sized exactly to ``num_output_placeholders`` at
+# preempt time (not a fixed queue depth): over-discarding drops the
+# post-resume re-prefill sample and leaves phantom placeholders.
+_TT_ASYNC_DISCARD_ATTR = "_tt_async_frames_to_discard"
 
 
 class TTSchedulingMode(Enum):
@@ -133,6 +140,9 @@ class TTScheduler(AsyncScheduler):
         try:
             result = super().schedule()
         finally:
+            # Only restore decode requests that were not preempted while hidden
+            # is impossible today (they are not in ``running`` for allocate);
+            # keep prior behavior: always re-attach the saved decode list.
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
@@ -161,3 +171,96 @@ class TTScheduler(AsyncScheduler):
                 self.running.extend(partial_prefills)
 
         return result
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Preempt and drop in-flight async frames (TT-specific).
+
+        Upstream keeps placeholders on ordinary preempt because the request is
+        not re-scheduled in the same step (vllm#38624). On TT, a preempted
+        request is immediately eligible for full re-prefill while batch-queued
+        / async-decode frames are still outstanding, so those frames must be
+        discarded or they race with the re-prefill sample token.
+        """
+        pending = int(getattr(request, "num_output_placeholders", 0) or 0)
+        super()._preempt_request(request, timestamp)
+        if not self.scheduler_config.async_scheduling:
+            return
+        # At least one frame may still be in the batch queue even when the
+        # placeholder counter already drained to 0 (output applied, execute
+        # not yet finalized). Cap at tracked placeholders when known, else 1.
+        pending = max(pending, 1)
+        request.num_output_placeholders = 0
+        # Frame counter only (do not also set discard_latest_async_tokens).
+        setattr(
+            request,
+            _TT_ASYNC_DISCARD_ATTR,
+            int(getattr(request, _TT_ASYNC_DISCARD_ATTR, 0) or 0) + pending,
+        )
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Advance computed tokens, then account async placeholders.
+
+        Base vLLM sets
+        ``is_prefill_chunk = computed < num_tokens + num_output_placeholders``.
+        After KV-preempt + re-prefill, leftover placeholders keep that flag
+        True even when the prompt is fully computed, so AsyncScheduler skips
+        the placeholder ``+1`` while the TT chunked-prefill path still returns
+        a sample token → ``num_output_placeholders`` underflow (same class as
+        upstream vllm#35755). Classify prefill chunks by prompt progress only.
+        """
+        # Grandparent advances num_computed_tokens / encoder bookkeeping.
+        Scheduler._update_after_schedule(self, scheduler_output)
+
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            request.is_prefill_chunk = request.num_computed_tokens < request.num_tokens
+
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.is_prefill_chunk:
+                continue
+
+            scheduler_output.pending_structured_output_tokens |= (
+                request.use_structured_output and request.num_output_placeholders > 0
+            )
+            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            request.num_output_placeholders += 1 + cur_num_spec_tokens
+            request.spec_token_ids = self._spec_token_placeholders
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        left = int(getattr(request, _TT_ASYNC_DISCARD_ATTR, 0) or 0)
+        if left > 0:
+            setattr(request, _TT_ASYNC_DISCARD_ATTR, left - 1)
+            return [], False
+        if request.discard_latest_async_tokens:
+            request.discard_latest_async_tokens = False
+            return [], False
+        # Stale async frame while the request sits preempted in the waiting
+        # queue (before re-prefill makes it RUNNING again).
+        if request.status == RequestStatus.PREEMPTED:
+            request.num_output_placeholders = 0
+            return [], False
+
+        status_before_update = request.status
+        new_token_ids, stopped = Scheduler._update_request_with_output(
+            self, request, new_token_ids
+        )
+
+        request.num_output_placeholders -= len(new_token_ids)
+        if request.num_output_placeholders < 0:
+            # Last-resort clamp: must not kill EngineCore under residual races.
+            logger.error(
+                "TTScheduler: clamping num_output_placeholders=%s for req=%s",
+                request.num_output_placeholders,
+                request.request_id,
+            )
+            request.num_output_placeholders = 0
+
+        if status_before_update == RequestStatus.RUNNING:
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens - request.num_output_placeholders
+            )
+        return new_token_ids, stopped
