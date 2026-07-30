@@ -502,6 +502,22 @@ Models that do not opt in stay on the legacy `Generator` path: uniform
 single-group KV cache, one page table, and no behavioral change. The plugin only
 sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
 
+### KV cache ownership
+
+The TT model **owns** its KV cache. At `initialize_kv_cache` time the runner
+builds a `per_layer_specs` list (each entry `(shape, dtype, tensor_idx)`) and
+calls the model's allocate method:
+
+- hybrid models → `allocate_kv_cache_per_layer(per_layer_specs)`
+- legacy/uniform models → `allocate_kv_cache(shape, dtype, num_layers)`
+
+These calls **build AND install** the cache directly onto the model (each
+attention layer's `layer_past`). The runner keeps **no** `kv_caches` handle, and
+the cache is **never** threaded back into the forwards — `prefill_forward`,
+`decode_forward`, `warmup_model_prefill`, and `warmup_model_decode` no longer
+take a `kv_cache` argument. The `tensor_idx` element lets hybrid models share a
+single DRAM buffer across the layers listed together in a `KVCacheTensor`.
+
 Hybrid models are not yet supported with `data_parallel_size > 1`; the DP
 merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models
 until per-group DP gather lands.

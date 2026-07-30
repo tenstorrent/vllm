@@ -512,7 +512,6 @@ class TTAsyncDecodeController:
         kwargs: dict[str, Any] = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
-            "kv_cache": runner.kv_caches,
             "start_pos": model_input.input_positions,
         }
         # Hybrid attention models route per-layer block tables; the

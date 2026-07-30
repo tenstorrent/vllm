@@ -87,7 +87,8 @@ def runner():
 
     # Default: single-attention model, 32 layers
     r.model_config.get_num_layers_by_block_type.return_value = 32
-    r.model.allocate_kv_cache.return_value = "kv-caches-sentinel"
+    # The model now OWNS its KV cache: allocate builds AND installs it on the
+    # model and the runner keeps no handle, so the return value is unused.
     return r
 
 
@@ -127,7 +128,6 @@ def test_kv_cache_shape_when_kv_heads_below_tp(runner):
 
 
 def test_initialize_single_group_calls_model_allocate(runner):
-    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
     spec = _full_spec(num_kv_heads=8, head_size=128, block_size=64)
     config = _config([KVCacheGroupSpec(layer_names=["l.0"], kv_cache_spec=spec)])
 
@@ -142,7 +142,9 @@ def test_initialize_single_group_calls_model_allocate(runner):
     assert all(
         s == (expected_shape, torch.bfloat16, i) for i, s in enumerate(per_layer_specs)
     )
-    assert runner.kv_caches == "kv-caches-sentinel"
+    # The model OWNS the cache: allocate installs it on the model and the
+    # runner keeps no ``kv_caches`` handle.
+    assert not hasattr(runner, "kv_caches")
     assert runner.kv_cache_config is config
 
 
@@ -153,7 +155,6 @@ def test_initialize_multi_group_assigns_specs_per_layer(runner):
     ``kv_cache_tensors`` sharing layout (one tensor per unique buffer).
     """
     runner.model_config.get_num_layers_by_block_type.return_value = 6
-    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
     full = _full_spec(num_kv_heads=4, head_size=128, block_size=64)
     sliding = _sliding_spec(
         num_kv_heads=4, head_size=128, block_size=64, sliding_window=1024
@@ -229,6 +230,8 @@ def test_initialize_stores_config_even_when_not_dp_rank_zero(runner):
     runner.initialize_kv_cache(config)
 
     runner.model.allocate_kv_cache.assert_not_called()
+    runner.model.allocate_kv_cache_per_layer.assert_not_called()
+    assert not hasattr(runner, "kv_caches")
     assert runner.kv_cache_config is config
     assert runner.input_batch is not None
 
@@ -323,7 +326,6 @@ def test_initialize_creates_one_block_table_per_group(runner, monkeypatch):
     monkeypatch.setattr(runner_module, "InputBatch", fake_input_batch)
 
     runner.model_config.get_num_layers_by_block_type.return_value = 6
-    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
     full = _full_spec()
     sliding = _sliding_spec()
     config = _config(
@@ -386,7 +388,6 @@ def test_initialize_mixed_block_sizes_threaded_per_group(runner, monkeypatch):
     monkeypatch.setattr(runner_module, "InputBatch", fake_input_batch)
 
     runner.model_config.get_num_layers_by_block_type.return_value = 2
-    runner.model.allocate_kv_cache_per_layer.return_value = "kv-caches-sentinel"
     g1 = KVCacheGroupSpec(
         layer_names=["model.layers.0.self_attn"],
         kv_cache_spec=_full_spec(block_size=32),

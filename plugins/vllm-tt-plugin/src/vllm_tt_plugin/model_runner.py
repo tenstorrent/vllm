@@ -358,7 +358,12 @@ class TTModelRunner:
         if self.parallel_config.data_parallel_rank_local != 0:
             return
 
-        self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        # The model owns its KV cache: ``_allocate_kv_caches`` calls the
+        # model's ``allocate_kv_cache_per_layer`` / ``allocate_kv_cache``,
+        # which build AND install the cache onto the model (each attention
+        # layer's ``layer_past``). The runner keeps no handle and never
+        # threads a cache back into the forwards.
+        self._allocate_kv_caches(kv_cache_config)
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -386,12 +391,16 @@ class TTModelRunner:
         num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
-    def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> Any:
-        """Allocate KV cache tensors, falling back to legacy uniform API.
+Lo    def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> None:
+        """Build and install the model's KV cache, falling back to legacy API.
 
-        Builds a ``per_layer_specs`` list of ``(shape, dtype)`` tuples — one
-        entry per attention layer in model layer-index order. Hybrid models
-        opt in to per-layer allocation by exposing
+        Builds a ``per_layer_specs`` list of ``(shape, dtype, tensor_idx)``
+        tuples — one entry per attention layer in model layer-index order —
+        then calls the model's allocate method for its side effect: the model
+        BUILDS AND INSTALLS the cache on itself (the model owns it). The runner
+        keeps NO handle and never passes the cache into the forwards.
+
+        Hybrid models opt in to per-layer allocation by exposing
         ``allocate_kv_cache_per_layer(per_layer_specs)``; legacy models keep
         the older ``allocate_kv_cache(shape, dtype, num_layers)`` signature
         and we adapt to it here, asserting the per-layer specs are uniform.
@@ -402,7 +411,8 @@ class TTModelRunner:
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
 
         if hasattr(self.model, "allocate_kv_cache_per_layer"):
-            return self.model.allocate_kv_cache_per_layer(per_layer_specs)
+            self.model.allocate_kv_cache_per_layer(per_layer_specs)
+            return
 
         # Legacy ``allocate_kv_cache(shape, dtype, num_layers)`` API: every
         # layer must have the same shape/dtype. The third tuple element is
@@ -416,7 +426,7 @@ class TTModelRunner:
                     "allocate_kv_cache; hybrid attention models must "
                     "override allocate_kv_cache_per_layer."
                 )
-        return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
+        self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
 
     def _block_tables_per_layer(
         self, block_tables_per_group: list[torch.Tensor]
@@ -2127,7 +2137,6 @@ class TTModelRunner:
         kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
-            "kv_cache": self.kv_caches,
             "enable_trace": self.trace_mode in ["all"],
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
@@ -2740,11 +2749,9 @@ class TTModelRunner:
         sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert sample_on_device_mode in (None, "all", "decode_only")
         prefill_kwargs = dict(
-            kv_cache=self.kv_caches,
             can_sample_on_device=sample_on_device_mode == "all",
         )
         decode_kwargs = dict(
-            kv_cache=self.kv_caches,
             max_batch_size=self.tt_max_batch_size,
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
