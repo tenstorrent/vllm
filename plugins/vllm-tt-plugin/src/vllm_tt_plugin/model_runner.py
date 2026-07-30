@@ -2097,11 +2097,11 @@ class TTModelRunner:
         if not is_decode and model_input.prompt_lens is not None:
             lane_batch = self.lane_batch
             prompt_lens = np.asarray(model_input.prompt_lens)
-            num_prompt_tokens = np.array(
-                [lane_batch.num_prompt_tokens[row] for row in scheduled_rows],
+            num_tokens = np.array(
+                [lane_batch.num_tokens[row] for row in scheduled_rows],
                 dtype=np.int64,
             )
-            intermediate_mask = prompt_lens < num_prompt_tokens
+            intermediate_mask = prompt_lens < num_tokens
 
             if intermediate_mask.any():
                 return self._build_chunked_prefill_output(
@@ -2260,8 +2260,8 @@ class TTModelRunner:
         if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
             num_reqs = self.input_batch.num_reqs
             prompt_lens = np.asarray(fwd.model_input.prompt_lens)
-            num_prompt_tokens = self.input_batch.num_prompt_tokens[:num_reqs]
-            intermediate_mask = prompt_lens < num_prompt_tokens
+            num_tokens = self.input_batch.num_tokens[:num_reqs]
+            intermediate_mask = prompt_lens < num_tokens
 
             if intermediate_mask.any():
                 output_req_ids = list(self.input_batch.req_ids[:num_reqs])
