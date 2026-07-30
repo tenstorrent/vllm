@@ -2,9 +2,8 @@
 
 Async device sampling deliberately lets vLLM's host token state trail the TT
 device by one decode step. Consequently, only the vLLM runner can decide
-whether host tensors are authoritative. A contract-aware tt-metal generator
-(`decode_input_update_contract >= 1`) receives four independent boolean
-commands on every decode:
+whether host tensors are authoritative. The paired tt-metal generator receives
+four independent boolean commands on every decode:
 
 | Command | Effect |
 | --- | --- |
@@ -13,10 +12,10 @@ commands on every decode:
 | `reload_sampling_params` | Upload temperature, top-k/top-p, penalties, seeds, and logprob configuration. |
 | `reset_sampling_state` | Rebuild mutable penalty/RNG state for the current layout. |
 
-`reset_batch` and generator-local tensor/mode comparisons are legacy fallback
-only. `slot_remap` remains data: it is composed by vLLM until a device-sampling
-submission consumes it, then tt-metal applies it once before sampling state is
-reset or advanced.
+`reset_batch` no longer decides reload behavior in the vLLM path. `slot_remap`
+remains data: it is composed by vLLM until a device-sampling submission
+consumes it, then tt-metal applies it once before sampling state is reset or
+advanced.
 
 ## Transition table
 
@@ -27,6 +26,7 @@ reset or advanced.
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if changed | keep | keep |
+| Model without `supports_async_decode` | reload every step | no | on transition | on transition |
 
 Any transition requiring a full input or sampling-state update drains pending
 decode work first. Page-table-only refresh is overlap-safe because page tables
@@ -61,10 +61,13 @@ empty token list before scheduler update. vLLM's scheduler independently
 ignores outputs for requests that no longer exist, so cancelled speculative
 work cannot append runner state or emit an extra client token.
 
-## Compatibility
+## Deployment coupling
 
-New vLLM checks `decode_input_update_contract` before sending the four kwargs
-or allowing host-stale overlap. Old tt-metal generators continue on the
-drain-before-next-step legacy path. New tt-metal generators keep their previous
-heuristics only when all four kwargs are absent, allowing the tt-metal change to
-land before the vLLM change.
+The vLLM and tt-metal changes are one required contract and should be deployed
+as a pinned pair. vLLM always sends all four commands; there is no per-model
+contract-version negotiation or fallback to an older tt-metal generator.
+`model_capabilities["supports_async_decode"]` remains the sole per-model gate.
+It both controls async scheduling and certifies that sampled-token feedback can
+remain device-resident between decode steps. Models without it still receive
+the explicit four-command contract, but vLLM conservatively requests a full
+forward-input reload on every step.
