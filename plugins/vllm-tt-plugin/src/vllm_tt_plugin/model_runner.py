@@ -211,6 +211,13 @@ class TTModelRunner:
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
+        # Gathered-DP results cross the engine/worker boundary as tensors.
+        # Keep the corresponding request-object identities local so an
+        # abort+resubmit that reuses a request ID cannot accept an old result.
+        self._next_dp_request_state_snapshot_id = 0
+        self._dp_request_state_snapshots: dict[
+            int, tuple[CachedRequestState, ...]
+        ] = {}
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
@@ -1114,7 +1121,14 @@ class TTModelRunner:
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
-        slot_remap = input_batch.pop_slot_remap() if capture_slot_remap else None
+        # Slot remap belongs to mutable device-sampling state. Keep it sticky
+        # across host-sampling steps and consume it only after an actual
+        # device-sampling decode submission.
+        slot_remap = (
+            input_batch.peek_slot_remap()
+            if capture_slot_remap and not is_prompt and perform_device_sampling
+            else None
+        )
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1153,8 +1167,17 @@ class TTModelRunner:
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """
-        # Update cached state
+        # Update scheduler-owned membership before applying a drained async
+        # output. Finished/resumed requests must reject the speculative token;
+        # continuing requests need the accepted token appended before current
+        # host tensors are built. A request may remain live while unscheduled,
+        # so its captured request state must still receive the accepted token.
+        # Captured request-object identity separately protects abort+resubmit
+        # with the same request ID.
         self._update_states(scheduler_output)
+        skipped = set(scheduler_output.finished_req_ids)
+        skipped.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+        self.async_decode.apply_ready_completed_decode_steps(skip_req_ids=skipped)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
@@ -1960,18 +1983,22 @@ class TTModelRunner:
             )
 
         lane_batch = self.lane_batch
-        self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
                 scheduler_output, None
             )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
-            self.async_decode.wait_for_all_pending_async_steps()
+            self.async_decode.wait_for_all_pending_async_steps(
+                apply_completed=False
+            )
 
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
         )
+        skipped = set(scheduler_output.finished_req_ids)
+        skipped.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+        self.async_decode.apply_ready_completed_decode_steps(skip_req_ids=skipped)
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
 
@@ -2094,14 +2121,15 @@ class TTModelRunner:
         # thread. In steady decode mode we intentionally allow one step of
         # lag between host application and device submission, but we never let
         # completed work pile up unbounded.
-        self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(
                 scheduler_output, None
             )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
-            self.async_decode.wait_for_all_pending_async_steps()
+            self.async_decode.wait_for_all_pending_async_steps(
+                apply_completed=False
+            )
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
@@ -2373,8 +2401,11 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
+            self.async_decode.note_prefill_submitted()
             return tt_out
-        return self.model.prefill_forward(**kwargs)
+        tt_out = self.model.prefill_forward(**kwargs)
+        self.async_decode.note_prefill_submitted()
+        return tt_out
 
     def _forward_with_model_input(
         self,
@@ -2488,6 +2519,7 @@ class TTModelRunner:
         int,
         list[str],
         dict[str, int],
+        int | None,
     ]:
         """Build the per-rank DP payload consumed by gather orchestration.
 
@@ -2501,6 +2533,7 @@ class TTModelRunner:
         needs_logprobs = 0
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
+        request_state_snapshot_id: int | None = None
         if scheduler_output is not None:
             model_input = self.build_model_input(scheduler_output, grammar_output)
             if model_input is not None:
@@ -2513,6 +2546,13 @@ class TTModelRunner:
                 num_reqs = self.input_batch.num_reqs
                 req_ids = list(self.input_batch.req_ids[:num_reqs])
                 req_id_to_index = dict(self.input_batch.req_id_to_index)
+                request_state_snapshot_id = (
+                    self._next_dp_request_state_snapshot_id
+                )
+                self._next_dp_request_state_snapshot_id += 1
+                self._dp_request_state_snapshots[request_state_snapshot_id] = (
+                    tuple(self.requests[req_id] for req_id in req_ids)
+                )
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = (
             int(model_input.grammar_bitmask[0] is not None) if model_input else 0
@@ -2527,6 +2567,7 @@ class TTModelRunner:
             needs_logprobs,
             req_ids,
             req_id_to_index,
+            request_state_snapshot_id,
         )
 
     def submit_dp_execution(
@@ -2566,6 +2607,7 @@ class TTModelRunner:
         logprobs_lists: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        request_state_snapshot_id: int | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result to runner state and build output.
 
@@ -2574,12 +2616,34 @@ class TTModelRunner:
         """
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
-        return self.apply_and_build_runner_output(
+        request_states = (
+            self._dp_request_state_snapshots.pop(request_state_snapshot_id)
+            if request_state_snapshot_id is not None
+            else None
+        )
+        invalid_req_ids = (
+            {
+                req_id
+                for req_id, captured_state in zip(req_ids or (), request_states)
+                if self.requests.get(req_id) is not captured_state
+            }
+            if request_states is not None
+            else set()
+        )
+        output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            request_states=request_states,
         )
+        # Identity-invalid rows belong to an aborted/replaced request. Keep
+        # their wire positions, but expose no generated token so the scheduler
+        # cannot apply an old in-flight result to a new request with the same
+        # string ID.
+        for req_id in invalid_req_ids:
+            output.sampled_token_ids[output.req_id_to_index[req_id]] = []
+        return output
 
     def _get_output_tokens(
         self,
@@ -2861,6 +2925,7 @@ class TTModelRunner:
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
@@ -2904,6 +2969,8 @@ class TTModelRunner:
         assert req_ids is not None
         captured_req_ids = req_ids
         for req_idx, req_id in enumerate(captured_req_ids):
+            if skip_req_ids is not None and req_id in skip_req_ids:
+                continue
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
@@ -2932,6 +2999,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        request_states: tuple[CachedRequestState, ...] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -2941,6 +3009,7 @@ class TTModelRunner:
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
+            request_states=request_states,
         )
         return self._build_runner_output(
             sampled_token_ids=sampled_token_ids,

@@ -245,10 +245,27 @@ class InputBatch:
         # from slot j after condense.  Identity when nothing moved.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
 
-    def pop_slot_remap(self) -> torch.Tensor:
-        """Return pending slot remap and reset to identity."""
-        remap = self._slot_remap
+    def peek_slot_remap(self) -> torch.Tensor:
+        """Return the pending slot remap without consuming it.
+
+        A batch may temporarily fall back to host sampling. In that case the
+        device sampler has not consumed the remap, so clearing it would lose the
+        RNG/state move required when device sampling resumes.
+        """
+        return self._slot_remap.clone()
+
+    def commit_slot_remap(self) -> None:
+        """Mark the pending remap as consumed by a device-sampling submit."""
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
+
+    def pop_slot_remap(self) -> torch.Tensor:
+        """Legacy eager-consume helper.
+
+        New decode submission code uses :meth:`peek_slot_remap` and commits only
+        after device sampling actually accepts the update.
+        """
+        remap = self.peek_slot_remap()
+        self.commit_slot_remap()
         return remap
 
     @property
@@ -1142,7 +1159,12 @@ class TTLaneInputBatch(InputBatch):
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
         reset_batch = runner._decode_layout_changed_since_last_decode
         runner._decode_layout_changed_since_last_decode = False
-        slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
+        # Device-sampling state owns this remap. Merely building a host-sampling
+        # input must not consume it; submit_decode commits it after a successful
+        # contract-aware device-sampling submission.
+        slot_remap = (
+            lane_batch.peek_slot_remap() if perform_device_sampling else None
+        )
 
         return TTModelInput(
             input_tokens=input_tokens,

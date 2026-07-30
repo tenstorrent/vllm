@@ -376,14 +376,16 @@ class TTWorker(WorkerBase):
         int,
         list[str],
         dict[str, int],
+        int | None,
     ]:
         """Build the local DP payload consumed by gathered-DP orchestration.
 
         Returns `(local_input, max_blocks, has_structured_input,
         has_penalties, reset_batch, can_sample_device, needs_logprobs,
-        req_ids, req_id_to_index)`, where `local_input` is this rank's
-        TT model input (or `None`) and the remaining fields are the
-        per-rank metadata consumed by gathered-DP orchestration.
+        req_ids, req_id_to_index, request_state_snapshot_id)`, where
+        `local_input` is this rank's TT model input (or `None`) and the
+        remaining fields are the per-rank metadata consumed by gathered-DP
+        orchestration.
         """
         return self.model_runner.prepare_dp_model_input(
             scheduler_output, grammar_output
@@ -412,6 +414,18 @@ class TTWorker(WorkerBase):
         return self.model_runner.can_attempt_steady_decode_from_scheduler(
             scheduler_output, grammar_output
         )
+
+    def commit_device_sampling_slot_updates(self) -> None:
+        """Commit the local remap after a gathered device-sampling submit."""
+        self.model_runner.input_batch.commit_slot_remap()
+
+    def note_dp_decode_submitted(self, device_sampling: bool) -> None:
+        """Mirror merged decode residency on this rank's overlap controller."""
+        self.model_runner.async_decode.note_dp_decode_submitted(device_sampling)
+
+    def note_dp_prefill_submitted(self) -> None:
+        """Invalidate this rank's decode residency after merged prefill."""
+        self.model_runner.async_decode.note_prefill_submitted()
 
     def build_dp_decode_gather_input(
         self,
@@ -476,6 +490,7 @@ class TTWorker(WorkerBase):
         logprobs_lists: Optional["LogprobsLists"] = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        request_state_snapshot_id: int | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result through the worker facade.
 
@@ -487,6 +502,7 @@ class TTWorker(WorkerBase):
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            request_state_snapshot_id=request_state_snapshot_id,
         )
 
     # ---- Destructor (used to close devices) ----

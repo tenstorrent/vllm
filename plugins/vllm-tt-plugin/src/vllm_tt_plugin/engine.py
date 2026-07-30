@@ -77,6 +77,7 @@ class DPGatherHandle:
     any_needs_logprobs: bool
     req_ids: list[str]
     req_id_to_index: dict[str, int]
+    request_state_snapshot_id: int | None
 
 
 class TTDPEngineCoreProc(DPEngineCoreProc):
@@ -404,21 +405,21 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             model_output = self.dp_gather_finalize(handle)
             if handle.scheduler_output is None:
                 return {}
+            # Match the synchronous/upstream engine ordering: aborts that
+            # arrived while the device step was in flight must update
+            # scheduler membership before its old output is applied.
+            self._process_aborts_queue()
             return self.scheduler.update_from_output(
                 handle.scheduler_output, model_output
             )
 
-        # Always finalize the previous step before submitting the next one.
-        #
-        # The submit reads ``input_batch.token_ids_cpu`` to build the decode
-        # input for the next step; that table is only updated once
-        # ``apply_dp_execution_result`` runs inside ``_finalize_previous``. The
-        # original overlap path (submit-next then finalize-prev) therefore
-        # built the next step's input from stale token state, so the device
-        # re-sampled the previous step's near-deterministic position — most
-        # visibly as doubled ``<|end|>`` and ``<|start|>assistant`` tokens,
-        # which break harmony parsing and silently null out chat responses.
-        finalize_before_submit = prev_handle is not None
+        # A contract-aware steady device decode deliberately builds the next
+        # step while host token/position state is one step behind: its explicit
+        # update plan preserves device-resident token/position buffers (and may
+        # refresh only page tables). Every transition requiring host inputs or
+        # sampling-state changes reports ``current_overlap_ok=False`` and
+        # drains first, re-establishing host authority before submission.
+        finalize_before_submit = prev_handle is not None and not current_overlap_ok
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
         if finalize_before_submit:
@@ -504,6 +505,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             local_needs_logprobs,
             req_ids,
             req_id_to_index,
+            request_state_snapshot_id,
         ) = all_local_inputs
         max_blocks_decode = None
         any_structured_inputs = False
@@ -703,6 +705,20 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 ),
             )
             future = _unwrap_single_worker_future(collective_future)
+            if is_decode:
+                self.model_executor.collective_rpc(
+                    "note_dp_decode_submitted",
+                    args=(all_sample_device,),
+                )
+            else:
+                self.model_executor.collective_rpc("note_dp_prefill_submitted")
+            if is_decode and all_sample_device:
+                # Each DP rank built its remap from local persistent state.
+                # Consume it only after the globally merged device-sampling
+                # submission has been accepted.
+                self.model_executor.collective_rpc(
+                    "commit_device_sampling_slot_updates"
+                )
         else:
             future = self._completed_dp_gather_future()
 
@@ -715,6 +731,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             any_needs_logprobs=any_needs_logprobs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            request_state_snapshot_id=request_state_snapshot_id,
         )
 
     def dp_gather_finalize(self, handle: DPGatherHandle) -> ModelRunnerOutput:
@@ -753,6 +770,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     my_logprobs_val,
                     handle.req_ids,
                     handle.req_id_to_index,
+                    handle.request_state_snapshot_id,
                 ),
             )[0]
             return output
