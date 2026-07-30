@@ -18,7 +18,7 @@ from vllm_tt_plugin.structured_output import has_structured_outputs
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm_tt_plugin.input_batch import CachedRequestState
-    from vllm_tt_plugin.model_input import TTModelInput
+    from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTModelInput
     from vllm_tt_plugin.model_runner import TTModelRunner
 
 
@@ -31,6 +31,7 @@ class TTDecodeSubmission:
     batch_size_per_dp: list[int]
     sampling_params: Any
     perform_device_sampling: bool
+    reload_plan: TTDecodeReloadPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class SubmittedStepContext:
     submit_time_ns: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class CompletedDecodeStep:
     """Decode output that has completed readback but is not yet applied."""
 
@@ -69,6 +70,7 @@ class CompletedDecodeStep:
     logprobs: LogprobsLists | None
     context: SubmittedStepContext
     completion_time_ns: int
+    runner_output: ModelRunnerOutput | None = None
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
@@ -160,8 +162,12 @@ class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
             context=self._context,
             scheduled_rows=self._scheduled_rows,
         )
+        runner_output = self._controller.build_runner_output_from_completed_step(
+            completed
+        )
+        completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
-        return self._controller.build_runner_output_from_completed_step(completed)
+        return runner_output
 
 
 class AsyncTTDPGatherOutput(DeferredDecodeOutput):
@@ -207,6 +213,103 @@ class TTAsyncDecodeController:
 
     def __init__(self, runner: TTModelRunner):
         self.runner = runner
+        # Decode-residency state is committed at submission, not readback. An
+        # overlapped device decode may deliberately leave host tokens one step
+        # behind, so only this submitted-device history can decide what is safe
+        # to reload on the next step.
+        self._decode_chain_valid = False
+        self._previous_device_sampling: bool | None = None
+        self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
+
+    @staticmethod
+    def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            table.detach().clone() for table in model_input.block_tables_per_group
+        )
+
+    def note_prefill_submitted(self) -> None:
+        """Invalidate decode-resident token/position state after a prefill."""
+        self._decode_chain_valid = False
+
+    def note_dp_decode_submitted(self, device_sampling: bool) -> None:
+        """Mirror the merged device submission on every DP rank controller.
+
+        Only the device rank executes ``decode_forward`` and owns page-table
+        snapshots, but every rank participates in the pre-submit overlap vote.
+        Mirroring chain/mode state keeps that vote from treating a first decode
+        or host→device transition as steady.
+        """
+        self._decode_chain_valid = True
+        self._previous_device_sampling = device_sampling
+
+    def _page_tables_changed(self, model_input: TTModelInput) -> bool:
+        current = model_input.block_tables_per_group
+        previous = self._submitted_page_tables
+        return (
+            previous is None
+            or len(previous) != len(current)
+            or any(not torch.equal(old, new) for old, new in zip(previous, current))
+        )
+
+    def plan_decode_reload(self, model_input: TTModelInput) -> TTDecodeReloadPlan:
+        """Return the explicit update plan for the next device submission.
+
+        Host sampling always reloads host-authoritative forward inputs. Device
+        sampling retains token/position state only across an uninterrupted,
+        layout-stable decode chain. Page tables are tracked independently so a
+        newly allocated KV block can be copied without clobbering the
+        device-produced token and advanced position.
+        """
+        from vllm_tt_plugin.model_input import TTDecodeReloadPlan
+
+        device_sampling = model_input.perform_device_sampling
+        sampling_mode_changed = (
+            self._previous_device_sampling is not None
+            and self._previous_device_sampling != device_sampling
+        )
+        transition = (
+            not self._decode_chain_valid
+            or model_input.reset_batch
+            or sampling_mode_changed
+        )
+        reload_inputs = (not device_sampling) or transition
+        sampling_reset = device_sampling and transition
+        return TTDecodeReloadPlan(
+            reload_inputs=reload_inputs,
+            reload_page_table=(
+                not reload_inputs and self._page_tables_changed(model_input)
+            ),
+            reload_sampling_params=sampling_reset,
+            reset_sampling_state=sampling_reset,
+        )
+
+    def commit_decode_submission(
+        self,
+        model_input: TTModelInput,
+        reload_plan: TTDecodeReloadPlan,
+    ) -> None:
+        """Commit residency state after ``decode_forward`` accepted the step."""
+        self._decode_chain_valid = True
+        self._previous_device_sampling = model_input.perform_device_sampling
+        if (
+            reload_plan.reload_inputs
+            or reload_plan.reload_page_table
+            or self._submitted_page_tables is None
+        ):
+            self._submitted_page_tables = self._clone_page_tables(model_input)
+
+    def scheduler_preserves_decode_layout(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        """Whether scheduling this step leaves every persistent decode row intact.
+
+        This prediction happens before ``_update_states``. It closes the old
+        gap where a new/finished/preempted request was only noticed after the
+        next decode had already been allowed to overlap with stale host input.
+        """
+        current_req_ids = set(self.runner.input_batch.req_id_to_index)
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        return current_req_ids == scheduled_req_ids
 
     def capture_submitted_step_context(
         self, req_ids: list[str] | None = None
@@ -234,6 +337,25 @@ class TTAsyncDecodeController:
 
     def steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
         runner = self.runner
+        contract_version = int(
+            getattr(
+                getattr(runner, "model", None),
+                "decode_input_update_contract",
+                0,
+            )
+        )
+        is_non_device_dp_rank = (
+            dp_gather
+            and runner.parallel_config.data_parallel_rank_local != 0
+        )
+        if contract_version < 1 and not is_non_device_dp_rank:
+            # Legacy generators may still run asynchronously, but must drain
+            # each result before building the next host input because their
+            # model-local reload heuristics cannot be proven host-stale-safe.
+            # Gathered non-device ranks deliberately have no model; their vote
+            # covers scheduler/layout state while each device-local rank 0
+            # supplies the capability vote.
+            return False
         if dp_gather:
             if not runner.scheduler_config.async_scheduling:
                 return False
@@ -257,6 +379,13 @@ class TTAsyncDecodeController:
             cached_reqs.resumed_req_ids
         )
         if is_prompt or runner._decode_layout_changed_since_last_decode:
+            return False
+        if (
+            not self._decode_chain_valid
+            or self._previous_device_sampling is not True
+        ):
+            return False
+        if not self.scheduler_preserves_decode_layout(scheduler_output):
             return False
         # Structured outputs are detected from the scheduler state, not from a
         # prepared bitmask: the non-DP/lane paths now defer grammar to sample
@@ -337,7 +466,7 @@ class TTAsyncDecodeController:
         max_num_logprobs = model_input.max_num_logprobs[0]
         if max_num_logprobs is not None:  # noqa: SIM103
             return False
-        return True
+        return self.plan_decode_reload(model_input).overlap_safe
 
     def enqueue_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
         with self.runner._steady_decode_lock:
@@ -369,12 +498,14 @@ class TTAsyncDecodeController:
                 completed.append(self.runner._completed_decode_steps.popleft())
         return completed
 
-    def apply_ready_completed_decode_steps(self) -> None:
+    def apply_ready_completed_decode_steps(
+        self, *, skip_req_ids: set[str] | None = None
+    ) -> None:
         for completed in self.drain_completed_decode_steps():
-            self.apply_completed_decode_step(completed)
+            self.apply_completed_decode_step(completed, skip_req_ids=skip_req_ids)
         self.prune_finished_async_events()
 
-    def wait_for_all_pending_async_steps(self) -> None:
+    def wait_for_all_pending_async_steps(self, *, apply_completed: bool = True) -> None:
         # Drive each pending readback to completion here rather than blocking on
         # its event: the engine has not popped these futures yet (and on 0.22
         # will not until after this returns), so nothing else will set the
@@ -384,7 +515,8 @@ class TTAsyncDecodeController:
             steps = list(self.runner._pending_async_steps)
         for step in steps:
             step.ensure_finalized()
-        self.apply_ready_completed_decode_steps()
+        if apply_completed:
+            self.apply_ready_completed_decode_steps()
 
     def must_drain_pending_async_steps(
         self,
@@ -456,11 +588,35 @@ class TTAsyncDecodeController:
             req_id_to_index=completed.context.req_id_to_index,
         )
 
-    def apply_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
+    def apply_completed_decode_step(
+        self,
+        completed: CompletedDecodeStep,
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> None:
+        invalid_req_ids = set(skip_req_ids or ())
+        invalid_req_ids.update(
+            req_id
+            for req_id, captured_state in zip(
+                completed.context.req_ids,
+                completed.context.request_states,
+            )
+            if self.runner.requests.get(req_id) is not captured_state
+        )
+        # The batch queue schedules/builds the current step before consuming
+        # the prior future. Mutating the cached prior output here therefore
+        # prevents an aborted/reused request ID from receiving its old token
+        # in scheduler.update_from_output, not just in runner host state.
+        if completed.runner_output is not None:
+            for req_id in invalid_req_ids:
+                req_idx = completed.runner_output.req_id_to_index.get(req_id)
+                if req_idx is not None:
+                    completed.runner_output.sampled_token_ids[req_idx] = []
         self.runner._apply_sampled_tokens_to_state(
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             request_states=completed.context.request_states,
+            skip_req_ids=invalid_req_ids,
         )
 
     def submit_async_non_dp_decode(
@@ -566,6 +722,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
                 perform_device_sampling=perform_device_sampling,
+                reload_plan=None,
             )
 
         kwargs: dict[str, Any] = {
@@ -603,6 +760,22 @@ class TTAsyncDecodeController:
             if model_input.slot_remap is not None:
                 kwargs["slot_remap"] = model_input.slot_remap
 
+        # Versioned compatibility seam. New tt-metal generators advertise the
+        # explicit contract; old generators keep their existing reset_batch
+        # heuristics and never see unknown kwargs.
+        contract_version = int(
+            getattr(runner.model, "decode_input_update_contract", 0)
+        )
+        reload_plan = None
+        if contract_version >= 1:
+            reload_plan = self.plan_decode_reload(model_input)
+            kwargs.update(
+                reload_inputs=reload_plan.reload_inputs,
+                reload_page_table=reload_plan.reload_page_table,
+                reload_sampling_params=reload_plan.reload_sampling_params,
+                reset_sampling_state=reload_plan.reset_sampling_state,
+            )
+
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
             if any(
@@ -626,6 +799,13 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
+        if reload_plan is not None:
+            self.commit_decode_submission(model_input, reload_plan)
+        if (
+            perform_device_sampling
+            and runner.parallel_config.data_parallel_size == 1
+        ):
+            runner.input_batch.commit_slot_remap()
         read_events = None
         if async_read:
             if hasattr(runner.model, "read_decode_output"):
@@ -650,6 +830,7 @@ class TTAsyncDecodeController:
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
+            reload_plan=reload_plan,
         )
 
     def finalize_decode(
