@@ -21,7 +21,10 @@ def _controller(current_req_ids=("req-0",)):
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(
             req_id_to_index={req_id: i for i, req_id in enumerate(current_req_ids)}
-        )
+        ),
+        model=SimpleNamespace(
+            model_capabilities={"supports_async_decode": True}
+        ),
     )
     return TTAsyncDecodeController(runner)
 
@@ -65,6 +68,20 @@ def test_steady_device_decode_reuses_resident_inputs():
     assert not plan.reset_sampling_state
     assert plan.overlap_safe
     assert controller._submitted_page_tables is submitted_page_tables
+
+
+def test_model_without_async_decode_support_reloads_inputs_every_step():
+    controller = _controller()
+    controller.runner.model.model_capabilities["supports_async_decode"] = False
+    _submit(controller, _decode_input(page=1))
+
+    plan = _submit(controller, _decode_input(page=1))
+
+    assert plan.reload_inputs
+    assert not plan.reload_page_table
+    assert not plan.reload_sampling_params
+    assert not plan.reset_sampling_state
+    assert not plan.overlap_safe
 
 
 def test_page_table_only_refresh_is_overlap_safe():
