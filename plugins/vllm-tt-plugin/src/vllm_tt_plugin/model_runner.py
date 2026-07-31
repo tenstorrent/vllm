@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -213,6 +214,12 @@ class TTModelRunner:
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
+        # Physical lowering for scheduler-owned Mamba/GDN state. Requests keep
+        # their compact slot while temporarily unscheduled; preemption/finish
+        # releases it and resumed prefills overwrite the newly assigned slot.
+        self._req_state_slot: dict[str, int] = {}
+        self._req_state_owner: dict[str, tuple[int, ...]] = {}
+        self._mamba_group_indices: list[int] = []
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -359,6 +366,11 @@ class TTModelRunner:
         # Number of kv_cache_groups; needed by DP gather/merge to pack
         # per-group block tables into the gather payload.
         self._num_kv_cache_groups = len(kv_cache_groups)
+        self._mamba_group_indices = [
+            i
+            for i, group in enumerate(kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
         # Cache layer→group index mapping for hybrid models so submit_*
         # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
         # without re-deriving vLLM's group construction order. Non-hybrid
@@ -368,9 +380,12 @@ class TTModelRunner:
         # == 0`` actually loads ``self.model``.
         self._layer_to_group_idx: list[int] | None = None
         if len(kv_cache_groups) > 1:
-            num_layers = self.model_config.get_num_layers_by_block_type(
-                self.parallel_config, "attention"
-            )
+            parsed_layer_indices = [
+                _parse_layer_index(layer_name)
+                for group in kv_cache_groups
+                for layer_name in group.layer_names
+            ]
+            num_layers = max(parsed_layer_indices) + 1
             mapping: list[int | None] = [None] * num_layers
             for g_idx, group in enumerate(kv_cache_groups):
                 for layer_name in group.layer_names:
@@ -404,11 +419,20 @@ class TTModelRunner:
             # full layers 1x512). We unwrap it to per-layer specs in
             # ``_build_per_layer_specs``, so accept it here too.
             if not isinstance(
-                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs)
+                group.kv_cache_spec,
+                (AttentionSpec, MambaSpec, UniformTypeKVCacheSpecs),
             ):
                 raise TypeError(
-                    f"Expected AttentionSpec/UniformTypeKVCacheSpecs for group "
+                    f"Expected AttentionSpec/MambaSpec/UniformTypeKVCacheSpecs for group "
                     f"{group.layer_names}, got {type(group.kv_cache_spec).__name__}"
+                )
+            if (
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode != "none"
+            ):
+                raise NotImplementedError(
+                    "TT supports MambaSpec cache mode 'none'; align/all require "
+                    "token-chunked prefill and state-copy support"
                 )
 
     def _kv_cache_shape(
@@ -435,8 +459,12 @@ class TTModelRunner:
         the older ``allocate_kv_cache(shape, dtype, num_layers)`` signature
         and we adapt to it here, asserting the per-layer specs are uniform.
         """
-        num_layers = self.model_config.get_num_layers_by_block_type(
-            self.parallel_config, "attention"
+        num_layers = (
+            len(self._layer_to_group_idx)
+            if self._layer_to_group_idx is not None
+            else self.model_config.get_num_layers_by_block_type(
+                self.parallel_config, "attention"
+            )
         )
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
 
@@ -447,6 +475,11 @@ class TTModelRunner:
         # layer must have the same shape/dtype. The third tuple element is
         # the tensor index, which is irrelevant for the legacy uniform
         # path (each layer gets its own buffer there).
+        if isinstance(per_layer_specs[0], dict):
+            raise NotImplementedError(
+                f"{type(self.model).__name__} must implement "
+                "allocate_kv_cache_per_layer for MambaSpec"
+            )
         shape, dtype, _ = per_layer_specs[0]
         for entry_shape, entry_dtype, _ in per_layer_specs[1:]:
             if (entry_shape, entry_dtype) != (shape, dtype):
@@ -501,7 +534,7 @@ class TTModelRunner:
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
-    ) -> list[tuple[tuple[int, int, int, int], Any, int]]:
+    ) -> list[Any]:
         """Resolve ``KVCacheConfig`` → list of ``(shape, dtype, tensor_idx)``
         per layer in model layer-index order.
 
@@ -520,6 +553,62 @@ class TTModelRunner:
         every layer gets a unique buffer and ``tensor_idx == layer_idx``.
         """
         kv_cache_groups = kv_cache_config.kv_cache_groups
+
+        if any(isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_groups):
+            spec_by_layer_name = {
+                layer_name: group.kv_cache_spec
+                for group in kv_cache_groups
+                for layer_name in group.layer_names
+            }
+            tensor_idx_by_layer_name = {
+                layer_name: tensor_idx
+                for tensor_idx, tensor in enumerate(kv_cache_config.kv_cache_tensors)
+                for layer_name in tensor.shared_by
+            }
+            per_layer: list[dict[str, Any] | None] = [None] * num_layers
+            for layer_name, spec in spec_by_layer_name.items():
+                idx = _parse_layer_index(layer_name)
+                if not 0 <= idx < num_layers:
+                    raise ValueError(
+                        f"Layer index {idx} parsed from {layer_name!r} is out "
+                        f"of range for {num_layers} cache layers"
+                    )
+                tensor_idx = tensor_idx_by_layer_name.get(layer_name)
+                if tensor_idx is None:
+                    raise ValueError(
+                        f"No KVCacheTensor.shared_by entry covers {layer_name!r}"
+                    )
+                if isinstance(spec, AttentionSpec):
+                    per_layer[idx] = {
+                        "type": "attention",
+                        "shape": self._kv_cache_shape(
+                            spec, kv_cache_config.num_blocks
+                        ),
+                        "dtype": spec.dtype,
+                        "tensor_idx": tensor_idx,
+                    }
+                elif isinstance(spec, MambaSpec):
+                    per_layer[idx] = {
+                        "type": "mamba",
+                        "shapes": spec.shapes,
+                        "dtypes": spec.dtypes,
+                        "tensor_idx": tensor_idx,
+                        # TT cannot expose heterogeneous typed views of
+                        # upstream's shared raw slab. Cache mode none is
+                        # lowered to a compact concurrency-sized state pool.
+                        "compact_slots": self.tt_max_batch_size,
+                    }
+                else:
+                    raise TypeError(
+                        f"Unsupported hybrid cache spec {type(spec).__name__} "
+                        f"for {layer_name}"
+                    )
+            missing = [i for i, entry in enumerate(per_layer) if entry is None]
+            if missing:
+                raise ValueError(
+                    f"No KV cache descriptor covers model layer indices {missing}"
+                )
+            return per_layer  # type: ignore[return-value]
 
         if len(kv_cache_groups) == 1:
             spec = kv_cache_groups[0].kv_cache_spec
@@ -610,6 +699,11 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._req_state_slot.pop(req_id, None)
+            self._req_state_owner.pop(req_id, None)
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._req_state_slot.pop(req_id, None)
+            self._req_state_owner.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -805,6 +899,92 @@ class TTModelRunner:
             num_logprobs=num_logprobs,
             enable_log_probs=num_logprobs >= 0,
         )
+
+    def _mamba_state_owner_keys(
+        self,
+        block_tables_per_group: list[torch.Tensor],
+        num_rows: int,
+    ) -> list[tuple[int, ...]] | None:
+        """Return scheduler-owned Mamba block tuples for each request row."""
+        if not self._mamba_group_indices:
+            return None
+        keys = []
+        for row in range(num_rows):
+            key = tuple(
+                int(block_tables_per_group[group_idx][row, 0].item())
+                for group_idx in self._mamba_group_indices
+            )
+            if any(block_id < 0 for block_id in key):
+                raise ValueError(
+                    f"request row {row} has invalid Mamba state blocks {key}"
+                )
+            keys.append(key)
+        return keys
+
+    def _managed_state_slots(
+        self,
+        row_req_ids: list[str],
+        owner_keys: list[tuple[int, ...]] | None,
+        *,
+        is_prompt: bool,
+    ) -> list[int] | None:
+        """Map logical Mamba ownership to compact TT state slots.
+
+        A temporarily unscheduled request remains in ``self.requests`` and
+        keeps its slot. A resumed/preempted request arrives as prefill and may
+        reuse its old physical slot, but its new Mamba block tuple replaces the
+        old logical owner before prefill overwrites the state.
+        """
+        if owner_keys is None:
+            return None
+        if len(owner_keys) != len(row_req_ids):
+            raise ValueError("Mamba owner keys and request rows are misaligned")
+
+        capacity = self.tt_per_lane_max_num_seqs
+        held = {
+            slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in self.requests
+        }
+        assigned: list[int] = []
+        for row, (req_id, owner) in enumerate(zip(row_req_ids, owner_keys)):
+            slot = self._req_state_slot.get(req_id)
+            old_owner = self._req_state_owner.get(req_id)
+            if slot is None:
+                if not is_prompt:
+                    raise RuntimeError(
+                        f"decode request {req_id!r} has Mamba blocks {owner} "
+                        "but no initialized TT state slot"
+                    )
+                preferred = row if row < capacity else None
+                if preferred is not None and preferred not in held:
+                    slot = preferred
+                else:
+                    slot = next(
+                        (candidate for candidate in range(capacity) if candidate not in held),
+                        None,
+                    )
+                if slot is None:
+                    raise RuntimeError(
+                        "no compact GDN state slot is available: "
+                        f"held={sorted(held)}, capacity={capacity}"
+                    )
+            elif old_owner != owner and not is_prompt:
+                raise RuntimeError(
+                    f"decode request {req_id!r} changed Mamba ownership "
+                    f"from {old_owner} to {owner} without a rebuilding prefill"
+                )
+
+            held.add(slot)
+            self._req_state_slot[req_id] = slot
+            self._req_state_owner[req_id] = owner
+            assigned.append(slot)
+
+        if len(set(assigned)) != len(assigned):
+            raise RuntimeError(
+                f"current Mamba requests alias compact state slots {assigned}"
+            )
+        return assigned
 
     def _prepare_model_inputs(
         self,
@@ -1114,6 +1294,21 @@ class TTModelRunner:
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
         slot_remap = input_batch.pop_slot_remap() if capture_slot_remap else None
+        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        owner_keys = self._mamba_state_owner_keys(
+            block_tables_per_group, len(row_req_ids)
+        )
+        state_slots = self._managed_state_slots(
+            row_req_ids,
+            owner_keys,
+            is_prompt=is_prompt,
+        )
+        prefill_empty_slots = state_slots if is_prompt else None
+        gdn_state_indices = (
+            torch.tensor(state_slots, dtype=torch.int32)
+            if state_slots is not None and not is_prompt
+            else None
+        )
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1137,6 +1332,8 @@ class TTModelRunner:
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[logitsprocs],
             generators_list=[generators],
+            prefill_empty_slots=prefill_empty_slots,
+            gdn_state_indices=gdn_state_indices,
         )
 
     def build_model_input(
@@ -1239,6 +1436,41 @@ class TTModelRunner:
             return flat[:max_batch]
         tail = torch.arange(n, max_batch, dtype=torch.int32, device=flat.device)
         return torch.cat([flat, tail])
+
+    @staticmethod
+    def _globalize_dp_gdn_state_indices(
+        per_rank_indices: torch.Tensor,
+        per_rank_batch: int,
+    ) -> torch.Tensor:
+        """Convert rank-local live/dummy GDN slots to one merged pool index.
+
+        Local live slots are ``[0, B)``. Any other value denotes padding and
+        is replaced with that row's unique dummy in the merged ``[total_B,
+        2*total_B)`` bank, avoiding write races between padded decode rows.
+        """
+        if per_rank_indices.dim() != 2:
+            raise ValueError("DP GDN state indices must have shape [world, B]")
+        world, width = per_rank_indices.shape
+        if width != per_rank_batch:
+            raise ValueError(
+                f"DP GDN state-index width {width} does not match B={per_rank_batch}"
+            )
+        row_offsets = (
+            torch.arange(world, dtype=torch.int32, device=per_rank_indices.device)
+            .unsqueeze(1)
+            * per_rank_batch
+        )
+        global_rows = row_offsets + torch.arange(
+            per_rank_batch,
+            dtype=torch.int32,
+            device=per_rank_indices.device,
+        )
+        total_batch = world * per_rank_batch
+        return torch.where(
+            per_rank_indices < per_rank_batch,
+            per_rank_indices + row_offsets,
+            total_batch + global_rows,
+        ).reshape(total_batch)
 
     def build_dp_decode_gather_input(
         self,
@@ -1382,12 +1614,24 @@ class TTModelRunner:
         # input batch uses global max_num_seqs, but the decode gather wire
         # format is per-lane/per-rank.
         slot_remap = self._decode_gather_slot_remap(model_input, max_batch)
+        if model_input is None or model_input.gdn_state_indices is None:
+            gdn_state_indices = torch.arange(
+                max_batch, 2 * max_batch, dtype=torch.int32
+            )
+        else:
+            raw_state_indices = torch.as_tensor(
+                model_input.gdn_state_indices, dtype=torch.int32
+            ).reshape(-1)
+            real = min(raw_state_indices.numel(), max_batch)
+            gdn_state_indices = torch.arange(
+                max_batch, 2 * max_batch, dtype=torch.int32
+            )
+            gdn_state_indices[:real] = raw_state_indices[:real]
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req, G = num kv_cache_groups.
-        # Layout includes one block_table block per group (G*B*W ints) so
-        # hybrid models can carry per-group routing through DP gather; for
-        # the legacy single-group case G == 1 and the layout is byte-
-        # identical to the pre-hybrid format.
+        # Layout includes one block_table block per group (G*B*W ints) and a
+        # GDN state-index row (B ints), so hybrid models carry both paged
+        # attention routing and recurrent-state ownership through DP gather.
         block_tables_packed = torch.cat(
             [
                 bt[:, :max_blocks_decode_batch].contiguous().view(-1)
@@ -1409,6 +1653,7 @@ class TTModelRunner:
                 .to(torch.int32),  # B (bool->int32)
                 torch.tensor([max_num_logprobs_val], dtype=torch.int32),  # 1
                 slot_remap.contiguous().view(-1),  # B
+                gdn_state_indices.contiguous().view(-1),  # B
             ],
             dim=0,
         ).contiguous()
@@ -1526,12 +1771,15 @@ class TTModelRunner:
         max_num_logprobs: list[int | None] = []
         generators_list: list[dict[int, torch.Generator]] = []
         slot_remap = None
+        gdn_state_indices = None
+        prefill_empty_slots = None
 
         if is_decode and isinstance(inputs, dict):
             # For decode, given gathered flattened tensors from all DP ranks.
-            # Ints: [toks(B), positions(B), block_tables(B*W),
+            # Ints: [toks(B), positions(B), block_tables(G*B*W),
             #        bs(1), top_k(B), seed(B), num_logprobs(B),
-            #        enable_log_probs(B)]
+            #        enable_log_probs(B), max_num_logprobs(1),
+            #        seed_slot_remap(B), gdn_state_indices(B)]
             #   - If any_structured_inputs, also has at the end of the list:
             #     [has_structured_inputs(1), bitmasks(B*bitmask_size)]
             # Floats: [temperature(B), top_p(B), presence_penalty(B),
@@ -1620,6 +1868,14 @@ class TTModelRunner:
             slot_remap = (raw_remap + offsets).reshape(total_B)
             off += B
 
+            raw_state_indices = stacked_int[:, off : off + B]
+            gdn_state_indices = (
+                self._globalize_dp_gdn_state_indices(raw_state_indices, B)
+                if self._mamba_group_indices
+                else None
+            )
+            off += B
+
             # Optional structured inputs: keep as list[Optional[tensor]]
             # per DP rank to match prefill behavior.
             grammar_bitmask_list = []
@@ -1705,6 +1961,7 @@ class TTModelRunner:
             num_logprobs_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
             reset_batch = False
+            prefill_empty_slots = None
 
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
@@ -1723,7 +1980,7 @@ class TTModelRunner:
             assert max_tok_width > 0, "At least one input must have tokens"
 
             # Iterate over DP inputs and build segments for concatenation.
-            for mi in inputs:
+            for rank_idx, mi in enumerate(inputs):
                 # Skip None slots entirely. Decode path reconstructs full
                 # inputs, so None should not occur there anymore.
                 if mi is not None:
@@ -1751,6 +2008,13 @@ class TTModelRunner:
                     )
                     for g, bt_g in enumerate(mi.block_tables_per_group):
                         block_tables_per_group_list[g].append(pad_block_tables(bt_g))
+                    if mi.prefill_empty_slots is not None:
+                        if prefill_empty_slots is None:
+                            prefill_empty_slots = []
+                        prefill_empty_slots.extend(
+                            rank_idx * self.tt_per_lane_max_num_seqs + int(slot)
+                            for slot in mi.prefill_empty_slots
+                        )
                     input_positions_list.append(mi.input_positions)
 
                     # Extract sampling parameter tensors from TTSamplingParams
@@ -1930,7 +2194,8 @@ class TTModelRunner:
             max_num_logprobs=max_num_logprobs,
             logitsprocs_list=logitsprocs_list,
             generators_list=generators_list,
-            prefill_empty_slots=None,
+            prefill_empty_slots=prefill_empty_slots,
+            gdn_state_indices=gdn_state_indices,
         )
         return merged
 
@@ -2371,16 +2636,16 @@ class TTModelRunner:
                 for s in sampling_param_dict["seed"]
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
-        if len(batch_size_per_dp) > 1:
-            empty_slots = model_input.prefill_empty_slots
-            if empty_slots is None:
-                # TODO: the model should only require DP ranks, but passing
-                # "global" user ids instead for backwards compatibility.
-                stride = self.tt_per_lane_max_num_seqs
-                empty_slots = []
-                for dp_rank, sz in enumerate(batch_size_per_dp):
-                    for i in range(int(sz)):
-                        empty_slots.append(dp_rank * stride + i)
+        empty_slots = model_input.prefill_empty_slots
+        if empty_slots is None and len(batch_size_per_dp) > 1:
+            # TODO: the model should only require DP ranks, but passing
+            # "global" user ids instead for backwards compatibility.
+            stride = self.tt_per_lane_max_num_seqs
+            empty_slots = []
+            for dp_rank, sz in enumerate(batch_size_per_dp):
+                for i in range(int(sz)):
+                    empty_slots.append(dp_rank * stride + i)
+        if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
 
         if self.request_specific_rope:
@@ -3007,8 +3272,11 @@ class TTModelRunner:
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled)
-        if trace_prefill_mode:
-            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+        # Phase 2: capture traces (all ops already compiled). Capture decode
+        # first and the much larger prefill trace last. A later trace capture
+        # can reuse addresses held by an earlier trace's temporaries; keeping
+        # the largest trace last prevents decode capture from clobbering it.
         if trace_decode_mode:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+        if trace_prefill_mode:
+            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)

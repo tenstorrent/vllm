@@ -123,6 +123,12 @@ class TTModelInput:
     # per-rank [B] tensors for DP).
     slot_remap: torch.Tensor | None = None
 
-    # Single-process DP prefill only: global stable slots supplied by the
-    # scheduler-owned step plan. ``None`` for non-DP, gathered-DP, and decode.
+    # Prefill-only: compact GDN state slots. In lane mode these are stable rows
+    # from the step plan; in non-DP/gathered-DP they come from the logical
+    # Mamba-owner map. ``None`` for models without MambaSpec and for decode.
     prefill_empty_slots: list[int] | None = None
+
+    # Qwen/GDN decode: compact recurrent-state slots in decode row order.
+    # Logical ownership comes from the request's MambaSpec block group; TT
+    # lowers it to a concurrency-sized physical pool.
+    gdn_state_indices: torch.Tensor | list[int] | None = None

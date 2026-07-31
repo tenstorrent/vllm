@@ -31,6 +31,7 @@ exercise the headroom formula.
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from vllm_tt_plugin import config as tt_config
 
 
@@ -75,6 +76,8 @@ def _model_budget(max_tokens: int, hybrid_enabled: bool = False):
     """
     fake_model_class = MagicMock()
     fake_model_class.get_max_tokens_all_users.return_value = max_tokens
+    fake_model_class.get_kv_cache_spec = None
+    fake_model_class.get_managed_state_pool_bytes = None
     fake_model_class._HYBRID_KV_CACHE_GROUPS_ENABLED = hybrid_enabled
     return patch(
         "vllm_tt_plugin.worker.get_model_architecture",
@@ -181,3 +184,144 @@ def test_per_model_branch_with_sliding_window(cfg):
     # gemma-3-4b N300 branch: 65536 base + 64*32 padding + 1024*32*8 sliding
     # = 65536 + 2048 + 262144 = 329728 -> ceil/64 = 5152
     assert n == 5152
+
+
+def test_mamba_group_count_matches_upstream_hybrid_partitioning():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm_tt_plugin.worker import _count_mamba_cache_groups
+
+    attention = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    mamba = MambaSpec(
+        shapes=((3, 128), (1, 128, 128)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        block_size=4096,
+    )
+    specs = {
+        **{f"layers.{i}.attn": attention for i in range(8)},
+        **{f"layers.{i}.gdn": mamba for i in range(8, 32)},
+    }
+    assert _count_mamba_cache_groups(specs) == 3
+
+
+def test_mamba_groups_add_one_block_per_live_request(cfg):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    attention = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    mamba = MambaSpec(
+        shapes=((3, 128), (1, 128, 128)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        block_size=4096,
+    )
+    specs = {
+        **{f"layers.{i}.attn": attention for i in range(8)},
+        **{f"layers.{i}.gdn": mamba for i in range(8, 32)},
+    }
+    fake_model_class = MagicMock()
+    fake_model_class.get_max_tokens_all_users.return_value = 6400
+    fake_model_class.get_kv_cache_spec.return_value = specs
+    fake_model_class.get_managed_state_pool_bytes = None
+    fake_model_class._HYBRID_KV_CACHE_GROUPS_ENABLED = False
+    cfg.scheduler_config.max_num_seqs = 2
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        patch(
+            "vllm_tt_plugin.worker.get_model_architecture",
+            return_value=(fake_model_class, "arch"),
+        ),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    # 100 attention blocks + 2 rounding/headroom blocks + 3*2 Mamba blocks.
+    assert n == 108
+
+
+def test_hybrid_hook_updates_block_size_before_headroom_math(cfg):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    attention = FullAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    mamba = MambaSpec(
+        shapes=((3, 128), (1, 128, 128)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        block_size=4096,
+    )
+    specs = {
+        **{f"layers.{i}.attn": attention for i in range(8)},
+        **{f"layers.{i}.gdn": mamba for i in range(8, 32)},
+    }
+
+    def get_specs(vllm_config):
+        vllm_config.cache_config.block_size = 1024
+        return specs
+
+    fake_model_class = MagicMock()
+    fake_model_class.get_max_tokens_all_users.return_value = 65_536
+    fake_model_class.get_kv_cache_spec.side_effect = get_specs
+    fake_model_class.get_managed_state_pool_bytes = None
+    fake_model_class._HYBRID_KV_CACHE_GROUPS_ENABLED = False
+
+    with patch(
+        "vllm_tt_plugin.worker.get_model_architecture",
+        return_value=(fake_model_class, "arch"),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    # 64 attention blocks + 32 per-request padding blocks + 3*32 Mamba blocks.
+    assert n == 192
+
+
+def test_managed_state_dram_reduces_attention_block_capacity(cfg):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    attention = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    mamba = MambaSpec(
+        shapes=((3, 128), (1, 128, 128)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        block_size=4096,
+    )
+    specs = {
+        **{f"layers.{i}.attn": attention for i in range(8)},
+        **{f"layers.{i}.gdn": mamba for i in range(8, 32)},
+    }
+    bytes_per_all_attention_block = 8 * attention.page_size_bytes
+    fake_model_class = MagicMock()
+    fake_model_class.get_max_tokens_all_users.return_value = 6400
+    fake_model_class.get_kv_cache_spec.return_value = specs
+    fake_model_class.get_managed_state_pool_bytes.return_value = (
+        bytes_per_all_attention_block + 1
+    )
+    fake_model_class._HYBRID_KV_CACHE_GROUPS_ENABLED = False
+    cfg.scheduler_config.max_num_seqs = 2
+
+    with patch(
+        "vllm_tt_plugin.worker.get_model_architecture",
+        return_value=(fake_model_class, "arch"),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    # The base hybrid calculation yields 108 blocks; state needs two
+    # all-attention block equivalents.
+    assert n == 106

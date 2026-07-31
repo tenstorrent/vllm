@@ -48,6 +48,17 @@ SEED_NONE_SENTINEL = -1
 LOGPROBS_NONE_SENTINEL = -2
 
 
+def _lane_gdn_state_indices(
+    total: int, scheduled_rows: tuple[int, ...]
+) -> torch.Tensor:
+    """Route only scheduled lane rows to live GDN state."""
+    scheduled = set(scheduled_rows)
+    return torch.tensor(
+        [row if row in scheduled else total + row for row in range(total)],
+        dtype=torch.int32,
+    )
+
+
 def build_cached_request_state(new_req_data) -> CachedRequestState:
     """Build a ``CachedRequestState`` for one newly-scheduled request.
 
@@ -1171,6 +1182,11 @@ class TTLaneInputBatch(InputBatch):
             logitsprocs_list=[None],
             generators_list=[{}],
             prefill_empty_slots=None,
+            gdn_state_indices=(
+                _lane_gdn_state_indices(total, plan.scheduled_rows)
+                if runner._mamba_group_indices
+                else None
+            ),
         )
 
     def _build_prefill_input(
@@ -1255,6 +1271,7 @@ class TTLaneInputBatch(InputBatch):
                 if plan.prefill_empty_slots is not None
                 else None
             ),
+            gdn_state_indices=None,
         )
 
     def extract_output(
