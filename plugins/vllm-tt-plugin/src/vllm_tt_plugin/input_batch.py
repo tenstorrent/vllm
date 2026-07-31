@@ -1190,10 +1190,16 @@ class TTLaneInputBatch(InputBatch):
         lane_batch = self
         rows = list(plan.input_rows)
         rows_np = np.asarray(rows, dtype=np.int64)
-        input_positions = torch.from_numpy(
-            lane_batch.num_computed_tokens_cpu[rows_np].astype(np.int32)
+        input_positions_np = lane_batch.num_computed_tokens_cpu[rows_np]
+        input_positions = torch.from_numpy(input_positions_np.astype(np.int32))
+        chunk_lens = np.asarray(
+            [
+                scheduler_output.num_scheduled_tokens[lane_batch.req_ids[row]]
+                for row in rows
+            ],
+            dtype=np.int64,
         )
-        prompt_lens = lane_batch.num_tokens[rows_np]
+        prompt_lens = input_positions_np + chunk_lens
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
 
