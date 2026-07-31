@@ -120,6 +120,12 @@ still using the same four-command interface.
 The vLLM and tt-metal changes are one required contract and should be deployed
 as a pinned pair. vLLM always sends all four commands; there is no per-model
 contract-version negotiation or fallback to an older tt-metal generator.
+The paired tt-metal change includes the unconditional decode-only seed
+initialization also addressed by
+[tt-metal#51556](https://github.com/tenstorrent/tt-metal/pull/51556):
+`reset_sampling_state=True` forces seed initialization for first-decode and
+layout transitions even when both the requested and cached seed are `None`.
+The paired change implements this directly and does not depend on that PR.
 `model_capabilities["supports_async_decode"]` remains the sole per-model gate.
 It both controls async scheduling and certifies that sampled-token feedback can
 remain device-resident between decode steps. Models without it still receive
