@@ -199,10 +199,11 @@ def test_dp_slot_remap_is_offset_into_global_slot_namespace():
     assert global_remap.tolist() == [3, 1, 2, 0, 6, 4, 7, 5]
 
 
-def test_submit_decode_keeps_layout_hint_inside_planner():
+def test_explicit_contract_keeps_layout_hint_inside_planner():
     captured = {}
 
     class FakeModel:
+        decode_input_update_contract = 1
         model_capabilities = {"supports_async_decode": True}
 
         def decode_forward(self, **kwargs):
@@ -245,10 +246,101 @@ def test_submit_decode_keeps_layout_hint_inside_planner():
 
     controller.submit_decode(model_input, read_from_device=False, async_read=False)
 
+    assert "reset_batch" not in captured
     assert "decode_layout_changed" not in captured
     assert captured["reload_inputs"] is True
     assert captured["reload_sampling_params"] is True
     assert captured["reset_sampling_state"] is True
+
+
+def test_legacy_contract_receives_reset_batch_without_explicit_commands(
+    monkeypatch,
+):
+    captured = {}
+    warnings = []
+    monkeypatch.setattr(
+        "vllm_tt_plugin.async_decode.logger.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    class FakeLegacyModel:
+        model_capabilities = {"supports_async_decode": True}
+
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        model=FakeLegacyModel(),
+        trace_mode="decode_only",
+        kv_caches=object(),
+        request_specific_rope=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        input_batch=SimpleNamespace(commit_slot_remap=lambda: None),
+    )
+    controller = TTAsyncDecodeController(runner)
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        input_positions=torch.zeros((1,), dtype=torch.int32),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        block_tables_per_group=[torch.zeros((1, 1), dtype=torch.int32)],
+        block_tables_per_layer=None,
+        unpadded_batch_size=1,
+        tt_sampling_params=TTSamplingParams(
+            temperature=torch.tensor([1.0]),
+            top_k=torch.tensor([32]),
+            top_p=torch.tensor([1.0]),
+            presence_penalty=torch.tensor([0.0]),
+            frequency_penalty=torch.tensor([0.0]),
+            repetition_penalty=torch.tensor([1.0]),
+            seed=torch.tensor([-1]),
+            num_logprobs=torch.tensor([-2]),
+            enable_log_probs=torch.tensor([False]),
+        ),
+        perform_device_sampling=True,
+        prompt_tokens=None,
+        output_tokens=None,
+        decode_layout_changed=True,
+        slot_remap=torch.tensor([0], dtype=torch.int32),
+    )
+
+    first_submission = controller.submit_decode(
+        model_input, read_from_device=False, async_read=False
+    )
+    second_submission = controller.submit_decode(
+        model_input, read_from_device=False, async_read=False
+    )
+
+    assert captured["reset_batch"] is True
+    assert "decode_layout_changed" not in captured
+    assert "reload_inputs" not in captured
+    assert "reload_page_table" not in captured
+    assert "reload_sampling_params" not in captured
+    assert "reset_sampling_state" not in captured
+    assert first_submission.reload_plan is None
+    assert second_submission.reload_plan is None
+    assert controller._decode_chain_valid
+    assert controller._previous_device_sampling is True
+    assert len(warnings) == 1
+
+
+def test_contract_version_does_not_change_steady_decode_eligibility():
+    runner = SimpleNamespace(
+        model=SimpleNamespace(model_capabilities={"supports_async_decode": True}),
+        non_dp_async_scheduling=True,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank_local=0,
+        ),
+        trace_mode="decode_only",
+    )
+    controller = TTAsyncDecodeController(runner)
+
+    assert controller.steady_decode_base_enabled(dp_gather=False)
+
+    runner.model.decode_input_update_contract = 1
+
+    assert controller.steady_decode_base_enabled(dp_gather=False)
 
 
 def test_scheduler_layout_prediction_detects_add_remove_and_preemption():
