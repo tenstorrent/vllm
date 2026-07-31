@@ -43,7 +43,38 @@ _GALAXY_GENERATOR_VERSIONS = {
 }
 
 # TT model types that have been validated with real chunked prefill.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4"}
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+
+
+def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
+    """Restricts token-chunked prefill to model types Metal has validated."""
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+    model_type = getattr(model_config.hf_config, "model_type", None)
+
+    if (
+        scheduler_config.enable_chunked_prefill
+        and model_type not in _CHUNKED_PREFILL_MODEL_TYPES
+    ):
+        logger.info(
+            "Chunked prefill is not validated for `model_type=%s` on TT; disabling it.",
+            model_type,
+        )
+
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        max_model_len = model_config.max_model_len
+        scheduler_config.enable_chunked_prefill = False
+
+        if max_num_batched_tokens < max_model_len:
+            logger.warning(
+                "`max_num_batched_tokens=%d < max_model_len=%d` with chunked prefill "
+                "disabled, bumping `max_num_batched_tokens` to match.",
+                max_num_batched_tokens,
+                max_model_len,
+            )
+
+            max_num_batched_tokens = max_model_len
+            scheduler_config.max_num_batched_tokens = max_num_batched_tokens
 
 
 def _galaxy_generator_version() -> str | None:
@@ -540,27 +571,9 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
+        _apply_chunked_prefill_policy(vllm_config)
 
-        # NOTE: Token-chunked prefill: upstream vLLM defaults `enable_chunked_prefill`
-        # to True and `max_num_batched_tokens` to 2048. The scheduler and model
-        # runner support chunking, but most Metal-side models have only been
-        # validated with full-prompt prefill. Models that have been validated
-        # with real chunking keep the user/default budget as-is; all others get
-        # bumped to `max_model_len` so every prompt fits in one step (no
-        # chunking). Users can always override via `--max_num_batched_tokens`.
-        sched = vllm_config.scheduler_config
-        model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
-        if (
-            sched.enable_chunked_prefill
-            and model_type not in _CHUNKED_PREFILL_MODEL_TYPES
-            and sched.max_num_batched_tokens < vllm_config.model_config.max_model_len
-        ):
-            sched.max_num_batched_tokens = vllm_config.model_config.max_model_len
-
-        # Never split a chunk boundary inside an image's token span. The vision encoder
-        # produces embeddings for the full image atomically; splitting corrupts the
-        # embedding/position alignment.
-        sched.disable_chunked_mm_input = True
+        vllm_config.scheduler_config.disable_chunked_mm_input = True
 
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
