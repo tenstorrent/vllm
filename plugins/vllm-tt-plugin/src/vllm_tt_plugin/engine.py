@@ -508,7 +508,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             local_max_blocks,
             local_has_structured,
             local_has_penalties,
-            local_reset_batch,
+            local_decode_layout_changed,
             local_can_sample_device,
             local_needs_logprobs,
             intermediate_prefill_mask,
@@ -527,7 +527,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     local_max_blocks,
                     local_has_structured,
                     local_has_penalties,
-                    local_reset_batch,
+                    local_decode_layout_changed,
                     1 - local_can_sample_device,
                     local_needs_logprobs,
                 ],
@@ -537,7 +537,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             max_blocks_decode = int(input_info_t[0].item())
             any_structured_inputs = input_info_t[1].item() > 0
             any_penalties_inputs = input_info_t[2].item() > 0
-            any_reset_batch = input_info_t[3].item() > 0
+            any_decode_layout_changed = input_info_t[3].item() > 0
             all_sample_device = input_info_t[4].item() == 0
             any_needs_logprobs = input_info_t[5].item() > 0
 
@@ -586,7 +586,9 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     dist.recv(stacked_float, src=0, group=group)
 
             gathered_tokens_inputs = None
-            if any_penalties_inputs and (not all_sample_device or any_reset_batch):
+            if any_penalties_inputs and (
+                not all_sample_device or any_decode_layout_changed
+            ):
                 if rank == 0:
                     gathered_tokens_inputs = [None for _ in range(world)]
                 local_tokens_inputs = decode_inputs["sampling_tokens_inputs"]
@@ -662,7 +664,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     "float_inputs": stacked_float,
                     "sampling_tokens_inputs": gathered_tokens_inputs,
                     "host_only_sample_params": gathered_host_only_sample_params,
-                    "reset_batch": any_reset_batch,
+                    "decode_layout_changed": any_decode_layout_changed,
                     "all_sample_device": all_sample_device,
                 }
 

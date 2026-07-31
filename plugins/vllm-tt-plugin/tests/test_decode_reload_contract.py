@@ -30,10 +30,10 @@ def _controller(current_req_ids=("req-0",), *, trace_mode="decode_only"):
     return TTAsyncDecodeController(runner)
 
 
-def _decode_input(*, device_sampling=True, reset_batch=False, page=0):
+def _decode_input(*, device_sampling=True, decode_layout_changed=False, page=0):
     return SimpleNamespace(
         perform_device_sampling=device_sampling,
-        reset_batch=reset_batch,
+        decode_layout_changed=decode_layout_changed,
         block_tables_per_group=[torch.tensor([[page, 0]], dtype=torch.int32)],
     )
 
@@ -129,7 +129,7 @@ def test_prefill_and_layout_change_break_the_decode_chain():
     controller.note_prefill_submitted()
 
     after_prefill = _submit(controller, _decode_input())
-    layout_change = _submit(controller, _decode_input(reset_batch=True))
+    layout_change = _submit(controller, _decode_input(decode_layout_changed=True))
 
     assert after_prefill.reload_inputs and after_prefill.reset_sampling_state
     assert layout_change.reload_inputs and layout_change.reset_sampling_state
@@ -239,13 +239,13 @@ def test_submit_decode_keeps_layout_hint_inside_planner():
         perform_device_sampling=True,
         prompt_tokens=None,
         output_tokens=None,
-        reset_batch=True,
+        decode_layout_changed=True,
         slot_remap=torch.tensor([0], dtype=torch.int32),
     )
 
     controller.submit_decode(model_input, read_from_device=False, async_read=False)
 
-    assert "reset_batch" not in captured
+    assert "decode_layout_changed" not in captured
     assert captured["reload_inputs"] is True
     assert captured["reload_sampling_params"] is True
     assert captured["reset_sampling_state"] is True

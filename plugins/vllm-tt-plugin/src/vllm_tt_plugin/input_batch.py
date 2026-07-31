@@ -1169,7 +1169,7 @@ class TTLaneInputBatch(InputBatch):
         if perform_device_sampling and not lane_batch.no_penalties:
             prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
-        reset_batch = runner._decode_layout_changed_since_last_decode
+        decode_layout_changed = runner._decode_layout_changed_since_last_decode
         runner._decode_layout_changed_since_last_decode = False
         # Device-sampling state owns this remap. Merely building a host-sampling
         # input must not consume it; submit_decode commits it after a successful
@@ -1193,7 +1193,7 @@ class TTLaneInputBatch(InputBatch):
             grammar_bitmask=[bitmask],
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host sampling reads the merged batch directly (see
             # ``extract_output``); the per-rank sidecars are unused here.
@@ -1286,7 +1286,7 @@ class TTLaneInputBatch(InputBatch):
             grammar_bitmask=[bitmask],
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=False,
+            decode_layout_changed=False,
             slot_remap=None,
             allowed_token_ids_mask_list=[None],
             bad_words_token_ids_list=[{}],
