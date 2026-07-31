@@ -212,9 +212,7 @@ class TTModelRunner:
         # Keep the corresponding request-object identities local so an
         # abort+resubmit that reuses a request ID cannot accept an old result.
         self._next_dp_request_state_snapshot_id = 0
-        self._dp_request_state_snapshots: dict[
-            int, tuple[CachedRequestState, ...]
-        ] = {}
+        self._dp_request_state_snapshots: dict[int, tuple[CachedRequestState, ...]] = {}
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
@@ -1314,6 +1312,24 @@ class TTModelRunner:
         tail = torch.arange(n, max_batch, dtype=torch.int32, device=flat.device)
         return torch.cat([flat, tail])
 
+    @staticmethod
+    def _globalize_dp_slot_remap(raw_remap: torch.Tensor) -> torch.Tensor:
+        """Convert rank-local seed slots into the merged DP slot namespace."""
+        if raw_remap.dim() != 2:
+            raise ValueError(
+                "DP slot remap must have shape [world_size, per_rank_batch]"
+            )
+        per_rank_batch = raw_remap.shape[1]
+        offsets = (
+            torch.arange(
+                raw_remap.shape[0],
+                dtype=raw_remap.dtype,
+                device=raw_remap.device,
+            ).unsqueeze(1)
+            * per_rank_batch
+        )
+        return (raw_remap + offsets).reshape(-1)
+
     def build_dp_decode_gather_input(
         self,
         model_input: TTModelInput | None,
@@ -1691,8 +1707,7 @@ class TTModelRunner:
             # the row-sharded SeedManager uses global indices [0, total_B).
             # Offset each rank's remap values by rank * B.
             raw_remap = stacked_int[:, off : off + B]  # [world, B]
-            offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * B
-            slot_remap = (raw_remap + offsets).reshape(total_B)
+            slot_remap = self._globalize_dp_slot_remap(raw_remap)
             off += B
 
             # Optional structured inputs: keep as list[Optional[tensor]]
@@ -2061,9 +2076,7 @@ class TTModelRunner:
             )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
-            self.async_decode.wait_for_all_pending_async_steps(
-                apply_completed=False
-            )
+            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
 
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
@@ -2222,9 +2235,7 @@ class TTModelRunner:
             )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
-            self.async_decode.wait_for_all_pending_async_steps(
-                apply_completed=False
-            )
+            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
@@ -2710,12 +2721,10 @@ class TTModelRunner:
                 num_reqs = self.input_batch.num_reqs
                 req_ids = list(self.input_batch.req_ids[:num_reqs])
                 req_id_to_index = dict(self.input_batch.req_id_to_index)
-                request_state_snapshot_id = (
-                    self._next_dp_request_state_snapshot_id
-                )
+                request_state_snapshot_id = self._next_dp_request_state_snapshot_id
                 self._next_dp_request_state_snapshot_id += 1
-                self._dp_request_state_snapshots[request_state_snapshot_id] = (
-                    tuple(self.requests[req_id] for req_id in req_ids)
+                self._dp_request_state_snapshots[request_state_snapshot_id] = tuple(
+                    self.requests[req_id] for req_id in req_ids
                 )
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = (

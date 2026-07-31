@@ -263,14 +263,18 @@ class TTAsyncDecodeController:
         from vllm_tt_plugin.model_input import TTDecodeReloadPlan
 
         device_sampling = model_input.perform_device_sampling
-        model_capabilities = getattr(
-            getattr(self.runner, "model", None),
-            "model_capabilities",
-            {},
-        ) or {}
+        model_capabilities = (
+            getattr(
+                getattr(self.runner, "model", None),
+                "model_capabilities",
+                {},
+            )
+            or {}
+        )
         supports_resident_decode = bool(
             model_capabilities.get("supports_async_decode", False)
         )
+        decode_trace_enabled = self.runner.trace_mode in ("all", "decode_only")
         sampling_mode_changed = (
             self._previous_device_sampling is not None
             and self._previous_device_sampling != device_sampling
@@ -284,6 +288,7 @@ class TTAsyncDecodeController:
             not device_sampling
             or transition
             or not supports_resident_decode
+            or not decode_trace_enabled
         )
         sampling_reset = device_sampling and transition
         return TTDecodeReloadPlan(
@@ -373,10 +378,7 @@ class TTAsyncDecodeController:
         )
         if is_prompt or runner._decode_layout_changed_since_last_decode:
             return False
-        if (
-            not self._decode_chain_valid
-            or self._previous_device_sampling is not True
-        ):
+        if not self._decode_chain_valid or self._previous_device_sampling is not True:
             return False
         if not self.scheduler_preserves_decode_layout(scheduler_output):
             return False
@@ -749,7 +751,6 @@ class TTAsyncDecodeController:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
-            kwargs["reset_batch"] = model_input.reset_batch
             if model_input.slot_remap is not None:
                 kwargs["slot_remap"] = model_input.slot_remap
 
@@ -789,10 +790,7 @@ class TTAsyncDecodeController:
             read_from_device=read_from_device,
         )
         self.commit_decode_submission(model_input, reload_plan)
-        if (
-            perform_device_sampling
-            and runner.parallel_config.data_parallel_size == 1
-        ):
+        if perform_device_sampling and runner.parallel_config.data_parallel_size == 1:
             runner.input_batch.commit_slot_remap()
         read_events = None
         if async_read:
