@@ -215,8 +215,9 @@ class TTModelRunner:
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
 
-        # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed RNG, decode
-        # trace buffers). Needed because evict/re-add and condense move a request's ROW, not its state.
+        # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed
+        # RNG, decode trace buffers). Needed because evict/re-add and condense move a
+        # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
 
         # Sampler for sampling on host when device sampling is not supported.
@@ -615,8 +616,8 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            # Only a FINISHED request releases its slot; an unscheduled one still owns its state
-            # even though the lines below drop it from the persistent batch.
+            # Only a FINISHED request releases its slot; an unscheduled one still
+            # owns its state even though the lines below drop it from the batch.
             self._req_state_slot.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
@@ -817,8 +818,9 @@ class TTModelRunner:
     # --- Per-request device state slots (see ``self._req_state_slot``) ---
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
-        """Pick each prefilling request's state slot, skipping slots live off-batch requests own.
-        Prefers its own row (the row it decodes at), so the steady state moves nothing."""
+        """Pick each prefilling request's state slot, skipping slots that live
+        off-batch requests own. Prefers its own row (where it decodes), so the
+        steady state moves nothing."""
         n_slots = self.tt_per_lane_max_num_seqs
         prefilling = set(row_req_ids)
         held = {
@@ -843,18 +845,21 @@ class TTModelRunner:
         return slots
 
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
-        """Gather permutation taking each request's state to its decode row: row ``i`` reads slot
-        ``remap[i]``. Always full slot width (no OOB gather); None means identity, so skip it."""
+        """Gather permutation taking each request's state to its decode row: row
+        ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
+        means identity, so skip it."""
         n_slots = self.tt_per_lane_max_num_seqs
         row_req_ids = row_req_ids[:n_slots]
         want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
-        settled = {r: row for row, r in enumerate(row_req_ids)}  # post-gather: state sits at its row
+        # post-gather: state sits at its row
+        settled = {r: row for row, r in enumerate(row_req_ids)}
         if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
-            # Never hand a non-permutation to a gather: one incoherent response beats an
-            # out-of-bounds device read.
+            # Never hand a non-permutation to a gather: one incoherent response beats
+            # an out-of-bounds device read.
             logger.warning(
-                f"TT decode state slots are not a permutation ({want}); skipping the state "
-                "remap for this step -- one response may be incoherent."
+                "TT decode state slots are not a permutation (%s); skipping the state "
+                "remap for this step -- one response may be incoherent.",
+                want,
             )
             self._req_state_slot.update(settled)
             return None
@@ -1172,8 +1177,8 @@ class TTModelRunner:
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
-        # State follows the request, not the row (``self._req_state_slot``). That subsumes the
-        # batch's condense-move remap, so pop and discard it.
+        # State follows the request, not the row (``self._req_state_slot``). That
+        # subsumes the batch's condense-move remap, so pop and discard it.
         input_batch.pop_slot_remap()
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
         if is_prompt:
@@ -1207,8 +1212,9 @@ class TTModelRunner:
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[logitsprocs],
             generators_list=[generators],
-            # Destination state slot per row. Without it a stateful model falls back to
-            # ``range(N)`` and a prefill overwrites a decoding request's state. Stateless: ignored.
+            # Destination state slot per row. Without it a stateful model falls
+            # back to ``range(N)`` and a prefill overwrites a decoding request's
+            # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
         )
 
@@ -2428,8 +2434,9 @@ class TTModelRunner:
                 for s in sampling_param_dict["seed"]
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
-        # Send the slots whenever the build supplied them. Multi-rank-only before, so a DP=1
-        # prefill sent nothing and the model's ``range(N)`` default clobbered live state.
+        # Send the slots whenever the build supplied them. Multi-rank-only before,
+        # so a DP=1 prefill sent nothing and the model's ``range(N)`` default
+        # clobbered live state.
         empty_slots = model_input.prefill_empty_slots
         if empty_slots is None and len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
