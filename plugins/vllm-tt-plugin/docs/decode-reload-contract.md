@@ -17,6 +17,25 @@ remains data: it is composed by vLLM until a device-sampling submission
 consumes it, then tt-metal applies it once before sampling state is reset or
 advanced.
 
+## Mode definitions
+
+- **Host sampling**: tt-metal returns logits and vLLM selects the token. Host
+  token and position tensors are authoritative, so every decode performs a
+  full input reload.
+- **Device sampling**: tt-metal selects the token. A supporting model writes
+  that token directly into the persistent input buffer used by the next decode
+  and advances its persistent position in the forward trace.
+- **Transition decode**: the first decode, the first decode after prefill, a
+  batch-layout or sampling-mode change, or a resume. Host state is
+  authoritative again; pending work drains before a full reload and any
+  required sampling-state reset.
+- **Steady device decode**: the request layout and sampling mode are unchanged
+  after a valid device-sampling decode. Token and position remain
+  device-resident, so no full reload occurs.
+- **Page-table-only refresh**: a steady device decode whose KV block mapping
+  changed. Only page-table trace inputs are copied; token, position, and RoPE
+  state must remain untouched.
+
 ## Transition table
 
 | Transition | Inputs | Page only | Sampling params | Sampling state |
@@ -60,6 +79,41 @@ object-identity check, and their cached runner-output rows are replaced with an
 empty token list before scheduler update. vLLM's scheduler independently
 ignores outputs for requests that no longer exist, so cancelled speculative
 work cannot append runner state or emit an extra client token.
+
+## Requirements for `supports_async_decode`
+
+Set `model_capabilities["supports_async_decode"] = True` only when the model
+adapter satisfies every requirement below:
+
+1. **Split submission and readback**: `decode_forward(...,
+   read_from_device=False)` submits decode without synchronizing the result, and
+   `read_decode_output(..., async_read=True)` can read that exact submission
+   later. Readback must be observational: it cannot advance position, sample
+   another token, or otherwise mutate decode state.
+2. **Persistent token feedback**: device sampling writes the selected token into
+   the same persistent token buffer consumed by the next decode. Writing only
+   to a separate output tensor is insufficient.
+3. **Single position advance**: each successful decode forward advances the
+   persistent position exactly once. Sampling and readback must not advance it.
+   After step `k`, the resident token and position must describe the input to
+   step `k+1`.
+4. **Independent page-table refresh**: the model can copy changed page-table
+   inputs without copying or rebinding token, position, or RoPE inputs.
+5. **Exact command handling**: the adapter honors `reload_inputs`,
+   `reload_page_table`, `reload_sampling_params`, and
+   `reset_sampling_state` independently. It must not add model-local mode or
+   tensor comparisons that turn a page-table-only update into a full reload.
+6. **Sampling-state ordering**: slot remaps are applied before parameter/state
+   reset; RNG and penalty state are reset only when requested; seed advancement
+   happens exactly once per sampled token.
+7. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
+   valid until the submitted step is read back and until the next command
+   explicitly replaces their contents.
+
+The capability is fail-closed. If any requirement is not met, leave
+`supports_async_decode` absent or `False`. vLLM disables async scheduling for
+that model and requests a full forward-input reload on every decode, while
+still using the same four-command interface.
 
 ## Deployment coupling
 
