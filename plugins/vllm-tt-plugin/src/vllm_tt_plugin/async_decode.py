@@ -581,6 +581,8 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        if model_input.gdn_state_indices is not None:
+            kwargs["gdn_state_indices"] = model_input.gdn_state_indices
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (

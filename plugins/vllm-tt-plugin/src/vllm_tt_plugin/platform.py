@@ -755,6 +755,22 @@ class TTPlatform(Platform):
                         "models with sliding window, disabling it"
                     )
 
+        # Upstream's hybrid-Mamba config runs before this platform hook and
+        # may have selected cache mode "all" while prefix caching was still
+        # enabled. If TT disabled prefix caching, restore the non-prefix
+        # lifecycle expected by the scheduler and TT's compact state lowering.
+        if (
+            not vllm_config.cache_config.enable_prefix_caching
+            and hasattr(model_class, "get_mamba_state_shape_from_config")
+        ):
+            vllm_config.cache_config.mamba_cache_mode = "none"
+            vllm_config.cache_config.mamba_block_size = (
+                vllm_config.model_config.max_model_len
+            )
+            # The model's cache-spec hook recomputes padding after any TT
+            # trace-compatible attention block adjustment.
+            vllm_config.cache_config.mamba_page_size_padded = None
+
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
