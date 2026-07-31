@@ -382,7 +382,7 @@ class TTWorker(WorkerBase):
         """Build the local DP payload consumed by gathered-DP orchestration.
 
         Returns `(local_input, max_blocks, has_structured_input,
-        has_penalties, reset_batch, can_sample_device, needs_logprobs,
+        has_penalties, decode_layout_changed, can_sample_device, needs_logprobs,
         intermediate_prefill_mask, req_ids, req_id_to_index,
         request_state_snapshot_id)`, where `local_input` is this rank's TT model
         input (or `None`) and the remaining fields are the per-rank metadata
