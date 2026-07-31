@@ -1174,9 +1174,7 @@ class TTLaneInputBatch(InputBatch):
         # Device-sampling state owns this remap. Merely building a host-sampling
         # input must not consume it; submit_decode commits it after a successful
         # contract-aware device-sampling submission.
-        slot_remap = (
-            lane_batch.peek_slot_remap() if perform_device_sampling else None
-        )
+        slot_remap = lane_batch.peek_slot_remap() if perform_device_sampling else None
 
         return TTModelInput(
             input_tokens=input_tokens,
