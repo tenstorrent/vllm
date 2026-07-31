@@ -281,7 +281,7 @@ class TTAsyncDecodeController:
         )
         transition = (
             not self._decode_chain_valid
-            or model_input.reset_batch
+            or model_input.decode_layout_changed
             or sampling_mode_changed
         )
         reload_inputs = (
@@ -445,7 +445,7 @@ class TTAsyncDecodeController:
             return False
         if not model_input.perform_device_sampling:
             return False
-        if model_input.reset_batch:
+        if model_input.decode_layout_changed:
             return False
         if model_input.grammar_bitmask[0] is not None:
             return False

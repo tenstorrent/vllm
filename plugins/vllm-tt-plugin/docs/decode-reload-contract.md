@@ -12,8 +12,8 @@ four independent boolean commands on every decode:
 | `reload_sampling_params` | Upload temperature, top-k/top-p, penalties, seeds, and logprob configuration. |
 | `reset_sampling_state` | Rebuild mutable penalty/RNG state for the current layout. |
 
-`reset_batch` is an internal vLLM lifecycle signal: the planner translates it
-into the four commands, but it is not forwarded to tt-metal. `slot_remap`
+`decode_layout_changed` is an internal vLLM lifecycle signal: the planner
+translates it into the four commands, but it is not forwarded to tt-metal. `slot_remap`
 remains data: it is composed by vLLM until a device-sampling submission
 consumes it, then tt-metal applies it once before sampling state is reset or
 advanced.

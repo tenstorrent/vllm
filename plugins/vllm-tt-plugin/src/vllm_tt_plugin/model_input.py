@@ -148,7 +148,7 @@ class TTModelInput:
 
     # Decode-only: indicates the padded decode-batch layout changed since the
     # previous step (used by on-device sampling).
-    reset_batch: bool = False
+    decode_layout_changed: bool = False
 
     # Per-rank slot remap from condense - remap[i]=j means slot i's data came
     # from slot j. Identity when nothing moved. Shape: [total_B] (concat of

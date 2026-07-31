@@ -932,7 +932,7 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
-            reset_batch = False
+            decode_layout_changed = False
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -942,7 +942,7 @@ class TTModelRunner:
             prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
-            reset_batch = self._decode_layout_changed_since_last_decode
+            decode_layout_changed = self._decode_layout_changed_since_last_decode
             self._decode_layout_changed_since_last_decode = False
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
@@ -1142,7 +1142,7 @@ class TTModelRunner:
             grammar_bitmask=[bitmask],  # wrap to match DP case
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
@@ -1526,7 +1526,7 @@ class TTModelRunner:
             Only provided when there are requests with penalties.
             One dict per DP rank, each with keys "prompt_tokens" and
             "output_tokens" (tensors padded with -1).
-          - "reset_batch": bool for if the batch layout changed
+          - "decode_layout_changed": bool for if the batch layout changed
             since the previous step.
           - "all_sample_device": bool for if all ranks can sample on device.
         """
@@ -1568,7 +1568,7 @@ class TTModelRunner:
             )
             B = self.tt_per_lane_max_num_seqs
             W = max_blocks_decode_batch
-            reset_batch = inputs["reset_batch"]
+            decode_layout_changed = inputs["decode_layout_changed"]
             perform_device_sampling = inputs["all_sample_device"]
             stacked_int: torch.Tensor = inputs["int_inputs"]
             stacked_float: torch.Tensor = inputs["float_inputs"]
@@ -1730,7 +1730,7 @@ class TTModelRunner:
             seed_list: list[torch.Tensor] = []
             num_logprobs_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
-            reset_batch = False
+            decode_layout_changed = False
 
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
@@ -1950,7 +1950,7 @@ class TTModelRunner:
             grammar_bitmask=grammar_bitmask_list,
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host-only sampling params (per-rank lists)
             allowed_token_ids_mask_list=allowed_token_ids_mask_list,
@@ -2539,7 +2539,7 @@ class TTModelRunner:
         """
         model_input = None
         has_penalties = 0
-        reset_batch = 0
+        decode_layout_changed = 0
         can_sample_device = 1
         needs_logprobs = 0
         req_ids: list[str] = []
@@ -2549,7 +2549,7 @@ class TTModelRunner:
             model_input = self.build_model_input(scheduler_output, grammar_output)
             if model_input is not None:
                 has_penalties = int(not self.input_batch.no_penalties)
-                reset_batch = int(model_input.reset_batch)
+                decode_layout_changed = int(model_input.decode_layout_changed)
                 can_sample_device = int(model_input.perform_device_sampling)
                 max_num_logprobs = model_input.max_num_logprobs[0]
                 # max_num_logprobs=0 still requests the sampled token's logprob.
@@ -2571,7 +2571,7 @@ class TTModelRunner:
             max_blocks,
             has_structured_input,
             has_penalties,
-            reset_batch,
+            decode_layout_changed,
             can_sample_device,
             needs_logprobs,
             req_ids,
