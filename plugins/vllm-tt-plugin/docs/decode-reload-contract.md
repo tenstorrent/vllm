@@ -2,8 +2,9 @@
 
 Async device sampling deliberately lets vLLM's host token state trail the TT
 device by one decode step. Consequently, only the vLLM runner can decide
-whether host tensors are authoritative. The paired tt-metal generator receives
-four independent boolean commands on every decode:
+whether host tensors are authoritative. A contract-aware tt-metal generator
+(`decode_input_update_contract >= 1`) receives four independent boolean
+commands on every decode:
 
 | Command | Effect |
 | --- | --- |
@@ -12,11 +13,12 @@ four independent boolean commands on every decode:
 | `reload_sampling_params` | Upload temperature, top-k/top-p, penalties, seeds, and logprob configuration. |
 | `reset_sampling_state` | Rebuild mutable penalty/RNG state for the current layout. |
 
-`decode_layout_changed` is an internal vLLM lifecycle signal: the planner
-translates it into the four commands, but it is not forwarded to tt-metal. `slot_remap`
-remains data: it is composed by vLLM until a device-sampling submission
-consumes it, then tt-metal applies it once before sampling state is reset or
-advanced.
+`decode_layout_changed` is an internal vLLM lifecycle signal: for an explicit
+contract adapter, the planner translates it into the four commands without
+forwarding the signal itself. For a legacy adapter, vLLM translates it to the
+old `reset_batch` keyword on device-sampling calls. `slot_remap` remains data:
+it is composed by vLLM until a device-sampling submission consumes it, then
+tt-metal applies it once before sampling state is reset or advanced.
 
 ## Mode definitions
 
@@ -84,8 +86,9 @@ work cannot append runner state or emit an extra client token.
 
 ## Requirements for `supports_async_decode`
 
-Set `model_capabilities["supports_async_decode"] = True` only when the model
-adapter satisfies every requirement below:
+For a version-1 adapter, set
+`model_capabilities["supports_async_decode"] = True` only when the adapter
+satisfies every requirement below:
 
 1. **Split submission and readback**: `decode_forward(...,
    read_from_device=False)` submits decode without synchronizing the result, and
@@ -115,21 +118,46 @@ adapter satisfies every requirement below:
 The capability is fail-closed. If any requirement is not met, leave
 `supports_async_decode` absent or `False`. vLLM disables async scheduling for
 that model and requests a full forward-input reload on every decode, while
-still using the same four-command interface.
+still using the negotiated generator interface. A legacy adapter may already
+advertise `supports_async_decode`; vLLM preserves that adapter's existing
+reload and overlap behavior, but warns that correctness is not guaranteed
+until the adapter also implements and advertises contract version 1.
 
-## Deployment coupling
+## Contract negotiation
 
-The vLLM and tt-metal changes are one required contract and should be deployed
-as a pinned pair. vLLM always sends all four commands; there is no per-model
-contract-version negotiation or fallback to an older tt-metal generator.
-The paired tt-metal change includes the unconditional decode-only seed
-initialization also addressed by
+Model adapters opt in by setting `decode_input_update_contract = 1`. vLLM sends
+the four explicit commands only to adapters advertising version 1 or newer.
+Adapters without the attribute, or with version 0, receive the legacy
+`reset_batch` keyword on device-sampling calls and never receive unknown
+command keywords. Their reload and overlap behavior remains unchanged from the
+pre-contract path, including any model-local heuristics. vLLM logs a warning
+because those heuristics may observe stale host state under async decode and
+cannot provide the version-1 correctness guarantees. This compatibility path
+allows the vLLM change to land before individual tt-metal adapters are
+refactored.
+
+| vLLM | tt-metal adapter | Result |
+| --- | --- | --- |
+| Old | Legacy / version 0 | Supported: existing behavior |
+| New | Legacy / version 0 | Compatibility path: legacy behavior with a warning |
+| New | Version 1+ | Supported: explicit commands and eligible resident overlap |
+| Old | Strict version 1 | Unsupported: old vLLM omits the required commands |
+
+The supported rollout order is therefore vLLM first, followed by tt-metal
+adapter migrations. Advertising version 1 before implementing every command
+is an adapter bug and should fail loudly rather than silently falling back.
+Versions greater than 1 must remain backward-compatible supersets of version 1;
+a breaking interface requires a distinct negotiation key or supported range.
+
+`model_capabilities["supports_async_decode"]` remains independent of contract
+versioning. It controls async scheduling and certifies that sampled-token
+feedback can remain device-resident between decode steps. A version-1 model
+without that capability receives a conservative full-input reload command on
+every decode.
+
+The refactored tt-metal implementation includes the unconditional decode-only
+seed initialization also addressed by
 [tt-metal#51556](https://github.com/tenstorrent/tt-metal/pull/51556):
 `reset_sampling_state=True` forces seed initialization for first-decode and
 layout transitions even when both the requested and cached seed are `None`.
-The paired change implements this directly and does not depend on that PR.
-`model_capabilities["supports_async_decode"]` remains the sole per-model gate.
-It both controls async scheduling and certifies that sampled-token feedback can
-remain device-resident between decode steps. Models without it still receive
-the explicit four-command contract, but vLLM conservatively requests a full
-forward-input reload on every step.
+The implementation does not depend on that PR.

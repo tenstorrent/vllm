@@ -13,6 +13,7 @@ import ttnn
 
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from vllm_tt_plugin.input_batch import CachedRequestState
     from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTModelInput
     from vllm_tt_plugin.model_runner import TTModelRunner
+
+logger = init_tt_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -220,6 +223,7 @@ class TTAsyncDecodeController:
         self._decode_chain_valid = False
         self._previous_device_sampling: bool | None = None
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
+        self._legacy_contract_warning_emitted = False
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -754,17 +758,33 @@ class TTAsyncDecodeController:
             if model_input.slot_remap is not None:
                 kwargs["slot_remap"] = model_input.slot_remap
 
-        # vLLM owns reload decisions because it alone knows when host tensors
-        # are authoritative under async scheduling. The paired tt-metal
-        # revision is therefore required and receives all four commands on
-        # every non-empty decode submission.
-        reload_plan = self.plan_decode_reload(model_input)
-        kwargs.update(
-            reload_inputs=reload_plan.reload_inputs,
-            reload_page_table=reload_plan.reload_page_table,
-            reload_sampling_params=reload_plan.reload_sampling_params,
-            reset_sampling_state=reload_plan.reset_sampling_state,
-        )
+        # Versioned compatibility seam. Refactored tt-metal generators opt in
+        # to the explicit contract. Existing generators retain their legacy
+        # reset_batch interface and never receive unknown command kwargs.
+        contract_version = int(getattr(runner.model, "decode_input_update_contract", 0))
+        reload_plan = None
+        if contract_version >= 1:
+            reload_plan = self.plan_decode_reload(model_input)
+            kwargs.update(
+                reload_inputs=reload_plan.reload_inputs,
+                reload_page_table=reload_plan.reload_page_table,
+                reload_sampling_params=reload_plan.reload_sampling_params,
+                reset_sampling_state=reload_plan.reset_sampling_state,
+            )
+        elif perform_device_sampling:
+            # Keep the lifecycle hint internal under the explicit contract,
+            # but translate it back to the legacy API while old adapters are
+            # still being migrated.
+            kwargs["reset_batch"] = model_input.decode_layout_changed
+        if contract_version < 1 and not self._legacy_contract_warning_emitted:
+            self._legacy_contract_warning_emitted = True
+            logger.warning(
+                "TT model %s does not advertise decode_input_update_contract "
+                ">= 1; preserving its legacy reset_batch reload behavior. "
+                "Async decode correctness is not guaranteed until the model "
+                "adapter implements and advertises the explicit contract.",
+                type(runner.model).__name__,
+            )
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
@@ -789,7 +809,14 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
-        self.commit_decode_submission(model_input, reload_plan)
+        if reload_plan is not None:
+            self.commit_decode_submission(model_input, reload_plan)
+        else:
+            # Preserve legacy overlap eligibility. The old adapter remains the
+            # owner of reload decisions; this only records that submission
+            # succeeded so the plugin does not introduce a new forced drain.
+            self._decode_chain_valid = True
+            self._previous_device_sampling = perform_device_sampling
         if perform_device_sampling and runner.parallel_config.data_parallel_size == 1:
             runner.input_batch.commit_slot_remap()
         read_events = None
