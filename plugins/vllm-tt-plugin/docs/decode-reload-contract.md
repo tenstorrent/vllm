@@ -42,7 +42,10 @@ Two superficially reasonable implementations are incorrect:
 The rule is therefore delivery on every version-1 decode and exactly-once
 application by every slot-owning subsystem. An authoritative rebuild may
 replace a subsystem's remap, but merely not using that subsystem this step may
-not. Empty-batch handling resets the composed layout to identity.
+not. A condense performed for a prefill/resume step records a remap without
+delivering it, because only decode consumes remaps. If every remaining request
+then departs before a later decode, empty-batch handling discards that obsolete
+mapping so it cannot be replayed after unrelated requests reuse the slots.
 
 ## Mode definitions
 
@@ -86,9 +89,9 @@ the persistent token slot contains sampled token `t_k`, and the persistent
 position is the position at which `t_k` must be consumed by step `k+1`.
 
 The base case is a full reload. vLLM first finalizes the prior non-steady step,
-filters finished, resumed, and replaced request identities, updates continuing
-host state (including a live request temporarily unscheduled this step), and
-copies authoritative token/position/layout tensors.
+filters finished and resumed requests, updates continuing host state (including
+a live request temporarily unscheduled this step), and copies authoritative
+token/position/layout tensors.
 
 For the induction step, a steady device decode issues no full or sampling-state
 reload. The trace therefore consumes the device-resident `t_k` and position,
@@ -101,12 +104,14 @@ Host sampling always performs a full reload from the accepted host token.
 Layout, resume, prefill, and sampling-mode transitions break the steady
 invariant and therefore drain and re-establish the base case.
 
-A completed async result is applied only to the captured request object when it
-is still live and was not finished/resumed. Reused request IDs fail the
-object-identity check, and their cached runner-output rows are replaced with an
-empty token list before scheduler update. vLLM's scheduler independently
-ignores outputs for requests that no longer exist, so cancelled speculative
-work cannot append runner state or emit an extra client token.
+A completed async result is applied only when its captured internal request ID
+is still live and was not finished/resumed. vLLM assigns a fresh internal ID to
+every accepted request, so aborting and resubmitting the same external ID cannot
+attach an old result to the new request. Cached runner-output rows for explicitly
+finished/resumed requests are replaced with an empty token list before scheduler
+update. vLLM's scheduler independently ignores outputs for requests that no
+longer exist, so cancelled speculative work cannot append runner state or emit
+an extra client token.
 
 ## Requirements for `supports_async_decode`
 

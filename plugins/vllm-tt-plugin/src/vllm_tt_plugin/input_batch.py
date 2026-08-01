@@ -256,6 +256,10 @@ class InputBatch:
 
     def commit_slot_remap(self) -> None:
         """Mark the pending remap as consumed by an accepted decode submit."""
+        self.reset_slot_remap()
+
+    def reset_slot_remap(self) -> None:
+        """Discard the pending remap because no continuing slot state remains."""
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
     def pop_slot_remap(self) -> torch.Tensor:
@@ -373,8 +377,8 @@ class InputBatch:
         )
 
         # Update fast-path bookkeeping sets.
-        # NOTE: Use `discard()` because `req_id` can be reused (abort+resubmit)
-        # and slots can be overwritten.
+        # Use `discard()` because slots can be overwritten and the request may
+        # not currently be present in a particular fast-path set.
         if sampling_params.temperature == 0.0:
             self.random_reqs.discard(req_id)
         else:
@@ -475,10 +479,7 @@ class InputBatch:
             # No continuing request state remains to remap. A non-identity
             # mapping composed before the last removal must not be replayed
             # onto slots initialized later by unrelated requests.
-            self._slot_remap = torch.arange(
-                self.max_num_reqs,
-                dtype=torch.int32,
-            )
+            self.reset_slot_remap()
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices

@@ -376,13 +376,12 @@ class TTWorker(WorkerBase):
         int,
         list[str],
         dict[str, int],
-        int | None,
     ]:
         """Build the local DP payload consumed by gathered-DP orchestration.
 
         Returns `(local_input, max_blocks, has_structured_input,
         has_penalties, decode_layout_changed, can_sample_device, needs_logprobs,
-        req_ids, req_id_to_index, request_state_snapshot_id)`, where
+        req_ids, req_id_to_index)`, where
         `local_input` is this rank's TT model input (or `None`) and the
         remaining fields are the per-rank metadata consumed by gathered-DP
         orchestration.
@@ -503,7 +502,6 @@ class TTWorker(WorkerBase):
         logprobs_lists: Optional["LogprobsLists"] = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
-        request_state_snapshot_id: int | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result through the worker facade.
 
@@ -515,7 +513,6 @@ class TTWorker(WorkerBase):
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
-            request_state_snapshot_id=request_state_snapshot_id,
         )
 
     # ---- Destructor (used to close devices) ----
