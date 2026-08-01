@@ -241,21 +241,21 @@ class InputBatch:
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
 
-        # Slot remap for seed manager: remap[i] = j means slot i's data came
-        # from slot j after condense.  Identity when nothing moved.
+        # Pending persistent-state remap: remap[i] = j means slot i's data
+        # came from slot j after condense. This covers sampler state and any
+        # model-owned per-slot decode state. Identity when nothing moved.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
 
     def peek_slot_remap(self) -> torch.Tensor:
         """Return the pending slot remap without consuming it.
 
-        A batch may temporarily fall back to host sampling. In that case the
-        device sampler has not consumed the remap, so clearing it would lose the
-        RNG/state move required when device sampling resumes.
+        Building an input does not prove that the model accepted it. Keep the
+        composed remap pending until the successful decode-submission boundary.
         """
         return self._slot_remap.clone()
 
     def commit_slot_remap(self) -> None:
-        """Mark the pending remap as consumed by a device-sampling submit."""
+        """Mark the pending remap as consumed by an accepted decode submit."""
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
     def pop_slot_remap(self) -> torch.Tensor:
@@ -472,6 +472,13 @@ class InputBatch:
             # The batched states are empty.
             self._req_ids.clear()
             self.req_output_token_ids.clear()
+            # No continuing request state remains to remap. A non-identity
+            # mapping composed before the last removal must not be replayed
+            # onto slots initialized later by unrelated requests.
+            self._slot_remap = torch.arange(
+                self.max_num_reqs,
+                dtype=torch.int32,
+            )
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
@@ -1159,10 +1166,10 @@ class TTLaneInputBatch(InputBatch):
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
         decode_layout_changed = runner._decode_layout_changed_since_last_decode
         runner._decode_layout_changed_since_last_decode = False
-        # Device-sampling state owns this remap. Merely building a host-sampling
-        # input must not consume it; submit_decode commits it after a successful
-        # contract-aware device-sampling submission.
-        slot_remap = lane_batch.peek_slot_remap() if perform_device_sampling else None
+        # The remap covers any persistent per-slot model state, not just the
+        # device sampler. Merely building the input does not consume it;
+        # submit_decode commits after a contract-aware decode accepts it.
+        slot_remap = lane_batch.peek_slot_remap()
 
         return TTModelInput(
             input_tokens=input_tokens,

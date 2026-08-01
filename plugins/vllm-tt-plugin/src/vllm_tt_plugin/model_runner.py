@@ -834,8 +834,9 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether to pop and attach the input batch's
-                pending slot remap.
+            capture_slot_remap: Whether to attach the input batch's pending
+                slot remap. The remap is committed only after a decode accepts
+                it.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling
@@ -1119,12 +1120,14 @@ class TTModelRunner:
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
-        # Slot remap belongs to mutable device-sampling state. Keep it sticky
-        # across host-sampling steps and consume it only after an actual
-        # device-sampling decode submission.
+        # Slot remap describes the whole persistent decode layout, not only
+        # sampling state: a model may also own per-slot recurrent/conv state.
+        # Contract-v1 adapters therefore receive it for host- and
+        # device-sampling decodes. Legacy delivery is filtered at the model
+        # call boundary so version-0 adapters keep their old call shape.
         slot_remap = (
             input_batch.peek_slot_remap()
-            if capture_slot_remap and not is_prompt and perform_device_sampling
+            if capture_slot_remap and not is_prompt
             else None
         )
 
