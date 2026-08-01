@@ -723,12 +723,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 )
             else:
                 self.model_executor.collective_rpc("note_dp_prefill_submitted")
-            if is_decode and all_sample_device:
-                # Each DP rank built its remap from local persistent state.
-                # Consume it only after the globally merged device-sampling
-                # submission has been accepted.
+            if is_decode and local_input is not None:
+                # Each participating DP rank built its remap from local
+                # persistent state. Commit it only after the globally merged
+                # submission has accepted it. The worker preserves v0's
+                # historical device-sampling-only consumption rule.
                 self.model_executor.collective_rpc(
-                    "commit_device_sampling_slot_updates"
+                    "commit_dp_slot_updates",
+                    args=(all_sample_device,),
                 )
         else:
             future = self._completed_dp_gather_future()

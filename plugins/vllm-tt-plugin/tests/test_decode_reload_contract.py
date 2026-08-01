@@ -15,8 +15,10 @@ from vllm_tt_plugin.async_decode import (
     SubmittedStepContext,
     TTAsyncDecodeController,
 )
+from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_input import TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.worker import TTWorker
 
 
 def _controller(current_req_ids=("req-0",), *, trace_mode="decode_only"):
@@ -35,6 +37,33 @@ def _decode_input(*, device_sampling=True, decode_layout_changed=False, page=0):
         perform_device_sampling=device_sampling,
         decode_layout_changed=decode_layout_changed,
         block_tables_per_group=[torch.tensor([[page, 0]], dtype=torch.int32)],
+    )
+
+
+def _submission_input(*, device_sampling: bool, slot_remap=(3, 1, 2, 3)):
+    return SimpleNamespace(
+        input_tokens=torch.zeros((4, 1), dtype=torch.int32),
+        input_positions=torch.zeros((4,), dtype=torch.int32),
+        block_tables=torch.zeros((4, 1), dtype=torch.int32),
+        block_tables_per_group=[torch.zeros((4, 1), dtype=torch.int32)],
+        block_tables_per_layer=None,
+        unpadded_batch_size=4,
+        tt_sampling_params=TTSamplingParams(
+            temperature=torch.ones(4),
+            top_k=torch.full((4,), 32),
+            top_p=torch.ones(4),
+            presence_penalty=torch.zeros(4),
+            frequency_penalty=torch.zeros(4),
+            repetition_penalty=torch.ones(4),
+            seed=torch.full((4,), -1),
+            num_logprobs=torch.full((4,), -2),
+            enable_log_probs=torch.zeros(4, dtype=torch.bool),
+        ),
+        perform_device_sampling=device_sampling,
+        prompt_tokens=None,
+        output_tokens=None,
+        decode_layout_changed=True,
+        slot_remap=torch.tensor(slot_remap, dtype=torch.int32),
     )
 
 
@@ -199,6 +228,45 @@ def test_dp_slot_remap_is_offset_into_global_slot_namespace():
     assert global_remap.tolist() == [3, 1, 2, 0, 6, 4, 7, 5]
 
 
+def test_empty_batch_discards_remap_from_previous_request_lifetimes():
+    batch = SimpleNamespace(
+        num_reqs=0,
+        max_num_reqs=4,
+        _req_ids=[None],
+        req_output_token_ids=[None],
+        _slot_remap=torch.tensor([3, 1, 2, 3], dtype=torch.int32),
+    )
+
+    InputBatch.condense(batch, [0])
+
+    assert batch._req_ids == []
+    assert batch.req_output_token_ids == []
+    assert batch._slot_remap.tolist() == [0, 1, 2, 3]
+
+
+def test_dp_slot_remap_commit_respects_contract_and_sampling_mode():
+    commits = []
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            model=SimpleNamespace(decode_input_update_contract=1),
+            input_batch=SimpleNamespace(
+                commit_slot_remap=lambda: commits.append("v1-host")
+            ),
+        )
+    )
+
+    TTWorker.commit_dp_slot_updates(worker, device_sampling=False)
+
+    worker.model_runner.model = SimpleNamespace()
+    worker.model_runner.input_batch.commit_slot_remap = lambda: commits.append(
+        "v0-device"
+    )
+    TTWorker.commit_dp_slot_updates(worker, device_sampling=False)
+    TTWorker.commit_dp_slot_updates(worker, device_sampling=True)
+
+    assert commits == ["v1-host", "v0-device"]
+
+
 def test_explicit_contract_keeps_layout_hint_inside_planner():
     captured = {}
 
@@ -251,6 +319,152 @@ def test_explicit_contract_keeps_layout_hint_inside_planner():
     assert captured["reload_inputs"] is True
     assert captured["reload_sampling_params"] is True
     assert captured["reset_sampling_state"] is True
+
+
+def test_explicit_contract_delivers_and_commits_slot_remap_for_host_sampling():
+    captured = {}
+    commits = []
+
+    class FakeModel:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": False}
+
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        model=FakeModel(),
+        trace_mode="decode_only",
+        kv_caches=object(),
+        request_specific_rope=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        input_batch=SimpleNamespace(commit_slot_remap=lambda: commits.append(True)),
+    )
+    controller = TTAsyncDecodeController(runner)
+
+    controller.submit_decode(
+        _submission_input(device_sampling=False),
+        read_from_device=False,
+        async_read=False,
+    )
+
+    assert captured["slot_remap"].tolist() == [3, 1, 2, 3]
+    assert commits == [True]
+
+
+def test_layout_change_refreshes_request_rope_even_when_request_id_is_reused():
+    captured = {}
+
+    class FakeModel:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": False}
+
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        model=FakeModel(),
+        trace_mode="decode_only",
+        kv_caches=object(),
+        request_specific_rope=True,
+        previous_req_ids={"req-0"},
+        requests={"req-0": SimpleNamespace(mrope_position_delta=17)},
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        input_batch=SimpleNamespace(
+            req_ids=["req-0"],
+            commit_slot_remap=lambda: None,
+        ),
+    )
+    controller = TTAsyncDecodeController(runner)
+
+    controller.submit_decode(
+        _submission_input(device_sampling=False),
+        read_from_device=False,
+        async_read=False,
+    )
+
+    assert captured["rope_deltas_all_users"] == [17]
+
+
+def test_slot_remap_is_not_committed_when_decode_submission_fails():
+    commits = []
+
+    class FakeModel:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": False}
+
+        def decode_forward(self, **kwargs):
+            raise RuntimeError("submission rejected")
+
+    runner = SimpleNamespace(
+        model=FakeModel(),
+        trace_mode="decode_only",
+        kv_caches=object(),
+        request_specific_rope=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        input_batch=SimpleNamespace(commit_slot_remap=lambda: commits.append(True)),
+    )
+    controller = TTAsyncDecodeController(runner)
+
+    try:
+        controller.submit_decode(
+            _submission_input(device_sampling=False),
+            read_from_device=False,
+            async_read=False,
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "submission rejected"
+    else:
+        raise AssertionError("decode submission should have failed")
+
+    assert commits == []
+
+
+def test_legacy_host_sampling_keeps_slot_remap_pending_for_device_sampling(
+    monkeypatch,
+):
+    calls = []
+    commits = []
+    monkeypatch.setattr(
+        "vllm_tt_plugin.async_decode.logger.warning",
+        lambda *args: None,
+    )
+
+    class FakeLegacyModel:
+        model_capabilities = {"supports_async_decode": True}
+
+        def decode_forward(self, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        model=FakeLegacyModel(),
+        trace_mode="decode_only",
+        kv_caches=object(),
+        request_specific_rope=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        input_batch=SimpleNamespace(commit_slot_remap=lambda: commits.append(True)),
+    )
+    controller = TTAsyncDecodeController(runner)
+    model_input = _submission_input(device_sampling=False)
+
+    controller.submit_decode(
+        model_input,
+        read_from_device=False,
+        async_read=False,
+    )
+    model_input.perform_device_sampling = True
+    controller.submit_decode(
+        model_input,
+        read_from_device=False,
+        async_read=False,
+    )
+
+    assert "slot_remap" not in calls[0]
+    assert calls[1]["slot_remap"].tolist() == [3, 1, 2, 3]
+    assert commits == [True]
 
 
 def test_legacy_contract_receives_reset_batch_without_explicit_commands(

@@ -150,9 +150,10 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     decode_layout_changed: bool = False
 
-    # Per-rank slot remap from condense - remap[i]=j means slot i's data came
-    # from slot j. Identity when nothing moved. Shape: [total_B] (concat of
-    # per-rank [B] tensors for DP).
+    # Per-rank persistent-state remap from condense - remap[i]=j means slot i's
+    # data came from slot j. Applies to model-owned decode state as well as
+    # sampler state, including during host sampling. Identity when nothing
+    # moved. Shape: [total_B] (concat of per-rank [B] tensors for DP).
     slot_remap: torch.Tensor | None = None
 
     # Single-process DP prefill only: global stable slots supplied by the
