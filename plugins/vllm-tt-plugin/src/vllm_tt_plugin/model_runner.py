@@ -919,8 +919,9 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether to pop and attach the input batch's
-                pending slot remap.
+            capture_slot_remap: Whether to attach the input batch's pending
+                slot remap. The remap is committed only after a decode accepts
+                it.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling

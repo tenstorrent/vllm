@@ -416,9 +416,22 @@ class TTWorker(WorkerBase):
             scheduler_output, grammar_output
         )
 
-    def commit_device_sampling_slot_updates(self) -> None:
-        """Commit the local remap after a gathered device-sampling submit."""
-        self.model_runner.input_batch.commit_slot_remap()
+    def commit_dp_slot_updates(self, device_sampling: bool) -> None:
+        """Commit a local remap consumed by the gathered decode submit.
+
+        Contract-v1 adapters consume layout remaps in both sampling modes.
+        Version-0 adapters retain their historical device-sampling-only call
+        shape, so a host-sampling step must leave their remap pending.
+        """
+        contract_version = int(
+            getattr(
+                self.model_runner.model,
+                "decode_input_update_contract",
+                0,
+            )
+        )
+        if contract_version >= 1 or device_sampling:
+            self.model_runner.input_batch.commit_slot_remap()
 
     def note_dp_decode_submitted(self, device_sampling: bool) -> None:
         """Mirror merged decode residency on this rank's overlap controller."""

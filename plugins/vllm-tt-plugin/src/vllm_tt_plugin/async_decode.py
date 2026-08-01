@@ -714,6 +714,9 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        contract_version = int(
+            getattr(runner.model, "decode_input_update_contract", 0)
+        )
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
@@ -755,13 +758,20 @@ class TTAsyncDecodeController:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
-            if model_input.slot_remap is not None:
-                kwargs["slot_remap"] = model_input.slot_remap
+
+        # Under the explicit contract, slot_remap is decode-layout data and is
+        # delivered even when this step samples on the host: adapters may own
+        # persistent per-slot state outside their device sampler. Preserve the
+        # legacy device-sampling-only call shape for version-0 adapters.
+        slot_remap_consumed = model_input.slot_remap is not None and (
+            contract_version >= 1 or perform_device_sampling
+        )
+        if slot_remap_consumed:
+            kwargs["slot_remap"] = model_input.slot_remap
 
         # Versioned compatibility seam. Refactored tt-metal generators opt in
         # to the explicit contract. Existing generators retain their legacy
         # reset_batch interface and never receive unknown command kwargs.
-        contract_version = int(getattr(runner.model, "decode_input_update_contract", 0))
         reload_plan = None
         if contract_version >= 1:
             reload_plan = self.plan_decode_reload(model_input)
@@ -788,7 +798,7 @@ class TTAsyncDecodeController:
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
-            if any(
+            if model_input.decode_layout_changed or any(
                 req_id not in runner.previous_req_ids
                 for req_id in runner.input_batch.req_ids
             ):
@@ -817,7 +827,7 @@ class TTAsyncDecodeController:
             # succeeded so the plugin does not introduce a new forced drain.
             self._decode_chain_valid = True
             self._previous_device_sampling = perform_device_sampling
-        if perform_device_sampling and runner.parallel_config.data_parallel_size == 1:
+        if slot_remap_consumed and runner.parallel_config.data_parallel_size == 1:
             runner.input_batch.commit_slot_remap()
         read_events = None
         if async_read:

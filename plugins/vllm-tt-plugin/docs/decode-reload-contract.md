@@ -17,8 +17,11 @@ commands on every decode:
 contract adapter, the planner translates it into the four commands without
 forwarding the signal itself. For a legacy adapter, vLLM translates it to the
 old `reset_batch` keyword on device-sampling calls. `slot_remap` remains data:
-it is composed by vLLM until a device-sampling submission consumes it, then
-tt-metal applies it once before sampling state is reset or advanced.
+for a version-1 adapter it is composed by vLLM until the next accepted decode
+submission in either sampling mode. tt-metal applies it once before the decode
+reads any persistent per-slot state. This includes model-owned recurrent or
+convolution state as well as device sampling state. Version-0 adapters retain
+the legacy device-sampling-only delivery and consumption behavior.
 
 ## Mode definitions
 
@@ -111,7 +114,11 @@ satisfies every requirement below:
 6. **Sampling-state ordering**: slot remaps are applied before parameter/state
    reset; RNG and penalty state are reset only when requested; seed advancement
    happens exactly once per sampled token.
-7. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
+7. **Complete slot remapping**: on every version-1 decode, `slot_remap` applies
+   to all persistent state indexed by the vLLM batch slot, even when that step
+   samples on the host. This includes model-internal recurrent/convolution
+   state; a full forward-input reload does not implicitly repair such state.
+8. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
    valid until the submitted step is read back and until the next command
    explicitly replaces their contents.
 
@@ -129,12 +136,12 @@ Model adapters opt in by setting `decode_input_update_contract = 1`. vLLM sends
 the four explicit commands only to adapters advertising version 1 or newer.
 Adapters without the attribute, or with version 0, receive the legacy
 `reset_batch` keyword on device-sampling calls and never receive unknown
-command keywords. Their reload and overlap behavior remains unchanged from the
-pre-contract path, including any model-local heuristics. vLLM logs a warning
-because those heuristics may observe stale host state under async decode and
-cannot provide the version-1 correctness guarantees. This compatibility path
-allows the vLLM change to land before individual tt-metal adapters are
-refactored.
+command keywords. They also retain device-sampling-only `slot_remap` delivery.
+Their reload and overlap behavior remains unchanged from the pre-contract path,
+including any model-local heuristics. vLLM logs a warning because those
+heuristics may observe stale host state under async decode and cannot provide
+the version-1 correctness guarantees. This compatibility path allows the vLLM
+change to land before individual tt-metal adapters are refactored.
 
 | vLLM | tt-metal adapter | Result |
 | --- | --- | --- |
