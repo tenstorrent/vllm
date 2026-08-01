@@ -42,10 +42,11 @@ Two superficially reasonable implementations are incorrect:
 The rule is therefore delivery on every version-1 decode and exactly-once
 application by every slot-owning subsystem. An authoritative rebuild may
 replace a subsystem's remap, but merely not using that subsystem this step may
-not. A condense performed for a prefill/resume step records a remap without
-delivering it, because only decode consumes remaps. If every remaining request
-then departs before a later decode, empty-batch handling discards that obsolete
-mapping so it cannot be replayed after unrelated requests reuse the slots.
+not. The version-0 compatibility path can leave a remap pending after a
+host-sampling decode because legacy adapters receive remaps only during device
+sampling. If every remaining request departs before that later device decode,
+empty-batch handling discards the obsolete mapping so it cannot be replayed
+after unrelated requests reuse the slots.
 
 ## Mode definitions
 
