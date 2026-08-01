@@ -227,81 +227,19 @@ def test_dp_slot_remap_is_offset_into_global_slot_namespace():
     assert global_remap.tolist() == [3, 1, 2, 0, 6, 4, 7, 5]
 
 
-def test_empty_batch_discards_remap_from_previous_request_lifetimes():
+def test_empty_batch_does_not_consume_pending_slot_remap():
     batch = SimpleNamespace(
         num_reqs=0,
-        max_num_reqs=4,
         _req_ids=[None],
         req_output_token_ids=[None],
         _slot_remap=torch.tensor([3, 1, 2, 3], dtype=torch.int32),
     )
-    batch.reset_slot_remap = lambda: InputBatch.reset_slot_remap(batch)
 
     InputBatch.condense(batch, [0])
 
     assert batch._req_ids == []
     assert batch.req_output_token_ids == []
-    assert batch._slot_remap.tolist() == [0, 1, 2, 3]
-
-
-def test_remove_all_discards_pending_remap_before_same_step_refill(monkeypatch):
-    class FakeBatch:
-        max_num_reqs = 4
-
-        def __init__(self):
-            self.req_id_to_index = {"old": 0}
-            self._slot_remap = torch.tensor([3, 1, 2, 3], dtype=torch.int32)
-            self.remap_seen_at_add = None
-
-        @property
-        def num_reqs(self):
-            return len(self.req_id_to_index)
-
-        def remove_request(self, req_id):
-            return self.req_id_to_index.pop(req_id, None)
-
-        def reset_slot_remap(self):
-            InputBatch.reset_slot_remap(self)
-
-        def add_request(self, req_state, req_index):
-            self.remap_seen_at_add = self._slot_remap.clone()
-            self.req_id_to_index[req_state.req_id] = req_index
-
-        def condense(self, empty_req_indices):
-            raise AssertionError("same-step refill should consume every freed slot")
-
-        def refresh_logitsprocs(self):
-            pass
-
-    batch = FakeBatch()
-    runner = SimpleNamespace(
-        requests={"old": object()},
-        input_batch=batch,
-        encoder_cache={},
-        _decode_layout_changed_since_last_decode=False,
-    )
-    scheduler_output = SimpleNamespace(
-        finished_req_ids={"old"},
-        free_encoder_mm_hashes=[],
-        num_scheduled_tokens={"new": 1},
-        scheduled_new_reqs=[SimpleNamespace(req_id="new")],
-        scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[],
-            num_computed_tokens=[],
-            new_block_ids=[],
-            resumed_req_ids=set(),
-        ),
-    )
-    monkeypatch.setattr(
-        "vllm_tt_plugin.model_runner.build_cached_request_state",
-        lambda new_req: SimpleNamespace(req_id=new_req.req_id),
-    )
-
-    TTModelRunner._update_states(runner, scheduler_output)
-
-    assert batch.req_id_to_index == {"new": 0}
-    assert batch.remap_seen_at_add.tolist() == [0, 1, 2, 3]
-    assert batch._slot_remap.tolist() == [0, 1, 2, 3]
+    assert batch._slot_remap.tolist() == [3, 1, 2, 3]
 
 
 def test_dp_slot_remap_commit_respects_contract_and_sampling_mode():

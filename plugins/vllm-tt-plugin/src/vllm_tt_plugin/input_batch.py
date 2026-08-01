@@ -262,10 +262,6 @@ class InputBatch:
 
     def commit_slot_remap(self) -> None:
         """Mark the pending remap as consumed by an accepted decode submit."""
-        self.reset_slot_remap()
-
-    def reset_slot_remap(self) -> None:
-        """Discard the pending remap because no continuing slot state remains."""
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
     def pop_slot_remap(self) -> torch.Tensor:
@@ -482,10 +478,6 @@ class InputBatch:
             # The batched states are empty.
             self._req_ids.clear()
             self.req_output_token_ids.clear()
-            # No continuing request state remains to remap. A non-identity
-            # mapping composed before the last removal must not be replayed
-            # onto slots initialized later by unrelated requests.
-            self.reset_slot_remap()
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
