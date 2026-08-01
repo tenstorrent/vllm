@@ -78,7 +78,6 @@ class DPGatherHandle:
     intermediate_prefill_mask: torch.Tensor | None
     req_ids: list[str]
     req_id_to_index: dict[str, int]
-    request_state_snapshot_id: int | None
 
 
 class TTDPEngineCoreProc(DPEngineCoreProc):
@@ -514,7 +513,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
-            request_state_snapshot_id,
         ) = all_local_inputs
         max_blocks_decode = None
         any_structured_inputs = False
@@ -745,7 +743,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             intermediate_prefill_mask=intermediate_prefill_mask,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
-            request_state_snapshot_id=request_state_snapshot_id,
         )
 
     def dp_gather_finalize(self, handle: DPGatherHandle) -> ModelRunnerOutput:
@@ -785,7 +782,6 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     handle.req_ids,
                     handle.req_id_to_index,
                     handle.intermediate_prefill_mask,
-                    handle.request_state_snapshot_id,
                 ),
             )[0]
             return output

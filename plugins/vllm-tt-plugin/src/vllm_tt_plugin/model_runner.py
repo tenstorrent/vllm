@@ -208,11 +208,6 @@ class TTModelRunner:
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
         self.async_decode = TTAsyncDecodeController(self)
-        # Gathered-DP results cross the engine/worker boundary as tensors.
-        # Keep the corresponding request-object identities local so an
-        # abort+resubmit that reuses a request ID cannot accept an old result.
-        self._next_dp_request_state_snapshot_id = 0
-        self._dp_request_state_snapshots: dict[int, tuple[CachedRequestState, ...]] = {}
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
@@ -614,12 +609,9 @@ class TTModelRunner:
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
 
-        # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
+        # Remove the finished requests from the persistent batch. vLLM gives
+        # each accepted request a fresh internal ID, including when a client
+        # aborts and resubmits the same external ID.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             req_index = self.input_batch.remove_request(req_id)
@@ -648,6 +640,12 @@ class TTModelRunner:
             assert req_index is not None
             removed_req_indices.append(req_index)
             persistent_batch_layout_changed = True
+
+        # A pending remap refers only to continuing occupants of the old
+        # layout. If removals empty the batch, discard it before this same
+        # scheduler update can refill every freed slot and bypass condense().
+        if removed_req_indices and self.input_batch.num_reqs == 0:
+            self.input_batch.reset_slot_remap()
 
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
@@ -1223,8 +1221,6 @@ class TTModelRunner:
         # continuing requests need the accepted token appended before current
         # host tensors are built. A request may remain live while unscheduled,
         # so its captured request state must still receive the accepted token.
-        # Captured request-object identity separately protects abort+resubmit
-        # with the same request ID.
         self._update_states(scheduler_output)
         skipped = set(scheduler_output.finished_req_ids)
         skipped.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
@@ -2695,7 +2691,6 @@ class TTModelRunner:
         torch.Tensor | None,
         list[str],
         dict[str, int],
-        int | None,
     ]:
         """Build the per-rank DP payload consumed by gather orchestration.
 
@@ -2710,7 +2705,6 @@ class TTModelRunner:
         intermediate_prefill_mask = None
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
-        request_state_snapshot_id: int | None = None
         if scheduler_output is not None:
             model_input = self.build_model_input(scheduler_output, grammar_output)
             if model_input is not None:
@@ -2724,11 +2718,6 @@ class TTModelRunner:
                 num_reqs = self.input_batch.num_reqs
                 req_ids = list(self.input_batch.req_ids[:num_reqs])
                 req_id_to_index = dict(self.input_batch.req_id_to_index)
-                request_state_snapshot_id = self._next_dp_request_state_snapshot_id
-                self._next_dp_request_state_snapshot_id += 1
-                self._dp_request_state_snapshots[request_state_snapshot_id] = tuple(
-                    self.requests[req_id] for req_id in req_ids
-                )
         max_blocks = model_input.block_tables.shape[1] if model_input else 0
         has_structured_input = (
             int(model_input.grammar_bitmask[0] is not None) if model_input else 0
@@ -2744,7 +2733,6 @@ class TTModelRunner:
             intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
-            request_state_snapshot_id,
         )
 
     def submit_dp_execution(
@@ -2785,7 +2773,6 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
         intermediate_prefill_mask: torch.Tensor | None = None,
-        request_state_snapshot_id: int | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result to runner state and build output.
 
@@ -2794,56 +2781,26 @@ class TTModelRunner:
         """
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
-        # The snapshot is popped before any early return: an intermediate-chunk
-        # step must not leave its entry behind for a later step to mistake for
-        # its own.
-        request_states = (
-            self._dp_request_state_snapshots.pop(request_state_snapshot_id)
-            if request_state_snapshot_id is not None
-            else None
+        if intermediate_prefill_mask is not None:
+            intermediate_mask = intermediate_prefill_mask[:num_reqs]
+            if intermediate_mask.any():
+                return self._build_chunked_prefill_output(
+                    req_ids=(
+                        list(req_ids)
+                        if req_ids is not None
+                        else list(self.input_batch.req_ids[:num_reqs])
+                    ),
+                    sampled_token_ids=sampled_token_ids,
+                    logprobs=logprobs_lists,
+                    intermediate_mask=intermediate_mask.cpu().numpy(),
+                    req_id_to_index=req_id_to_index,
+                )
+        return self.apply_and_build_runner_output(
+            sampled_token_ids,
+            logprobs_lists,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
         )
-        invalid_req_ids = (
-            {
-                req_id
-                for req_id, captured_state in zip(req_ids or (), request_states)
-                if self.requests.get(req_id) is not captured_state
-            }
-            if request_states is not None
-            else set()
-        )
-        intermediate_mask = (
-            intermediate_prefill_mask[:num_reqs]
-            if intermediate_prefill_mask is not None
-            else None
-        )
-        if intermediate_mask is not None and bool(intermediate_mask.any()):
-            output = self._build_chunked_prefill_output(
-                req_ids=(
-                    list(req_ids)
-                    if req_ids is not None
-                    else list(self.input_batch.req_ids[:num_reqs])
-                ),
-                sampled_token_ids=sampled_token_ids,
-                logprobs=logprobs_lists,
-                intermediate_mask=intermediate_mask.cpu().numpy(),
-                req_id_to_index=req_id_to_index,
-                skip_req_ids=invalid_req_ids,
-            )
-        else:
-            output = self.apply_and_build_runner_output(
-                sampled_token_ids,
-                logprobs_lists,
-                req_ids=req_ids,
-                req_id_to_index=req_id_to_index,
-                request_states=request_states,
-            )
-        # Identity-invalid rows belong to an aborted/replaced request. Keep
-        # their wire positions, but expose no generated token so the scheduler
-        # cannot apply an old in-flight result to a new request with the same
-        # string ID.
-        for req_id in invalid_req_ids:
-            output.sampled_token_ids[output.req_id_to_index[req_id]] = []
-        return output
 
     def _get_output_tokens(
         self,
@@ -3131,14 +3088,13 @@ class TTModelRunner:
         self,
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
-        request_states: tuple[CachedRequestState, ...] | None = None,
         skip_req_ids: set[str] | None = None,
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime
-        # and the ``request_states`` identity check guards slot reuse, so the
-        # live row equals the captured one. ``req_id_to_index`` is therefore the
+        # time. vLLM assigns a fresh internal ID to every accepted request, so
+        # a live lookup by captured ID cannot resolve to a later request that
+        # reused the same external ID. ``req_id_to_index`` is therefore the
         # single source of truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
@@ -3181,8 +3137,6 @@ class TTModelRunner:
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
-            if request_states is not None and req_state is not request_states[req_idx]:
-                continue
 
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
@@ -3206,7 +3160,6 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
-        request_states: tuple[CachedRequestState, ...] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -3216,7 +3169,6 @@ class TTModelRunner:
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
-            request_states=request_states,
         )
         return self._build_runner_output(
             sampled_token_ids=sampled_token_ids,
