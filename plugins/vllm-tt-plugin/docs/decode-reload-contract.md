@@ -19,9 +19,30 @@ forwarding the signal itself. For a legacy adapter, vLLM translates it to the
 old `reset_batch` keyword on device-sampling calls. `slot_remap` remains data:
 for a version-1 adapter it is composed by vLLM until the next accepted decode
 submission in either sampling mode. tt-metal applies it once before the decode
-reads any persistent per-slot state. This includes model-owned recurrent or
-convolution state as well as device sampling state. Version-0 adapters retain
-the legacy device-sampling-only delivery and consumption behavior.
+reads any persistent per-slot state. Dormant state that the decode cannot read,
+such as a device sampler during host sampling, may be remapped immediately
+after successful submission; applying its non-idempotent remap before a call
+that can fail would corrupt a retry. Persistent state includes model-owned
+recurrent or convolution state as well as device sampling state. Version-0
+adapters retain the legacy device-sampling-only delivery and consumption
+behavior.
+
+Two superficially reasonable implementations are incorrect:
+
+1. **Deliver the remap only for device sampling.** A host-sampling decode can
+   still change the vLLM slot layout. Withholding `slot_remap` leaves
+   model-owned slot state, such as recurrent/conv buffers or cached RoPE
+   deltas, attached to the prior request.
+2. **Apply a delivered remap only inside the active device-sampling call.** A
+   model may retain slot-indexed sampler state even while that decode samples
+   on the host. Skipping the dormant sampler leaves seed/RNG/penalty state in
+   the old slots, so a later return to device sampling resumes the wrong
+   request's state.
+
+The rule is therefore delivery on every version-1 decode and exactly-once
+application by every slot-owning subsystem. An authoritative rebuild may
+replace a subsystem's remap, but merely not using that subsystem this step may
+not. Empty-batch handling resets the composed layout to identity.
 
 ## Mode definitions
 
@@ -117,7 +138,8 @@ satisfies every requirement below:
 7. **Complete slot remapping**: on every version-1 decode, `slot_remap` applies
    to all persistent state indexed by the vLLM batch slot, even when that step
    samples on the host. This includes model-internal recurrent/convolution
-   state; a full forward-input reload does not implicitly repair such state.
+   state and dormant device-sampler state; a full forward-input reload does
+   not implicitly repair either one.
 8. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
    valid until the submitted step is read back and until the next command
    explicitly replaces their contents.
