@@ -649,12 +649,6 @@ class TTModelRunner:
             removed_req_indices.append(req_index)
             persistent_batch_layout_changed = True
 
-        # A pending remap refers only to continuing occupants of the old
-        # layout. If removals empty the batch, discard it before this same
-        # scheduler update can refill every freed slot and bypass condense().
-        if removed_req_indices and self.input_batch.num_reqs == 0:
-            self.input_batch.reset_slot_remap()
-
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
