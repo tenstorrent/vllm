@@ -18,7 +18,6 @@ from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm_tt_plugin.input_batch import CachedRequestState
     from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTModelInput
     from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -61,7 +60,6 @@ class SubmittedStepContext:
 
     req_ids: list[str]
     req_id_to_index: dict[str, int]
-    request_states: tuple[CachedRequestState, ...]
     submit_time_ns: int
 
 
@@ -352,7 +350,6 @@ class TTAsyncDecodeController:
         return SubmittedStepContext(
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
-            request_states=tuple(runner.requests[req_id] for req_id in req_ids),
             submit_time_ns=time.perf_counter_ns(),
         )
 
@@ -594,17 +591,9 @@ class TTAsyncDecodeController:
         skip_req_ids: set[str] | None = None,
     ) -> None:
         invalid_req_ids = set(skip_req_ids or ())
-        invalid_req_ids.update(
-            req_id
-            for req_id, captured_state in zip(
-                completed.context.req_ids,
-                completed.context.request_states,
-            )
-            if self.runner.requests.get(req_id) is not captured_state
-        )
         # The batch queue schedules/builds the current step before consuming
         # the prior future. Mutating the cached prior output here therefore
-        # prevents an aborted/reused request ID from receiving its old token
+        # prevents a finished or resumed request from receiving its old token
         # in scheduler.update_from_output, not just in runner host state.
         if completed.runner_output is not None:
             for req_id in invalid_req_ids:
@@ -614,7 +603,6 @@ class TTAsyncDecodeController:
         self.runner._apply_sampled_tokens_to_state(
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
-            request_states=completed.context.request_states,
             skip_req_ids=invalid_req_ids,
         )
 

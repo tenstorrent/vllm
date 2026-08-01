@@ -189,7 +189,6 @@ def test_drained_decode_updates_next_host_token_and_position_before_transition()
         context=SubmittedStepContext(
             req_ids=["req-0"],
             req_id_to_index={"req-0": 0},
-            request_states=(req_state,),
             submit_time_ns=1,
         ),
         completion_time_ns=2,
@@ -236,11 +235,72 @@ def test_empty_batch_discards_remap_from_previous_request_lifetimes():
         req_output_token_ids=[None],
         _slot_remap=torch.tensor([3, 1, 2, 3], dtype=torch.int32),
     )
+    batch.reset_slot_remap = lambda: InputBatch.reset_slot_remap(batch)
 
     InputBatch.condense(batch, [0])
 
     assert batch._req_ids == []
     assert batch.req_output_token_ids == []
+    assert batch._slot_remap.tolist() == [0, 1, 2, 3]
+
+
+def test_remove_all_discards_pending_remap_before_same_step_refill(monkeypatch):
+    class FakeBatch:
+        max_num_reqs = 4
+
+        def __init__(self):
+            self.req_id_to_index = {"old": 0}
+            self._slot_remap = torch.tensor([3, 1, 2, 3], dtype=torch.int32)
+            self.remap_seen_at_add = None
+
+        @property
+        def num_reqs(self):
+            return len(self.req_id_to_index)
+
+        def remove_request(self, req_id):
+            return self.req_id_to_index.pop(req_id, None)
+
+        def reset_slot_remap(self):
+            InputBatch.reset_slot_remap(self)
+
+        def add_request(self, req_state, req_index):
+            self.remap_seen_at_add = self._slot_remap.clone()
+            self.req_id_to_index[req_state.req_id] = req_index
+
+        def condense(self, empty_req_indices):
+            raise AssertionError("same-step refill should consume every freed slot")
+
+        def refresh_logitsprocs(self):
+            pass
+
+    batch = FakeBatch()
+    runner = SimpleNamespace(
+        requests={"old": object()},
+        input_batch=batch,
+        encoder_cache={},
+        _decode_layout_changed_since_last_decode=False,
+    )
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"old"},
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens={"new": 1},
+        scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            num_computed_tokens=[],
+            new_block_ids=[],
+            resumed_req_ids=set(),
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_tt_plugin.model_runner.build_cached_request_state",
+        lambda new_req: SimpleNamespace(req_id=new_req.req_id),
+    )
+
+    TTModelRunner._update_states(runner, scheduler_output)
+
+    assert batch.req_id_to_index == {"new": 0}
+    assert batch.remap_seen_at_add.tolist() == [0, 1, 2, 3]
     assert batch._slot_remap.tolist() == [0, 1, 2, 3]
 
 
@@ -581,7 +641,6 @@ def test_cancelled_or_resumed_request_is_not_applied_to_runner_state():
         context=SubmittedStepContext(
             req_ids=["req-0"],
             req_id_to_index={"req-0": 0},
-            request_states=(object(),),
             submit_time_ns=1,
         ),
         completion_time_ns=2,
@@ -589,38 +648,6 @@ def test_cancelled_or_resumed_request_is_not_applied_to_runner_state():
 
     controller.apply_completed_decode_step(completed, skip_req_ids={"req-0"})
 
-    assert captured[0]["skip_req_ids"] == {"req-0"}
-
-
-def test_reused_request_id_suppresses_cached_non_dp_scheduler_output():
-    old_req_state = SimpleNamespace(output_token_ids=[])
-    new_req_state = SimpleNamespace(output_token_ids=[])
-    captured = []
-    runner_output = SimpleNamespace(
-        sampled_token_ids=[[7]],
-        req_id_to_index={"req-0": 0},
-    )
-    controller = _controller()
-    controller.runner.requests = {"req-0": new_req_state}
-    controller.runner._apply_sampled_tokens_to_state = lambda **kwargs: captured.append(
-        kwargs
-    )
-    completed = CompletedDecodeStep(
-        sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        logprobs=None,
-        context=SubmittedStepContext(
-            req_ids=["req-0"],
-            req_id_to_index={"req-0": 0},
-            request_states=(old_req_state,),
-            submit_time_ns=1,
-        ),
-        completion_time_ns=2,
-        runner_output=runner_output,
-    )
-
-    controller.apply_completed_decode_step(completed)
-
-    assert runner_output.sampled_token_ids == [[]]
     assert captured[0]["skip_req_ids"] == {"req-0"}
 
 
@@ -636,53 +663,7 @@ def test_unscheduled_live_request_keeps_completed_token_in_cached_state():
         runner,
         sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
         req_ids=["req-0"],
-        request_states=(req_state,),
         skip_req_ids=set(),
     )
 
     assert req_state.output_token_ids == [7]
-
-
-def test_reused_request_id_rejects_captured_dp_request_identity():
-    old_req_state = SimpleNamespace(output_token_ids=[])
-    new_req_state = SimpleNamespace(output_token_ids=[])
-    runner = SimpleNamespace(
-        requests={"req-0": new_req_state},
-        input_batch=SimpleNamespace(req_id_to_index={"req-0": 0}),
-        model_config=SimpleNamespace(max_model_len=32),
-    )
-
-    TTModelRunner._apply_sampled_tokens_to_state(
-        runner,
-        sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        req_ids=["req-0"],
-        request_states=(old_req_state,),
-    )
-
-    assert old_req_state.output_token_ids == []
-    assert new_req_state.output_token_ids == []
-
-
-def test_reused_request_id_suppresses_old_dp_scheduler_output():
-    old_req_state = SimpleNamespace(output_token_ids=[])
-    new_req_state = SimpleNamespace(output_token_ids=[])
-    runner = SimpleNamespace(
-        requests={"req-0": new_req_state},
-        input_batch=SimpleNamespace(num_reqs=1),
-        _dp_request_state_snapshots={4: (old_req_state,)},
-        apply_and_build_runner_output=lambda *args, **kwargs: SimpleNamespace(
-            sampled_token_ids=[[7]],
-            req_id_to_index={"req-0": 0},
-        ),
-    )
-
-    output = TTModelRunner.apply_dp_execution_result(
-        runner,
-        sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
-        request_state_snapshot_id=4,
-    )
-
-    assert output.sampled_token_ids == [[]]
-    assert runner._dp_request_state_snapshots == {}
