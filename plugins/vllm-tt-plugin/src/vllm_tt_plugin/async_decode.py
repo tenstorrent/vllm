@@ -702,9 +702,7 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
-        contract_version = int(
-            getattr(runner.model, "decode_input_update_contract", 0)
-        )
+        contract_version = int(getattr(runner.model, "decode_input_update_contract", 0))
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
