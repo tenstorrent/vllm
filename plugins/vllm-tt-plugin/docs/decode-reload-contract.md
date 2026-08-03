@@ -110,14 +110,15 @@ Host sampling always performs a full reload from the accepted host token.
 Layout, resume, prefill, and sampling-mode transitions break the steady
 invariant and therefore drain and re-establish the base case.
 
-A completed async result is applied only when its captured internal request ID
-is still live and was not finished/resumed. vLLM assigns a fresh internal ID to
-every accepted request, so aborting and resubmitting the same external ID cannot
-attach an old result to the new request. Cached runner-output rows for explicitly
-finished/resumed requests are replaced with an empty token list before scheduler
-update. vLLM's scheduler independently ignores outputs for requests that no
-longer exist, so cancelled speculative work cannot append runner state or emit
-an extra client token.
+A completed async result is applied only to requests that are still live and
+were neither finished nor resumed since the step was submitted. Request ids are
+client-supplied and may be reused, so an abort followed by a resubmit under the
+same id appears in one scheduler output as both a finished id and a new request.
+The finished id is what marks the step's result invalid, which is why rejection
+is keyed on the scheduler's lifecycle events rather than on identity of the
+cached request state. Runner-output rows for those ids are replaced with an empty
+token list before the scheduler update, so a cancelled step can neither append
+runner state nor emit an extra client token.
 
 ## Requirements for `supports_async_decode`
 

@@ -614,9 +614,12 @@ class TTModelRunner:
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
 
-        # Remove the finished requests from the persistent batch. vLLM gives
-        # each accepted request a fresh internal ID, including when a client
-        # aborts and resubmits the same external ID.
+        # Remove the finished requests from the persistent batch.
+        # ``finished_req_ids`` can overlap the scheduled ids: a request id is the
+        # client-supplied one, so an abort followed by a resubmit under the same
+        # id arrives as two distinct requests in one step. The first is cleared
+        # here and the second is added below; the invalidated set keeps the old
+        # request's in-flight result from reaching the new one.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             req_index = self.input_batch.remove_request(req_id)
@@ -3108,10 +3111,10 @@ class TTModelRunner:
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time. vLLM assigns a fresh internal ID to every accepted request, so
-        # a live lookup by captured ID cannot resolve to a later request that
-        # reused the same external ID. ``req_id_to_index`` is therefore the
-        # single source of truth for the target row.
+        # time, because the batch may have condensed in between. Request ids are
+        # client-supplied and can therefore be reused after an abort; the caller
+        # excludes such ids via ``skip_req_ids`` so a stale result cannot reach
+        # the request that took the id over.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         assert sampled_token_ids.shape[0] == num_reqs, (
