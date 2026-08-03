@@ -415,20 +415,26 @@ class TTWorker(WorkerBase):
             scheduler_output, grammar_output
         )
 
-    def commit_dp_slot_updates(self, device_sampling: bool) -> None:
+    def decode_input_update_contract_version(self) -> int:
+        """This rank's view of the adapter contract version, or -1 if unknown.
+
+        Only the device rank loads a model; the engine reduces these into one
+        globally agreed version.
+        """
+        version = self.model_runner.async_decode.decode_input_update_contract_version()
+        return -1 if version is None else version
+
+    def commit_dp_slot_updates(
+        self, device_sampling: bool, contract_version: int
+    ) -> None:
         """Commit a local remap consumed by the gathered decode submit.
 
-        Contract-v1 adapters consume layout remaps in both sampling modes.
-        Version-0 adapters retain their historical device-sampling-only call
-        shape, so a host-sampling step must leave their remap pending.
+        ``contract_version`` is the globally agreed value because a rank that
+        holds no model cannot read it. Contract-v1 adapters consume layout
+        remaps in both sampling modes; version-0 adapters retain their
+        historical device-sampling-only call shape, so a host-sampling step must
+        leave their remap pending.
         """
-        contract_version = int(
-            getattr(
-                self.model_runner.model,
-                "decode_input_update_contract",
-                0,
-            )
-        )
         if contract_version >= 1 or device_sampling:
             self.model_runner.input_batch.commit_slot_remap()
 

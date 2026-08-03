@@ -99,6 +99,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         self.dlog = dlog_logger
         super().__init__(vllm_config, *args, **kwargs)
         self._dp_in_flight: DPGatherHandle | None = None
+        self._dp_local_contract_version: int | None = None
         if self.batch_queue is not None:
             self.step_fn = self.step_dp_with_batch_queue
 
@@ -523,6 +524,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         gathered_inputs: Any = None
         if is_decode:
+            # Only ``data_parallel_rank_local == 0`` loads a model, so ranks
+            # without one report -1 and the MAX reduction below yields the
+            # device ranks' agreed version. Static for the process lifetime.
+            if self._dp_local_contract_version is None:
+                self._dp_local_contract_version = self.model_executor.collective_rpc(
+                    "decode_input_update_contract_version"
+                )[0]
             input_info_t = torch.tensor(
                 [
                     local_max_blocks,
@@ -531,6 +539,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     local_decode_layout_changed,
                     1 - local_can_sample_device,
                     local_needs_logprobs,
+                    self._dp_local_contract_version,
                 ],
                 dtype=torch.int32,
             )
@@ -541,6 +550,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             any_decode_layout_changed = input_info_t[3].item() > 0
             all_sample_device = input_info_t[4].item() == 0
             any_needs_logprobs = input_info_t[5].item() > 0
+            contract_version = int(input_info_t[6].item())
 
             decode_inputs: dict[str, Any] = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
@@ -731,7 +741,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 # historical device-sampling-only consumption rule.
                 self.model_executor.collective_rpc(
                     "commit_dp_slot_updates",
-                    args=(all_sample_device,),
+                    args=(all_sample_device, contract_version),
                 )
         else:
             future = self._completed_dp_gather_future()

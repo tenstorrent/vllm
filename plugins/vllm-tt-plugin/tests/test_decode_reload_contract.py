@@ -246,23 +246,35 @@ def test_dp_slot_remap_commit_respects_contract_and_sampling_mode():
     commits = []
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(
-            model=SimpleNamespace(decode_input_update_contract=1),
             input_batch=SimpleNamespace(
                 commit_slot_remap=lambda: commits.append("v1-host")
             ),
         )
     )
 
-    TTWorker.commit_dp_slot_updates(worker, device_sampling=False)
+    TTWorker.commit_dp_slot_updates(worker, device_sampling=False, contract_version=1)
 
-    worker.model_runner.model = SimpleNamespace()
     worker.model_runner.input_batch.commit_slot_remap = lambda: commits.append(
         "v0-device"
     )
-    TTWorker.commit_dp_slot_updates(worker, device_sampling=False)
-    TTWorker.commit_dp_slot_updates(worker, device_sampling=True)
+    TTWorker.commit_dp_slot_updates(worker, device_sampling=False, contract_version=0)
+    TTWorker.commit_dp_slot_updates(worker, device_sampling=True, contract_version=0)
 
     assert commits == ["v1-host", "v0-device"]
+
+
+def test_contract_version_probe_tolerates_a_rank_without_a_model():
+    """Non-device DP ranks never load a model, so they cannot read the version."""
+    controller = TTAsyncDecodeController(
+        SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
+    )
+    worker = SimpleNamespace(model_runner=SimpleNamespace(async_decode=controller))
+
+    assert TTWorker.decode_input_update_contract_version(worker) == -1
+
+    controller.runner.model = SimpleNamespace(decode_input_update_contract=1)
+
+    assert TTWorker.decode_input_update_contract_version(worker) == 1
 
 
 def test_explicit_contract_keeps_layout_hint_inside_planner():
