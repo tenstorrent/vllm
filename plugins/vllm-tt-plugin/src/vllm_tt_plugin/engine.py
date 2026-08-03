@@ -420,12 +420,15 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 handle.scheduler_output, model_output
             )
 
-        # A contract-aware steady device decode deliberately builds the next
-        # step while host token/position state is one step behind: its explicit
+        # A contract-v1 steady device decode deliberately builds the next step
+        # while host token/position state is one step behind: its explicit
         # update plan preserves device-resident token/position buffers (and may
         # refresh only page tables). Every transition requiring host inputs or
         # sampling-state changes reports ``current_overlap_ok=False`` and
         # drains first, re-establishing host authority before submission.
+        # Version-0 adapters never report True (see
+        # ``gathered_dp_overlap_permitted``) because their model-local reload
+        # heuristics would copy the stale host tensors.
         finalize_before_submit = prev_handle is not None and not current_overlap_ok
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}

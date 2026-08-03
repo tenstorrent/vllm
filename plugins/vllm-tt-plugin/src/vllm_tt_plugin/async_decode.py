@@ -426,12 +426,41 @@ class TTAsyncDecodeController:
             scheduler_output, grammar_output
         )
 
+    def decode_input_update_contract_version(self) -> int | None:
+        """Adapter's negotiated contract version.
+
+        ``None`` when this rank holds no model: only
+        ``data_parallel_rank_local == 0`` loads one, so the other ranks cannot
+        inspect it and must not answer on its behalf.
+        """
+        model = getattr(self.runner, "model", None)
+        if model is None:
+            return None
+        return int(getattr(model, "decode_input_update_contract", 0))
+
+    def gathered_dp_overlap_permitted(self) -> bool:
+        """Whether gathered DP may submit a step before applying the previous one.
+
+        Only a version-1 adapter is told which inputs are authoritative, so a
+        version-0 adapter keeps the pre-contract finalize-before-submit order:
+        its own reload heuristics would otherwise copy host token/position
+        tensors that are deliberately one step behind the device. Ranks holding
+        no model abstain; the device rank's answer reaches the global decision
+        through the caller's MIN reduction.
+        """
+        if self.runner.parallel_config.data_parallel_size == 1:
+            return True
+        version = self.decode_input_update_contract_version()
+        return version is None or version >= 1
+
     def can_attempt_steady_dp_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
         grammar_output: GrammarOutput | None,
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=True):
+            return False
+        if not self.gathered_dp_overlap_permitted():
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
@@ -702,9 +731,7 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
-        contract_version = int(
-            getattr(runner.model, "decode_input_update_contract", 0)
-        )
+        contract_version = int(getattr(runner.model, "decode_input_update_contract", 0))
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
