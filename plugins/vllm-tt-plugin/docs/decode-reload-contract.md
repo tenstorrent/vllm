@@ -159,6 +159,13 @@ satisfies every requirement below:
    samples on the host. This includes model-internal recurrent/convolution
    state and dormant device-sampler state; a full forward-input reload does
    not implicitly repair either one.
+
+   One exemption: state that is not addressable by vLLM slot cannot be
+   remapped, only reset. Unseeded on-device RNG is the known case — its state
+   is a per-core hardware PRNG register that no operation can move between
+   cores, and the adapter is expected to leave it in place. An adapter must
+   declare any such state rather than silently skip a remap, and vLLM's commit
+   of the mapping is valid for it by exemption.
 9. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
    valid until the submitted step is read back and until the next command
    explicitly replaces their contents.
