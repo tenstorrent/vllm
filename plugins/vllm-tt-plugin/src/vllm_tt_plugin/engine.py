@@ -75,6 +75,7 @@ class DPGatherHandle:
     is_decode: bool
     overlap_ok: bool
     any_needs_logprobs: bool
+    intermediate_prefill_mask: torch.Tensor | None
     req_ids: list[str]
     req_id_to_index: dict[str, int]
 
@@ -502,6 +503,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             local_reset_batch,
             local_can_sample_device,
             local_needs_logprobs,
+            intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
         ) = all_local_inputs
@@ -713,6 +715,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             is_decode=is_decode,
             overlap_ok=overlap_ok,
             any_needs_logprobs=any_needs_logprobs,
+            intermediate_prefill_mask=intermediate_prefill_mask,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
@@ -753,6 +756,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     my_logprobs_val,
                     handle.req_ids,
                     handle.req_id_to_index,
+                    handle.intermediate_prefill_mask,
                 ),
             )[0]
             return output
