@@ -52,29 +52,31 @@ def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     model_type = getattr(model_config.hf_config, "model_type", None)
 
-    if (
-        scheduler_config.enable_chunked_prefill
-        and model_type not in _CHUNKED_PREFILL_MODEL_TYPES
-    ):
-        logger.info(
-            "Chunked prefill is not validated for `model_type=%s` on TT; disabling it.",
-            model_type,
-        )
-
-        max_num_batched_tokens = scheduler_config.max_num_batched_tokens
-        max_model_len = model_config.max_model_len
-        scheduler_config.enable_chunked_prefill = False
-
-        if max_num_batched_tokens < max_model_len:
-            logger.warning(
-                "`max_num_batched_tokens=%d < max_model_len=%d` with chunked prefill "
-                "disabled, bumping `max_num_batched_tokens` to match.",
-                max_num_batched_tokens,
-                max_model_len,
+    if model_type not in _CHUNKED_PREFILL_MODEL_TYPES:
+        if scheduler_config.enable_chunked_prefill:
+            logger.info(
+                "Chunked prefill is not validated for `model_type=%s`; disabling it.",
+                model_type,
             )
+            scheduler_config.enable_chunked_prefill = False
 
-            max_num_batched_tokens = max_model_len
-            scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+            max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+            max_model_len = model_config.max_model_len
+            if max_num_batched_tokens < max_model_len:
+                logger.warning(
+                    "`max_num_batched_tokens=%d < max_model_len=%d` with "
+                    "chunked prefill "
+                    "disabled, bumping `max_num_batched_tokens` to match.",
+                    max_num_batched_tokens,
+                    max_model_len,
+                )
+
+                scheduler_config.max_num_batched_tokens = max_model_len
+
+        # The scheduler applies this threshold before checking
+        # ``enable_chunked_prefill``. Leaving it nonzero can still split a
+        # prefill despite the disabled flag.
+        scheduler_config.long_prefill_token_threshold = 0
 
 
 def _galaxy_generator_version() -> str | None:
