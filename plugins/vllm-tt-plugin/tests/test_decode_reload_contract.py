@@ -536,7 +536,7 @@ def test_legacy_contract_receives_reset_batch_without_explicit_commands(
     assert len(warnings) == 1
 
 
-def test_contract_version_does_not_change_steady_decode_eligibility():
+def test_contract_version_does_not_change_non_dp_steady_decode_eligibility():
     runner = SimpleNamespace(
         model=SimpleNamespace(model_capabilities={"supports_async_decode": True}),
         non_dp_async_scheduling=True,
@@ -553,6 +553,34 @@ def test_contract_version_does_not_change_steady_decode_eligibility():
     runner.model.decode_input_update_contract = 1
 
     assert controller.steady_decode_base_enabled(dp_gather=False)
+
+
+def test_gathered_dp_overlap_requires_the_explicit_contract():
+    def _controller_for(dp_size, model):
+        return TTAsyncDecodeController(
+            SimpleNamespace(
+                model=model,
+                parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+            )
+        )
+
+    legacy = SimpleNamespace()
+    v0 = SimpleNamespace(decode_input_update_contract=0)
+    v1 = SimpleNamespace(decode_input_update_contract=1)
+
+    assert not _controller_for(4, legacy).gathered_dp_overlap_permitted()
+    assert not _controller_for(4, v0).gathered_dp_overlap_permitted()
+    assert _controller_for(4, v1).gathered_dp_overlap_permitted()
+
+    # Lane mode is single-process; its overlap path is unchanged by the gate.
+    assert _controller_for(1, legacy).gathered_dp_overlap_permitted()
+
+    # A rank that holds no model abstains instead of vetoing the global vote.
+    abstaining = TTAsyncDecodeController(
+        SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
+    )
+    assert abstaining.decode_input_update_contract_version() is None
+    assert abstaining.gathered_dp_overlap_permitted()
 
 
 def test_scheduler_layout_prediction_detects_add_remove_and_preemption():
