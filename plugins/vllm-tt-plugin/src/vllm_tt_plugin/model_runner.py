@@ -952,11 +952,14 @@ class TTModelRunner:
 
         # DP optimization: don't send padding blocks if possible to reduce
         # overhead from gathering inputs to rank 0 and rely on DP concat
-        # function to pad to global max blocks.
+        # function to pad to global max blocks. The width comes from the
+        # scheduler's allocation, not from a token count: an overlapped
+        # device-sampling decode builds this input while host token state is
+        # one step behind, and a token-derived width would drop the block the
+        # device is about to write at every block boundary.
         if self.tt_data_parallel_size > 1:
-            max_tokens_in_batch = max(input_batch.num_tokens[i] for i in req_indices)
-            max_blocks_in_batch = cdiv(
-                max_tokens_in_batch, self.cache_config.block_size
+            max_blocks_in_batch = min(
+                input_batch.allocated_blocks_for_rows(req_indices), target_width
             )
             block_tables_per_group = [
                 bt[:, :max_blocks_in_batch] for bt in block_tables_per_group

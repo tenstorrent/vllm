@@ -677,6 +677,22 @@ class InputBatch:
             out.append(bt_cpu)
         return out
 
+    def allocated_blocks_for_rows(self, rows: torch.Tensor | list[int]) -> int:
+        """Widest per-group block count the scheduler has allocated to ``rows``.
+
+        Truncating a block table narrower than this drops a block the device
+        will address. Derived from the allocation rather than from a token count
+        because host token state is intentionally one step behind an overlapped
+        device-sampling decode.
+        """
+        return max(
+            (
+                int(bt.num_blocks_per_row[rows].max())
+                for bt in self.block_table.block_tables
+            ),
+            default=0,
+        )
+
     def advance_generators(self, req_indices: list[int] | None = None) -> None:
         # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied,
