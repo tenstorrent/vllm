@@ -264,6 +264,16 @@ class InputBatch:
         """Mark the pending remap as consumed by an accepted decode submit."""
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
+    def _reset_slot_remap_entry(self, req_index: int) -> None:
+        """Drop a pending remap entry for a slot taken by a new request.
+
+        A newly placed request has no predecessor state to gather from, so a
+        non-identity entry would tell the model to copy another slot's
+        persistent state into it. The pending remap outlives steps that submit
+        no decode, so such an entry can outlive the layout that produced it.
+        """
+        self._slot_remap[req_index] = req_index
+
     def pop_slot_remap(self) -> torch.Tensor:
         """Legacy eager-consume helper.
 
@@ -308,6 +318,7 @@ class InputBatch:
         assert req_index < self.max_num_reqs, (
             f"req_index={req_index} >= max_num_reqs={self.max_num_reqs}"
         )
+        self._reset_slot_remap_entry(req_index)
 
         req_id = request.req_id
         if req_index == len(self._req_ids):

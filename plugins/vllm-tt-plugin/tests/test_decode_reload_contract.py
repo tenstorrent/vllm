@@ -782,3 +782,18 @@ def test_gathered_dp_result_rejects_requests_invalidated_since_submit():
     assert resumed.output_token_ids == []
     assert output.sampled_token_ids == [[5], []]
     assert runner._invalidated_req_ids == set()
+
+
+def test_slot_reuse_clears_a_stale_pending_remap_entry():
+    """Prefill steps neither deliver nor commit a remap, so entries persist.
+
+    Two condense-then-reuse rounds without an intervening decode would
+    otherwise hand a brand-new request another slot's source index.
+    """
+    batch = InputBatch.__new__(InputBatch)
+    batch.max_num_reqs = 4
+    batch._slot_remap = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
+
+    InputBatch._reset_slot_remap_entry(batch, 1)
+
+    assert batch._slot_remap.tolist() == [0, 1, 2, 3]

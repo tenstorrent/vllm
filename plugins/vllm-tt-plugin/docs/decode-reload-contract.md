@@ -44,6 +44,15 @@ application by every slot-owning subsystem. An authoritative rebuild may
 replace a subsystem's remap, but merely not using that subsystem this step may
 not. Version-0 adapters retain their historical remap behavior unchanged.
 
+A remap cannot express slot reuse. When a new request takes a slot there is no
+predecessor state to gather from, so vLLM keeps that slot's entry the identity
+and signals the event through `decode_layout_changed`. Sampling state is then
+invalidated by `reset_sampling_state`. Model-owned per-slot state — recurrent,
+convolution, cached RoPE deltas — has no equivalent command in version 1, so an
+adapter that keeps such state must rebuild the reused slot from the reloaded
+forward inputs. A future version should carry the reused slots explicitly rather
+than leave that inference to the adapter.
+
 ## Mode definitions
 
 - **Host sampling**: tt-metal returns logits and vLLM selects the token. Host
