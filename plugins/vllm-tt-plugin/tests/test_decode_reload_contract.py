@@ -719,3 +719,24 @@ def test_layout_change_causes_are_all_rejected_before_update_states():
     )
     assert controller.scheduler_preserves_decode_layout(resumed)
     assert not controller.steady_decode_scheduler_invariants_met(resumed, None)
+
+
+def test_dp_block_table_width_follows_allocation_not_host_tokens():
+    """A one-step-stale token count must not narrow the gathered page table.
+
+    At a block boundary the scheduler has already allocated the block the
+    device is about to write, while host ``num_tokens`` still lags by one.
+    Trimming to the token-derived width would drop that block, and the DP
+    concat zero-pads it back to block id 0.
+    """
+    block_size = 32
+    allocated_blocks = 2
+    stale_num_tokens = 32  # the applied token count lags the device by one
+
+    group = SimpleNamespace(
+        num_blocks_per_row=np.array([allocated_blocks, 0], dtype=np.int32)
+    )
+    batch = SimpleNamespace(block_table=SimpleNamespace(block_tables=[group]))
+
+    assert InputBatch.allocated_blocks_for_rows(batch, [0]) == allocated_blocks
+    assert stale_num_tokens // block_size < allocated_blocks
