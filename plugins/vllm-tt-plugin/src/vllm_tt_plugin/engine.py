@@ -540,6 +540,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     1 - local_can_sample_device,
                     local_needs_logprobs,
                     self._dp_local_contract_version,
+                    int(local_input is not None),
                 ],
                 dtype=torch.int32,
             )
@@ -551,6 +552,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             all_sample_device = input_info_t[4].item() == 0
             any_needs_logprobs = input_info_t[5].item() > 0
             contract_version = int(input_info_t[6].item())
+            any_local_input = input_info_t[7].item() > 0
 
             decode_inputs: dict[str, Any] = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
@@ -728,10 +730,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             )
             future = _unwrap_single_worker_future(collective_future)
             if is_decode:
-                self.model_executor.collective_rpc(
-                    "note_dp_decode_submitted",
-                    args=(all_sample_device,),
-                )
+                # With no rank contributing work the merged submit short-circuits
+                # without a forward, so nothing became device-resident and the
+                # residency flags must not advance.
+                if any_local_input:
+                    self.model_executor.collective_rpc(
+                        "note_dp_decode_submitted",
+                        args=(all_sample_device,),
+                    )
             else:
                 self.model_executor.collective_rpc("note_dp_prefill_submitted")
             if is_decode and local_input is not None:
