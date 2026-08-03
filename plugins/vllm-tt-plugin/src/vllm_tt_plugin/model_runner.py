@@ -1291,19 +1291,6 @@ class TTModelRunner:
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
-        # ``_update_states`` may have just discovered a layout change that the
-        # scheduler-output prediction could not see: it predicts the resets caused by
-        # new or resumed requests, but removals, unscheduled requests and batch
-        # condensation only surface here, after the drain decision was already made.
-        # ``_decode_layout_changed_since_last_decode = True`` implies
-        # ``reset_batch=True``: ``_prepare_model_inputs`` below reloads inputs from host
-        # state, which a pending async decode step has not been applied to yet. This
-        # step is therefore not steady-decode eligible, so drain pending decodes to
-        # ensure updated host inputs. No-op when the flag was already set before the
-        # step (the caller's drain decision covered it) or when nothing is pending.
-        if self._decode_layout_changed_since_last_decode:
-            self.async_decode.wait_for_all_pending_async_steps()
-
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         return model_input
@@ -2148,11 +2135,6 @@ class TTModelRunner:
         self.async_decode.apply_ready_completed_decode_steps(skip_req_ids=skipped)
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
-            # ``_decode_layout_changed_since_last_decode = True`` implies
-            # ``reset_batch=True``: the model will reload inputs. This step is not
-            # steady-decode eligible, so drain pending decodes to ensure updated
-            # host inputs.
-            self.async_decode.wait_for_all_pending_async_steps()
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT

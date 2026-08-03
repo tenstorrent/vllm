@@ -605,3 +605,77 @@ def test_unscheduled_live_request_keeps_completed_token_in_cached_state():
     )
 
     assert req_state.output_token_ids == [7]
+
+
+def _steady_eligible_runner(current_req_ids=("req-0",)):
+    """Runner mock whose every steady-decode invariant is satisfied."""
+    sampling = SimpleNamespace(
+        bad_words_token_ids={},
+        has_active_logitsprocs=lambda: False,
+    )
+    return SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_id_to_index={req_id: i for i, req_id in enumerate(current_req_ids)},
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            max_num_logprobs=None,
+            sampling=sampling,
+        ),
+        requests={
+            req_id: SimpleNamespace(sampling_params=None) for req_id in current_req_ids
+        },
+        model=SimpleNamespace(model_capabilities={"supports_async_decode": True}),
+        model_config=SimpleNamespace(logits_processors=None),
+        trace_mode="decode_only",
+        _decode_layout_changed_since_last_decode=False,
+        check_perform_device_sampling=lambda **_kwargs: True,
+    )
+
+
+def _steady_scheduler_output(current_req_ids=("req-0",), **overrides):
+    fields = {
+        "num_scheduled_tokens": {req_id: 1 for req_id in current_req_ids},
+        "scheduled_new_reqs": [],
+        "scheduled_cached_reqs": SimpleNamespace(
+            req_ids=list(current_req_ids), resumed_req_ids=set()
+        ),
+        "pending_structured_output_tokens": False,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_layout_change_causes_are_all_rejected_before_update_states():
+    """Every ``_update_states`` layout-change cause must fail the pre-drain check.
+
+    The drain decision is taken from the scheduler output before the persistent
+    batch is mutated, so it has to reject each event that would later set
+    ``_decode_layout_changed_since_last_decode`` and force a host reload.
+    """
+    controller = _controller(("req-0", "req-1"))
+    controller.note_dp_decode_submitted(True)
+    controller.runner = _steady_eligible_runner(("req-0", "req-1"))
+    controller.runner.input_batch.req_id_to_index = {"req-0": 0, "req-1": 1}
+
+    baseline = _steady_scheduler_output(("req-0", "req-1"))
+    assert controller.steady_decode_scheduler_invariants_met(baseline, None)
+
+    # Finished or unscheduled: present in the batch, absent from this step.
+    removed = _steady_scheduler_output(("req-0",))
+    removed.scheduled_cached_reqs = SimpleNamespace(
+        req_ids=["req-0"], resumed_req_ids=set()
+    )
+    assert not controller.steady_decode_scheduler_invariants_met(removed, None)
+
+    # Added: scheduled this step, absent from the batch.
+    added = _steady_scheduler_output(("req-0", "req-1", "req-2"))
+    assert not controller.steady_decode_scheduler_invariants_met(added, None)
+
+    # Resumed from preemption: membership is unchanged, so only the prefill
+    # check rejects it. This leg is why the membership diff alone is not enough.
+    resumed = _steady_scheduler_output(("req-0", "req-1"))
+    resumed.scheduled_cached_reqs = SimpleNamespace(
+        req_ids=["req-0", "req-1"], resumed_req_ids={"req-1"}
+    )
+    assert controller.scheduler_preserves_decode_layout(resumed)
+    assert not controller.steady_decode_scheduler_invariants_met(resumed, None)
