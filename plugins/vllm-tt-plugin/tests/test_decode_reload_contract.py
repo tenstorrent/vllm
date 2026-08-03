@@ -740,3 +740,45 @@ def test_dp_block_table_width_follows_allocation_not_host_tokens():
 
     assert InputBatch.allocated_blocks_for_rows(batch, [0]) == allocated_blocks
     assert stale_num_tokens // block_size < allocated_blocks
+
+
+def test_gathered_dp_result_rejects_requests_invalidated_since_submit():
+    """Under overlap the next step is processed before the previous is applied.
+
+    A request that step finished or resumed must get neither a runner-state
+    update nor a scheduler-visible token.
+    """
+    live = SimpleNamespace(output_token_ids=[])
+    resumed = SimpleNamespace(output_token_ids=[])
+    runner = SimpleNamespace(
+        requests={"live": live, "resumed": resumed},
+        input_batch=SimpleNamespace(req_id_to_index={}, num_reqs=2),
+        model_config=SimpleNamespace(max_model_len=32),
+        _invalidated_req_ids={"resumed"},
+    )
+    runner._consume_invalidated_req_ids = lambda: (
+        TTModelRunner._consume_invalidated_req_ids(runner)
+    )
+    runner._apply_sampled_tokens_to_state = lambda **kwargs: (
+        TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
+    )
+    runner._build_runner_output = lambda **kwargs: SimpleNamespace(
+        req_id_to_index=dict(kwargs["req_id_to_index"]),
+        sampled_token_ids=[[5], [6]],
+    )
+    runner.apply_and_build_runner_output = lambda *args, **kwargs: (
+        TTModelRunner.apply_and_build_runner_output(runner, *args, **kwargs)
+    )
+
+    output = TTModelRunner.apply_dp_execution_result(
+        runner,
+        torch.tensor([[5], [6]], dtype=torch.int32),
+        None,
+        req_ids=["live", "resumed"],
+        req_id_to_index={"live": 0, "resumed": 1},
+    )
+
+    assert live.output_token_ids == [5]
+    assert resumed.output_token_ids == []
+    assert output.sampled_token_ids == [[5], []]
+    assert runner._invalidated_req_ids == set()

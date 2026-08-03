@@ -207,6 +207,11 @@ class TTModelRunner:
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
+        # Requests whose state an in-flight decode result may no longer touch:
+        # finished, or resumed from preemption and therefore re-prefilling.
+        # Accumulated as the scheduler reveals them and consumed by whichever
+        # path applies the outstanding result.
+        self._invalidated_req_ids: set[str] = set()
         self.async_decode = TTAsyncDecodeController(self)
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
@@ -695,6 +700,23 @@ class TTModelRunner:
 
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
+
+    def _note_invalidated_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Record requests an outstanding decode result may no longer update.
+
+        A finished request must not receive a speculative token, and a request
+        resumed from preemption re-prefills from freed KV, so the token computed
+        against that KV is void.
+        """
+        self._invalidated_req_ids.update(scheduler_output.finished_req_ids)
+        self._invalidated_req_ids.update(
+            scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+
+    def _consume_invalidated_req_ids(self) -> set[str]:
+        invalidated = self._invalidated_req_ids
+        self._invalidated_req_ids = set()
+        return invalidated
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
@@ -1219,8 +1241,14 @@ class TTModelRunner:
         # host tensors are built. A request may remain live while unscheduled,
         # so its captured request state must still receive the accepted token.
         self._update_states(scheduler_output)
-        skipped = set(scheduler_output.finished_req_ids)
-        skipped.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+        self._note_invalidated_requests(scheduler_output)
+        # Gathered DP applies the outstanding result later, in
+        # ``apply_dp_execution_result``, so it must not consume the set here.
+        skipped = (
+            self._consume_invalidated_req_ids()
+            if self.parallel_config.data_parallel_size == 1
+            else None
+        )
         self.async_decode.apply_ready_completed_decode_steps(skip_req_ids=skipped)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
@@ -2064,9 +2092,10 @@ class TTModelRunner:
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
         )
-        skipped = set(scheduler_output.finished_req_ids)
-        skipped.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
-        self.async_decode.apply_ready_completed_decode_steps(skip_req_ids=skipped)
+        self._note_invalidated_requests(scheduler_output)
+        self.async_decode.apply_ready_completed_decode_steps(
+            skip_req_ids=self._consume_invalidated_req_ids()
+        )
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
 
@@ -2756,10 +2785,16 @@ class TTModelRunner:
         """Apply the local DP rank result to runner state and build output.
 
         Converts the local gathered-DP result into the same state update and
-        `ModelRunnerOutput` used by non-DP execution.
+        `ModelRunnerOutput` used by non-DP execution. Under overlap the next
+        step's scheduler output has already been processed, so requests it
+        finished or resumed must reject this result.
         """
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
+        # Consumed before the chunked-prefill branch: an intermediate-chunk step
+        # that returned early would otherwise leave the set for a later step,
+        # which would then reject a token that is legitimately its own.
+        skip_req_ids = self._consume_invalidated_req_ids() if req_ids else None
         if intermediate_prefill_mask is not None:
             intermediate_mask = intermediate_prefill_mask[:num_reqs]
             if intermediate_mask.any():
@@ -2773,12 +2808,14 @@ class TTModelRunner:
                     logprobs=logprobs_lists,
                     intermediate_mask=intermediate_mask.cpu().numpy(),
                     req_id_to_index=req_id_to_index,
+                    skip_req_ids=skip_req_ids,
                 )
         return self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            skip_req_ids=skip_req_ids,
         )
 
     def _get_output_tokens(
@@ -3139,22 +3176,34 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        skip_req_ids: set[str] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
         Updates persistent runner state from sampled tokens and returns the
-        `ModelRunnerOutput` consumed by the rest of vLLM.
+        `ModelRunnerOutput` consumed by the rest of vLLM. ``skip_req_ids`` names
+        requests whose state this result may no longer touch; their rows are
+        emptied so the scheduler does not append the token either.
         """
+        assert not skip_req_ids or req_ids is not None, (
+            "skip_req_ids resolves rows by request id, so req_ids is required"
+        )
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
+            skip_req_ids=skip_req_ids,
         )
-        return self._build_runner_output(
+        output = self._build_runner_output(
             sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
+        for req_id in skip_req_ids or ():
+            req_idx = output.req_id_to_index.get(req_id)
+            if req_idx is not None:
+                output.sampled_token_ids[req_idx] = []
+        return output
 
     def warmup_model(self) -> None:
         # Two-phase warmup: compile first, then capture traces.
