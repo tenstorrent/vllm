@@ -274,16 +274,6 @@ class InputBatch:
         """
         self._slot_remap[req_index] = req_index
 
-    def pop_slot_remap(self) -> torch.Tensor:
-        """Legacy eager-consume helper.
-
-        New decode submission code uses :meth:`peek_slot_remap` and commits only
-        after device sampling actually accepts the update.
-        """
-        remap = self.peek_slot_remap()
-        self.commit_slot_remap()
-        return remap
-
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
