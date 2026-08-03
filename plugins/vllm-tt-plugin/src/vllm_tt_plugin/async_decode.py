@@ -265,14 +265,9 @@ class TTAsyncDecodeController:
         from vllm_tt_plugin.model_input import TTDecodeReloadPlan
 
         device_sampling = model_input.perform_device_sampling
-        model_capabilities = (
-            getattr(
-                getattr(self.runner, "model", None),
-                "model_capabilities",
-                {},
-            )
-            or {}
-        )
+        # Reached only on the rank that submits the forward, so a model is
+        # loaded here.
+        model_capabilities = getattr(self.runner.model, "model_capabilities", {}) or {}
         supports_resident_decode = bool(
             model_capabilities.get("supports_async_decode", False)
         )
