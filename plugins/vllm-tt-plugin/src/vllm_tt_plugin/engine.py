@@ -323,12 +323,19 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         return int(has_requests_t.item()) > 0
 
     def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
-        has_running = bool(getattr(self.scheduler, "running", []))
+        running = getattr(self.scheduler, "running", [])
+        has_running = bool(running)
         has_waiting = bool(getattr(self.scheduler, "waiting", False))
         max_running = getattr(self.scheduler, "max_num_running_reqs", 0)
-        has_capacity = len(getattr(self.scheduler, "running", [])) < max_running
+        has_partial_prefill = any(request.is_prefill_chunk for request in running)
+        has_capacity = len(running) < max_running
         local_prefill_intent = (
-            1 if (has_waiting and ((not has_running) or has_capacity)) else 0
+            1
+            if (
+                has_partial_prefill
+                or (has_waiting and ((not has_running) or has_capacity))
+            )
+            else 0
         )
         intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
         self.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
