@@ -620,11 +620,17 @@ class TTAsyncDecodeController:
         skip_req_ids: set[str] | None = None,
     ) -> None:
         invalid_req_ids = set(skip_req_ids or ())
-        # The batch queue schedules/builds the current step before consuming
-        # the prior future. Mutating the cached prior output here therefore
-        # prevents a finished or resumed request from receiving its old token
-        # in scheduler.update_from_output, not just in runner host state.
+        # The batch queue schedules and executes the current step before
+        # resolving the prior future, so this engine-thread mutation of an
+        # output the executor's output thread produced still lands before
+        # ``scheduler.update_from_output`` reads it. That ordering is what lets
+        # a finished or resumed request reject the token in the scheduler too,
+        # not only in runner host state; assert it rather than trust it.
         if completed.runner_output is not None:
+            assert self.runner.scheduler_config.async_scheduling, (
+                "mutating a published runner output is only ordered correctly "
+                "under the batch-queue step loop"
+            )
             for req_id in invalid_req_ids:
                 req_idx = completed.runner_output.req_id_to_index.get(req_id)
                 if req_idx is not None:
