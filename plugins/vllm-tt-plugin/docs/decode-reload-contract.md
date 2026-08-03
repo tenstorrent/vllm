@@ -137,12 +137,20 @@ satisfies every requirement below:
 6. **Sampling-state ordering**: slot remaps are applied before parameter/state
    reset; RNG and penalty state are reset only when requested; seed advancement
    happens exactly once per sampled token.
-7. **Complete slot remapping**: on every version-1 decode, `slot_remap` applies
+7. **Host input authority**: the `tokens` and `start_pos` arguments are
+   authoritative only when `reload_inputs` is true. When it is false they are
+   deliberately one step behind, and the adapter must derive nothing from them —
+   not forward inputs, and not sampling state. Deriving an RNG counter from
+   `start_pos` on a steady step makes the sampled stream depend on when the
+   asynchronous readback landed, so the same request and seed stop reproducing.
+   An adapter that ties per-token seeds to the absolute decode position must do
+   so only on a reloading step and advance its own resident counter otherwise.
+8. **Complete slot remapping**: on every version-1 decode, `slot_remap` applies
    to all persistent state indexed by the vLLM batch slot, even when that step
    samples on the host. This includes model-internal recurrent/convolution
    state and dormant device-sampler state; a full forward-input reload does
    not implicitly repair either one.
-8. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
+9. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
    valid until the submitted step is read back and until the next command
    explicitly replaces their contents.
 
