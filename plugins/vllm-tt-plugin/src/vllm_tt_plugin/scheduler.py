@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from enum import Enum
+from typing import ClassVar
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -10,6 +12,59 @@ from vllm.v1.request import Request
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
+
+
+@dataclass
+class _PendingOutputs:
+    """Counts a request's decode tokens that are still in the pipeline.
+
+    Async scheduling starts new decode steps before the tokens from earlier
+    steps have come back. If a request is preempted, it has to redo its prefill
+    from scratch, and we have to throw the tokens still in the pipeline away instead
+    of adding them to the output.
+
+    ``outstanding`` counts tokens that were scheduled but have not come back
+    yet. ``stale`` counts how many of those we have decided to throw away.
+    """
+
+    PENDING_ATTR: ClassVar[str] = "_tt_pending_outputs"
+
+    outstanding: int = 0
+    stale: int = 0
+
+    def record(self) -> None:
+        """Count one decode step; its token comes back a few steps later.
+
+        A step counts once even if it speculates several tokens, because it
+        still sends back a single output.
+        """
+        self.outstanding += 1
+
+    def discard_outstanding(self) -> None:
+        """On preempt, mark every token now in the pipeline to be thrown away."""
+        self.stale = self.outstanding
+
+    def is_next_stale(self) -> bool:
+        """Take the next returned token; True means throw it away.
+
+        Tokens come back in the order they were scheduled, so the stale ones
+        always arrive before any fresh token from after the preempt.
+        """
+        if not self.outstanding:
+            return False
+        self.outstanding -= 1
+        if not self.stale:
+            return False
+        self.stale -= 1
+        return True
+
+    @classmethod
+    def for_request(cls, request: Request) -> "_PendingOutputs":
+        pending = getattr(request, cls.PENDING_ATTR, None)
+        if pending is None:
+            pending = cls()
+            setattr(request, cls.PENDING_ATTR, pending)
+        return pending
 
 
 class TTSchedulingMode(Enum):
@@ -44,6 +99,8 @@ class TTScheduler(AsyncScheduler):
     - with async_scheduling=True, placeholders allow decode requests to be
       re-scheduled before update_from_output processes the previous step's
       results, enabling host/device overlap
+    - under async_scheduling, preemption invalidates that request's
+      scheduled-but-unreturned outputs (see ``_preempt_request``)
 
     Supports ``set_forced_mode`` for DP-gather coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
@@ -161,3 +218,53 @@ class TTScheduler(AsyncScheduler):
                 self.running.extend(partial_prefills)
 
         return result
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Preempt a request and drop any decode tokens still in the pipeline.
+
+        The base class frees the request's KV cache and queues it to redo its
+        prefill. Under async scheduling, the tokens it already scheduled are
+        still on their way back; those were built on the now-freed cache, so we
+        mark them to be thrown away and reset the placeholder count so the base
+        scheduler treats the request as a fresh prefill.
+        """
+        super()._preempt_request(request, timestamp)
+
+        if not self.scheduler_config.async_scheduling:
+            return
+
+        _PendingOutputs.for_request(request).discard_outstanding()
+        request.num_output_placeholders = 0
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """After scheduling, count the decode tokens this step put in the pipeline.
+
+        Only decode steps produce a token to track; prefill chunks do not. This
+        running count is what lets a later preempt know how many in-flight
+        tokens it has to throw away.
+        """
+        super()._update_after_schedule(scheduler_output)
+
+        if self.scheduler_config.async_scheduling:
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests[req_id]
+                if not request.is_prefill_chunk:
+                    _PendingOutputs.for_request(request).record()
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        """Add a returned token to the request, unless a preempt invalidated it.
+
+        When a token comes back for a request that was preempted while the token
+        was in the pipeline, adding it would corrupt the output, so we throw it
+        away here instead of handing it to the base class.
+        """
+        if not self.scheduler_config.async_scheduling:
+            return super()._update_request_with_output(request, new_token_ids)
+
+        if _PendingOutputs.for_request(request).is_next_stale():
+            request.discard_latest_async_tokens = False
+            return [], False
+
+        return super()._update_request_with_output(request, new_token_ids)
