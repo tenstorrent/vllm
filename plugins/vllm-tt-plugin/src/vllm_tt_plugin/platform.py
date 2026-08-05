@@ -42,6 +42,42 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
+# TT model types that have been validated with real chunked prefill.
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+
+
+def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
+    """Restricts token-chunked prefill to model types Metal has validated."""
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+    model_type = getattr(model_config.hf_config, "model_type", None)
+
+    if model_type not in _CHUNKED_PREFILL_MODEL_TYPES:
+        if scheduler_config.enable_chunked_prefill:
+            logger.info(
+                "Chunked prefill is not validated for `model_type=%s`; disabling it.",
+                model_type,
+            )
+            scheduler_config.enable_chunked_prefill = False
+
+            max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+            max_model_len = model_config.max_model_len
+            if max_num_batched_tokens < max_model_len:
+                logger.warning(
+                    "`max_num_batched_tokens=%d < max_model_len=%d` with "
+                    "chunked prefill "
+                    "disabled, bumping `max_num_batched_tokens` to match.",
+                    max_num_batched_tokens,
+                    max_model_len,
+                )
+
+                scheduler_config.max_num_batched_tokens = max_model_len
+
+        # The scheduler applies this threshold before checking
+        # ``enable_chunked_prefill``. Leaving it nonzero can still split a
+        # prefill despite the disabled flag.
+        scheduler_config.long_prefill_token_threshold = 0
+
 
 def _galaxy_generator_version() -> str | None:
     """Return the active Galaxy-generator model version, or None.
@@ -537,27 +573,9 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
-        if vllm_config.scheduler_config.enable_chunked_prefill:
-            logger.info("Chunked prefill is not yet supported for TT backend")
-            vllm_config.scheduler_config.enable_chunked_prefill = False
-            # vLLM does this bump silently earlier
-            # if chunked prefill is already disabled,
-            # and max_num_batched_tokens is not explicitly set.
-            # We can't know if it was specified
-            # or the default, hence the warning.
-            if (
-                vllm_config.scheduler_config.max_num_batched_tokens
-                < vllm_config.model_config.max_model_len
-            ):
-                logger.warning(
-                    "max_num_batched_tokens=%d < max_model_len=%d with chunked prefill "
-                    "disabled, bumping max_num_batched_tokens to match.",
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    vllm_config.model_config.max_model_len,
-                )
-                vllm_config.scheduler_config.max_num_batched_tokens = (
-                    vllm_config.model_config.max_model_len
-                )
+        _apply_chunked_prefill_policy(vllm_config)
+
+        vllm_config.scheduler_config.disable_chunked_mm_input = True
 
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"

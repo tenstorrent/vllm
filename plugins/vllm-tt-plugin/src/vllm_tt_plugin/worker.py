@@ -374,6 +374,7 @@ class TTWorker(WorkerBase):
         int,
         int,
         int,
+        torch.Tensor | None,
         list[str],
         dict[str, int],
     ]:
@@ -381,7 +382,8 @@ class TTWorker(WorkerBase):
 
         Returns `(local_input, max_blocks, has_structured_input,
         has_penalties, reset_batch, can_sample_device, needs_logprobs,
-        req_ids, req_id_to_index)`, where `local_input` is this rank's
+        intermediate_prefill_mask, req_ids, req_id_to_index)`, where
+        `local_input` is this rank's
         TT model input (or `None`) and the remaining fields are the
         per-rank metadata consumed by gathered-DP orchestration.
         """
@@ -476,6 +478,7 @@ class TTWorker(WorkerBase):
         logprobs_lists: Optional["LogprobsLists"] = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        intermediate_prefill_mask: torch.Tensor | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result through the worker facade.
 
@@ -487,6 +490,7 @@ class TTWorker(WorkerBase):
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
     # ---- Destructor (used to close devices) ----
