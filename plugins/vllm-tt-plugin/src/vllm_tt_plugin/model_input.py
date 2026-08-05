@@ -126,3 +126,7 @@ class TTModelInput:
     # Single-process DP prefill only: global stable slots supplied by the
     # scheduler-owned step plan. ``None`` for non-DP, gathered-DP, and decode.
     prefill_empty_slots: list[int] | None = None
+
+    # Prefill-only: rows whose forward contributes KV state but must not
+    # consume a sampling RNG draw because more prompt tokens remain.
+    intermediate_prefill_mask: torch.Tensor | None = None

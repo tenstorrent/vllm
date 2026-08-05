@@ -32,9 +32,11 @@ class FakeLane:
     fallback.
     """
 
-    def __init__(self, waiting=0, running=0, pending_finished=()):
+    def __init__(self, waiting=0, running=0, partial_prefills=0, pending_finished=()):
         self.waiting = [object()] * waiting
-        self.running = [object()] * running
+        self.running = [
+            SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
+        ] + [SimpleNamespace(is_prefill_chunk=True) for _ in range(partial_prefills)]
         self._pending_finished = set(pending_finished)
         self._mode = TTSchedulingMode.DEFAULT
         self.scheduled_modes: list[TTSchedulingMode] = []
@@ -50,9 +52,10 @@ class FakeLane:
         self._pending_finished = set()
         out = SchedulerOutput.make_empty()
         out.finished_req_ids = set(finished)
-        if self._mode == TTSchedulingMode.DECODE_ONLY and self.running:
-            out.num_scheduled_tokens = {f"dec-{id(self)}": len(self.running)}
-            out.total_num_scheduled_tokens = len(self.running)
+        pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
+        if self._mode == TTSchedulingMode.DECODE_ONLY and pure_decodes:
+            out.num_scheduled_tokens = {f"dec-{id(self)}": len(pure_decodes)}
+            out.total_num_scheduled_tokens = len(pure_decodes)
         return out
 
     def update_from_output(self, scheduler_output, model_runner_output):
@@ -92,6 +95,12 @@ def test_negotiate_prefill_when_any_lane_wants_prefill():
 def test_negotiate_decode_when_no_lane_wants_prefill():
     coordinator = _make_coordinator([FakeLane(running=2), FakeLane(running=1)])
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.DECODE_ONLY
+
+
+def test_negotiate_prefill_for_running_continuation_without_waiting():
+    coordinator = _make_coordinator([FakeLane(partial_prefills=1)], per_lane_max=1)
+
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
 def test_idle_step_propagates_finished_req_ids():
@@ -145,6 +154,17 @@ def test_no_fallback_when_no_running_requests():
     assert get_tt_step_plan(output).is_decode is False
     # Only the prefill pass ran (no decode fallback).
     assert lane0.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
+
+
+def test_no_decode_fallback_when_only_continuations_are_running():
+    lane = FakeLane(partial_prefills=1)
+    coordinator = _make_coordinator([lane])
+
+    output = coordinator.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert get_tt_step_plan(output).is_decode is False
+    assert lane.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
 
 
 def test_update_from_output_routes_and_merges_per_lane():

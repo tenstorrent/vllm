@@ -104,6 +104,12 @@ def apply_cached_req_state_update(
             block_ids.extend(new_ids)
 
 
+def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
+    clone = torch.Generator(device=generator.device)
+    clone.set_state(generator.get_state())
+    return clone
+
+
 class SamplingInputBatch:
     # Default values for padding sampling parameters in decode mode.
     DEFAULTS = {
@@ -935,7 +941,9 @@ class TTLaneInputBatch(InputBatch):
             logit_proc.update_state(batch_update)
 
     def build_merged_sampling_metadata(
-        self, scheduled_rows: list[int] | None = None
+        self,
+        scheduled_rows: list[int] | None = None,
+        non_sampling_rows: list[int] | None = None,
     ) -> SamplingMetadata:
         """Build one :class:`SamplingMetadata` over every slot row.
 
@@ -957,8 +965,9 @@ class TTLaneInputBatch(InputBatch):
         rows' generators are passed through: a seeded request occupying a slot
         but not scheduled this step (e.g. a running decode request during a
         prefill-only step) must not have its RNG advanced, or its token stream
-        would drift by one draw per step it sat out. ``None`` advances all live
-        generators (whole-batch fallback / tests).
+        would drift by one draw per step it sat out. ``non_sampling_rows`` are
+        scheduled intermediate-prefill rows; their generator clones preserve the
+        fixed slot layout without advancing the request's real RNG state.
         """
         n = self.max_num_reqs
         sampling = self.sampling
@@ -1002,8 +1011,11 @@ class TTLaneInputBatch(InputBatch):
             generators = dict(sampling.generators)
         else:
             scheduled = set(scheduled_rows)
+            non_sampling = set(non_sampling_rows or ())
             generators = {
-                row: gen for row, gen in sampling.generators.items() if row in scheduled
+                row: clone_torch_generator(gen) if row in non_sampling else gen
+                for row, gen in sampling.generators.items()
+                if row in scheduled
             }
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
@@ -1190,10 +1202,19 @@ class TTLaneInputBatch(InputBatch):
         lane_batch = self
         rows = list(plan.input_rows)
         rows_np = np.asarray(rows, dtype=np.int64)
-        input_positions = torch.from_numpy(
-            lane_batch.num_computed_tokens_cpu[rows_np].astype(np.int32)
+        input_positions_np = lane_batch.num_computed_tokens_cpu[rows_np]
+        input_positions = torch.from_numpy(input_positions_np.astype(np.int32))
+        chunk_lens = np.asarray(
+            [
+                scheduler_output.num_scheduled_tokens[lane_batch.req_ids[row]]
+                for row in rows
+            ],
+            dtype=np.int64,
         )
-        prompt_lens = lane_batch.num_tokens[rows_np]
+        prompt_lens = input_positions_np + chunk_lens
+        intermediate_prefill_mask = torch.from_numpy(
+            prompt_lens < lane_batch.num_tokens[rows_np]
+        )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
 
@@ -1212,6 +1233,8 @@ class TTLaneInputBatch(InputBatch):
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=False, has_structured_outputs=has_structured
         )
+        if intermediate_prefill_mask.any():
+            perform_device_sampling = False
 
         # Device-side penalties only; host sampling rebuilds these in
         # ``build_merged_sampling_metadata`` (over the full slot batch), so
@@ -1255,6 +1278,7 @@ class TTLaneInputBatch(InputBatch):
                 if plan.prefill_empty_slots is not None
                 else None
             ),
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
     def extract_output(
@@ -1278,7 +1302,26 @@ class TTLaneInputBatch(InputBatch):
         """
         n = len(scheduled_rows)
         rows_t = torch.as_tensor(scheduled_rows, dtype=torch.long)
+        intermediate_prefill_mask = getattr(
+            model_input, "intermediate_prefill_mask", None
+        )
+        intermediate_rows: list[int] = []
+        if not is_decode and intermediate_prefill_mask is not None:
+            assert intermediate_prefill_mask.numel() == n
+            intermediate_rows = [
+                row
+                for row, is_intermediate in zip(
+                    scheduled_rows, intermediate_prefill_mask.tolist(), strict=True
+                )
+                if is_intermediate
+            ]
+            if len(intermediate_rows) == n:
+                return torch.zeros((n, 1), dtype=torch.int32), None
         if model_input.perform_device_sampling:
+            assert not intermediate_rows, (
+                "Intermediate prefill rows must use host sampling so their "
+                "device RNG state is not advanced."
+            )
             tokens = tt_out.reshape(-1) if isinstance(tt_out, torch.Tensor) else tt_out
             # Decode reads each scheduled slot; prefill returns one token per
             # scheduled request, already in row order.
@@ -1295,7 +1338,9 @@ class TTLaneInputBatch(InputBatch):
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
             runner.apply_grammar_bitmask(logits, bitmask)
-        sampling_metadata = self.build_merged_sampling_metadata(scheduled_rows)
+        sampling_metadata = self.build_merged_sampling_metadata(
+            scheduled_rows, non_sampling_rows=intermediate_rows
+        )
         sampler_output = runner.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
