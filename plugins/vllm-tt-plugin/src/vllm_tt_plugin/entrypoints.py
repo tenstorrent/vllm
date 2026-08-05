@@ -24,11 +24,12 @@ def _register_tt_reasoning_parsers() -> None:
     """
     from vllm.reasoning import ReasoningParserManager
 
-    ReasoningParserManager.register_lazy_module(
-        "gemma4",
-        "vllm_tt_plugin.gemma4_reasoning_parser",
-        "Gemma4ReasoningParser",
-    )
+    for parser_name in ("gemma4", "diffusion_gemma"):
+        ReasoningParserManager.register_lazy_module(
+            parser_name,
+            "vllm_tt_plugin.gemma4_reasoning_parser",
+            "Gemma4ReasoningParser",
+        )
 
 
 def _register_tt_tool_parsers() -> None:

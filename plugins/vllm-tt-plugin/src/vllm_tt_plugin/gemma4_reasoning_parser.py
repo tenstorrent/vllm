@@ -18,7 +18,7 @@ _THOUGHT_PREFIX = "thought\n"
 
 
 class Gemma4ReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for Google Gemma4 unified thinking models."""
+    """Reasoning parser for Google Gemma 4 and DiffusionGemma thinking models."""
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
