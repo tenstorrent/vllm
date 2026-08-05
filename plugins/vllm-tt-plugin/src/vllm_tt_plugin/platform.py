@@ -480,20 +480,11 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
-    # DiffusionGemma 26B-A4B-it (block-diffusion; text backbone == Gemma-4 26B-A4B).
-    # Emits a 256-token block per decode step; requires the #47488 block-granular
-    # runner/scheduler change to advance num_computed_tokens by canvas_length and
-    # accept a [num_reqs, 256] block output (runner today asserts one token/step).
-    _diffusion_gemma_target = (
-        "models.experimental.diffusion_gemma.tt.generator_vllm:DiffusionGemmaForCausalLM"
-    )
-    for arch in (
+    _register_model_if_missing(
+        ModelRegistry,
         "DiffusionGemmaForBlockDiffusion",
-        "DiffusionGemmaForCausalLM",
-        "TTDiffusionGemmaForBlockDiffusion",
-        "TTDiffusionGemmaForCausalLM",
-    ):
-        _register_model_if_missing(ModelRegistry, arch, _diffusion_gemma_target)
+        "models.experimental.diffusion_gemma.tt.generator_vllm:DiffusionGemmaForCausalLM",
+    )
 
     # DeepseekV3
     _register_model_if_missing(

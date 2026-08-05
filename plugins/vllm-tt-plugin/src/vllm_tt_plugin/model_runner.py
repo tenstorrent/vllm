@@ -596,19 +596,6 @@ class TTModelRunner:
             )
         return per_layer  # type: ignore[return-value]
 
-    def _release_finished_model_request(self, req_id: str) -> None:
-        """Let stateful TT models release row-owned resources before removal.
-
-        Most autoregressive models have no per-request model state and therefore
-        expose no callback. Block-diffusion models can own Metal traces and
-        persistent buffers keyed by the current batch row; release them before
-        ``InputBatch.remove_request`` invalidates that row mapping.
-        """
-        req_index = self.input_batch.req_id_to_index.get(req_id)
-        release_request = getattr(self.model, "release_request", None)
-        if req_index is not None and callable(release_request):
-            release_request(req_index)
-
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
         scheduler output.
@@ -630,7 +617,6 @@ class TTModelRunner:
         # and handling the second as a new request.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
-            self._release_finished_model_request(req_id)
             req_index = self.input_batch.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -2419,11 +2405,8 @@ class TTModelRunner:
             if token_ids.numel() == 0:
                 token_ids = torch.zeros((B, 1), dtype=torch.int32)
             else:
-                # #47488: block-diffusion models (DiffusionGemma) emit a whole
-                # canvas of ``num_out_tokens = canvas_length`` (e.g. 256) ids per
-                # step; autoregressive models emit 1. Accept any [num_reqs, N>=1].
-                assert token_ids.dim() == 2 and token_ids.shape[1] >= 1, (
-                    "Expected [num_reqs, num_out_tokens>=1] sampled ids"
+                assert token_ids.dim() == 2 and token_ids.shape[1] == 1, (
+                    "Currently only supporting 1 output token per request"
                 )
                 pad_rows = B - token_ids.shape[0]
                 if pad_rows > 0:
@@ -2951,13 +2934,10 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
-                # #47488: keep the full [sz, num_out_tokens] TT sample. Prefill can
-                # return [sz] and autoregressive decode [sz, 1]; block-diffusion
-                # (DiffusionGemma) returns [sz, canvas_length] (a whole 256-token
-                # committed canvas per step). ``reshape(sz, -1)`` preserves all of
-                # them; the per-token logprobs path (below) still collapses to [sz]
-                # and is guarded to the 1-token case.
-                next_token_ids = _take(tt_out).reshape(sz, -1)
+                # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
+                # while decode may return [sz, 1]; downstream logprobs packing
+                # expects a flat vector here.
+                next_token_ids = _take(tt_out).reshape(sz)
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
@@ -2966,17 +2946,13 @@ class TTModelRunner:
                 if rank_enable_lp.any():
                     # Sanity check for if we correctly detect
                     # when logprobs are supported.
-                    assert next_token_ids.shape[1] == 1, (
-                        "device logprobs path supports 1 output token per step "
-                        "(block-diffusion serving requests no logprobs)"
-                    )
                     assert tt_log_probs is not None, (
                         "model should return logprobs when requested"
                     )
                     logprobs_per_dp.append(
                         build_device_logprobs(
                             tt_log_probs=tt_log_probs,
-                            sampled_token_ids=next_token_ids.reshape(sz),
+                            sampled_token_ids=next_token_ids,
                             rows=rows,
                             max_num_logprobs=rank_max_num_logprobs or 0,
                         )
@@ -2984,7 +2960,7 @@ class TTModelRunner:
                 else:
                     logprobs_per_dp.append(None)
 
-            sampled_token_ids_per_dp.append(next_token_ids.reshape(sz, -1))
+            sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
 
             if is_decode:
                 # Fixed stride segments per DP rank for decode
@@ -3043,11 +3019,7 @@ class TTModelRunner:
             f"number of requests in input batch {num_reqs}"
         )
 
-        # #47488: [num_reqs, num_out_tokens] — 1 for autoregressive, canvas_length
-        # (e.g. 256) for block-diffusion. Emit all num_out_tokens per request as
-        # the per-request output list vLLM's engine core appends and detokenizes.
-        num_out_tokens = sampled_token_ids.shape[1]
-        sampled_token_ids_np = sampled_token_ids.reshape(num_reqs, num_out_tokens).numpy()
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
@@ -3055,7 +3027,7 @@ class TTModelRunner:
             (output_req_ids[i] for i in range(num_reqs)), None
         )
         sampled_token_id_lists = [
-            [int(token_id) for token_id in row] for row in sampled_token_ids_np.tolist()
+            [int(token_id)] for token_id in sampled_token_ids_np.tolist()
         ]
 
         return ModelRunnerOutput(
@@ -3085,20 +3057,17 @@ class TTModelRunner:
             f"Number of request outputs {sampled_token_ids.shape[0]} != "
             f"number of requests in input batch {num_reqs}"
         )
-        # #47488: ``num_out_tokens`` is 1 for autoregressive models and
-        # ``canvas_length`` (e.g. 256) for block-diffusion (DiffusionGemma), which
-        # commits a whole canvas per step. Keep the [num_reqs, num_out_tokens]
-        # shape and write/advance by ``num_out_tokens`` instead of by 1.
         num_out_tokens = sampled_token_ids.shape[1]
+        assert num_out_tokens == 1, "Currently only supporting 1 output token"
 
-        sampled_token_ids_np = sampled_token_ids.reshape(num_reqs, num_out_tokens).numpy()
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
         if not use_captured_req_ids:
             rows = np.arange(num_reqs)
             start_idxs = self.input_batch.num_tokens[rows]
-            end_idxs = start_idxs + num_out_tokens
+            end_idxs = start_idxs + 1
             max_end = int(end_idxs.max()) if num_reqs > 0 else 0
             assert max_end <= self.model_config.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
@@ -3106,16 +3075,13 @@ class TTModelRunner:
                 f"{self.model_config.max_model_len}"
             )
 
+            self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
+            self.input_batch.num_tokens[rows] = end_idxs
+
             for req_idx in range(num_reqs):
-                start_idx = int(start_idxs[req_idx])
-                block = sampled_token_ids_np[req_idx]  # [num_out_tokens]
-                self.input_batch.token_ids_cpu[
-                    req_idx, start_idx : start_idx + num_out_tokens
-                ] = block
                 output_token_ids = self.input_batch.req_output_token_ids[req_idx]
                 assert output_token_ids is not None
-                output_token_ids.extend(int(t) for t in block)
-            self.input_batch.num_tokens[rows] = end_idxs
+                output_token_ids.append(int(sampled_token_ids_np[req_idx]))
             return
 
         assert req_ids is not None
@@ -3127,22 +3093,21 @@ class TTModelRunner:
             if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
-            block = sampled_token_ids_np[req_idx]  # [num_out_tokens]
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
-                end_idx = start_idx + num_out_tokens
+                end_idx = start_idx + 1
                 assert end_idx <= self.model_config.max_model_len, (
                     "Sampled token IDs exceed the max model length. "
                     f"Total number of tokens: {end_idx} > max_model_len: "
                     f"{self.model_config.max_model_len}"
                 )
-                self.input_batch.token_ids_cpu[
-                    current_row, start_idx:end_idx
-                ] = block
+                self.input_batch.token_ids_cpu[current_row, start_idx] = (
+                    sampled_token_ids_np[req_idx]
+                )
                 self.input_batch.num_tokens[current_row] = end_idx
 
-            req_state.output_token_ids.extend(int(t) for t in block)
+            req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
     def apply_and_build_runner_output(
         self,

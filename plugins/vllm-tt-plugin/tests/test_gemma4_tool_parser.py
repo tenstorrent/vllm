@@ -124,11 +124,11 @@ def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
             prev, cur, chunk, [], [], [], request=None
         )
         if delta is not None and delta.tool_calls:
-            fn = delta.tool_calls[0].function
-            if fn is not None and fn.name:
-                name = fn.name
-            if fn is not None and fn.arguments:
-                args_acc += fn.arguments
+            fn = delta.tool_calls[0].function or {}
+            if fn.get("name"):
+                name = fn["name"]
+            if fn.get("arguments"):
+                args_acc += fn["arguments"]
         prev = cur
 
     assert name == "get_weather"

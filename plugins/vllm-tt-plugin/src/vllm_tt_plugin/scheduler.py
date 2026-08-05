@@ -8,8 +8,7 @@ from typing import ClassVar
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
@@ -124,64 +123,6 @@ class TTScheduler(AsyncScheduler):
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
-
-    def _update_block_granular_request_with_output(
-        self, request: Request, new_token_ids: list[int]
-    ) -> tuple[list[int], bool]:
-        """#47488 scheduler half: generalize the 1-token async accounting to
-        block-granular commits (block-diffusion models such as DiffusionGemma).
-
-        AsyncScheduler models an autoregressive 1-in/1-out decode step: it
-        reserves exactly one output placeholder per scheduled step and asserts
-        ``num_output_placeholders >= 0`` after subtracting the committed count.
-        A block-diffusion decode step commits a whole canvas of ``n`` tokens
-        (n == ``canvas_length``, e.g. 256) in ONE model step whose K/V is written
-        inside the model, so more than one committed token survives the stop-trim
-        and AsyncScheduler underflows (``async_scheduler.py:53``).
-
-        This override keeps the same intent while allowing ``n > 1``:
-        * clamp the placeholder budget at 0 instead of asserting;
-        * advance ``num_computed_tokens`` by the extra ``n - 1`` committed tokens
-          so it keeps lagging the committed output by exactly one position — the
-          invariant the running-loop scheduler math relies on to schedule the
-          next decode step (``num_new_tokens == 1``);
-        * skip the prefix-cache bookkeeping for block commits (prefix caching is
-          force-disabled on this sliding-window / block-diffusion path and the
-          committed block's slots are model-owned, not vLLM-paged).
-
-        For ``n == 1`` (every autoregressive model, and DiffusionGemma requests
-        that stop at the block's first token) this is byte-identical to
-        ``AsyncScheduler._update_request_with_output``.
-        """
-        if request.discard_latest_async_tokens:
-            # Force-preempted in reset_prefix_cache: discard the async token.
-            request.discard_latest_async_tokens = False
-            return [], False
-
-        status_before_update = request.status
-        # Grandparent (base Scheduler) does the append + stop-trim; we replace
-        # AsyncScheduler's fixed 1-token placeholder/num_computed accounting.
-        new_token_ids, stopped = Scheduler._update_request_with_output(
-            self, request, new_token_ids
-        )
-        n = len(new_token_ids)
-
-        request.num_output_placeholders -= n
-        if request.num_output_placeholders < 0:
-            # Block committed more tokens than the single reserved placeholder.
-            request.num_output_placeholders = 0
-        if n > 1:
-            # _update_after_schedule already advanced num_computed by the one
-            # scheduled input position; add the remaining committed tokens so
-            # num_computed catches up to (num_tokens - 1).
-            request.num_computed_tokens += n - 1
-
-        if status_before_update == RequestStatus.RUNNING and n == 1:
-            self.kv_cache_manager.cache_blocks(
-                request,
-                request.num_computed_tokens - request.num_output_placeholders,
-            )
-        return new_token_ids, stopped
 
     def _has_pending_prefill(self) -> bool:
         """Whether any request needs prefill work.
@@ -313,19 +254,17 @@ class TTScheduler(AsyncScheduler):
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
-        """Add returned tokens unless an async preempt invalidated this output.
+        """Add a returned token to the request, unless a preempt invalidated it.
 
-        The pending-output check comes from token-chunked prefill support. Once
-        an output is known to be current, use the block-granular accounting path
-        so DiffusionGemma can commit a full canvas in one scheduler step.
+        When a token comes back for a request that was preempted while the token
+        was in the pipeline, adding it would corrupt the output, so we throw it
+        away here instead of handing it to the base class.
         """
-        if (
-            self.scheduler_config.async_scheduling
-            and _PendingOutputs.for_request(request).is_next_stale()
-        ):
+        if not self.scheduler_config.async_scheduling:
+            return super()._update_request_with_output(request, new_token_ids)
+
+        if _PendingOutputs.for_request(request).is_next_stale():
             request.discard_latest_async_tokens = False
             return [], False
 
-        return TTScheduler._update_block_granular_request_with_output(
-            self, request, new_token_ids
-        )
+        return super()._update_request_with_output(request, new_token_ids)
