@@ -546,6 +546,8 @@ class TTPlatform(Platform):
     device_name: str = "tt"
     device_type: str = "tt"
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
+    block_output_size: ClassVar[int | None] = None
+    block_model_max_len: ClassVar[int | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
@@ -646,6 +648,18 @@ class TTPlatform(Platform):
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
         arch_names = vllm_config.model_config.hf_config.architectures
+        is_diffusion_gemma = any("DiffusionGemma" in name for name in arch_names)
+        if is_diffusion_gemma:
+            if vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError(
+                    "DiffusionGemma owns one model-side KV cache and requires "
+                    "--max-num-seqs 1"
+                )
+            cls.block_output_size = 256
+            cls.block_model_max_len = model_config.max_model_len
+        else:
+            cls.block_output_size = None
+            cls.block_model_max_len = None
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
@@ -822,6 +836,61 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        output_size = cls.block_output_size
+        if not isinstance(params, SamplingParams) or not output_size:
+            return
+
+        prompt_token_ids = processed_inputs.get("prompt_token_ids")
+        max_model_len = cls.block_model_max_len
+        if (
+            prompt_token_ids is not None
+            and max_model_len is not None
+            and len(prompt_token_ids) + output_size > max_model_len
+        ):
+            raise ValueError(
+                "DiffusionGemma prompts must reserve one full "
+                f"{output_size}-token output canvas: prompt length "
+                f"{len(prompt_token_ids)} exceeds {max_model_len - output_size}"
+            )
+
+        unsupported = []
+        if params.n != 1:
+            unsupported.append("n")
+        if params.logprobs is not None:
+            unsupported.append("logprobs")
+        if params.temperature != 1.0:
+            unsupported.append("temperature")
+        if params.top_p != 1.0:
+            unsupported.append("top_p")
+        if params.top_k not in (0, -1):
+            unsupported.append("top_k")
+        if params.min_p != 0.0:
+            unsupported.append("min_p")
+        if params.seed is not None:
+            unsupported.append("seed")
+        if params.presence_penalty != 0.0:
+            unsupported.append("presence_penalty")
+        if params.frequency_penalty != 0.0:
+            unsupported.append("frequency_penalty")
+        if params.repetition_penalty != 1.0:
+            unsupported.append("repetition_penalty")
+        if params.bad_words:
+            unsupported.append("bad_words")
+        if params.structured_outputs is not None:
+            unsupported.append("structured_outputs")
+        if params.logit_bias is not None:
+            unsupported.append("logit_bias")
+        if params.allowed_token_ids is not None:
+            unsupported.append("allowed_token_ids")
+        if params.min_tokens != 0:
+            unsupported.append("min_tokens")
+
+        if unsupported:
+            raise ValueError(
+                "DiffusionGemma uses its model-owned block sampler and does not "
+                "support these request parameters: " + ", ".join(unsupported)
+            )
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
