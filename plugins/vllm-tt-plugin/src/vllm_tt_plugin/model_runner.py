@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import deque
 from dataclasses import dataclass, fields, replace
@@ -15,7 +14,6 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -52,9 +50,11 @@ from vllm_tt_plugin.input_batch import (
     TTLaneInputBatch,
     apply_cached_req_state_update,
     build_cached_request_state,
+    clone_torch_generator,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
@@ -72,7 +72,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
@@ -143,9 +143,6 @@ class TTModelRunner:
         self.request_specific_rope = bool(self.model_config.uses_mrope)
         if self.request_specific_rope:
             self.previous_req_ids: set[str] = set()
-
-        # Currently, TT model runner doesn't support chunked prefill.
-        assert self.scheduler_config.enable_chunked_prefill is False
 
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
@@ -821,6 +818,31 @@ class TTModelRunner:
             enable_log_probs=num_logprobs >= 0,
         )
 
+    @staticmethod
+    def _build_host_generators(
+        input_batch: InputBatch,
+        req_indices: list[int],
+        intermediate_prefill_mask: torch.Tensor | None,
+    ) -> dict[int, torch.Generator]:
+        intermediate_rows = (
+            set(intermediate_prefill_mask.nonzero().view(-1).tolist())
+            if intermediate_prefill_mask is not None
+            else set()
+        )
+        generators: dict[int, torch.Generator] = {}
+        rows_to_advance: list[int] = []
+        for local_row, batch_row in enumerate(req_indices):
+            generator = input_batch.sampling.generators.get(batch_row)
+            if generator is None:
+                continue
+            if local_row in intermediate_rows:
+                generators[local_row] = clone_torch_generator(generator)
+            else:
+                generators[local_row] = generator
+                rows_to_advance.append(batch_row)
+        input_batch.advance_generators(rows_to_advance)
+        return generators
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -905,39 +927,71 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
+        num_sched = scheduler_output.num_scheduled_tokens
         # A "prefill" step can contain:
         # - brand new requests (scheduled_new_reqs), and/or
         # - resumed-from-preemption requests (scheduled_cached_reqs with
-        #   resumed_req_ids set) that need to replay tokens to rebuild KV.
-        is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
-            cached_reqs.resumed_req_ids
+        #   resumed_req_ids set) that need to replay tokens to rebuild KV,
+        #   and/or
+        # - chunked-prefill continuations (cached requests that haven't
+        #   finished computing all their prompt tokens yet).
+        has_chunked_continuation = any(
+            input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
+            < input_batch.num_prompt_tokens[input_batch.req_id_to_index[req_id]]
+            for req_id in cached_reqs.req_ids
+            if req_id not in cached_reqs.resumed_req_ids
+        )
+        is_prompt = (
+            len(scheduler_output.scheduled_new_reqs) > 0
+            or bool(cached_reqs.resumed_req_ids)
+            or has_chunked_continuation
         )
         sample_params = input_batch.sampling
+        intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
             # cached on the worker", not necessarily "decode". During a prefill
             # step we can legitimately see cached requests if they are resumed
-            # from preemption (still prefill work).
+            # from preemption (still prefill work) or are chunked-prefill
+            # continuations (`num_computed < num_prompt_tokens` - still prefilling).
             if cached_reqs.num_reqs > 0:
-                any_running = any(
+                any_decode_in_prefill = any(
                     req_id not in cached_reqs.resumed_req_ids
+                    and input_batch.num_computed_tokens_cpu[
+                        input_batch.req_id_to_index[req_id]
+                    ]
+                    >= input_batch.num_prompt_tokens[
+                        input_batch.req_id_to_index[req_id]
+                    ]
                     for req_id in cached_reqs.req_ids
                 )
-                assert not any_running, (
-                    "Prefill batch should not include decode/running cached "
-                    "requests (req_id not in resumed_req_ids)."
+                assert not any_decode_in_prefill, (
+                    "Prefill batch should not include decode cached requests "
+                    "(cached req_id that has finished its prompt)."
                 )
 
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[req_indices]
-            # Prefill length in tokens for each request:
-            # - For new requests: equals prompt length.
-            # - For resumed-from-preemption requests: includes any generated
-            #   output tokens so far, so we can replay the full sequence to
-            #   rebuild KV after preemption freed the cache blocks.
-            prompt_lens = input_batch.num_tokens[req_indices]
-            max_prefill_tokens = max(prompt_lens)
+            # Chunk-aware `prompt_lens`: for each request, the "prompt length"
+            # the generator sees is `start_pos` + `chunk_len`, i.e., the position
+            # up to which tokens should be processed.  The generator slices
+            # `tokens[start_pos : prompt_lens]` and processes that chunk.
+            # - Full prefill (no chunking): `start_pos=0`, `chunk_len=prompt_len`
+            #   => `prompt_lens = prompt_len` (same as before).
+            # - APC hit: `start_pos=cached`, `chunk_len=prompt_len-cached`
+            #   => `prompt_lens = prompt_len` (same as before).
+            # - Chunked continuation: `start_pos=computed`, `chunk_len=budget`
+            #   => `prompt_lens = computed + budget` (the chunk end position).
+            chunk_lens = np.array(
+                [num_sched[input_batch.req_ids[i]] for i in req_indices],
+                dtype=np.int64,
+            )
+            prompt_lens = input_positions + chunk_lens
+            intermediate_prefill_mask = torch.from_numpy(
+                prompt_lens < input_batch.num_tokens[req_indices]
+            )
+            max_prefill_tokens = int(max(prompt_lens))
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
@@ -1032,6 +1086,17 @@ class TTModelRunner:
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
         )
+        if is_prompt and (
+            intermediate_prefill_mask.any()
+            or (
+                self.tt_data_parallel_size > 1
+                and self.scheduler_config.enable_chunked_prefill
+            )
+        ):
+            # A gathered prefill can switch to host sampling when another rank
+            # has an intermediate chunk, so every rank needs host generator
+            # state available before inputs are gathered.
+            perform_device_sampling = False
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only).
@@ -1099,27 +1164,11 @@ class TTModelRunner:
         # local batch, so the host sampler reuses them as-is.
         logitsprocs = input_batch.sampling.logitsprocs
 
-        generators = dict()
+        generators: dict[int, torch.Generator] = {}
         if not perform_device_sampling:
-            # Re-key generators (req_index -> Generator) to lane-local rows.
-            # The values are the same Generator objects advanced just below, so
-            # advancing via the shared ``input_batch`` keeps them in step.
-            src_generators = input_batch.sampling.generators
-            generators = {
-                local: src_generators[g]
-                for local, g in enumerate(req_indices)
-                if g in src_generators
-            }
-            # Technically this advances the generator before it is copied,
-            # but it's ok because this happens consistently.
-            #
-            # Each generator belongs to exactly one request (one lane), so we
-            # advance only this build's generators. Non-DP / gathered-DP build
-            # the whole batch once per step, so all generators advance exactly
-            # once; lane builds run once per lane, and passing the lane's
-            # ``req_indices`` keeps each generator advancing exactly once per
-            # step instead of once per lane.
-            input_batch.advance_generators(req_indices)
+            generators = self._build_host_generators(
+                input_batch, req_indices, intermediate_prefill_mask
+            )
             # NOTE: Our sampling paths are different between host and device.
             # Whether a request is sampled on device or host
             # depends also on other requests in the batch.
@@ -1152,6 +1201,7 @@ class TTModelRunner:
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[logitsprocs],
             generators_list=[generators],
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
     def build_model_input(
@@ -1171,6 +1221,19 @@ class TTModelRunner:
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
+
+        # ``_update_states`` may have just discovered a layout change that the
+        # scheduler-output prediction could not see: it predicts the resets caused by
+        # new or resumed requests, but removals, unscheduled requests and batch
+        # condensation only surface here, after the drain decision was already made.
+        # ``_decode_layout_changed_since_last_decode = True`` implies
+        # ``reset_batch=True``: ``_prepare_model_inputs`` below reloads inputs from host
+        # state, which a pending async decode step has not been applied to yet. This
+        # step is therefore not steady-decode eligible, so drain pending decodes to
+        # ensure updated host inputs. No-op when the flag was already set before the
+        # step (the caller's drain decision covered it) or when nothing is pending.
+        if self._decode_layout_changed_since_last_decode:
+            self.async_decode.wait_for_all_pending_async_steps()
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
@@ -1528,6 +1591,7 @@ class TTModelRunner:
         max_num_logprobs: list[int | None] = []
         generators_list: list[dict[int, torch.Generator]] = []
         slot_remap = None
+        intermediate_prefill_mask = None
 
         if is_decode and isinstance(inputs, dict):
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -1706,6 +1770,7 @@ class TTModelRunner:
             seed_list: list[torch.Tensor] = []
             num_logprobs_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
+            intermediate_prefill_masks: list[torch.Tensor] = []
             reset_batch = False
 
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
@@ -1766,6 +1831,13 @@ class TTModelRunner:
                     seed_list.append(sp.seed)
                     num_logprobs_list.append(sp.num_logprobs)
                     enable_log_probs_list.append(sp.enable_log_probs)
+                    if mi.intermediate_prefill_mask is None:
+                        intermediate_prefill_masks.append(
+                            torch.zeros(toks.shape[0], dtype=torch.bool)
+                        )
+                    else:
+                        assert mi.intermediate_prefill_mask.shape[0] == toks.shape[0]
+                        intermediate_prefill_masks.append(mi.intermediate_prefill_mask)
 
                 # We know it's not a list here before concatenation
                 unpadded_batch_size: int = (
@@ -1811,6 +1883,7 @@ class TTModelRunner:
             seed = torch.cat(seed_list, dim=0)
             num_logprobs = torch.cat(num_logprobs_list, dim=0)
             enable_log_probs = torch.cat(enable_log_probs_list, dim=0)
+            intermediate_prefill_mask = torch.cat(intermediate_prefill_masks, dim=0)
 
         else:
             # Gathered-DP decode passes a dict (handled above) and prefill a
@@ -1905,8 +1978,6 @@ class TTModelRunner:
                             rank_output_tokens
                         )
 
-        if os.environ.get("DP_GATHER_DEBUG") == "1":
-            logger.info("batch_size_per_dp=%s", batch_size_per_dp)
         merged = TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -1935,6 +2006,7 @@ class TTModelRunner:
             logitsprocs_list=logitsprocs_list,
             generators_list=generators_list,
             prefill_empty_slots=None,
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
         return merged
 
@@ -1988,6 +2060,11 @@ class TTModelRunner:
         )
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
+            # ``_decode_layout_changed_since_last_decode = True`` implies
+            # ``reset_batch=True``: the model will reload inputs. This step is not
+            # steady-decode eligible, so drain pending decodes to ensure updated
+            # host inputs.
+            self.async_decode.wait_for_all_pending_async_steps()
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2082,6 +2159,24 @@ class TTModelRunner:
         # ``scheduled_rows`` are persistent slots; their req_ids in row order are
         # the canonical merged output order.
         req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+
+        if not is_decode and model_input.prompt_lens is not None:
+            lane_batch = self.lane_batch
+            prompt_lens = np.asarray(model_input.prompt_lens)
+            num_tokens = np.array(
+                [lane_batch.num_tokens[row] for row in scheduled_rows],
+                dtype=np.int64,
+            )
+            intermediate_mask = prompt_lens < num_tokens
+
+            if intermediate_mask.any():
+                return self._build_chunked_prefill_output(
+                    req_ids=req_ids,
+                    sampled_token_ids=sampled,
+                    logprobs=logprobs,
+                    intermediate_mask=intermediate_mask,
+                )
+
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
@@ -2227,11 +2322,65 @@ class TTModelRunner:
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+
+        if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
+            num_reqs = self.input_batch.num_reqs
+            prompt_lens = np.asarray(fwd.model_input.prompt_lens)
+            num_tokens = self.input_batch.num_tokens[:num_reqs]
+            intermediate_mask = prompt_lens < num_tokens
+
+            if intermediate_mask.any():
+                output_req_ids = list(self.input_batch.req_ids[:num_reqs])
+                return self._build_chunked_prefill_output(
+                    req_ids=output_req_ids,
+                    sampled_token_ids=sampled_token_ids,
+                    logprobs=logprobs,
+                    intermediate_mask=intermediate_mask,
+                )
+
         return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+
+    def _build_chunked_prefill_output(
+        self,
+        req_ids: list[str],
+        sampled_token_ids: torch.Tensor,
+        logprobs: list | None,
+        intermediate_mask: np.ndarray,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        """Builds output with ``[]`` for intermediate, ``[tokens]`` for final chunks."""
+        final_idx_np = np.where(~intermediate_mask)[0]
+        if final_idx_np.shape[0] > 0:
+            final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
+            final_tokens = sampled_token_ids[final_idx_tensor]
+            final_req_ids = [req_ids[int(i)] for i in final_idx_np]
+            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+
+        num_reqs = len(req_ids)
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if sampled_token_ids_np.dtype != np.int32:
+            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+        sampled_token_id_lists = [
+            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            for i in range(num_reqs)
+        ]
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=(
+                dict(req_id_to_index)
+                if req_id_to_index is not None
+                else {r_id: idx for idx, r_id in enumerate(req_ids)}
+            ),
+            sampled_token_ids=sampled_token_id_lists,
+            logprobs=logprobs,
+            prompt_logprobs_dict=dict.fromkeys(req_ids, None),
+            pooler_output=[],
+        )
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput | None:
         """Sample the forward deferred by a preceding ``execute_model``.
 
         Pops the oldest pending forward (FIFO, matching the engine's
@@ -2239,7 +2388,14 @@ class TTModelRunner:
         produces its output (or an async wrapper for overlapped decode). The
         engine calls this exactly once per ``execute_model`` that returned
         ``None``.
+
+        If the deque is empty, ``execute_model`` must have raised an exception
+        that was captured by the executor; return ``None`` so the engine can
+        surface the original error from the execute future.
         """
+        if not self._pending_samples:
+            return None
+
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
@@ -2503,6 +2659,7 @@ class TTModelRunner:
         int,
         int,
         int,
+        torch.Tensor | None,
         list[str],
         dict[str, int],
     ]:
@@ -2516,6 +2673,7 @@ class TTModelRunner:
         reset_batch = 0
         can_sample_device = 1
         needs_logprobs = 0
+        intermediate_prefill_mask = None
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         if scheduler_output is not None:
@@ -2527,6 +2685,7 @@ class TTModelRunner:
                 max_num_logprobs = model_input.max_num_logprobs[0]
                 # max_num_logprobs=0 still requests the sampled token's logprob.
                 needs_logprobs = int(max_num_logprobs is not None)
+                intermediate_prefill_mask = model_input.intermediate_prefill_mask
                 num_reqs = self.input_batch.num_reqs
                 req_ids = list(self.input_batch.req_ids[:num_reqs])
                 req_id_to_index = dict(self.input_batch.req_id_to_index)
@@ -2542,6 +2701,7 @@ class TTModelRunner:
             reset_batch,
             can_sample_device,
             needs_logprobs,
+            intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
         )
@@ -2583,6 +2743,7 @@ class TTModelRunner:
         logprobs_lists: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        intermediate_prefill_mask: torch.Tensor | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result to runner state and build output.
 
@@ -2591,6 +2752,21 @@ class TTModelRunner:
         """
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
+        if intermediate_prefill_mask is not None:
+            intermediate_mask = intermediate_prefill_mask[:num_reqs]
+            if intermediate_mask.any():
+                output_req_ids = (
+                    list(req_ids)
+                    if req_ids is not None
+                    else list(self.input_batch.req_ids[:num_reqs])
+                )
+                return self._build_chunked_prefill_output(
+                    req_ids=output_req_ids,
+                    sampled_token_ids=sampled_token_ids,
+                    logprobs=logprobs_lists,
+                    intermediate_mask=intermediate_mask.cpu().numpy(),
+                    req_id_to_index=req_id_to_index,
+                )
         return self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs_lists,
@@ -2644,7 +2820,14 @@ class TTModelRunner:
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
 
-            if not perform_device_sampling:
+            if (
+                not is_decode
+                and model_input.intermediate_prefill_mask is not None
+                and bool(model_input.intermediate_prefill_mask[rows].all())
+            ):
+                next_token_ids = torch.zeros(sz, dtype=torch.int32)
+                logprobs_per_dp.append(None)
+            elif not perform_device_sampling:
                 logits = tt_out[rows, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]

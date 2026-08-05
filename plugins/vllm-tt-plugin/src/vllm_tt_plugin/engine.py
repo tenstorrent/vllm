@@ -13,7 +13,6 @@ import torch
 import torch.distributed as dist
 
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.logger import init_logger
 from vllm.utils.network_utils import get_tcp_uri
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import (
@@ -25,9 +24,10 @@ from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm_tt_plugin.config import get_tt_config, get_tt_per_lane_max_num_seqs
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 _T = TypeVar("_T")
 
 
@@ -75,6 +75,7 @@ class DPGatherHandle:
     is_decode: bool
     overlap_ok: bool
     any_needs_logprobs: bool
+    intermediate_prefill_mask: torch.Tensor | None
     req_ids: list[str]
     req_id_to_index: dict[str, int]
 
@@ -322,12 +323,19 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         return int(has_requests_t.item()) > 0
 
     def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
-        has_running = bool(getattr(self.scheduler, "running", []))
+        running = getattr(self.scheduler, "running", [])
+        has_running = bool(running)
         has_waiting = bool(getattr(self.scheduler, "waiting", False))
         max_running = getattr(self.scheduler, "max_num_running_reqs", 0)
-        has_capacity = len(getattr(self.scheduler, "running", [])) < max_running
+        has_partial_prefill = any(request.is_prefill_chunk for request in running)
+        has_capacity = len(running) < max_running
         local_prefill_intent = (
-            1 if (has_waiting and ((not has_running) or has_capacity)) else 0
+            1
+            if (
+                has_partial_prefill
+                or (has_waiting and ((not has_running) or has_capacity))
+            )
+            else 0
         )
         intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
         self.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
@@ -502,6 +510,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             local_reset_batch,
             local_can_sample_device,
             local_needs_logprobs,
+            intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
         ) = all_local_inputs
@@ -713,6 +722,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             is_decode=is_decode,
             overlap_ok=overlap_ok,
             any_needs_logprobs=any_needs_logprobs,
+            intermediate_prefill_mask=intermediate_prefill_mask,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
@@ -753,6 +763,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     my_logprobs_val,
                     handle.req_ids,
                     handle.req_id_to_index,
+                    handle.intermediate_prefill_mask,
                 ),
             )[0]
             return output

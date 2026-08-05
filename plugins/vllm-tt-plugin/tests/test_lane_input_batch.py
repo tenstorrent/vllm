@@ -243,6 +243,50 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert b.occupied_rows() == []
 
 
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    batch = _lane_batch(num_lanes=1, per_lane=1)
+    request = _make_req(
+        "request",
+        list(range(8)),
+        [],
+        dict(temperature=0.0),
+    )
+    row = _add_to_lane(batch, request, lane=0)
+    batch.num_computed_tokens_cpu[row] = 2
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"request": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    plan = TTStepPlan(
+        is_decode=False,
+        capacity=1,
+        scheduled_req_ids=("request",),
+        scheduled_rows=(row,),
+        input_rows=(row,),
+        req_id_to_row={"request": row},
+        batch_size_per_dp=(1,),
+        prefill_empty_slots=(row,),
+    )
+    runner = SimpleNamespace(
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _block_tables_per_layer=lambda _: None,
+        check_perform_device_sampling=lambda **_: True,
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        requests={"request": request},
+    )
+
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+
+    assert model_input.input_positions.tolist() == [2]
+    assert model_input.prompt_lens.tolist() == [3]
+    assert model_input.input_tokens.tolist() == [[0, 1, 2]]
+    assert model_input.perform_device_sampling is False
+
+
 def test_lane_full_raises():
     b = _lane_batch(num_lanes=1, per_lane=2)
     _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)
@@ -475,6 +519,22 @@ def test_merged_sampling_metadata_filters_generators_to_scheduled_rows():
 
     assert set(metadata.generators) == {row4}
     assert metadata.generators[row4] is b.sampling.generators[row4]
+
+
+def test_merged_sampling_metadata_clones_intermediate_generators():
+    b = _lane_batch(num_lanes=1, per_lane=1, with_custom=False)
+    row = _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.7), seed=11), 0)
+    generator = b.sampling.generators[row]
+    before = generator.get_state().clone()
+
+    metadata = b.build_merged_sampling_metadata(
+        scheduled_rows=[row], non_sampling_rows=[row]
+    )
+
+    assert metadata.generators[row] is not generator
+    assert torch.equal(metadata.generators[row].get_state(), before)
+    Sampler()(torch.randn(1, VOCAB), metadata)
+    assert torch.equal(generator.get_state(), before)
 
 
 def test_scheduled_seeded_row_isolated_from_unscheduled_random_row():

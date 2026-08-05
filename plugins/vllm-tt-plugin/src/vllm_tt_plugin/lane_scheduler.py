@@ -33,7 +33,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -47,6 +46,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
 if TYPE_CHECKING:
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.structured_output import StructuredOutputManager
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -350,14 +350,17 @@ class TTLaneCoordinator(SchedulerInterface):
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
 
-        A lane wants to prefill when it has queued requests and either nothing
-        running (so it must prefill to make progress) or spare capacity to admit
-        more alongside its running decodes.
+        A running prefill continuation must always make progress, even when the
+        lane is at its request capacity. New queued requests need either no
+        running work or spare capacity to be admitted alongside running decodes.
         """
         has_waiting = bool(sched.waiting)
         has_running = bool(sched.running)
+        has_partial_prefill = any(request.is_prefill_chunk for request in sched.running)
         has_capacity = len(sched.running) < self._per_lane_max
-        return int(has_waiting and ((not has_running) or has_capacity))
+        return int(
+            has_partial_prefill or (has_waiting and ((not has_running) or has_capacity))
+        )
 
     def _negotiate_forced_mode(self) -> TTSchedulingMode:
         """Pick the single mode (prefill- or decode-only) all lanes will run.
@@ -502,7 +505,10 @@ class TTLaneCoordinator(SchedulerInterface):
         if (
             forced_mode == TTSchedulingMode.PREFILL_ONLY
             and merged.total_num_scheduled_tokens == 0
-            and any(sched.running for sched in self.lanes)
+            and any(
+                any(not request.is_prefill_chunk for request in sched.running)
+                for sched in self.lanes
+            )
         ):
             # The discarded prefill pass already drained each lane's
             # finished/freed-encoder bookkeeping; carry it onto the decode pass

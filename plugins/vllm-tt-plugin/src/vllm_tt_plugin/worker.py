@@ -12,10 +12,10 @@ import torch
 import ttnn
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm_tt_plugin.logger import init_tt_logger
 
 try:
     # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
@@ -55,13 +56,39 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import LogprobsLists
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Ensure TT model architectures are registered in this process as early as
 # possible. `WorkerWrapperBase.init_worker` imports the worker class module
 # before initializing multimodal caches; without this, early architecture
 # inspection may fail for TT-prefixed architectures.
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
+
+
+def _validate_tt_kv_cache_capacity(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Reject TT KV configs that cannot serve one max_model_len request."""
+    # When rebased to include https://github.com/vllm-project/vllm/pull/41069
+    # verify and remove this check.
+    if not kv_cache_config.kv_cache_groups:
+        return
+
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    if max_concurrency >= 1.0:
+        return
+
+    model_config = vllm_config.model_config
+    raise ValueError(
+        "TT KV cache cannot hold one request at max_model_len. "
+        f"Maximum concurrency for {model_config.max_model_len:,} tokens per "
+        f"request is {max_concurrency:.2f}x, but must be at least 1.00x. "
+        f"num_blocks={kv_cache_config.num_blocks}, corresponding to approximately "
+        f"{kv_cache_config.num_blocks * vllm_config.cache_config.block_size:,} tokens, "
+        "Increase max_tokens_all_users or reduce max_model_len."
+    )
 
 
 class TTWorker(WorkerBase):
@@ -276,6 +303,7 @@ class TTWorker(WorkerBase):
         """Allocate TT KV cache (only DP rank 0) and initialize persistent
         input batch (all DP ranks) with the specified kv_cache_config.
         """
+        _validate_tt_kv_cache_capacity(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
@@ -346,6 +374,7 @@ class TTWorker(WorkerBase):
         int,
         int,
         int,
+        torch.Tensor | None,
         list[str],
         dict[str, int],
     ]:
@@ -353,7 +382,8 @@ class TTWorker(WorkerBase):
 
         Returns `(local_input, max_blocks, has_structured_input,
         has_penalties, reset_batch, can_sample_device, needs_logprobs,
-        req_ids, req_id_to_index)`, where `local_input` is this rank's
+        intermediate_prefill_mask, req_ids, req_id_to_index)`, where
+        `local_input` is this rank's
         TT model input (or `None`) and the remaining fields are the
         per-rank metadata consumed by gathered-DP orchestration.
         """
@@ -448,6 +478,7 @@ class TTWorker(WorkerBase):
         logprobs_lists: Optional["LogprobsLists"] = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        intermediate_prefill_mask: torch.Tensor | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result through the worker facade.
 
@@ -459,6 +490,7 @@ class TTWorker(WorkerBase):
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
     # ---- Destructor (used to close devices) ----

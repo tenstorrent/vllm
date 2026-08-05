@@ -364,6 +364,27 @@ implementations. Current families:
 Model availability, supported device shapes, max sequence limits, and required
 environment variables are documented in the corresponding tt-metal model demos.
 
+### Registering models dynamically (`EXTRA_MODELS_DIR`)
+
+Instead of adding a hard-coded line to `platform.py`, a model can be registered at
+startup by dropping a **bundle folder** under a directory named by the
+`EXTRA_MODELS_DIR` environment variable. Each subfolder holds a `vllm_metadata.json`
+and the adapter class (plus its dependencies):
+
+```text
+$EXTRA_MODELS_DIR/
+  my-model/
+    vllm_metadata.json      # {"arch": "<HFArch>", "main_class": "module:Class", ...}
+    <adapter class + deps>
+```
+
+At import time the plugin scans `EXTRA_MODELS_DIR`, appends each folder to `sys.path`
+(so an installed package of the same name is never shadowed), and registers `arch`
+under the plugin's `TT`-prefixed convention (`TT<HFArch>`) pointing at `main_class`.
+This lets a distribution tool (e.g. `tt-kernel`) deliver a ready-to-serve model with no
+source edit to the plugin. The built-in map above stays enabled by default; set
+`TT_VLLM_BUILTIN_MODELS=0` to rely solely on `EXTRA_MODELS_DIR`.
+
 ## Operational Constraints
 
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a

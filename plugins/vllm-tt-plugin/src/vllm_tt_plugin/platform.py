@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_tt_plugin.config import (
     get_tt_config,
@@ -17,6 +16,7 @@ from vllm_tt_plugin.config import (
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 else:
     FlexibleArgumentParser = object
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
@@ -41,6 +41,42 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_LLAMA_TEXT_VER": "llama3_70b_galaxy",
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
+
+# TT model types that have been validated with real chunked prefill.
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+
+
+def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
+    """Restricts token-chunked prefill to model types Metal has validated."""
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+    model_type = getattr(model_config.hf_config, "model_type", None)
+
+    if model_type not in _CHUNKED_PREFILL_MODEL_TYPES:
+        if scheduler_config.enable_chunked_prefill:
+            logger.info(
+                "Chunked prefill is not validated for `model_type=%s`; disabling it.",
+                model_type,
+            )
+            scheduler_config.enable_chunked_prefill = False
+
+            max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+            max_model_len = model_config.max_model_len
+            if max_num_batched_tokens < max_model_len:
+                logger.warning(
+                    "`max_num_batched_tokens=%d < max_model_len=%d` with "
+                    "chunked prefill "
+                    "disabled, bumping `max_num_batched_tokens` to match.",
+                    max_num_batched_tokens,
+                    max_model_len,
+                )
+
+                scheduler_config.max_num_batched_tokens = max_model_len
+
+        # The scheduler applies this threshold before checking
+        # ``enable_chunked_prefill``. Leaving it nonzero can still split a
+        # prefill despite the disabled flag.
+        scheduler_config.long_prefill_token_threshold = 0
 
 
 def _galaxy_generator_version() -> str | None:
@@ -221,8 +257,102 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
 
 
+def _iter_extra_model_bundles():
+    """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
+
+    ``EXTRA_MODELS_DIR`` is a directory of self-contained per-model bundle
+    folders. Each folder holds a ``vllm_metadata.json`` (``arch`` = HF
+    architecture name, ``main_class`` = ``"module:Class"`` implementing the vLLM
+    generator adapter) plus the adapter class and its dependencies. Any
+    distribution tool (e.g. tt-kernel) can drop a bundle folder here and have it
+    registered with no source edit to this plugin. Malformed / incomplete folders
+    are skipped with a warning.
+    """
+    base = os.getenv("EXTRA_MODELS_DIR")
+    if not base:
+        return
+    if not os.path.isdir(base):
+        logger.warning("EXTRA_MODELS_DIR=%s is not a directory; ignoring.", base)
+        return
+    for name in sorted(os.listdir(base)):
+        folder = os.path.join(base, name)
+        if not os.path.isdir(folder):
+            continue
+        meta_path = os.path.join(folder, "vllm_metadata.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Skipping %s: cannot read vllm_metadata.json (%s)", folder, exc
+            )
+            continue
+        arch = data.get("arch")
+        main_class = data.get("main_class")
+        if not arch or not main_class:
+            logger.warning(
+                "Skipping %s: vllm_metadata.json needs 'arch' and 'main_class'.",
+                folder,
+            )
+            continue
+        yield folder, arch, main_class
+
+
+def _register_models_from_extra_dir(ModelRegistry) -> int:
+    """Register every model found under ``EXTRA_MODELS_DIR``; return the count.
+
+    Registration is lazy (a ``"module:Class"`` string resolved by vLLM later), so
+    a bundle folder that carries its own adapter module must stay importable when
+    that resolution happens. We ``append`` the folder to ``sys.path`` (never
+    ``insert(0)``, so an installed package of the same name always wins and
+    nothing is shadowed); built-in adapters given as a full dotted path resolve
+    normally and need no path entry. The arch is registered under the plugin's
+    ``TT``-prefixed convention (mirroring ``check_and_update_config``).
+    """
+    count = 0
+    for folder, arch, main_class in _iter_extra_model_bundles():
+        if folder not in sys.path:
+            sys.path.append(folder)
+        tt_arch = arch if arch.startswith("TT") else "TT" + arch
+        _register_model_if_missing(ModelRegistry, tt_arch, main_class)
+        logger.info(
+            "Registered TT model %s -> %s (from EXTRA_MODELS_DIR/%s)",
+            tt_arch,
+            main_class,
+            os.path.basename(folder),
+        )
+        count += 1
+    return count
+
+
+def _builtin_models_enabled() -> bool:
+    """Whether to register the built-in (hard-coded) TT model map.
+
+    Defaults to enabled for backward compatibility. Set
+    ``TT_VLLM_BUILTIN_MODELS=0`` to rely solely on ``EXTRA_MODELS_DIR`` (the
+    intended end-state once all models ship as bundles). Any of 0/false/no/off
+    disables it.
+    """
+    val = os.getenv("TT_VLLM_BUILTIN_MODELS")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
 def register_tt_models(register_test_models=False) -> None:
     from vllm.model_executor.models.registry import ModelRegistry
+
+    # Dynamic hook: register any bundles dropped under EXTRA_MODELS_DIR. Runs
+    # first so a distributed bundle can supply a model without touching this file.
+    _register_models_from_extra_dir(ModelRegistry)
+
+    # Built-in map. Kept for compatibility; disable with TT_VLLM_BUILTIN_MODELS=0.
+    if not _builtin_models_enabled():
+        if register_test_models:
+            register_tt_test_models()
+        return
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
@@ -272,19 +402,10 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
     # Qwen3.5 - Text
-    qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
-    if qwen35_text_version == "qwen36_blackhole":
-        path_qwen35_text = (
-            "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM"
-        )
-    else:
-        raise ValueError(
-            f"Unsupported TT Qwen3.5 version: {qwen35_text_version}, "
-            "pick one of [qwen36_blackhole]"
-        )
-
     _register_model_if_missing(
-        ModelRegistry, "TTQwen3_5ForConditionalGeneration", path_qwen35_text
+        ModelRegistry,
+        "TTQwen3_5ForConditionalGeneration",
+        "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM",
     )
 
     # Qwen2.5 - Vision
@@ -467,9 +588,10 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
-        if vllm_config.scheduler_config.enable_chunked_prefill:
-            logger.info("Chunked prefill is not yet supported for TT backend")
-            vllm_config.scheduler_config.enable_chunked_prefill = False
+        _apply_chunked_prefill_policy(vllm_config)
+
+        vllm_config.scheduler_config.disable_chunked_mm_input = True
+
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
@@ -669,6 +791,10 @@ class TTPlatform(Platform):
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
+        )
+        # Check that all invariants are satisfied after all rewriting
+        vllm_config.scheduler_config.verify_max_model_len(
+            vllm_config.model_config.max_model_len
         )
 
     @classmethod
