@@ -141,6 +141,7 @@ def test_scheduler_accounts_for_full_256_token_block(monkeypatch):
     )
     cached = []
     scheduler = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         kv_cache_manager=SimpleNamespace(cache_blocks=lambda *args: cached.append(args))
     )
     request = _scheduler_request()
@@ -174,6 +175,7 @@ def test_scheduler_accounts_after_stop_trimming(
     )
     cached = []
     scheduler = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         kv_cache_manager=SimpleNamespace(cache_blocks=lambda *args: cached.append(args))
     )
     request = _scheduler_request()

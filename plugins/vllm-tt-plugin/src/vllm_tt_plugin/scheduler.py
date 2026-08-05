@@ -125,7 +125,7 @@ class TTScheduler(AsyncScheduler):
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
 
-    def _update_request_with_output(
+    def _update_block_granular_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
         """#47488 scheduler half: generalize the 1-token async accounting to
@@ -313,17 +313,19 @@ class TTScheduler(AsyncScheduler):
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
-        """Add a returned token to the request, unless a preempt invalidated it.
+        """Add returned tokens unless an async preempt invalidated this output.
 
-        When a token comes back for a request that was preempted while the token
-        was in the pipeline, adding it would corrupt the output, so we throw it
-        away here instead of handing it to the base class.
+        The pending-output check comes from token-chunked prefill support. Once
+        an output is known to be current, use the block-granular accounting path
+        so DiffusionGemma can commit a full canvas in one scheduler step.
         """
-        if not self.scheduler_config.async_scheduling:
-            return super()._update_request_with_output(request, new_token_ids)
-
-        if _PendingOutputs.for_request(request).is_next_stale():
+        if (
+            self.scheduler_config.async_scheduling
+            and _PendingOutputs.for_request(request).is_next_stale()
+        ):
             request.discard_latest_async_tokens = False
             return [], False
 
-        return super()._update_request_with_output(request, new_token_ids)
+        return TTScheduler._update_block_granular_request_with_output(
+            self, request, new_token_ids
+        )
