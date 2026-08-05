@@ -1009,14 +1009,35 @@ class TTModelRunner:
         req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
 
-        # All modes pad decode to the per-rank/per-lane wire capacity. The
+        # Pad decode to the per-rank/per-lane wire capacity by default. The
         # DP-decode gather packs and unpacks each rank at
         # ``tt_per_lane_max_num_seqs``; padding to ``input_batch.max_num_reqs``
         # (the *global* gathered capacity ``max_num_seqs * dp_size`` for
         # gathered multi-process DP) would carry too many rows in the
         # never-trimmed tokens/positions/block_tables fields and desync the
         # packed gather layout. For non-DP these two capacities are equal.
+        #
+        # Models that declare ``tt_supported_decode_batch_sizes`` (e.g. Gemma4)
+        # may pad only to the nearest supported size >= num_reqs, so B=1 is not
+        # forced through a B=max graph.
+        #
+        # A model must declare only the buckets it has actually captured a decode
+        # trace for on this instance: padding to a bucket with no captured trace
+        # leaves the device in an undefined state. There is deliberately no
+        # separate "warmed" list to fall back from -- a bucket that is not warmed
+        # is not supported.
         decode_pad_to = self.tt_per_lane_max_num_seqs
+        decode_buckets = getattr(self.model, "tt_supported_decode_batch_sizes", None)
+        if decode_buckets:
+            bucket = next(
+                (
+                    int(b)
+                    for b in sorted(int(x) for x in decode_buckets)
+                    if int(b) >= num_reqs and int(b) <= self.tt_per_lane_max_num_seqs
+                ),
+                self.tt_per_lane_max_num_seqs,
+            )
+            decode_pad_to = bucket
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
