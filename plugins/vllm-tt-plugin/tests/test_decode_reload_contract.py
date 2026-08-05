@@ -720,6 +720,14 @@ def test_layout_change_causes_are_all_rejected_before_update_states():
     assert controller.scheduler_preserves_decode_layout(resumed)
     assert not controller.steady_decode_scheduler_invariants_met(resumed, None)
 
+    # Chunked-prefill continuation: a cached request, neither new nor resumed,
+    # so membership is unchanged and the new/resumed test alone accepts it. The
+    # multi-token schedule is what marks it as still prefilling.
+    continuation = _steady_scheduler_output(("req-0", "req-1"))
+    continuation.num_scheduled_tokens = {"req-0": 1, "req-1": 256}
+    assert controller.scheduler_preserves_decode_layout(continuation)
+    assert not controller.steady_decode_scheduler_invariants_met(continuation, None)
+
 
 def test_dp_block_table_width_follows_allocation_not_host_tokens():
     """A one-step-stale token count must not narrow the gathered page table.

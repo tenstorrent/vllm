@@ -312,6 +312,28 @@ class TTAsyncDecodeController:
         ):
             self._submitted_page_tables = self._clone_page_tables(model_input)
 
+    @staticmethod
+    def scheduler_output_is_prompt(scheduler_output: SchedulerOutput) -> bool:
+        """Whether this step carries prefill work of any kind.
+
+        Decided before ``_update_states``, so the persistent batch's
+        ``num_computed_tokens`` still describes the previous step and cannot be
+        consulted. The scheduler output alone is authoritative: a pure decode
+        row is scheduled exactly one token, so a cached request with more is
+        still prefilling - a chunked-prefill continuation, which is a prefill
+        that leaves batch membership intact and therefore passes
+        ``scheduler_preserves_decode_layout``.
+
+        Over-reporting is safe (it only forgoes overlap), so any future feature
+        that schedules several tokens for a decode row lands on the
+        conservative side.
+        """
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
+            return True
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        return any(num_scheduled.get(req_id, 0) > 1 for req_id in cached_reqs.req_ids)
+
     def scheduler_preserves_decode_layout(
         self, scheduler_output: SchedulerOutput
     ) -> bool:
@@ -368,11 +390,9 @@ class TTAsyncDecodeController:
         grammar_output: GrammarOutput | None,
     ) -> bool:
         runner = self.runner
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
-            cached_reqs.resumed_req_ids
-        )
-        if is_prompt or runner._decode_layout_changed_since_last_decode:
+        if self.scheduler_output_is_prompt(scheduler_output):
+            return False
+        if runner._decode_layout_changed_since_last_decode:
             return False
         if not self._decode_chain_valid or self._previous_device_sampling is not True:
             return False
