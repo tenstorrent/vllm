@@ -269,6 +269,7 @@ def test_apply_dp_result_suppresses_intermediate_prefill_rows():
         apply_and_build_runner_output=lambda *args, **kwargs: pytest.fail(
             "intermediate rows must not be applied"
         ),
+        _consume_invalidated_req_ids=set,
     )
 
     output = TTModelRunner.apply_dp_execution_result(
@@ -347,6 +348,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         trace_mode="none",
         request_specific_rope=False,
         model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
     )
     model_input = SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
