@@ -869,14 +869,33 @@ class TTModelRunner:
         req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
 
-        # All modes pad decode to the per-rank/per-lane wire capacity. The
+        # Pad decode to the per-rank/per-lane wire capacity by default. The
         # DP-decode gather packs and unpacks each rank at
         # ``tt_per_lane_max_num_seqs``; padding to ``input_batch.max_num_reqs``
         # (the *global* gathered capacity ``max_num_seqs * dp_size`` for
         # gathered multi-process DP) would carry too many rows in the
         # never-trimmed tokens/positions/block_tables fields and desync the
         # packed gather layout. For non-DP these two capacities are equal.
+        #
+        # Models that declare ``tt_supported_decode_batch_sizes`` (e.g. Gemma4)
+        # and warm a decode trace per bucket may pad only to the nearest
+        # supported size ≥ num_reqs so B=1 is not forced through a B=max graph.
         decode_pad_to = self.tt_per_lane_max_num_seqs
+        # Prefer actually-warmed decode buckets when present (Gemma4 warms
+        # B=1 + B=max by default); else fall back to declared supported sizes.
+        decode_buckets = getattr(
+            self.model, "tt_warmed_decode_batch_sizes", None
+        ) or getattr(self.model, "tt_supported_decode_batch_sizes", None)
+        if decode_buckets:
+            bucket = next(
+                (
+                    int(b)
+                    for b in sorted(int(x) for x in decode_buckets)
+                    if int(b) >= num_reqs and int(b) <= self.tt_per_lane_max_num_seqs
+                ),
+                self.tt_per_lane_max_num_seqs,
+            )
+            decode_pad_to = bucket
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
@@ -1010,9 +1029,17 @@ class TTModelRunner:
                 # many users are active on this rank. Keep ``block_tables``
                 # aliased to the (now padded) group-0 view, matching the
                 # alias set up where ``block_tables_per_group`` is built.
+                # Use -1 (not 0): physical block 0 is a real KV page; zero-pad
+                # makes inactive decode rows read/write block 0 and corrupts
+                # concurrent users (Gemma4 multi-seq long-decode).
                 block_tables_per_group = [
                     torch.cat(
-                        [bt, torch.zeros(batch_pad, bt.shape[1], dtype=bt.dtype)],
+                        [
+                            bt,
+                            torch.full(
+                                (batch_pad, bt.shape[1]), -1, dtype=bt.dtype
+                            ),
+                        ],
                         dim=0,
                     )
                     for bt in block_tables_per_group
@@ -1364,8 +1391,14 @@ class TTModelRunner:
             for bt in model_input.block_tables_per_group:
                 if bt.shape[0] < max_batch:
                     batch_pad = max_batch - bt.shape[0]
+                    # -1 = inactive decode row (see decode pad note above).
                     bt = torch.cat(
-                        [bt, torch.zeros(batch_pad, bt.shape[1], dtype=bt.dtype)],
+                        [
+                            bt,
+                            torch.full(
+                                (batch_pad, bt.shape[1]), -1, dtype=bt.dtype
+                            ),
+                        ],
                         dim=0,
                     )
                 if bt.shape[1] > max_blocks_decode_batch:
