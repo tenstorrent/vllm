@@ -866,6 +866,7 @@ class TTModelRunner:
         if all(remap[i] == i for i in range(n_slots)):
             return None
         return torch.tensor(remap, dtype=torch.int32)
+
     @staticmethod
     def _build_host_generators(
         input_batch: InputBatch,
