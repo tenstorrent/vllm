@@ -792,6 +792,48 @@ def test_gathered_dp_result_rejects_requests_invalidated_since_submit():
     assert runner._invalidated_req_ids == set()
 
 
+def test_intermediate_chunk_step_still_consumes_and_honours_rejections():
+    """A chunked-prefill step returns early, but rejection still applies.
+
+    The invalidated set has to be consumed here too: carried into a later step
+    it would reject a token that step legitimately produced. The final-chunk row
+    of an invalidated request must also stay empty.
+    """
+    live = SimpleNamespace(output_token_ids=[])
+    resumed = SimpleNamespace(output_token_ids=[])
+    runner = SimpleNamespace(
+        requests={"live": live, "resumed": resumed},
+        input_batch=SimpleNamespace(req_id_to_index={}, num_reqs=3),
+        model_config=SimpleNamespace(max_model_len=32),
+        _invalidated_req_ids={"resumed"},
+    )
+    runner._consume_invalidated_req_ids = lambda: (
+        TTModelRunner._consume_invalidated_req_ids(runner)
+    )
+    runner._apply_sampled_tokens_to_state = lambda *args, **kwargs: (
+        TTModelRunner._apply_sampled_tokens_to_state(runner, *args, **kwargs)
+    )
+    runner._build_chunked_prefill_output = lambda **kwargs: (
+        TTModelRunner._build_chunked_prefill_output(runner, **kwargs)
+    )
+
+    # Rows: a final chunk that may keep its token, a final chunk that must be
+    # rejected, and an intermediate chunk that never produces one.
+    output = TTModelRunner.apply_dp_execution_result(
+        runner,
+        torch.tensor([[5], [6], [7]], dtype=torch.int32),
+        None,
+        req_ids=["live", "resumed", "chunking"],
+        req_id_to_index={"live": 0, "resumed": 1, "chunking": 2},
+        intermediate_prefill_mask=torch.tensor([False, False, True]),
+    )
+
+    assert live.output_token_ids == [5]
+    assert resumed.output_token_ids == []
+    assert output.sampled_token_ids == [[5], [], []]
+    assert runner._invalidated_req_ids == set()
+
+
 def test_slot_reuse_clears_a_stale_pending_remap_entry():
     """Prefill steps neither deliver nor commit a remap, so entries persist.
 
