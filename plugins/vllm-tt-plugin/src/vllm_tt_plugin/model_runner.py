@@ -718,6 +718,11 @@ class TTModelRunner:
         A finished request must not receive a speculative token, and a request
         resumed from preemption re-prefills from freed KV, so the token computed
         against that KV is void.
+
+        These ids reject only results submitted *before* this scheduler output
+        was processed. A request resumed here is a member of this step's own
+        batch, so its own result is legitimate; the set must therefore reach the
+        outstanding submission and no later one.
         """
         self._invalidated_req_ids.update(scheduler_output.finished_req_ids)
         self._invalidated_req_ids.update(
@@ -728,6 +733,35 @@ class TTModelRunner:
         invalidated = self._invalidated_req_ids
         self._invalidated_req_ids = set()
         return invalidated
+
+    def note_decode_layout_consumed(self) -> None:
+        """Retire the layout signal an accepted decode submission carried.
+
+        Paired with ``InputBatch.commit_slot_remap`` at the same boundary. The
+        two must not be retired separately: a remap tells the model to gather
+        each slot's state from its old slot and zeroes what it vacated, and the
+        authoritative rebuild that ``decode_layout_changed`` requests is what
+        repairs that for a slot an intervening prefill has refilled. Retiring
+        the signal at input-build time would drop it on a raised decode while
+        leaving the remap pending.
+        """
+        self._decode_layout_changed_since_last_decode = False
+
+    def _dp_block_table_width(
+        self, req_indices: list[int], *, target_width: int
+    ) -> int:
+        """Width the gathered page table is trimmed to for this batch.
+
+        Derived from the scheduler's allocation rather than a token count: an
+        overlapped device-sampling decode builds its input while host token
+        state is one step behind, and a token-derived width would drop the block
+        the device is about to write at every block boundary. The DP concat then
+        zero-pads that column back to block id 0, i.e. into another request's
+        page.
+        """
+        return min(
+            self.input_batch.allocated_blocks_for_rows(req_indices), target_width
+        )
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
@@ -977,14 +1011,10 @@ class TTModelRunner:
 
         # DP optimization: don't send padding blocks if possible to reduce
         # overhead from gathering inputs to rank 0 and rely on DP concat
-        # function to pad to global max blocks. The width comes from the
-        # scheduler's allocation, not from a token count: an overlapped
-        # device-sampling decode builds this input while host token state is
-        # one step behind, and a token-derived width would drop the block the
-        # device is about to write at every block boundary.
+        # function to pad to global max blocks.
         if self.tt_data_parallel_size > 1:
-            max_blocks_in_batch = min(
-                input_batch.allocated_blocks_for_rows(req_indices), target_width
+            max_blocks_in_batch = self._dp_block_table_width(
+                req_indices, target_width=target_width
             )
             block_tables_per_group = [
                 bt[:, :max_blocks_in_batch] for bt in block_tables_per_group
@@ -1079,9 +1109,11 @@ class TTModelRunner:
             ].view(-1, 1)
             prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
-            # decode batch layout changed since the previous step.
+            # decode batch layout changed since the previous step. Read but not
+            # cleared here: building an input does not prove the model accepted
+            # it, and this signal has to survive or die with the pending slot
+            # remap it travels beside (see ``note_decode_layout_consumed``).
             decode_layout_changed = self._decode_layout_changed_since_last_decode
-            self._decode_layout_changed_since_last_decode = False
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -1314,8 +1346,10 @@ class TTModelRunner:
         # so its captured request state must still receive the accepted token.
         self._update_states(scheduler_output)
         self._note_invalidated_requests(scheduler_output)
-        # Gathered DP applies the outstanding result later, in
-        # ``apply_dp_execution_result``, so it must not consume the set here.
+        # The drain below applies the step submitted before this scheduler
+        # output was processed, so it is the submission these ids reject.
+        # Gathered DP applies its outstanding result from the engine's handle
+        # instead, and ``prepare_dp_model_input`` drains the set into it.
         skipped = (
             self._consume_invalidated_req_ids()
             if self.parallel_config.data_parallel_size == 1
@@ -2774,11 +2808,13 @@ class TTModelRunner:
         torch.Tensor | None,
         list[str],
         dict[str, int],
+        set[str],
     ]:
         """Build the per-rank DP payload consumed by gather orchestration.
 
         Returns the local TT model input plus the per-rank metadata needed by
-        gathered-DP negotiation and input gathering.
+        gathered-DP negotiation and input gathering, ending with the requests
+        this step invalidated for the outstanding submission.
         """
         model_input = None
         has_penalties = 0
@@ -2805,6 +2841,11 @@ class TTModelRunner:
         has_structured_input = (
             int(model_input.grammar_bitmask[0] is not None) if model_input else 0
         )
+        # Drained unconditionally, including when this rank scheduled nothing:
+        # the ids belong to the submission that was outstanding when
+        # ``build_model_input`` noted them, and carrying them into a later step
+        # would reject a token that step legitimately produced.
+        invalidated_req_ids = self._consume_invalidated_req_ids()
         return (
             model_input,
             max_blocks,
@@ -2816,6 +2857,7 @@ class TTModelRunner:
             intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
+            invalidated_req_ids,
         )
 
     def submit_dp_execution(
@@ -2856,20 +2898,19 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
         intermediate_prefill_mask: torch.Tensor | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result to runner state and build output.
 
         Converts the local gathered-DP result into the same state update and
-        `ModelRunnerOutput` used by non-DP execution. Under overlap the next
-        step's scheduler output has already been processed, so requests it
-        finished or resumed must reject this result.
+        `ModelRunnerOutput` used by non-DP execution. ``skip_req_ids`` comes
+        from the engine handle for this submission and names the requests a
+        later scheduler output invalidated while it was in flight; the caller
+        owns that set precisely so this result cannot be filtered by ids
+        belonging to a different step.
         """
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
-        # Consumed before the chunked-prefill branch: an intermediate-chunk step
-        # that returned early would otherwise leave the set for a later step,
-        # which would then reject a token that is legitimately its own.
-        skip_req_ids = self._consume_invalidated_req_ids() if req_ids else None
         if intermediate_prefill_mask is not None:
             intermediate_mask = intermediate_prefill_mask[:num_reqs]
             if intermediate_mask.any():

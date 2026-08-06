@@ -377,15 +377,16 @@ class TTWorker(WorkerBase):
         torch.Tensor | None,
         list[str],
         dict[str, int],
+        set[str],
     ]:
         """Build the local DP payload consumed by gathered-DP orchestration.
 
         Returns `(local_input, max_blocks, has_structured_input,
         has_penalties, decode_layout_changed, can_sample_device, needs_logprobs,
-        intermediate_prefill_mask, req_ids, req_id_to_index)`, where
-        `local_input` is this rank's TT model input (or `None`) and the
-        remaining fields are the per-rank metadata consumed by gathered-DP
-        orchestration.
+        intermediate_prefill_mask, req_ids, req_id_to_index,
+        invalidated_req_ids)`, where `local_input` is this rank's TT model input
+        (or `None`) and the remaining fields are the per-rank metadata consumed
+        by gathered-DP orchestration.
         """
         return self.model_runner.prepare_dp_model_input(
             scheduler_output, grammar_output
@@ -427,15 +428,23 @@ class TTWorker(WorkerBase):
     def commit_dp_slot_updates(
         self, device_sampling: bool, contract_version: int
     ) -> None:
-        """Commit a local remap consumed by the gathered decode submit.
+        """Retire the layout signals the gathered decode submit carried.
 
         ``contract_version`` is the globally agreed value because a rank that
         holds no model cannot read it. Contract-v1 adapters consume layout
         remaps in both sampling modes; version-0 adapters retain their
         historical device-sampling-only call shape, so a host-sampling step must
         leave their remap pending.
+
+        Retired at submission rather than completion: only the driver rank runs
+        the merged forward, and a raised forward surfaces through the gather
+        future, which is fatal to the engine rather than retried.
         """
-        if contract_version >= 1 or device_sampling:
+        controller = self.model_runner.async_decode
+        self.model_runner.note_decode_layout_consumed()
+        if device_sampling or controller.slot_remap_delivered_on_host_sampling(
+            contract_version
+        ):
             self.model_runner.input_batch.commit_slot_remap()
 
     def note_dp_decode_submitted(self, device_sampling: bool) -> None:
@@ -510,11 +519,13 @@ class TTWorker(WorkerBase):
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
         intermediate_prefill_mask: torch.Tensor | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result through the worker facade.
 
         Applies the local DP rank result and returns the corresponding
-        `ModelRunnerOutput`.
+        `ModelRunnerOutput`. ``skip_req_ids`` travels with the submission whose
+        result this is, so it cannot filter a different step's rows.
         """
         return self.model_runner.apply_dp_execution_result(
             sampled_token_ids,
@@ -522,6 +533,7 @@ class TTWorker(WorkerBase):
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            skip_req_ids=skip_req_ids,
         )
 
     # ---- Destructor (used to close devices) ----

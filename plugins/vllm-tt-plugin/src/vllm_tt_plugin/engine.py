@@ -6,7 +6,7 @@ import os
 import pickle
 import queue
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar, cast
 
 import torch
@@ -78,6 +78,10 @@ class DPGatherHandle:
     intermediate_prefill_mask: torch.Tensor | None
     req_ids: list[str]
     req_id_to_index: dict[str, int]
+    # Requests a scheduler output processed after this submission invalidated,
+    # filled in by the later ``dp_gather_submit`` that observes them. Rows for
+    # these ids are dropped when this handle's result is applied.
+    invalidated_req_ids: set[str] = field(default_factory=set)
 
 
 class TTDPEngineCoreProc(DPEngineCoreProc):
@@ -428,8 +432,11 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         # sampling-state changes reports ``current_overlap_ok=False`` and
         # drains first, re-establishing host authority before submission.
         # Version-0 adapters never report True (see
-        # ``gathered_dp_overlap_permitted``) because their model-local reload
-        # heuristics would copy the stale host tensors.
+        # ``resident_decode_overlap_permitted``) because their model-local reload
+        # heuristics would copy the stale host tensors: getting this wrong
+        # presents as doubled end-of-turn tokens (``<|end|>`` then
+        # ``<|start|>assistant``), which break harmony parsing and silently null
+        # out chat responses.
         finalize_before_submit = prev_handle is not None and not current_overlap_ok
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
@@ -447,10 +454,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         next_handle: DPGatherHandle | None = None
         if global_has_requests:
+            # ``prev_handle`` is None exactly when it was already finalized
+            # above, which is what tells the submit whether an outstanding
+            # result still needs this step's invalidations.
             next_handle = self.dp_gather_submit(
                 scheduler_output,
                 grammar_output,
                 overlap_ok=current_overlap_ok,
+                outstanding=prev_handle,
             )
 
         if not finalize_before_submit and prev_handle is not None:
@@ -486,7 +497,18 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         grammar_output: GrammarOutput | None,
         *,
         overlap_ok: bool = False,
+        outstanding: DPGatherHandle | None = None,
     ) -> DPGatherHandle:
+        """Submit one merged DP step and return its handle.
+
+        ``outstanding`` is the still-unapplied handle this step overlaps, if
+        any. Building the local input processes this step's scheduler output,
+        which is what invalidates requests for that earlier submission, so the
+        ids go to ``outstanding`` and never to the handle returned here. When
+        the caller already applied the previous result they pass ``None`` and
+        the ids are dropped: the results were applied in scheduler order, so
+        there is nothing left to reject.
+        """
         parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
@@ -517,7 +539,10 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
+            invalidated_req_ids,
         ) = all_local_inputs
+        if outstanding is not None:
+            outstanding.invalidated_req_ids |= invalidated_req_ids
         max_blocks_decode = None
         any_structured_inputs = False
         any_needs_logprobs = False
@@ -741,10 +766,11 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             else:
                 self.model_executor.collective_rpc("note_dp_prefill_submitted")
             if is_decode and local_input is not None:
-                # Each participating DP rank built its remap from local
-                # persistent state. Commit it only after the globally merged
-                # submission has accepted it. The worker preserves v0's
-                # historical device-sampling-only consumption rule.
+                # Each participating DP rank built its own remap and layout
+                # signal from local persistent state, and only the driver runs
+                # the merged forward, so every rank retires its pair here. The
+                # worker preserves v0's historical device-sampling-only
+                # consumption rule.
                 self.model_executor.collective_rpc(
                     "commit_dp_slot_updates",
                     args=(all_sample_device, contract_version),
@@ -801,6 +827,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     handle.req_ids,
                     handle.req_id_to_index,
                     handle.intermediate_prefill_mask,
+                    handle.invalidated_req_ids,
                 ),
             )[0]
             return output
@@ -811,8 +838,10 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         scheduler_output: SchedulerOutput | None,
         grammar_output: GrammarOutput | None,
     ) -> ModelRunnerOutput:
+        # Submit and finalize the same step, so no earlier result is
+        # outstanding and this step's own invalidations apply to nothing.
         handle = self.dp_gather_submit(
-            scheduler_output, grammar_output, overlap_ok=False
+            scheduler_output, grammar_output, overlap_ok=False, outstanding=None
         )
         return self.dp_gather_finalize(handle)
 
