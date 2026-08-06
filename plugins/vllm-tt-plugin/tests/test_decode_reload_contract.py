@@ -9,6 +9,7 @@ the plugin still requires the normal ttnn-enabled test environment.
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from vllm_tt_plugin.async_decode import (
     CompletedDecodeStep,
@@ -16,16 +17,77 @@ from vllm_tt_plugin.async_decode import (
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.input_batch import InputBatch
-from vllm_tt_plugin.model_input import TTSamplingParams
+from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
+
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+_VOCAB = 64
+_BLOCK = 16
+_MAX_MODEL_LEN = 256
+
+
+def _new_request(req_id: str) -> CachedRequestState:
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=1,
+        output_token_ids=[],
+    )
+
+
+def _input_batch_with_slot_remap(remap: list[int]) -> InputBatch:
+    """A real occupied ``InputBatch`` carrying a pending non-identity remap."""
+    max_num_reqs = len(remap)
+    logitsprocs = build_logitsprocs(
+        SimpleNamespace(
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_reqs),
+        ),
+        torch.device("cpu"),
+        is_pin_memory=False,
+        is_pooling_model=False,
+        custom_logitsprocs=[],
+    )
+    batch = InputBatch(
+        max_num_reqs=max_num_reqs,
+        max_model_len=_MAX_MODEL_LEN,
+        max_num_batched_tokens=_MAX_MODEL_LEN * max_num_reqs,
+        vocab_size=_VOCAB,
+        block_sizes=[_BLOCK],
+        kernel_block_sizes=[_BLOCK],
+        logitsprocs=logitsprocs,
+    )
+    for row in range(max_num_reqs):
+        batch.add_request(_new_request(f"seed-{row}"), req_index=row)
+    # Set after placement: ``add_request`` resets each entry it fills.
+    batch._slot_remap = torch.tensor(remap, dtype=torch.int32)
+    return batch
+
+
+def _front_packed_batch_stub(current_req_ids, **extra):
+    """Batch stub that answers row questions with the real front-packed rule."""
+    batch = SimpleNamespace(
+        req_id_to_index={req_id: i for i, req_id in enumerate(current_req_ids)},
+        **extra,
+    )
+    batch.scheduling_preserves_rows = lambda so: InputBatch.scheduling_preserves_rows(
+        batch, so
+    )
+    return batch
 
 
 def _controller(current_req_ids=("req-0",), *, trace_mode="decode_only"):
     runner = SimpleNamespace(
-        input_batch=SimpleNamespace(
-            req_id_to_index={req_id: i for i, req_id in enumerate(current_req_ids)}
-        ),
+        input_batch=_front_packed_batch_stub(current_req_ids),
         model=SimpleNamespace(model_capabilities={"supports_async_decode": True}),
         trace_mode=trace_mode,
     )
@@ -162,6 +224,32 @@ def test_prefill_and_layout_change_break_the_decode_chain():
 
     assert after_prefill.reload_inputs and after_prefill.reset_sampling_state
     assert layout_change.reload_inputs and layout_change.reset_sampling_state
+
+
+def test_a_plan_cannot_express_a_state_reset_without_a_host_input_reload():
+    """Requirement 7 holds because the plan refuses to say otherwise.
+
+    An adapter aligns its seed counters from the host positions on a state
+    reset, so a reset without a restage would bind a seeded stream to positions
+    that lag the device. The pairing must not depend on how the planner's two
+    boolean expressions happen to line up.
+    """
+    with pytest.raises(AssertionError, match="reset_sampling_state requires"):
+        TTDecodeReloadPlan(
+            reload_inputs=False,
+            reload_page_table=False,
+            reload_sampling_params=True,
+            reset_sampling_state=True,
+        )
+
+    # The page-table-only copy is meaningless alongside a full reload.
+    with pytest.raises(AssertionError, match="reload_page_table"):
+        TTDecodeReloadPlan(
+            reload_inputs=True,
+            reload_page_table=True,
+            reload_sampling_params=False,
+            reset_sampling_state=False,
+        )
 
 
 def test_drained_decode_updates_next_host_token_and_position_before_transition():
@@ -580,19 +668,19 @@ def test_gathered_dp_overlap_requires_the_explicit_contract():
     v0 = SimpleNamespace(decode_input_update_contract=0)
     v1 = SimpleNamespace(decode_input_update_contract=1)
 
-    assert not _controller_for(4, legacy).gathered_dp_overlap_permitted()
-    assert not _controller_for(4, v0).gathered_dp_overlap_permitted()
-    assert _controller_for(4, v1).gathered_dp_overlap_permitted()
+    assert not _controller_for(4, legacy).resident_decode_overlap_permitted()
+    assert not _controller_for(4, v0).resident_decode_overlap_permitted()
+    assert _controller_for(4, v1).resident_decode_overlap_permitted()
 
     # Lane mode is single-process; its overlap path is unchanged by the gate.
-    assert _controller_for(1, legacy).gathered_dp_overlap_permitted()
+    assert _controller_for(1, legacy).resident_decode_overlap_permitted()
 
     # A rank that holds no model abstains instead of vetoing the global vote.
     abstaining = TTAsyncDecodeController(
         SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
     )
     assert abstaining.decode_input_update_contract_version() is None
-    assert abstaining.gathered_dp_overlap_permitted()
+    assert abstaining.resident_decode_overlap_permitted()
 
 
 def test_scheduler_layout_prediction_detects_add_remove_and_preemption():
@@ -654,8 +742,8 @@ def _steady_eligible_runner(current_req_ids=("req-0",)):
         has_active_logitsprocs=lambda: False,
     )
     return SimpleNamespace(
-        input_batch=SimpleNamespace(
-            req_id_to_index={req_id: i for i, req_id in enumerate(current_req_ids)},
+        input_batch=_front_packed_batch_stub(
+            current_req_ids,
             no_penalties=True,
             no_allowed_token_ids=True,
             max_num_logprobs=None,
@@ -672,13 +760,29 @@ def _steady_eligible_runner(current_req_ids=("req-0",)):
     )
 
 
+def _cached_reqs(req_ids, *, resumed=(), context_phase=()):
+    """A real ``CachedRequestData``, so ``is_context_phase`` cannot be faked.
+
+    ``context_phase`` names requests that have produced no output token yet,
+    i.e. chunked-prefill continuations.
+    """
+    req_ids = list(req_ids)
+    return CachedRequestData(
+        req_ids=req_ids,
+        resumed_req_ids=set(resumed),
+        new_token_ids=[[] for _ in req_ids],
+        all_token_ids={},
+        new_block_ids=[None for _ in req_ids],
+        num_computed_tokens=[1 for _ in req_ids],
+        num_output_tokens=[0 if r in set(context_phase) else 1 for r in req_ids],
+    )
+
+
 def _steady_scheduler_output(current_req_ids=("req-0",), **overrides):
     fields = {
         "num_scheduled_tokens": {req_id: 1 for req_id in current_req_ids},
         "scheduled_new_reqs": [],
-        "scheduled_cached_reqs": SimpleNamespace(
-            req_ids=list(current_req_ids), resumed_req_ids=set()
-        ),
+        "scheduled_cached_reqs": _cached_reqs(current_req_ids),
         "pending_structured_output_tokens": False,
     }
     fields.update(overrides)
@@ -702,9 +806,6 @@ def test_layout_change_causes_are_all_rejected_before_update_states():
 
     # Finished or unscheduled: present in the batch, absent from this step.
     removed = _steady_scheduler_output(("req-0",))
-    removed.scheduled_cached_reqs = SimpleNamespace(
-        req_ids=["req-0"], resumed_req_ids=set()
-    )
     assert not controller.steady_decode_scheduler_invariants_met(removed, None)
 
     # Added: scheduled this step, absent from the batch.
@@ -714,19 +815,36 @@ def test_layout_change_causes_are_all_rejected_before_update_states():
     # Resumed from preemption: membership is unchanged, so only the prefill
     # check rejects it. This leg is why the membership diff alone is not enough.
     resumed = _steady_scheduler_output(("req-0", "req-1"))
-    resumed.scheduled_cached_reqs = SimpleNamespace(
-        req_ids=["req-0", "req-1"], resumed_req_ids={"req-1"}
-    )
+    resumed.scheduled_cached_reqs = _cached_reqs(("req-0", "req-1"), resumed=("req-1",))
     assert controller.scheduler_preserves_decode_layout(resumed)
     assert not controller.steady_decode_scheduler_invariants_met(resumed, None)
 
     # Chunked-prefill continuation: a cached request, neither new nor resumed,
-    # so membership is unchanged and the new/resumed test alone accepts it. The
-    # multi-token schedule is what marks it as still prefilling.
+    # so membership is unchanged and the new/resumed test alone accepts it.
+    # Being in the context phase is what marks it as still prefilling.
     continuation = _steady_scheduler_output(("req-0", "req-1"))
     continuation.num_scheduled_tokens = {"req-0": 1, "req-1": 256}
+    continuation.scheduled_cached_reqs = _cached_reqs(
+        ("req-0", "req-1"), context_phase=("req-1",)
+    )
     assert controller.scheduler_preserves_decode_layout(continuation)
     assert not controller.steady_decode_scheduler_invariants_met(continuation, None)
+
+    # Same continuation with one prompt token left: indistinguishable from a
+    # decode row by scheduled-token count, so only the phase test rejects it.
+    final_chunk = _steady_scheduler_output(("req-0", "req-1"))
+    final_chunk.scheduled_cached_reqs = _cached_reqs(
+        ("req-0", "req-1"), context_phase=("req-1",)
+    )
+    assert final_chunk.num_scheduled_tokens == {"req-0": 1, "req-1": 1}
+    assert controller.scheduler_preserves_decode_layout(final_chunk)
+    assert not controller.steady_decode_scheduler_invariants_met(final_chunk, None)
+
+    # A decode row scheduled several tokens is not prefill work: speculative
+    # decode counts its proposals, and forgoing overlap there is a real cost.
+    speculated = _steady_scheduler_output(("req-0", "req-1"))
+    speculated.num_scheduled_tokens = {"req-0": 1, "req-1": 4}
+    assert controller.steady_decode_scheduler_invariants_met(speculated, None)
 
 
 def test_dp_block_table_width_follows_allocation_not_host_tokens():
@@ -735,19 +853,33 @@ def test_dp_block_table_width_follows_allocation_not_host_tokens():
     At a block boundary the scheduler has already allocated the block the
     device is about to write, while host ``num_tokens`` still lags by one.
     Trimming to the token-derived width would drop that block, and the DP
-    concat zero-pads it back to block id 0.
+    concat zero-pads it back to block id 0, i.e. into another request's page.
     """
     block_size = 32
     allocated_blocks = 2
     stale_num_tokens = 32  # the applied token count lags the device by one
+    target_width = 8
 
     group = SimpleNamespace(
         num_blocks_per_row=np.array([allocated_blocks, 0], dtype=np.int32)
     )
     batch = SimpleNamespace(block_table=SimpleNamespace(block_tables=[group]))
+    batch.allocated_blocks_for_rows = lambda rows: InputBatch.allocated_blocks_for_rows(
+        batch, rows
+    )
+    runner = SimpleNamespace(input_batch=batch)
 
-    assert InputBatch.allocated_blocks_for_rows(batch, [0]) == allocated_blocks
     assert stale_num_tokens // block_size < allocated_blocks
+
+    width = TTModelRunner._dp_block_table_width(runner, [0], target_width=target_width)
+    assert width == allocated_blocks
+
+    # The wire capacity still bounds an over-wide allocation.
+    group.num_blocks_per_row = np.array([target_width + 4, 0], dtype=np.int32)
+    assert (
+        TTModelRunner._dp_block_table_width(runner, [0], target_width=target_width)
+        == target_width
+    )
 
 
 def test_gathered_dp_result_rejects_requests_invalidated_since_submit():
@@ -762,10 +894,6 @@ def test_gathered_dp_result_rejects_requests_invalidated_since_submit():
         requests={"live": live, "resumed": resumed},
         input_batch=SimpleNamespace(req_id_to_index={}, num_reqs=2),
         model_config=SimpleNamespace(max_model_len=32),
-        _invalidated_req_ids={"resumed"},
-    )
-    runner._consume_invalidated_req_ids = lambda: (
-        TTModelRunner._consume_invalidated_req_ids(runner)
     )
     runner._apply_sampled_tokens_to_state = lambda **kwargs: (
         TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
@@ -784,20 +912,79 @@ def test_gathered_dp_result_rejects_requests_invalidated_since_submit():
         None,
         req_ids=["live", "resumed"],
         req_id_to_index={"live": 0, "resumed": 1},
+        skip_req_ids={"resumed"},
     )
 
     assert live.output_token_ids == [5]
     assert resumed.output_token_ids == []
     assert output.sampled_token_ids == [[5], []]
+
+
+def test_dp_result_application_does_not_read_runner_invalidations():
+    """The set arrives with the submission, never from live runner state.
+
+    Reading it here would let a rejection noted for one submission filter a
+    different step's rows.
+    """
+    live = SimpleNamespace(output_token_ids=[])
+    runner = SimpleNamespace(
+        requests={"live": live},
+        input_batch=SimpleNamespace(req_id_to_index={}, num_reqs=1),
+        model_config=SimpleNamespace(max_model_len=32),
+        _invalidated_req_ids={"live"},
+    )
+    runner._consume_invalidated_req_ids = lambda: pytest.fail(
+        "apply_dp_execution_result must not consume runner-owned invalidations"
+    )
+    runner._apply_sampled_tokens_to_state = lambda **kwargs: (
+        TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
+    )
+    runner._build_runner_output = lambda **kwargs: SimpleNamespace(
+        req_id_to_index=dict(kwargs["req_id_to_index"]),
+        sampled_token_ids=[[5]],
+    )
+    runner.apply_and_build_runner_output = lambda *args, **kwargs: (
+        TTModelRunner.apply_and_build_runner_output(runner, *args, **kwargs)
+    )
+
+    output = TTModelRunner.apply_dp_execution_result(
+        runner,
+        torch.tensor([[5]], dtype=torch.int32),
+        None,
+        req_ids=["live"],
+        req_id_to_index={"live": 0},
+    )
+
+    assert live.output_token_ids == [5]
+    assert output.sampled_token_ids == [[5]]
+
+
+def test_dp_payload_drains_invalidations_even_on_an_idle_rank():
+    """A rank that scheduled nothing still hands its noted ids to the engine.
+
+    Left on the runner they would filter rows of a step that has no relation to
+    the scheduler output that produced them.
+    """
+    runner = SimpleNamespace(
+        _invalidated_req_ids={"finished"},
+        input_batch=SimpleNamespace(num_reqs=0, req_ids=[], req_id_to_index={}),
+    )
+    runner._consume_invalidated_req_ids = lambda: (
+        TTModelRunner._consume_invalidated_req_ids(runner)
+    )
+
+    payload = TTModelRunner.prepare_dp_model_input(runner, None, None)
+
+    assert payload[0] is None  # no local model input
+    assert payload[-1] == {"finished"}
     assert runner._invalidated_req_ids == set()
 
 
-def test_intermediate_chunk_step_still_consumes_and_honours_rejections():
+def test_intermediate_chunk_step_still_honours_rejections():
     """A chunked-prefill step returns early, but rejection still applies.
 
-    The invalidated set has to be consumed here too: carried into a later step
-    it would reject a token that step legitimately produced. The final-chunk row
-    of an invalidated request must also stay empty.
+    The final-chunk row of an invalidated request must stay empty on this path
+    too, not only on the plain decode path.
     """
     live = SimpleNamespace(output_token_ids=[])
     resumed = SimpleNamespace(output_token_ids=[])
@@ -805,10 +992,6 @@ def test_intermediate_chunk_step_still_consumes_and_honours_rejections():
         requests={"live": live, "resumed": resumed},
         input_batch=SimpleNamespace(req_id_to_index={}, num_reqs=3),
         model_config=SimpleNamespace(max_model_len=32),
-        _invalidated_req_ids={"resumed"},
-    )
-    runner._consume_invalidated_req_ids = lambda: (
-        TTModelRunner._consume_invalidated_req_ids(runner)
     )
     runner._apply_sampled_tokens_to_state = lambda *args, **kwargs: (
         TTModelRunner._apply_sampled_tokens_to_state(runner, *args, **kwargs)
@@ -826,24 +1009,24 @@ def test_intermediate_chunk_step_still_consumes_and_honours_rejections():
         req_ids=["live", "resumed", "chunking"],
         req_id_to_index={"live": 0, "resumed": 1, "chunking": 2},
         intermediate_prefill_mask=torch.tensor([False, False, True]),
+        skip_req_ids={"resumed"},
     )
 
     assert live.output_token_ids == [5]
     assert resumed.output_token_ids == []
     assert output.sampled_token_ids == [[5], [], []]
-    assert runner._invalidated_req_ids == set()
 
 
 def test_slot_reuse_clears_a_stale_pending_remap_entry():
     """Prefill steps neither deliver nor commit a remap, so entries persist.
 
     Two condense-then-reuse rounds without an intervening decode would
-    otherwise hand a brand-new request another slot's source index.
+    otherwise hand a brand-new request another slot's source index. Placing a
+    request has to clear its own entry, and only its own.
     """
-    batch = InputBatch.__new__(InputBatch)
-    batch.max_num_reqs = 4
-    batch._slot_remap = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
+    batch = _input_batch_with_slot_remap([3, 2, 2, 0])
 
-    InputBatch._reset_slot_remap_entry(batch, 1)
+    batch.add_request(_new_request("fresh"), req_index=1)
 
-    assert batch._slot_remap.tolist() == [0, 1, 2, 3]
+    # Only the reused slot is reset; the rest of the pending remap survives.
+    assert batch._slot_remap.tolist() == [3, 1, 2, 0]

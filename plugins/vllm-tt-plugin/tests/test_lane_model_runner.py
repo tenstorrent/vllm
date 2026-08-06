@@ -269,7 +269,6 @@ def test_apply_dp_result_suppresses_intermediate_prefill_rows():
         apply_and_build_runner_output=lambda *args, **kwargs: pytest.fail(
             "intermediate rows must not be applied"
         ),
-        _consume_invalidated_req_ids=set,
     )
 
     output = TTModelRunner.apply_dp_execution_result(
