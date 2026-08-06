@@ -264,6 +264,16 @@ class InputBatch:
         """Mark the pending remap as consumed by an accepted decode submit."""
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
+    def scheduling_preserves_rows(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether applying this scheduler output leaves every row where it is.
+
+        Answered before the batch is mutated, so it has to be derived from the
+        scheduler output alone. This batch front-packs: an occupied row absent
+        from the step is evicted and ``condense`` moves the rows behind it, so
+        membership equality is exactly the question.
+        """
+        return set(self.req_id_to_index) == set(scheduler_output.num_scheduled_tokens)
+
     def _reset_slot_remap_entry(self, req_index: int) -> None:
         """Drop a pending remap entry for a slot taken by a new request.
 
@@ -863,6 +873,23 @@ class TTLaneInputBatch(InputBatch):
         """
         return
 
+    def scheduling_preserves_rows(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Lane rows are stable, so only a release or a placement moves state.
+
+        Mirrors ``apply_step_plan``'s three ``layout_changed`` causes. Merely
+        being unscheduled keeps a request's slot here, so the front-packed
+        membership-equality test would report a change on every step that leaves
+        a running decode unscheduled and give up overlap for nothing.
+        """
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+            return False
+        return not any(
+            req_id in self.req_id_to_index
+            for req_id in scheduler_output.finished_req_ids
+        )
+
     # ------------------------------------------------------------------
     # State update (lane step plan -> batch + request map)
     # ------------------------------------------------------------------
@@ -1186,11 +1213,11 @@ class TTLaneInputBatch(InputBatch):
         if perform_device_sampling and not lane_batch.no_penalties:
             prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
-        decode_layout_changed = runner._decode_layout_changed_since_last_decode
-        runner._decode_layout_changed_since_last_decode = False
         # The remap covers any persistent per-slot model state, not just the
-        # device sampler. Merely building the input does not consume it;
-        # submit_decode commits after a contract-aware decode accepts it.
+        # device sampler. Merely building the input does not consume it, nor the
+        # layout signal beside it; ``submit_decode`` retires both once a
+        # contract-aware decode has accepted them.
+        decode_layout_changed = runner._decode_layout_changed_since_last_decode
         slot_remap = lane_batch.peek_slot_remap()
 
         return TTModelInput(

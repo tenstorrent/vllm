@@ -313,39 +313,40 @@ class TTAsyncDecodeController:
             self._submitted_page_tables = self._clone_page_tables(model_input)
 
     @staticmethod
-    def scheduler_output_is_prompt(scheduler_output: SchedulerOutput) -> bool:
+    def scheduler_output_has_prefill_work(scheduler_output: SchedulerOutput) -> bool:
         """Whether this step carries prefill work of any kind.
 
         Decided before ``_update_states``, so the persistent batch's
         ``num_computed_tokens`` still describes the previous step and cannot be
-        consulted. The scheduler output alone is authoritative: a pure decode
-        row is scheduled exactly one token, so a cached request with more is
-        still prefilling - a chunked-prefill continuation, which is a prefill
-        that leaves batch membership intact and therefore passes
-        ``scheduler_preserves_decode_layout``.
+        consulted; the scheduler output is the only sound source here.
 
-        Over-reporting is safe (it only forgoes overlap), so any future feature
-        that schedules several tokens for a decode row lands on the
-        conservative side.
+        A cached request still in its context phase is a chunked-prefill
+        continuation: a prefill that leaves batch membership intact and
+        therefore passes ``scheduler_preserves_decode_layout``, so this is the
+        only test that rejects it. ``is_context_phase`` is exact, unlike a
+        scheduled-token count: a continuation whose remaining prompt is one
+        token schedules one token, and a decode row may legitimately be
+        scheduled several (speculative decode counts its proposals).
         """
         cached_reqs = scheduler_output.scheduled_cached_reqs
         if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
             return True
-        num_scheduled = scheduler_output.num_scheduled_tokens
-        return any(num_scheduled.get(req_id, 0) > 1 for req_id in cached_reqs.req_ids)
+        return any(
+            cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids
+        )
 
     def scheduler_preserves_decode_layout(
         self, scheduler_output: SchedulerOutput
     ) -> bool:
         """Whether scheduling this step leaves every persistent decode row intact.
 
-        This prediction happens before ``_update_states``. It closes the old
+        This prediction happens before the batch is mutated. It closes the old
         gap where a new/finished/preempted request was only noticed after the
         next decode had already been allowed to overlap with stale host input.
+        The batch answers it, because what moves a row is its own eviction and
+        placement policy: front-packed and lane batches differ there.
         """
-        current_req_ids = set(self.runner.input_batch.req_id_to_index)
-        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
-        return current_req_ids == scheduled_req_ids
+        return self.runner.input_batch.scheduling_preserves_rows(scheduler_output)
 
     def capture_submitted_step_context(
         self, req_ids: list[str] | None = None
@@ -390,7 +391,7 @@ class TTAsyncDecodeController:
         grammar_output: GrammarOutput | None,
     ) -> bool:
         runner = self.runner
-        if self.scheduler_output_is_prompt(scheduler_output):
+        if self.scheduler_output_has_prefill_work(scheduler_output):
             return False
         if runner._decode_layout_changed_since_last_decode:
             return False
@@ -453,15 +454,31 @@ class TTAsyncDecodeController:
             return None
         return int(getattr(model, "decode_input_update_contract", 0))
 
-    def gathered_dp_overlap_permitted(self) -> bool:
-        """Whether gathered DP may submit a step before applying the previous one.
+    @staticmethod
+    def slot_remap_delivered_on_host_sampling(contract_version: int) -> bool:
+        """Whether a host-sampling decode still delivers ``slot_remap``.
+
+        Under the explicit contract the remap is decode-layout data, so it is
+        delivered in both sampling modes: an adapter may own persistent per-slot
+        state outside its device sampler. Version-0 adapters keep their historical
+        device-sampling-only call shape. Gathered DP decides this from the agreed
+        version rather than a local read, so both sides must ask the same
+        question of the same number.
+        """
+        return contract_version >= 1
+
+    def resident_decode_overlap_permitted(self) -> bool:
+        """Whether a decode step may be submitted before the previous is applied.
 
         Only a version-1 adapter is told which inputs are authoritative, so a
         version-0 adapter keeps the pre-contract finalize-before-submit order:
         its own reload heuristics would otherwise copy host token/position
-        tensors that are deliberately one step behind the device. Ranks holding
-        no model abstain; the device rank's answer reaches the global decision
-        through the caller's MIN reduction.
+        tensors that are deliberately one step behind the device.
+
+        Ranks holding no model abstain; the device rank's answer reaches the
+        global decision through the caller's MIN reduction. Only gathered
+        multi-process DP finalizes out of scheduler order, so single-engine
+        deployments (including lane-DP) are unaffected either way.
         """
         if self.runner.parallel_config.data_parallel_size == 1:
             return True
@@ -475,7 +492,7 @@ class TTAsyncDecodeController:
     ) -> bool:
         if not self.steady_decode_base_enabled(dp_gather=True):
             return False
-        if not self.gathered_dp_overlap_permitted():
+        if not self.resident_decode_overlap_permitted():
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
@@ -752,7 +769,10 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
-        contract_version = int(getattr(runner.model, "decode_input_update_contract", 0))
+        # Reached only on the rank that submits the forward, so a model is loaded
+        # and the accessor cannot abstain here.
+        contract_version = self.decode_input_update_contract_version()
+        assert contract_version is not None
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
@@ -795,19 +815,19 @@ class TTAsyncDecodeController:
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
 
-        # Under the explicit contract, slot_remap is decode-layout data and is
-        # delivered even when this step samples on the host: adapters may own
-        # persistent per-slot state outside their device sampler. Preserve the
-        # legacy device-sampling-only call shape for version-0 adapters.
         slot_remap_consumed = model_input.slot_remap is not None and (
-            contract_version >= 1 or perform_device_sampling
+            perform_device_sampling
+            or self.slot_remap_delivered_on_host_sampling(contract_version)
         )
         if slot_remap_consumed:
             kwargs["slot_remap"] = model_input.slot_remap
 
         # Versioned compatibility seam. Refactored tt-metal generators opt in
         # to the explicit contract. Existing generators retain their legacy
-        # reset_batch interface and never receive unknown command kwargs.
+        # reset_batch interface and never receive unknown command kwargs. A
+        # deployment whose tt-metal predates the contract takes the legacy branch
+        # for every model, which is why the contract-v1 code below can look
+        # unreachable in a profile.
         reload_plan = None
         if contract_version >= 1:
             reload_plan = self.plan_decode_reload(model_input)
@@ -823,12 +843,16 @@ class TTAsyncDecodeController:
             # still being migrated.
             kwargs["reset_batch"] = model_input.decode_layout_changed
         if contract_version < 1 and not self._legacy_contract_warning_emitted:
+            # Addressed at whoever can act on it, which is the adapter author,
+            # not the operator running the server: nothing about the deployment
+            # changes this.
             self._legacy_contract_warning_emitted = True
-            logger.warning(
+            logger.info(
                 "TT model %s does not advertise decode_input_update_contract "
-                ">= 1; preserving its legacy reset_batch reload behavior. "
-                "Async decode correctness is not guaranteed until the model "
-                "adapter implements and advertises the explicit contract.",
+                ">= 1; preserving its legacy reset_batch reload behavior. Its "
+                "adapter keeps ownership of reload decisions, and gathered-DP "
+                "decode overlap stays off. Set decode_input_update_contract = 1 "
+                "on the generator once it executes the four update commands.",
                 type(runner.model).__name__,
             )
 
@@ -863,8 +887,13 @@ class TTAsyncDecodeController:
             # succeeded so the plugin does not introduce a new forced drain.
             self._decode_chain_valid = True
             self._previous_device_sampling = perform_device_sampling
-        if slot_remap_consumed and runner.parallel_config.data_parallel_size == 1:
-            runner.input_batch.commit_slot_remap()
+        # Past the forward, so the submission was accepted. Gathered DP retires
+        # both signals from ``TTWorker.commit_dp_slot_updates`` instead, because
+        # every rank composed its own and only the driver reaches this line.
+        if runner.parallel_config.data_parallel_size == 1:
+            runner.note_decode_layout_consumed()
+            if slot_remap_consumed:
+                runner.input_batch.commit_slot_remap()
         read_events = None
         if async_read:
             if hasattr(runner.model, "read_decode_output"):

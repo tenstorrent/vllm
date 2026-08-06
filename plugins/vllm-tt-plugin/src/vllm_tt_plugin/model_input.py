@@ -42,6 +42,24 @@ class TTDecodeReloadPlan:
     reload_sampling_params: bool
     reset_sampling_state: bool
 
+    def __post_init__(self) -> None:
+        # Requirement 7, host input authority: an adapter aligns its RNG counters
+        # from the host positions on a state reset, which is only sound when the
+        # same step also restages them. Without this the alignment would silently
+        # bind a seeded stream to positions that lag the device by one step, so
+        # the implication is checked here rather than left to hold by accident of
+        # how the two flags happen to be computed.
+        assert not (self.reset_sampling_state and not self.reload_inputs), (
+            "reset_sampling_state requires reload_inputs: an adapter derives its "
+            "seed counters from host positions on a state reset"
+        )
+        # ``reload_inputs`` subsumes the page-table copy, so asking for both is a
+        # contradiction rather than a stronger request.
+        assert not (self.reload_page_table and self.reload_inputs), (
+            "reload_page_table is the page-table-only copy and is meaningless "
+            "when reload_inputs already copies it"
+        )
+
     @property
     def overlap_safe(self) -> bool:
         """Whether a device-resident decode may be submitted host-stale."""
