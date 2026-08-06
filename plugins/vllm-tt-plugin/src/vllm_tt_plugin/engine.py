@@ -569,7 +569,17 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 ],
                 dtype=torch.int32,
             )
+            # MIN alongside MAX for the version alone. Every device rank loads the
+            # same model, so their versions agree and MAX simply skips the
+            # abstaining -1s. If that ever stops holding, MAX would hand a
+            # version-0 rank the v1 consumption rule and it would retire a remap
+            # its adapter was never sent, so disagreement has to be fatal rather
+            # than resolved in the permissive direction.
+            version_floor_t = torch.tensor(
+                [self._dp_local_contract_version], dtype=torch.int32
+            )
             dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(version_floor_t, op=dist.ReduceOp.MIN, group=group)
             max_blocks_decode = int(input_info_t[0].item())
             any_structured_inputs = input_info_t[1].item() > 0
             any_penalties_inputs = input_info_t[2].item() > 0
@@ -578,6 +588,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             any_needs_logprobs = input_info_t[5].item() > 0
             contract_version = int(input_info_t[6].item())
             any_local_input = input_info_t[7].item() > 0
+            version_floor = int(version_floor_t.item())
+            if version_floor >= 0 and version_floor != contract_version:
+                raise RuntimeError(
+                    "gathered DP ranks disagree on the decode input-update "
+                    f"contract version ({version_floor} vs {contract_version}); "
+                    "every device rank must load the same model"
+                )
 
             decode_inputs: dict[str, Any] = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",

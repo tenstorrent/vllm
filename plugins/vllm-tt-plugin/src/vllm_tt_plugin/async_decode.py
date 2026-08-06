@@ -96,20 +96,38 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
     _finalize_lock: threading.Lock
     _finalized: bool
     _cached_output: Any
+    _cached_exception: BaseException | None
 
     def _init_deferred(self) -> None:
         self._finalized = False
         self._cached_output = None
+        self._cached_exception = None
         self._finalize_lock = threading.Lock()
 
     def ensure_finalized(self) -> Any:
         if self._finalized:
-            return self._cached_output
+            return self._replay()
         with self._finalize_lock:
             if not self._finalized:
-                self._cached_output = self._get_output_impl()
-                self._finalized = True
-                self._completion_event.set()
+                # A raised readback still consumed the submission, so record the
+                # failure as terminal: leaving it unfinalized would let the other
+                # caller run the same non-idempotent readback a second time, which
+                # is what this class exists to prevent. Completion is signalled
+                # either way so a waiting drain does not block on a step that will
+                # never resolve.
+                try:
+                    self._cached_output = self._get_output_impl()
+                except BaseException as exc:
+                    self._cached_exception = exc
+                    raise
+                finally:
+                    self._finalized = True
+                    self._completion_event.set()
+        return self._replay()
+
+    def _replay(self) -> Any:
+        if self._cached_exception is not None:
+            raise self._cached_exception
         return self._cached_output
 
     def is_resolved(self) -> bool:
@@ -845,9 +863,10 @@ class TTAsyncDecodeController:
         if contract_version < 1 and not self._legacy_contract_warning_emitted:
             # Addressed at whoever can act on it, which is the adapter author,
             # not the operator running the server: nothing about the deployment
-            # changes this.
+            # changes this. Still a warning, because the adapter keeps ownership
+            # of reload decisions and its heuristics may observe stale host state.
             self._legacy_contract_warning_emitted = True
-            logger.info(
+            logger.warning(
                 "TT model %s does not advertise decode_input_update_contract "
                 ">= 1; preserving its legacy reset_batch reload behavior. Its "
                 "adapter keeps ownership of reload decisions, and gathered-DP "
