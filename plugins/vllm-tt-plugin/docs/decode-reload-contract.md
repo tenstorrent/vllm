@@ -8,10 +8,30 @@ commands on every decode:
 
 | Command | Effect |
 | --- | --- |
-| `reload_inputs` | Copy all forward inputs: token, position, RoPE inputs, and page tables. |
-| `reload_page_table` | Copy only page-table inputs. Ignored when `reload_inputs` is true. |
+| `reload_inputs` | Copy all forward inputs: token, position, RoPE inputs, and page tables. Subsumes `reload_page_table`. |
+| `reload_page_table` | Copy only page-table inputs. vLLM never sets it together with `reload_inputs`. |
 | `reload_sampling_params` | Upload temperature, top-k/top-p, penalties, seeds, and logprob configuration. |
 | `reset_sampling_state` | Rebuild mutable penalty/RNG state for the current layout. |
+
+The first two are not independent: `reload_inputs` already copies page tables,
+so an adapter that treats them as two disjoint switches never copies the page
+table on a transition step, and the device then addresses the previous batch's
+KV blocks with no error. vLLM asserts the pair is never both true, so the only
+legal readings are "everything", "page tables only", and "nothing".
+
+`reset_sampling_state` implies `reload_inputs`, also asserted on the vLLM side.
+That is what makes requirement 7 satisfiable: an adapter may align seed counters
+from `start_pos` on a state reset precisely because the same step restages it.
+
+### Command defaults
+
+vLLM sends all four explicitly on every version-1 decode, so an adapter needs no
+defaults. Where an adapter does default one, the only permitted value is the
+host-authoritative one: `reload_inputs=True` and the other three `False`. Any
+other default silently reuses device state a caller did not ask to keep. An
+adapter that absorbs unrecognised keywords through `**kwargs` should still reject
+the pre-contract `reset_batch` by name, so a vLLM too old to send the commands
+fails with a message instead of being interpreted as a full reload.
 
 `decode_layout_changed` is an internal vLLM lifecycle signal: for an explicit
 contract adapter, the planner translates it into the four commands without
@@ -26,6 +46,14 @@ that can fail would corrupt a retry. Persistent state includes model-owned
 recurrent or convolution state as well as device sampling state. Version-0
 adapters retain the legacy device-sampling-only delivery and consumption
 behavior.
+
+State the forward *does* read has to be remapped before it, so those remaps are
+necessarily applied on a call that can fail. A raised decode therefore leaves the
+model-owned half applied while vLLM's own commit is still pending. vLLM does not
+retry a failed decode submission: under gathered DP the exception surfaces through
+the gather future and is fatal to the engine, and on the single-engine path the
+pending remap is retired only on success so the next step re-establishes host
+authority. An adapter must not treat a raised `decode_forward` as resumable.
 
 Two superficially reasonable implementations are incorrect:
 
@@ -47,11 +75,16 @@ not. Version-0 adapters retain their historical remap behavior unchanged.
 A remap cannot express slot reuse. When a new request takes a slot there is no
 predecessor state to gather from, so vLLM keeps that slot's entry the identity
 and signals the event through `decode_layout_changed`. Sampling state is then
-invalidated by `reset_sampling_state`. Model-owned per-slot state — recurrent,
-convolution, cached RoPE deltas — has no equivalent command in version 1, so an
+invalidated by `reset_sampling_state`. Model-owned per-slot state (recurrent,
+convolution, cached RoPE deltas) has no equivalent command in version 1, so an
 adapter that keeps such state must rebuild the reused slot from the reloaded
 forward inputs. A future version should carry the reused slots explicitly rather
 than leave that inference to the adapter.
+
+The remap and the layout signal are retired together, at the boundary where a
+decode submission is accepted. Retiring one without the other would leave a
+remap pending while the rebuild that repairs its destructive effect on a vacated
+slot has already been consumed.
 
 ## Mode definitions
 
@@ -65,6 +98,12 @@ than leave that inference to the adapter.
   batch-layout or sampling-mode change, or a resume. Host state is
   authoritative again; pending work drains before a full reload and any
   required sampling-state reset.
+- **Chunked-prefill continuation**: a further prompt chunk of a request that is
+  already resident. It is prefill, but it is neither a new nor a resumed
+  request, so batch membership is unchanged and the layout prediction alone
+  accepts it. vLLM classifies it from the scheduler output's context phase, not
+  from a scheduled-token count: the last chunk of a prompt can be a single
+  token, and a decode row may legitimately be scheduled several.
 - **Steady device decode**: the request layout and sampling mode are unchanged
   after a valid device-sampling decode. Token and position remain
   device-resident, so no full reload occurs.
@@ -78,6 +117,7 @@ than leave that inference to the adapter.
 | --- | ---: | ---: | ---: | ---: |
 | First decode or prefill → decode | reload | no | reload on device | reset on device |
 | Batch add/remove/reuse/condense or resume | reload | no | reload on device | reset on device |
+| Chunked-prefill continuation of a resident request | reload | no | reload on device | reset on device |
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if changed | keep | keep |
@@ -110,6 +150,12 @@ Host sampling always performs a full reload from the accepted host token.
 Layout, resume, prefill, and sampling-mode transitions break the steady
 invariant and therefore drain and re-establish the base case.
 
+"Prefill" there includes an intermediate or final chunk of an already-resident
+request. Such a step leaves batch membership intact, so the membership-based
+layout prediction accepts it and the context-phase test is the only thing that
+rejects it. Missing it would submit a prefill over a pending decode readback
+whose token has not yet reached host state.
+
 A completed async result is applied only to requests that are still live and
 were neither finished nor resumed since the step was submitted. Request ids are
 client-supplied and may be reused, so an abort followed by a resubmit under the
@@ -120,11 +166,70 @@ cached request state. Runner-output rows for those ids are replaced with an empt
 token list before the scheduler update, so a cancelled step can neither append
 runner state nor emit an extra client token.
 
-## Requirements for `supports_async_decode`
+## Requirements for `decode_input_update_contract = 1`
 
-For a version-1 adapter, set
-`model_capabilities["supports_async_decode"] = True` only when the adapter
-satisfies every requirement below:
+Requirements keep their original numbers so existing references stay valid; the
+two headings say which decision each number belongs to.
+
+Every version-1 adapter must satisfy requirements 5, 6, 8 and 9, whatever it
+advertises for `supports_async_decode`. vLLM sends the four commands and delivers
+`slot_remap` to every version-1 adapter, in both sampling modes, so these are
+obligations of the version, not of the capability.
+
+<ol start="5">
+<li>
+
+**Exact command handling**: the adapter honors `reload_inputs`,
+`reload_page_table`, `reload_sampling_params`, and `reset_sampling_state`. It
+must not add model-local mode or tensor comparisons that turn a page-table-only
+update into a full reload. An adapter that cannot execute part of the contract
+must reject the combination loudly, naming the offending command (see "Partial
+adapters" below); quietly ignoring a command is what this contract exists to
+forbid.
+
+</li>
+<li>
+
+**Sampling-state ordering**: slot remaps are applied before parameter/state
+reset; RNG and penalty state are reset only when requested; seed advancement
+happens exactly once per sampled token.
+
+</li>
+</ol>
+
+<ol start="8">
+<li>
+
+**Complete slot remapping**: on every version-1 decode, `slot_remap` applies to
+all persistent state indexed by the vLLM batch slot, even when that step samples
+on the host. This includes model-internal recurrent/convolution state and dormant
+device-sampler state; a full forward-input reload does not implicitly repair
+either one.
+
+One exemption: state that is not addressable by vLLM slot cannot be remapped,
+only reset. Unseeded on-device RNG is the known case: its state is a per-core
+hardware PRNG register that no operation can move between cores, and the adapter
+is expected to leave it in place. An adapter must declare any such state rather
+than silently skip a remap, and vLLM's commit of the mapping is valid for it by
+exemption. "Declare" means naming the state and the reason in the adapter's own
+documentation, next to the code that skips it; the exemption covers only state
+with no move primitive, never state the adapter finds inconvenient to move.
+
+</li>
+<li>
+
+**Stable-buffer lifetime**: persistent decode and sampling buffers remain valid
+until the submitted step is read back and until the next command explicitly
+replaces their contents.
+
+</li>
+</ol>
+
+## Additional requirements for `supports_async_decode`
+
+Set `model_capabilities["supports_async_decode"] = True` only when the adapter
+also satisfies requirements 1 to 4 and 7. These are what let vLLM submit a decode
+whose host token and position state is deliberately one step behind.
 
 1. **Split submission and readback**: `decode_forward(...,
    read_from_device=False)` submits decode without synchronizing the result, and
@@ -140,44 +245,51 @@ satisfies every requirement below:
    step `k+1`.
 4. **Independent page-table refresh**: the model can copy changed page-table
    inputs without copying or rebinding token, position, or RoPE inputs.
-5. **Exact command handling**: the adapter honors `reload_inputs`,
-   `reload_page_table`, `reload_sampling_params`, and
-   `reset_sampling_state` independently. It must not add model-local mode or
-   tensor comparisons that turn a page-table-only update into a full reload.
-6. **Sampling-state ordering**: slot remaps are applied before parameter/state
-   reset; RNG and penalty state are reset only when requested; seed advancement
-   happens exactly once per sampled token.
-7. **Host input authority**: the `tokens` and `start_pos` arguments are
-   authoritative only when `reload_inputs` is true. When it is false they are
-   deliberately one step behind, and the adapter must derive nothing from them —
-   not forward inputs, and not sampling state. Deriving an RNG counter from
-   `start_pos` on a steady step makes the sampled stream depend on when the
-   asynchronous readback landed, so the same request and seed stop reproducing.
-   An adapter that ties per-token seeds to the absolute decode position must do
-   so only on a reloading step and advance its own resident counter otherwise.
-8. **Complete slot remapping**: on every version-1 decode, `slot_remap` applies
-   to all persistent state indexed by the vLLM batch slot, even when that step
-   samples on the host. This includes model-internal recurrent/convolution
-   state and dormant device-sampler state; a full forward-input reload does
-   not implicitly repair either one.
 
-   One exemption: state that is not addressable by vLLM slot cannot be
-   remapped, only reset. Unseeded on-device RNG is the known case — its state
-   is a per-core hardware PRNG register that no operation can move between
-   cores, and the adapter is expected to leave it in place. An adapter must
-   declare any such state rather than silently skip a remap, and vLLM's commit
-   of the mapping is valid for it by exemption.
-9. **Stable-buffer lifetime**: persistent decode and sampling buffers remain
-   valid until the submitted step is read back and until the next command
-   explicitly replaces their contents.
+<ol start="7">
+<li>
+
+**Host input authority**: the `tokens` and `start_pos` arguments are
+authoritative only when `reload_inputs` is true. When it is false they are
+deliberately one step behind, and the adapter must derive nothing from them: not
+forward inputs, and not sampling state. Deriving an RNG counter from `start_pos`
+on a steady step makes the sampled stream depend on when the asynchronous
+readback landed, so the same request and seed stop reproducing. An adapter that
+ties per-token seeds to the absolute decode position must do so only on a
+reloading step and advance its own resident counter otherwise. vLLM guarantees
+`reset_sampling_state` implies `reload_inputs`, so a state reset is always a step
+on which those arguments may be trusted.
+
+</li>
+</ol>
 
 The capability is fail-closed. If any requirement is not met, leave
 `supports_async_decode` absent or `False`. vLLM disables async scheduling for
 that model and requests a full forward-input reload on every decode, while
 still using the negotiated generator interface. A legacy adapter may already
 advertise `supports_async_decode`; vLLM preserves that adapter's existing
-reload and overlap behavior, but warns that correctness is not guaranteed
+reload and overlap behavior, but logs that correctness is not guaranteed
 until the adapter also implements and advertises contract version 1.
+
+### Partial adapters
+
+An adapter may advertise version 1 while being structurally unable to execute a
+command combination, provided both hold:
+
+- it leaves `supports_async_decode` absent or `False`, which is what stops vLLM
+  from ever planning the combination it cannot execute, and
+- it rejects that combination with an error naming the command, rather than
+  degrading silently.
+
+Requiring a full input reload is the common case: an adapter that rebuilds all
+host inputs every decode cannot honor `reload_inputs=False`. Such an adapter is
+conformant, not buggy. The unconditional part of the contract, requirements 5, 6,
+8 and 9, still applies to it in full, which is what makes `slot_remap` delivery
+useful to a host-sampling model that owns per-slot recurrent state.
+
+Because the two keys interact this way, an adapter must not flip
+`supports_async_decode` on without first removing its rejections. The rejection
+comment should say so at the site.
 
 ## Contract negotiation
 
@@ -199,6 +311,30 @@ order and forgo the overlap rather than reload from host tensors that are
 deliberately one step behind the device. Single-process lane DP is unaffected: it
 reports `data_parallel_size == 1` and its overlap behavior predates the contract.
 
+### Where the version is declared, and what that arms
+
+**The marker belongs on the generator that implements the commands, not on each
+leaf adapter, and is therefore inherited by every subclass of that generator.**
+That is the decided placement. Its direct consequence: when a shared generator
+declares version 1, gathered-DP decode overlap becomes eligible for every adapter
+built on it that also advertises `supports_async_decode`, without any further
+per-adapter decision. Arming is not staged one adapter at a time.
+
+This is the right trade because the commands are implemented once, in the shared
+generator, and a subclass that inherits that implementation genuinely implements
+the contract. The alternative, a per-leaf marker, is fail-open in the other and
+worse direction: a leaf that forgets the marker silently drops to the legacy call
+shape and its reload decisions revert to model-local heuristics with no error.
+
+Two obligations follow for tt-metal:
+
+- Moving the marker up onto a generator is a change to the arming set. Audit
+  every existing subclass against the requirements above before doing it, not
+  only the adapter that motivated the move.
+- A subclass that overrides `decode_forward` no longer inherits the
+  implementation the marker attests to, so it must re-declare the marker itself
+  or keep its own conformance.
+
 | vLLM | tt-metal adapter | Result |
 | --- | --- | --- |
 | Old | Legacy / version 0 | Supported: existing behavior |
@@ -207,16 +343,29 @@ reports `data_parallel_size == 1` and its overlap behavior predates the contract
 | Old | Strict version 1 | Unsupported: old vLLM omits the required commands |
 
 The supported rollout order is therefore vLLM first, followed by tt-metal
-adapter migrations. Advertising version 1 before implementing every command
-is an adapter bug and should fail loudly rather than silently falling back.
+adapter migrations. Advertising version 1 while quietly ignoring a command is an
+adapter bug; rejecting a combination it cannot execute is not (see "Partial
+adapters").
+
 Versions greater than 1 must remain backward-compatible supersets of version 1;
 a breaking interface requires a distinct negotiation key or supported range.
+There is no handshake in the other direction: an adapter cannot read the
+plugin's version, and a version-1 plugin sends exactly the four commands above
+to anything advertising 1 or newer. So any command a later version adds must be
+keyword-only with a default that reproduces version-1 behavior, or a version-2
+adapter breaks against a version-1 plugin. Making a new command required is a
+breaking interface and needs a new negotiation key.
 
-`model_capabilities["supports_async_decode"]` remains independent of contract
-versioning. It controls async scheduling and certifies that sampled-token
-feedback can remain device-resident between decode steps. A version-1 model
-without that capability receives a conservative full-input reload command on
-every decode.
+`model_capabilities["supports_async_decode"]` is a separate key with a separate
+question: it controls async scheduling and certifies that sampled-token feedback
+can remain device-resident between decode steps. A version-1 model without that
+capability receives a conservative full-input reload command on every decode.
+The keys are not fully orthogonal in practice, because leaving the capability off
+is what makes a partial adapter safe; see "Partial adapters".
+
+Not every tt-metal generator is migrated. Deliberate version-0 holdouts are
+listed in tt-metal's `models/common/sampling/README.md`, which is authoritative
+for which generator stacks still take the legacy path and why.
 
 The refactored tt-metal implementation includes the unconditional decode-only
 seed initialization also addressed by
