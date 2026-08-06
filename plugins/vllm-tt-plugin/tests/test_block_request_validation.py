@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import sys
+from types import SimpleNamespace
 
 import pytest
 from vllm_tt_plugin.platform import TTPlatform
@@ -38,49 +38,44 @@ def test_block_model_accepts_exact_prompt_canvas_boundary():
 
 
 def test_block_model_rejects_prompt_that_cannot_fit_a_canvas():
-    with pytest.raises(ValueError, match="reserve one full 256-token.*261888"):
+    with pytest.raises(ValueError, match="physical 256-token canvases"):
         _validate(SamplingParams(max_tokens=1), prompt_len=261889)
 
 
-@pytest.mark.parametrize(
-    ("cli_args", "max_model_len"),
-    [
-        (
-            [
-                "--model",
-                "google/diffusiongemma-26B-A4B-it",
-                "--max-model-len",
-                "262144",
-            ],
-            262144,
-        ),
-        (
-            [
-                "--model=google/diffusiongemma-26B-A4B-it",
-                "--max_model_len=131072",
-            ],
-            131072,
-        ),
-    ],
-)
-def test_api_pre_registration_initializes_exact_block_boundary(
-    monkeypatch, cli_args, max_model_len
-):
-    monkeypatch.setattr(sys, "argv", ["vllm", "serve", *cli_args])
+def test_block_model_rejects_rounded_physical_capacity_overrun():
+    with pytest.raises(
+        ValueError,
+        match=r"prompt length 261844.*max_tokens=300.*512 physical",
+    ):
+        _validate(SamplingParams(max_tokens=300), prompt_len=261844)
 
-    TTPlatform.pre_register_and_update()
+
+def test_block_model_accepts_two_physical_canvases_at_short_prompt():
+    _validate(SamplingParams(max_tokens=300), prompt_len=32)
+
+
+def test_block_model_resolves_unbounded_max_tokens_before_dispatch():
+    _validate(SamplingParams(max_tokens=None), prompt_len=261888)
+    with pytest.raises(ValueError, match="max_tokens=257.*512 physical"):
+        _validate(SamplingParams(max_tokens=None), prompt_len=261887)
+
+
+def test_api_config_initializes_contract_from_model_capability():
+    class BlockModel:
+        model_capabilities = {"output_tokens_per_step": 256}
+
+    TTPlatform._set_block_output_contract(
+        BlockModel,
+        SimpleNamespace(max_model_len=262144),
+        is_diffusion_gemma=True,
+    )
 
     assert TTPlatform.block_output_size == 256
-    assert TTPlatform.block_model_max_len == max_model_len
-    _validate(
-        SamplingParams(max_tokens=256),
-        prompt_len=max_model_len - TTPlatform.block_output_size,
-    )
-    with pytest.raises(ValueError, match="reserve one full 256-token"):
-        _validate(
-            SamplingParams(max_tokens=1),
-            prompt_len=max_model_len - TTPlatform.block_output_size + 1,
-        )
+    assert TTPlatform.block_model_max_len == 262144
+
+
+def test_block_model_accepts_neutral_temperature():
+    _validate(SamplingParams(max_tokens=256, temperature=1.0))
 
 
 @pytest.mark.parametrize(
@@ -88,6 +83,7 @@ def test_api_pre_registration_initializes_exact_block_boundary(
     [
         ({"n": 2}, "n"),
         ({"logprobs": 0}, "logprobs"),
+        ({"temperature": 0.0}, "temperature"),
         ({"temperature": 0.5}, "temperature"),
         ({"top_p": 0.9}, "top_p"),
         ({"top_k": 10}, "top_k"),

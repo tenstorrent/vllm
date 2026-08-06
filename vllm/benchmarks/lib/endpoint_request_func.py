@@ -346,20 +346,9 @@ async def async_request_openai_chat_completions(
 
                             if choices := data.get("choices"):
                                 delta = choices[0]["delta"]
-                                # Count reasoning tokens (e.g. GPT-OSS harmony
-                                # reasoning channel, DiffusionGemma's Gemma-family
-                                # thought channel) the same as regular content;
-                                # both are produced tokens. This server serializes
-                                # the channel as ``reasoning`` (DeltaMessage.reasoning);
-                                # ``reasoning_content`` is kept for OpenAI-compatible
-                                # endpoints that still use the older field name.
-                                # Without ``reasoning``, benchmarking a thinking model
-                                # whose reply never leaves the thought channel -- every
-                                # DiffusionGemma row at output_len 128, one 256-token
-                                # canvas block -- records an empty generated_text while
-                                # the usage block still yields a plausible throughput,
-                                # so --save-detailed cannot tell real generation from a
-                                # rejected request.
+                                # Reasoning and content are both generated text.
+                                # Keep the older reasoning_content alias for
+                                # OpenAI-compatible endpoints.
                                 content = (
                                     delta.get("content")
                                     or delta.get("reasoning")

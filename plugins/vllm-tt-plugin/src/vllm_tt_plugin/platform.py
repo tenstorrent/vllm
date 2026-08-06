@@ -44,7 +44,6 @@ _GALAXY_GENERATOR_VERSIONS = {
 
 # TT model types that have been validated with real chunked prefill.
 _CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
-_DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE = 256
 
 
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
@@ -219,49 +218,6 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
     return bool(
         isinstance(tt_config, dict) and tt_config.get("register_test_models") is True
     )
-
-
-def _get_cli_option(argv: list[str], option: str) -> str | None:
-    """Return the last CLI value for an option before argparse runs.
-
-    Accept both hyphen/underscore spellings and ``--option value`` /
-    ``--option=value`` forms, matching vLLM's flexible argument parser.
-    """
-    normalized_option = option.replace("_", "-")
-    value = None
-    for index, arg in enumerate(argv):
-        flag, separator, inline_value = arg.partition("=")
-        if flag.replace("_", "-") != normalized_option:
-            continue
-        if separator:
-            value = inline_value
-        elif index + 1 < len(argv) and not argv[index + 1].startswith("--"):
-            value = argv[index + 1]
-    return value
-
-
-def _diffusion_gemma_block_contract_from_cli(
-    argv: list[str] | None = None,
-) -> tuple[int | None, int | None]:
-    """Resolve the API-process block contract before VllmConfig exists."""
-    argv = list(sys.argv[1:] if argv is None else argv)
-    model = _get_cli_option(argv, "--model")
-    if not model or "diffusiongemma" not in model.lower():
-        return None, None
-
-    raw_max_model_len = _get_cli_option(argv, "--max-model-len")
-    if raw_max_model_len is None:
-        return _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE, None
-    try:
-        max_model_len = int(raw_max_model_len)
-    except ValueError:
-        logger.warning(
-            "Cannot initialize DiffusionGemma API request boundary from "
-            "--max-model-len=%r; argparse will validate it later.",
-            raw_max_model_len,
-        )
-        return _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE, None
-    return _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE, max_model_len
 
 
 def _install_tt_harmony_truncation_patch() -> None:
@@ -616,9 +572,6 @@ class TTPlatform(Platform):
         # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
         _install_tt_harmony_truncation_patch()
-        cls.block_output_size, cls.block_model_max_len = (
-            _diffusion_gemma_block_contract_from_cli()
-        )
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
 
@@ -634,6 +587,41 @@ class TTPlatform(Platform):
     @classmethod
     def inference_mode(cls):
         return torch.no_grad()
+
+    @classmethod
+    def _set_block_output_contract(
+        cls, model_class: type, model_config, is_diffusion_gemma: bool
+    ) -> None:
+        """Initialize API-process request validation from parsed capabilities."""
+        model_capabilities: dict | None = getattr(
+            model_class, "model_capabilities", None
+        )
+        output_tokens_per_step = (
+            model_capabilities.get("output_tokens_per_step", 1)
+            if model_capabilities
+            else 1
+        )
+        if (
+            isinstance(output_tokens_per_step, bool)
+            or not isinstance(output_tokens_per_step, int)
+            or output_tokens_per_step < 1
+        ):
+            raise ValueError(
+                f"Invalid output_tokens_per_step={output_tokens_per_step!r} for "
+                f"{model_class.__module__}.{model_class.__name__}; "
+                "expected an integer >= 1"
+            )
+        if is_diffusion_gemma:
+            if output_tokens_per_step == 1:
+                raise ValueError(
+                    "DiffusionGemma must declare output_tokens_per_step > 1 "
+                    "in model_capabilities"
+                )
+            cls.block_output_size = output_tokens_per_step
+            cls.block_model_max_len = model_config.max_model_len
+        else:
+            cls.block_output_size = None
+            cls.block_model_max_len = None
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -696,17 +684,11 @@ class TTPlatform(Platform):
         # e.g. "TTLlamaForCausalLM"
         arch_names = vllm_config.model_config.hf_config.architectures
         is_diffusion_gemma = any("DiffusionGemma" in name for name in arch_names)
-        if is_diffusion_gemma:
-            if vllm_config.scheduler_config.max_num_seqs != 1:
-                raise ValueError(
-                    "DiffusionGemma owns one model-side KV cache and requires "
-                    "--max-num-seqs 1"
-                )
-            cls.block_output_size = _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE
-            cls.block_model_max_len = model_config.max_model_len
-        else:
-            cls.block_output_size = None
-            cls.block_model_max_len = None
+        if is_diffusion_gemma and vllm_config.scheduler_config.max_num_seqs != 1:
+            raise ValueError(
+                "DiffusionGemma owns one model-side KV cache and requires "
+                "--max-num-seqs 1"
+            )
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
@@ -768,6 +750,7 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+        cls._set_block_output_contract(model_class, model_config, is_diffusion_gemma)
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
@@ -890,16 +873,24 @@ class TTPlatform(Platform):
 
         prompt_token_ids = processed_inputs.get("prompt_token_ids")
         max_model_len = cls.block_model_max_len
-        if (
-            prompt_token_ids is not None
-            and max_model_len is not None
-            and len(prompt_token_ids) + output_size > max_model_len
-        ):
-            raise ValueError(
-                "DiffusionGemma prompts must reserve one full "
-                f"{output_size}-token output canvas: prompt length "
-                f"{len(prompt_token_ids)} exceeds {max_model_len - output_size}"
-            )
+        if prompt_token_ids is not None and max_model_len is not None:
+            prompt_len = len(prompt_token_ids)
+            max_tokens = params.max_tokens
+            if max_tokens is None:
+                # InputProcessor applies this same unbounded/default clamp after
+                # platform validation. Resolve it here so physical block
+                # capacity is checked before EngineCore dispatch.
+                max_tokens = max(0, max_model_len - prompt_len)
+            num_output_blocks = (max_tokens + output_size - 1) // output_size
+            physical_output_tokens = num_output_blocks * output_size
+            if prompt_len + physical_output_tokens > max_model_len:
+                raise ValueError(
+                    "DiffusionGemma output is committed in physical "
+                    f"{output_size}-token canvases: prompt length {prompt_len} "
+                    f"plus max_tokens={max_tokens} requires "
+                    f"{physical_output_tokens} physical output tokens, exceeding "
+                    f"max_model_len={max_model_len}"
+                )
 
         unsupported = []
         if params.n != 1:

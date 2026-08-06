@@ -609,6 +609,18 @@ class TTModelRunner:
         if req_index is not None and callable(release_request):
             release_request(req_index)
 
+    def _release_preempted_model_requests(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Release model-owned state only for requests explicitly preempted.
+
+        A request absent from one scheduler step can be temporarily unscheduled
+        and later resumed, so the general unscheduled path must retain its
+        model state. Preempted requests instead restart prefill from scratch.
+        """
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._release_finished_model_request(req_id)
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
         scheduler output.
@@ -639,6 +651,8 @@ class TTModelRunner:
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
+
+        self._release_preempted_model_requests(scheduler_output)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -2414,16 +2428,25 @@ class TTModelRunner:
         ]
         world = self.tt_data_parallel_size
         B = self.tt_per_lane_max_num_seqs
+        num_out_tokens = next(
+            (
+                token_ids.shape[1]
+                for token_ids in sampled_token_ids_per_dp
+                if token_ids.numel() > 0
+            ),
+            1,
+        )
         for dp_rank in range(world):
             token_ids = sampled_token_ids_per_dp[dp_rank].to(torch.int32)
             if token_ids.numel() == 0:
-                token_ids = torch.zeros((B, 1), dtype=torch.int32)
+                token_ids = torch.zeros((B, num_out_tokens), dtype=torch.int32)
             else:
-                # #47488: block-diffusion models (DiffusionGemma) emit a whole
-                # canvas of ``num_out_tokens = canvas_length`` (e.g. 256) ids per
-                # step; autoregressive models emit 1. Accept any [num_reqs, N>=1].
-                assert token_ids.dim() == 2 and token_ids.shape[1] >= 1, (
-                    "Expected [num_reqs, num_out_tokens>=1] sampled ids"
+                assert token_ids.dim() == 2, (
+                    "Expected sampled token IDs with shape [num_reqs, num_out_tokens]"
+                )
+                assert token_ids.shape[1] == num_out_tokens, (
+                    "All data-parallel ranks must return the same number "
+                    "of sampled tokens per request"
                 )
                 pad_rows = B - token_ids.shape[0]
                 if pad_rows > 0:
@@ -2966,13 +2989,17 @@ class TTModelRunner:
                 if rank_enable_lp.any():
                     # Sanity check for if we correctly detect
                     # when logprobs are supported.
-                    assert next_token_ids.shape[1] == 1, (
-                        "device logprobs path supports 1 output token per step "
-                        "(block-diffusion serving requests no logprobs)"
-                    )
-                    assert tt_log_probs is not None, (
-                        "model should return logprobs when requested"
-                    )
+                    if next_token_ids.shape[1] != 1:
+                        raise ValueError(
+                            "Device logprobs support one output token per step; "
+                            "block-output models must reject logprobs at "
+                            "request validation"
+                        )
+                    if tt_log_probs is None:
+                        raise ValueError(
+                            "Model did not return device logprobs for a request "
+                            "that enabled them"
+                        )
                     logprobs_per_dp.append(
                         build_device_logprobs(
                             tt_log_probs=tt_log_probs,
@@ -3104,11 +3131,12 @@ class TTModelRunner:
             start_idxs = self.input_batch.num_tokens[rows]
             end_idxs = start_idxs + num_out_tokens
             max_end = int(end_idxs.max()) if num_reqs > 0 else 0
-            assert max_end <= self.model_config.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {max_end} > max_model_len: "
-                f"{self.model_config.max_model_len}"
-            )
+            if max_end > self.model_config.max_model_len:
+                raise ValueError(
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {max_end} > max_model_len: "
+                    f"{self.model_config.max_model_len}"
+                )
 
             for req_idx in range(num_reqs):
                 start_idx = int(start_idxs[req_idx])
@@ -3124,6 +3152,26 @@ class TTModelRunner:
 
         assert req_ids is not None
         captured_req_ids = req_ids
+        # Validate every still-live captured target before mutating any runner
+        # row, so one oversized block cannot leave earlier requests partially
+        # advanced.
+        for req_idx, req_id in enumerate(captured_req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if request_states is not None and req_state is not request_states[req_idx]:
+                continue
+
+            current_row = self.input_batch.req_id_to_index.get(req_id)
+            if current_row is not None:
+                end_idx = int(self.input_batch.num_tokens[current_row]) + num_out_tokens
+                if end_idx > self.model_config.max_model_len:
+                    raise ValueError(
+                        "Sampled token IDs exceed the max model length. "
+                        f"Total number of tokens: {end_idx} > max_model_len: "
+                        f"{self.model_config.max_model_len}"
+                    )
+
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
             if req_state is None:
@@ -3136,11 +3184,6 @@ class TTModelRunner:
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
                 end_idx = start_idx + num_out_tokens
-                assert end_idx <= self.model_config.max_model_len, (
-                    "Sampled token IDs exceed the max model length. "
-                    f"Total number of tokens: {end_idx} > max_model_len: "
-                    f"{self.model_config.max_model_len}"
-                )
                 self.input_batch.token_ids_cpu[current_row, start_idx:end_idx] = block
                 self.input_batch.num_tokens[current_row] = end_idx
 

@@ -15,6 +15,25 @@ from vllm_tt_plugin.logger import init_tt_logger
 logger = init_tt_logger(__name__)
 
 
+def _resolve_output_tokens_per_step(vllm_config) -> int:
+    """Read a model's committed-output width from its static capabilities."""
+    from vllm.model_executor.model_loader.utils import get_model_architecture
+
+    model_class, _ = get_model_architecture(vllm_config.model_config)
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    output_tokens_per_step = capabilities.get("output_tokens_per_step", 1)
+    if (
+        isinstance(output_tokens_per_step, bool)
+        or not isinstance(output_tokens_per_step, int)
+        or output_tokens_per_step < 1
+    ):
+        raise ValueError(
+            f"Invalid output_tokens_per_step={output_tokens_per_step!r} for "
+            f"{model_class.__module__}.{model_class.__name__}; expected an integer >= 1"
+        )
+    return output_tokens_per_step
+
+
 @dataclass
 class _PendingOutputs:
     """Counts a request's decode tokens that are still in the pipeline.
@@ -121,67 +140,17 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        self._output_tokens_per_step = _resolve_output_tokens_per_step(self.vllm_config)
+        # Autoregressive models retain the existing unconditional cache call.
+        # Multi-token models cache only when they opt into vLLM APC; a
+        # model-owned KV cache must not be recorded as a vLLM paged prefix.
+        self._cache_block_outputs = (
+            self._output_tokens_per_step == 1
+            or self.vllm_config.cache_config.enable_prefix_caching
+        )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
-
-    def _update_block_granular_request_with_output(
-        self, request: Request, new_token_ids: list[int]
-    ) -> tuple[list[int], bool]:
-        """#47488 scheduler half: generalize the 1-token async accounting to
-        block-granular commits (block-diffusion models such as DiffusionGemma).
-
-        AsyncScheduler models an autoregressive 1-in/1-out decode step: it
-        reserves exactly one output placeholder per scheduled step and asserts
-        ``num_output_placeholders >= 0`` after subtracting the committed count.
-        A block-diffusion decode step commits a whole canvas of ``n`` tokens
-        (n == ``canvas_length``, e.g. 256) in ONE model step whose K/V is written
-        inside the model, so more than one committed token survives the stop-trim
-        and AsyncScheduler underflows (``async_scheduler.py:53``).
-
-        This override keeps the same intent while allowing ``n > 1``:
-        * clamp the placeholder budget at 0 instead of asserting;
-        * advance ``num_computed_tokens`` by the extra ``n - 1`` committed tokens
-          so it keeps lagging the committed output by exactly one position — the
-          invariant the running-loop scheduler math relies on to schedule the
-          next decode step (``num_new_tokens == 1``);
-        * skip the prefix-cache bookkeeping for block commits (prefix caching is
-          force-disabled on this sliding-window / block-diffusion path and the
-          committed block's slots are model-owned, not vLLM-paged).
-
-        For ``n == 1`` (every autoregressive model, and DiffusionGemma requests
-        that stop at the block's first token) this is byte-identical to
-        ``AsyncScheduler._update_request_with_output``.
-        """
-        if request.discard_latest_async_tokens:
-            # Force-preempted in reset_prefix_cache: discard the async token.
-            request.discard_latest_async_tokens = False
-            return [], False
-
-        status_before_update = request.status
-        # Grandparent (base Scheduler) does the append + stop-trim; we replace
-        # AsyncScheduler's fixed 1-token placeholder/num_computed accounting.
-        new_token_ids, stopped = Scheduler._update_request_with_output(
-            self, request, new_token_ids
-        )
-        n = len(new_token_ids)
-
-        request.num_output_placeholders -= n
-        if request.num_output_placeholders < 0:
-            # Block committed more tokens than the single reserved placeholder.
-            request.num_output_placeholders = 0
-        if n > 1:
-            # _update_after_schedule already advanced num_computed by the one
-            # scheduled input position; add the remaining committed tokens so
-            # num_computed catches up to (num_tokens - 1).
-            request.num_computed_tokens += n - 1
-
-        if status_before_update == RequestStatus.RUNNING and n == 1:
-            self.kv_cache_manager.cache_blocks(
-                request,
-                request.num_computed_tokens - request.num_output_placeholders,
-            )
-        return new_token_ids, stopped
 
     def _has_pending_prefill(self) -> bool:
         """Whether any request needs prefill work.
@@ -196,36 +165,35 @@ class TTScheduler(AsyncScheduler):
         has_pending_prefill = self._has_pending_prefill()
         has_running = any(not r.is_prefill_chunk for r in self.running)
         mode = self._forced_mode
-
-        if mode == TTSchedulingMode.PREFILL_ONLY:
-            result = self._schedule_prefill_only()
+        # Base Scheduler reserves/checks one decode input position. Tighten its
+        # visible context limit by the physical canvas remainder so its normal
+        # pre-dispatch max-length check requires the complete output block.
+        original_max_model_len = self.max_model_len
+        self.max_model_len -= self._output_tokens_per_step - 1
+        result = None
+        try:
+            if mode == TTSchedulingMode.PREFILL_ONLY:
+                result = self._schedule_prefill_only()
+            elif mode == TTSchedulingMode.DECODE_ONLY:
+                if has_pending_prefill:
+                    # Hide waiting and partial-prefill continuations.
+                    result = self._schedule_decode_only()
+                else:
+                    # No pending prefill: base scheduler naturally runs decode-only.
+                    result = super().schedule()
+            elif has_pending_prefill:
+                # Default mode prefers prefill whenever there is pending
+                # prefill work, falling back to decode when prefill cannot
+                # make progress.
+                result = self._schedule_prefill_only()
+                if result.total_num_scheduled_tokens == 0 and has_running:
+                    result = self._schedule_decode_only()
+            else:
+                # No pending prefill work: run decode-only naturally.
+                result = super().schedule()
             return self._finalize_scheduler_output(result)
-        if mode == TTSchedulingMode.DECODE_ONLY:
-            if has_pending_prefill:
-                # Hide waiting and partial-prefill continuations.
-                result = self._schedule_decode_only()
-                return self._finalize_scheduler_output(result)
-            # No pending prefill: base scheduler naturally runs decode-only.
-            result = super().schedule()
-            return self._finalize_scheduler_output(result)
-
-        # Default mode:
-        # Prefer prefill whenever there is pending prefill work - either new
-        # requests in the waiting queue or partial-prefill continuations in
-        # the running list.
-        if has_pending_prefill:
-            prefill_result = self._schedule_prefill_only()
-            # If prefill cannot make progress (e.g., KV pressure) but running
-            # decode requests exist, fall back to decode-only so they can
-            # advance and free capacity.
-            if prefill_result.total_num_scheduled_tokens == 0 and has_running:
-                result = self._schedule_decode_only()
-                return self._finalize_scheduler_output(result)
-            return self._finalize_scheduler_output(prefill_result)
-
-        # No pending prefill work: run decode-only naturally.
-        result = super().schedule()
-        return self._finalize_scheduler_output(result)
+        finally:
+            self.max_model_len = original_max_model_len
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
@@ -289,20 +257,22 @@ class TTScheduler(AsyncScheduler):
         """
         super()._preempt_request(request, timestamp)
 
-        if not self.scheduler_config.async_scheduling:
-            return
-
-        _PendingOutputs.for_request(request).discard_outstanding()
+        if self.scheduler_config.async_scheduling:
+            _PendingOutputs.for_request(request).discard_outstanding()
         request.num_output_placeholders = 0
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """After scheduling, count the decode tokens this step put in the pipeline.
-
-        Only decode steps produce a token to track; prefill chunks do not. This
-        running count is what lets a later preempt know how many in-flight
-        tokens it has to throw away.
-        """
+        """Reserve every physical output position before model execution."""
         super()._update_after_schedule(scheduler_output)
+
+        extra_output_tokens = self._output_tokens_per_step - 1
+        if extra_output_tokens:
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests[req_id]
+                if request.is_prefill_chunk:
+                    continue
+                request.num_output_placeholders += extra_output_tokens
+                request.num_computed_tokens += extra_output_tokens
 
         if self.scheduler_config.async_scheduling:
             for req_id in scheduler_output.num_scheduled_tokens:
@@ -313,12 +283,6 @@ class TTScheduler(AsyncScheduler):
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
-        """Add returned tokens unless an async preempt invalidated this output.
-
-        The pending-output check comes from token-chunked prefill support. Once
-        an output is known to be current, use the block-granular accounting path
-        so DiffusionGemma can commit a full canvas in one scheduler step.
-        """
         if (
             self.scheduler_config.async_scheduling
             and _PendingOutputs.for_request(request).is_next_stale()
@@ -326,6 +290,46 @@ class TTScheduler(AsyncScheduler):
             request.discard_latest_async_tokens = False
             return [], False
 
-        return TTScheduler._update_block_granular_request_with_output(
+        if self._output_tokens_per_step == 1:
+            return super()._update_request_with_output(request, new_token_ids)
+
+        if len(new_token_ids) > self._output_tokens_per_step:
+            raise ValueError(
+                "Model returned more tokens than its output_tokens_per_step "
+                f"contract: {len(new_token_ids)} > {self._output_tokens_per_step}"
+            )
+
+        if request.discard_latest_async_tokens:
+            request.discard_latest_async_tokens = False
+            return [], False
+
+        status_before_update = request.status
+        # The base scheduler appends tokens and applies EOS/max-token trimming.
+        # Reconcile against the surviving tokens, not the raw canvas.
+        new_token_ids, stopped = Scheduler._update_request_with_output(
             self, request, new_token_ids
         )
+        if (
+            not stopped
+            and request.num_tokens + self._output_tokens_per_step > self.max_model_len
+        ):
+            # Frontend admission rejects this state. Keep an internal request
+            # that bypassed frontend validation from dispatching an oversized
+            # physical canvas on its next step.
+            request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            stopped = True
+        unused_output_tokens = self._output_tokens_per_step - len(new_token_ids)
+        request.num_computed_tokens -= unused_output_tokens
+        request.num_output_placeholders -= unused_output_tokens
+        request.num_output_placeholders -= len(new_token_ids)
+        if request.num_output_placeholders < 0:
+            raise RuntimeError(
+                "Output placeholders underflowed after block-output reconciliation"
+            )
+
+        if status_before_update == RequestStatus.RUNNING and self._cache_block_outputs:
+            self.kv_cache_manager.cache_blocks(
+                request,
+                request.num_computed_tokens - request.num_output_placeholders,
+            )
+        return new_token_ids, stopped
