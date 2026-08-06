@@ -16,7 +16,9 @@ The current TT path is more specialized than upstream vLLM:
 
 - A TT step is treated as either all-prefill or all-decode.
 - TT does not support mixed prefill+decode batches.
-- TT does not support chunked prefill at the scheduling level.
+- Chunked prefill is per-model, not global: the platform enables it only for the
+  model types in `_CHUNKED_PREFILL_MODEL_TYPES`, and every other model is
+  scheduled without it.
 - CPU-device work overlap is a decode optimization.
 - Gathered-DP is not just "the same thing on more ranks"; it adds a global mode negotiation and a gather/execute/scatter step around every DP execution.
 
@@ -56,7 +58,7 @@ The TT scheduler prefers to admit waiting work first, because TT wants to form a
 The current TT scheduler enforces two important rules:
 
 - no mixed prefill+decode batch
-- no chunked prefill
+- no chunked prefill, unless the model type opts in (see above)
 
 So each TT scheduling step picks one of:
 

@@ -6,6 +6,8 @@ whether host tensors are authoritative. A contract-aware tt-metal generator
 (`decode_input_update_contract >= 1`) receives four independent boolean
 commands on every decode:
 
+## Commands
+
 | Command | Effect |
 | --- | --- |
 | `reload_inputs` | Copy all forward inputs: token, position, RoPE inputs, and page tables. Subsumes `reload_page_table`. |
@@ -80,6 +82,13 @@ convolution, cached RoPE deltas) has no equivalent command in version 1, so an
 adapter that keeps such state must rebuild the reused slot from the reloaded
 forward inputs. A future version should carry the reused slots explicitly rather
 than leave that inference to the adapter.
+
+`slot_remap` is in **global** slot indices. Under gathered multi-process DP vLLM
+offsets each rank's local `[0, max_num_seqs)` mapping by `rank * max_num_seqs`, so
+a generator holding per-rank state must rebase its own slice before indexing that
+state, and must check that the width it received matches the stride it assumed. A
+mapping that moves a request between ranks is an error, not a move. Non-DP and
+lane deployments send one rank's worth, where local and global coincide.
 
 The remap and the layout signal are retired together, at the boundary where a
 decode submission is accepted. Retiring one without the other would leave a
@@ -332,8 +341,9 @@ Two obligations follow for tt-metal:
   every existing subclass against the requirements above before doing it, not
   only the adapter that motivated the move.
 - A subclass that overrides `decode_forward` no longer inherits the
-  implementation the marker attests to, so it must re-declare the marker itself
-  or keep its own conformance.
+  implementation the marker attests to. Re-declaring the marker is not what makes
+  it conformant: the override must itself execute every command, or the subclass
+  must set `decode_input_update_contract = 0` and take the legacy path.
 
 | vLLM | tt-metal adapter | Result |
 | --- | --- | --- |
