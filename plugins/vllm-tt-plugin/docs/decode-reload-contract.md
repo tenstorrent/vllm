@@ -192,6 +192,13 @@ heuristics may observe stale host state under async decode and cannot provide
 the version-1 correctness guarantees. This compatibility path allows the vLLM
 change to land before individual tt-metal adapters are refactored.
 
+Overlap eligibility under gathered multi-process DP (`data_parallel_size > 1`)
+therefore requires version 1. Submit-before-finalize is authorised from a plan a
+version-0 adapter is never sent, so those adapters keep the finalize-before-submit
+order and forgo the overlap rather than reload from host tensors that are
+deliberately one step behind the device. Single-process lane DP is unaffected: it
+reports `data_parallel_size == 1` and its overlap behavior predates the contract.
+
 | vLLM | tt-metal adapter | Result |
 | --- | --- | --- |
 | Old | Legacy / version 0 | Supported: existing behavior |
