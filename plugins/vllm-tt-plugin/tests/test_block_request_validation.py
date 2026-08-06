@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+
 import pytest
 from vllm_tt_plugin.platform import TTPlatform
 
@@ -38,6 +40,47 @@ def test_block_model_accepts_exact_prompt_canvas_boundary():
 def test_block_model_rejects_prompt_that_cannot_fit_a_canvas():
     with pytest.raises(ValueError, match="reserve one full 256-token.*261888"):
         _validate(SamplingParams(max_tokens=1), prompt_len=261889)
+
+
+@pytest.mark.parametrize(
+    ("cli_args", "max_model_len"),
+    [
+        (
+            [
+                "--model",
+                "google/diffusiongemma-26B-A4B-it",
+                "--max-model-len",
+                "262144",
+            ],
+            262144,
+        ),
+        (
+            [
+                "--model=google/diffusiongemma-26B-A4B-it",
+                "--max_model_len=131072",
+            ],
+            131072,
+        ),
+    ],
+)
+def test_api_pre_registration_initializes_exact_block_boundary(
+    monkeypatch, cli_args, max_model_len
+):
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", *cli_args])
+
+    TTPlatform.pre_register_and_update()
+
+    assert TTPlatform.block_output_size == 256
+    assert TTPlatform.block_model_max_len == max_model_len
+    _validate(
+        SamplingParams(max_tokens=256),
+        prompt_len=max_model_len - TTPlatform.block_output_size,
+    )
+    with pytest.raises(ValueError, match="reserve one full 256-token"):
+        _validate(
+            SamplingParams(max_tokens=1),
+            prompt_len=max_model_len - TTPlatform.block_output_size + 1,
+        )
 
 
 @pytest.mark.parametrize(

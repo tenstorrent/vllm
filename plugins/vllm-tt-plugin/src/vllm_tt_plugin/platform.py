@@ -44,6 +44,7 @@ _GALAXY_GENERATOR_VERSIONS = {
 
 # TT model types that have been validated with real chunked prefill.
 _CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+_DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE = 256
 
 
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
@@ -218,6 +219,49 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
     return bool(
         isinstance(tt_config, dict) and tt_config.get("register_test_models") is True
     )
+
+
+def _get_cli_option(argv: list[str], option: str) -> str | None:
+    """Return the last CLI value for an option before argparse runs.
+
+    Accept both hyphen/underscore spellings and ``--option value`` /
+    ``--option=value`` forms, matching vLLM's flexible argument parser.
+    """
+    normalized_option = option.replace("_", "-")
+    value = None
+    for index, arg in enumerate(argv):
+        flag, separator, inline_value = arg.partition("=")
+        if flag.replace("_", "-") != normalized_option:
+            continue
+        if separator:
+            value = inline_value
+        elif index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            value = argv[index + 1]
+    return value
+
+
+def _diffusion_gemma_block_contract_from_cli(
+    argv: list[str] | None = None,
+) -> tuple[int | None, int | None]:
+    """Resolve the API-process block contract before VllmConfig exists."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    model = _get_cli_option(argv, "--model")
+    if not model or "diffusiongemma" not in model.lower():
+        return None, None
+
+    raw_max_model_len = _get_cli_option(argv, "--max-model-len")
+    if raw_max_model_len is None:
+        return _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE, None
+    try:
+        max_model_len = int(raw_max_model_len)
+    except ValueError:
+        logger.warning(
+            "Cannot initialize DiffusionGemma API request boundary from "
+            "--max-model-len=%r; argparse will validate it later.",
+            raw_max_model_len,
+        )
+        return _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE, None
+    return _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE, max_model_len
 
 
 def _install_tt_harmony_truncation_patch() -> None:
@@ -572,6 +616,9 @@ class TTPlatform(Platform):
         # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
         _install_tt_harmony_truncation_patch()
+        cls.block_output_size, cls.block_model_max_len = (
+            _diffusion_gemma_block_contract_from_cli()
+        )
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
 
@@ -655,7 +702,7 @@ class TTPlatform(Platform):
                     "DiffusionGemma owns one model-side KV cache and requires "
                     "--max-num-seqs 1"
                 )
-            cls.block_output_size = 256
+            cls.block_output_size = _DIFFUSION_GEMMA_BLOCK_OUTPUT_SIZE
             cls.block_model_max_len = model_config.max_model_len
         else:
             cls.block_output_size = None
