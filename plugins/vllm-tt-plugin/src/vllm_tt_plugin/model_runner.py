@@ -1036,9 +1036,7 @@ class TTModelRunner:
                     torch.cat(
                         [
                             bt,
-                            torch.full(
-                                (batch_pad, bt.shape[1]), -1, dtype=bt.dtype
-                            ),
+                            torch.full((batch_pad, bt.shape[1]), -1, dtype=bt.dtype),
                         ],
                         dim=0,
                     )
@@ -1395,9 +1393,7 @@ class TTModelRunner:
                     bt = torch.cat(
                         [
                             bt,
-                            torch.full(
-                                (batch_pad, bt.shape[1]), -1, dtype=bt.dtype
-                            ),
+                            torch.full((batch_pad, bt.shape[1]), -1, dtype=bt.dtype),
                         ],
                         dim=0,
                     )
