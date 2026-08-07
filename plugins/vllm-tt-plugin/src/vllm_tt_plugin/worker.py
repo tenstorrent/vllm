@@ -434,7 +434,7 @@ class TTWorker(WorkerBase):
         holds no model cannot read it. Contract-v1 adapters consume layout
         remaps in both sampling modes; version-0 adapters retain their
         historical device-sampling-only call shape, so a host-sampling step must
-        leave their remap pending.
+        leave their state-slot layout where it is.
 
         Retired at submission rather than completion: only the driver rank runs
         the merged forward, and a raised forward surfaces through the gather
@@ -445,7 +445,9 @@ class TTWorker(WorkerBase):
         if device_sampling or controller.slot_remap_delivered_on_host_sampling(
             contract_version
         ):
-            self.model_runner.input_batch.commit_slot_remap()
+            self.model_runner.note_decode_state_slots_settled()
+        else:
+            self.model_runner.discard_pending_state_slot_settle()
 
     def note_dp_decode_submitted(self, device_sampling: bool) -> None:
         """Mirror merged decode residency on this rank's overlap controller."""

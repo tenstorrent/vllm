@@ -38,24 +38,32 @@ fails with a message instead of being interpreted as a full reload.
 `decode_layout_changed` is an internal vLLM lifecycle signal: for an explicit
 contract adapter, the planner translates it into the four commands without
 forwarding the signal itself. For a legacy adapter, vLLM translates it to the
-old `reset_batch` keyword on device-sampling calls. `slot_remap` remains data:
-for a version-1 adapter it is composed by vLLM until the next accepted decode
-submission in either sampling mode. tt-metal applies it once before the decode
-reads any persistent per-slot state. Dormant state that the decode cannot read,
-such as a device sampler during host sampling, may be remapped immediately
-after successful submission; applying its non-idempotent remap before a call
-that can fail would corrupt a retry. Persistent state includes model-owned
-recurrent or convolution state as well as device sampling state. Version-0
-adapters retain the legacy device-sampling-only delivery and consumption
-behavior.
+old `reset_batch` keyword on device-sampling calls.
+
+`slot_remap` is data, and it is an **absolute gather permutation**, not a delta:
+`remap[i] = j` means row *i* must read the state currently in slot *j*. vLLM tracks
+which slot holds each request's state by request id, not by row, because a request's
+row moves whenever the batch evicts, re-admits or condenses while its device state
+stays put. Each decode step derives the permutation from that ownership record, so
+it is recomputed rather than accumulated, and it is omitted entirely when it would
+be the identity. A version-1 adapter receives it in both sampling modes; version-0
+adapters retain the legacy device-sampling-only delivery.
+
+Applying it is still not idempotent: gathering twice moves state twice. tt-metal
+therefore applies it exactly once, before the decode reads any persistent per-slot
+state. Dormant state the decode cannot read, such as a device sampler during host
+sampling, may instead be remapped immediately after successful submission, which
+keeps a failed call retryable for that subsystem. Persistent state includes
+model-owned recurrent or convolution state as well as device sampling state.
 
 State the forward *does* read has to be remapped before it, so those remaps are
 necessarily applied on a call that can fail. A raised decode therefore leaves the
-model-owned half applied while vLLM's own commit is still pending. vLLM does not
-retry a failed decode submission: under gathered DP the exception surfaces through
-the gather future and is fatal to the engine, and on the single-engine path the
-pending remap is retired only on success so the next step re-establishes host
-authority. An adapter must not treat a raised `decode_forward` as resumable.
+model-owned half applied while vLLM has not yet advanced its ownership record. vLLM
+does not retry a failed decode submission: under gathered DP the exception surfaces
+through the gather future and is fatal to the engine, and on the single-engine path
+the ownership record advances only on success, so the next step re-derives its
+permutation from where the state actually is. An adapter must not treat a raised
+`decode_forward` as resumable.
 
 Two superficially reasonable implementations are incorrect:
 
@@ -74,9 +82,9 @@ application by every slot-owning subsystem. An authoritative rebuild may
 replace a subsystem's remap, but merely not using that subsystem this step may
 not. Version-0 adapters retain their historical remap behavior unchanged.
 
-A remap cannot express slot reuse. When a new request takes a slot there is no
-predecessor state to gather from, so vLLM keeps that slot's entry the identity
-and signals the event through `decode_layout_changed`. Sampling state is then
+A remap cannot express slot reuse. A slot a new request has just taken holds no
+predecessor state to gather from, so vLLM leaves that row reading its own slot and
+signals the event through `decode_layout_changed`. Sampling state is then
 invalidated by `reset_sampling_state`. Model-owned per-slot state (recurrent,
 convolution, cached RoPE deltas) has no equivalent command in version 1, so an
 adapter that keeps such state must rebuild the reused slot from the reloaded
@@ -90,10 +98,13 @@ state, and must check that the width it received matches the stride it assumed. 
 mapping that moves a request between ranks is an error, not a move. Non-DP and
 lane deployments send one rank's worth, where local and global coincide.
 
-The remap and the layout signal are retired together, at the boundary where a
-decode submission is accepted. Retiring one without the other would leave a
-remap pending while the rebuild that repairs its destructive effect on a vacated
-slot has already been consumed.
+The ownership record and the layout signal advance together, at the boundary where
+a decode submission is accepted, and neither advances when the step withholds the
+remap from the adapter. Both describe what the accepted submission did to device
+state, so advancing one without the other leaves them describing different steps:
+the signal says the layout was rebuilt while the record still points at the
+pre-gather slots, or the record claims a gather that never ran and every later
+permutation is derived from a layout the device never reached.
 
 ## Mode definitions
 

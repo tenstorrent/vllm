@@ -221,6 +221,9 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # Where the remap built this step will leave that state, held until the
+        # submission carrying it is accepted.
+        self._pending_state_slot_settle: dict[str, int] | None = None
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -737,13 +740,12 @@ class TTModelRunner:
     def note_decode_layout_consumed(self) -> None:
         """Retire the layout signal an accepted decode submission carried.
 
-        Paired with ``InputBatch.commit_slot_remap`` at the same boundary. The
-        two must not be retired separately: a remap tells the model to gather
-        each slot's state from its old slot and zeroes what it vacated, and the
-        authoritative rebuild that ``decode_layout_changed`` requests is what
-        repairs that for a slot an intervening prefill has refilled. Retiring
-        the signal at input-build time would drop it on a raised decode while
-        leaving the remap pending.
+        Paired with ``note_decode_state_slots_settled`` at the same boundary. Both
+        describe what the accepted submission did to device state, so retiring one
+        without the other leaves the pair describing different steps: the signal
+        says the layout was rebuilt while the ownership map still points at the
+        pre-gather slots, or the reverse. Retiring either at input-build time drops
+        it on a raised decode.
         """
         self._decode_layout_changed_since_last_decode = False
 
@@ -900,28 +902,55 @@ class TTModelRunner:
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
-        means identity, so skip it."""
+        means identity, so skip it.
+
+        Records where the gather *will* leave each request's state as pending rather
+        than applying it here. Building an input does not prove the model accepted
+        it: on a raised ``decode_forward`` the gather never runs, and an ownership
+        map already advanced to the post-gather layout would compute every later
+        remap from a layout the device never reached.
+        ``note_decode_state_slots_settled`` promotes it once the submission is
+        accepted.
+        """
         n_slots = self.tt_per_lane_max_num_seqs
         row_req_ids = row_req_ids[:n_slots]
         want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
         # post-gather: state sits at its row
-        settled = {r: row for row, r in enumerate(row_req_ids)}
+        self._pending_state_slot_settle = {r: row for row, r in enumerate(row_req_ids)}
         if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
             # Never hand a non-permutation to a gather: one incoherent response beats
-            # an out-of-bounds device read.
+            # an out-of-bounds device read. No gather runs, so the state stays where
+            # it is and the map must not move either.
             logger.warning(
                 "TT decode state slots are not a permutation (%s); skipping the state "
                 "remap for this step -- one response may be incoherent.",
                 want,
             )
-            self._req_state_slot.update(settled)
+            self._pending_state_slot_settle = None
             return None
         taken = set(want)
         remap = want + [s for s in range(n_slots) if s not in taken]
-        self._req_state_slot.update(settled)
         if all(remap[i] == i for i in range(n_slots)):
+            # Identity: nothing to gather, so nothing moves and the map already
+            # describes the layout.
+            self._pending_state_slot_settle = None
             return None
         return torch.tensor(remap, dtype=torch.int32)
+
+    def note_decode_state_slots_settled(self) -> None:
+        """Promote the pending state-slot layout after an accepted decode submit.
+
+        Paired with ``note_decode_layout_consumed`` at the same boundary: the remap
+        and the ownership record it implies have to advance together, or a later step
+        derives its gather from a layout the device never reached.
+        """
+        if self._pending_state_slot_settle is not None:
+            self._req_state_slot.update(self._pending_state_slot_settle)
+            self._pending_state_slot_settle = None
+
+    def discard_pending_state_slot_settle(self) -> None:
+        """Drop the pending layout for a submission that was never made."""
+        self._pending_state_slot_settle = None
 
     @staticmethod
     def _build_host_generators(
@@ -970,9 +999,9 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether to attach the input batch's pending
-                slot remap. The remap is committed only after a decode accepts
-                it.
+            capture_slot_remap: Whether to attach the per-request state-slot
+                remap. The ownership map it implies advances only after a decode
+                accepts the submission.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling

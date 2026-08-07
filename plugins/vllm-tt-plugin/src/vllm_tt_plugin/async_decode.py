@@ -907,12 +907,16 @@ class TTAsyncDecodeController:
             self._decode_chain_valid = True
             self._previous_device_sampling = perform_device_sampling
         # Past the forward, so the submission was accepted. Gathered DP retires
-        # both signals from ``TTWorker.commit_dp_slot_updates`` instead, because
+        # these signals from ``TTWorker.commit_dp_slot_updates`` instead, because
         # every rank composed its own and only the driver reaches this line.
         if runner.parallel_config.data_parallel_size == 1:
             runner.note_decode_layout_consumed()
             if slot_remap_consumed:
-                runner.input_batch.commit_slot_remap()
+                runner.note_decode_state_slots_settled()
+            else:
+                # The remap was built but withheld from this adapter, so the gather
+                # never ran and the state did not move.
+                runner.discard_pending_state_slot_settle()
         read_events = None
         if async_read:
             if hasattr(runner.model, "read_decode_output"):

@@ -247,22 +247,15 @@ class InputBatch:
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
 
-        # Pending persistent-state remap: remap[i] = j means slot i's data
-        # came from slot j after condense. This covers sampler state and any
-        # model-owned per-slot decode state. Identity when nothing moved.
+        # Slot remap for seed manager: remap[i] = j means slot i's data came
+        # from slot j after condense.  Identity when nothing moved.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
 
-    def peek_slot_remap(self) -> torch.Tensor:
-        """Return the pending slot remap without consuming it.
-
-        Building an input does not prove that the model accepted it. Keep the
-        composed remap pending until the successful decode-submission boundary.
-        """
-        return self._slot_remap.clone()
-
-    def commit_slot_remap(self) -> None:
-        """Mark the pending remap as consumed by an accepted decode submit."""
+    def pop_slot_remap(self) -> torch.Tensor:
+        """Return pending slot remap and reset to identity."""
+        remap = self._slot_remap
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
+        return remap
 
     def scheduling_preserves_rows(self, scheduler_output: "SchedulerOutput") -> bool:
         """Whether applying this scheduler output leaves every row where it is.
@@ -273,16 +266,6 @@ class InputBatch:
         membership equality is exactly the question.
         """
         return set(self.req_id_to_index) == set(scheduler_output.num_scheduled_tokens)
-
-    def _reset_slot_remap_entry(self, req_index: int) -> None:
-        """Drop a pending remap entry for a slot taken by a new request.
-
-        A newly placed request has no predecessor state to gather from, so a
-        non-identity entry would tell the model to copy another slot's
-        persistent state into it. The pending remap outlives steps that submit
-        no decode, so such an entry can outlive the layout that produced it.
-        """
-        self._slot_remap[req_index] = req_index
 
     @property
     def req_ids(self) -> list[str]:
@@ -318,8 +301,6 @@ class InputBatch:
         assert req_index < self.max_num_reqs, (
             f"req_index={req_index} >= max_num_reqs={self.max_num_reqs}"
         )
-        self._reset_slot_remap_entry(req_index)
-
         req_id = request.req_id
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
@@ -1213,12 +1194,11 @@ class TTLaneInputBatch(InputBatch):
         if perform_device_sampling and not lane_batch.no_penalties:
             prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
-        # The remap covers any persistent per-slot model state, not just the
-        # device sampler. Merely building the input does not consume it, nor the
-        # layout signal beside it; ``submit_decode`` retires both once a
-        # contract-aware decode has accepted them.
+        # Lane rows are stable, so this batch never moves per-slot state and its
+        # remap is always the identity. The layout signal is read but not retired:
+        # ``submit_decode`` does that once a contract-aware decode has accepted it.
         decode_layout_changed = runner._decode_layout_changed_since_last_decode
-        slot_remap = lane_batch.peek_slot_remap()
+        slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
 
         return TTModelInput(
             input_tokens=input_tokens,

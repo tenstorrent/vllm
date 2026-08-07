@@ -21,56 +21,7 @@ from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
 
-from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData
-from vllm.v1.sample.logits_processor import build_logitsprocs
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
-
-_VOCAB = 64
-_BLOCK = 16
-_MAX_MODEL_LEN = 256
-
-
-def _new_request(req_id: str) -> CachedRequestState:
-    return CachedRequestState(
-        req_id=req_id,
-        prompt_token_ids=[1],
-        mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
-        generator=None,
-        block_ids=([0],),
-        num_computed_tokens=1,
-        output_token_ids=[],
-    )
-
-
-def _input_batch_with_slot_remap(remap: list[int]) -> InputBatch:
-    """A real occupied ``InputBatch`` carrying a pending non-identity remap."""
-    max_num_reqs = len(remap)
-    logitsprocs = build_logitsprocs(
-        SimpleNamespace(
-            speculative_config=None,
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_reqs),
-        ),
-        torch.device("cpu"),
-        is_pin_memory=False,
-        is_pooling_model=False,
-        custom_logitsprocs=[],
-    )
-    batch = InputBatch(
-        max_num_reqs=max_num_reqs,
-        max_model_len=_MAX_MODEL_LEN,
-        max_num_batched_tokens=_MAX_MODEL_LEN * max_num_reqs,
-        vocab_size=_VOCAB,
-        block_sizes=[_BLOCK],
-        kernel_block_sizes=[_BLOCK],
-        logitsprocs=logitsprocs,
-    )
-    for row in range(max_num_reqs):
-        batch.add_request(_new_request(f"seed-{row}"), req_index=row)
-    # Set after placement: ``add_request`` resets each entry it fills.
-    batch._slot_remap = torch.tensor(remap, dtype=torch.int32)
-    return batch
 
 
 def _front_packed_batch_stub(current_req_ids, **extra):
@@ -330,25 +281,43 @@ def test_empty_batch_does_not_consume_pending_slot_remap():
     assert batch._slot_remap.tolist() == [3, 1, 2, 3]
 
 
-def test_dp_slot_remap_commit_respects_contract_and_sampling_mode():
-    commits = []
-    worker = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            input_batch=SimpleNamespace(
-                commit_slot_remap=lambda: commits.append("v1-host")
-            ),
-        )
+def _dp_commit_worker(events):
+    controller = TTAsyncDecodeController(
+        SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
+    )
+    runner = SimpleNamespace(
+        async_decode=controller,
+        note_decode_layout_consumed=lambda: events.append("layout"),
+        note_decode_state_slots_settled=lambda: events.append("settled"),
+        discard_pending_state_slot_settle=lambda: events.append("discarded"),
+    )
+    return SimpleNamespace(model_runner=runner)
+
+
+@pytest.mark.parametrize(
+    "device_sampling, contract_version, expected",
+    [
+        # v1 delivers the remap in both sampling modes, so the gather ran.
+        (False, 1, "settled"),
+        (True, 1, "settled"),
+        # v0 keeps its device-sampling-only call shape: on a host-sampling step the
+        # adapter never received the remap, so its state did not move.
+        (True, 0, "settled"),
+        (False, 0, "discarded"),
+    ],
+)
+def test_dp_state_slot_commit_respects_contract_and_sampling_mode(
+    device_sampling, contract_version, expected
+):
+    events = []
+
+    TTWorker.commit_dp_slot_updates(
+        _dp_commit_worker(events),
+        device_sampling=device_sampling,
+        contract_version=contract_version,
     )
 
-    TTWorker.commit_dp_slot_updates(worker, device_sampling=False, contract_version=1)
-
-    worker.model_runner.input_batch.commit_slot_remap = lambda: commits.append(
-        "v0-device"
-    )
-    TTWorker.commit_dp_slot_updates(worker, device_sampling=False, contract_version=0)
-    TTWorker.commit_dp_slot_updates(worker, device_sampling=True, contract_version=0)
-
-    assert commits == ["v1-host", "v0-device"]
+    assert events == ["layout", expected]
 
 
 def test_contract_version_probe_tolerates_a_rank_without_a_model():
@@ -382,7 +351,9 @@ def test_explicit_contract_keeps_layout_hint_inside_planner():
         kv_caches=object(),
         request_specific_rope=False,
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        input_batch=SimpleNamespace(commit_slot_remap=lambda: None),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: None,
+        discard_pending_state_slot_settle=lambda: None,
     )
     controller = TTAsyncDecodeController(runner)
     model_input = SimpleNamespace(
@@ -437,7 +408,9 @@ def test_explicit_contract_delivers_and_commits_slot_remap_for_host_sampling():
         kv_caches=object(),
         request_specific_rope=False,
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        input_batch=SimpleNamespace(commit_slot_remap=lambda: commits.append(True)),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: commits.append(True),
+        discard_pending_state_slot_settle=lambda: None,
     )
     controller = TTAsyncDecodeController(runner)
 
@@ -470,9 +443,11 @@ def test_layout_change_refreshes_request_rope_even_when_request_id_is_reused():
         previous_req_ids={"req-0"},
         requests={"req-0": SimpleNamespace(mrope_position_delta=17)},
         parallel_config=SimpleNamespace(data_parallel_size=1),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: None,
+        discard_pending_state_slot_settle=lambda: None,
         input_batch=SimpleNamespace(
             req_ids=["req-0"],
-            commit_slot_remap=lambda: None,
         ),
     )
     controller = TTAsyncDecodeController(runner)
@@ -502,7 +477,9 @@ def test_slot_remap_is_not_committed_when_decode_submission_fails():
         kv_caches=object(),
         request_specific_rope=False,
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        input_batch=SimpleNamespace(commit_slot_remap=lambda: commits.append(True)),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: commits.append(True),
+        discard_pending_state_slot_settle=lambda: None,
     )
     controller = TTAsyncDecodeController(runner)
 
@@ -543,7 +520,9 @@ def test_legacy_host_sampling_keeps_slot_remap_pending_for_device_sampling(
         kv_caches=object(),
         request_specific_rope=False,
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        input_batch=SimpleNamespace(commit_slot_remap=lambda: commits.append(True)),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: commits.append(True),
+        discard_pending_state_slot_settle=lambda: None,
     )
     controller = TTAsyncDecodeController(runner)
     model_input = _submission_input(device_sampling=False)
@@ -588,7 +567,9 @@ def test_legacy_contract_receives_reset_batch_without_explicit_commands(
         kv_caches=object(),
         request_specific_rope=False,
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        input_batch=SimpleNamespace(commit_slot_remap=lambda: None),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: None,
+        discard_pending_state_slot_settle=lambda: None,
     )
     controller = TTAsyncDecodeController(runner)
     model_input = SimpleNamespace(
@@ -1017,16 +998,61 @@ def test_intermediate_chunk_step_still_honours_rejections():
     assert output.sampled_token_ids == [[5], [], []]
 
 
-def test_slot_reuse_clears_a_stale_pending_remap_entry():
-    """Prefill steps neither deliver nor commit a remap, so entries persist.
+def _state_slot_runner(req_state_slot, slots=4):
+    runner = SimpleNamespace(
+        tt_per_lane_max_num_seqs=slots,
+        _req_state_slot=dict(req_state_slot),
+        _pending_state_slot_settle=None,
+    )
+    for name in (
+        "_decode_state_slot_remap",
+        "note_decode_state_slots_settled",
+        "discard_pending_state_slot_settle",
+    ):
+        setattr(
+            runner,
+            name,
+            lambda *a, _n=name, **k: getattr(TTModelRunner, _n)(runner, *a, **k),
+        )
+    return runner
 
-    Two condense-then-reuse rounds without an intervening decode would
-    otherwise hand a brand-new request another slot's source index. Placing a
-    request has to clear its own entry, and only its own.
+
+def test_state_slot_ownership_advances_only_on_an_accepted_submission():
+    """A raised decode never gathers, so the ownership map must not move.
+
+    The map says which slot holds each request's state. Advancing it to the
+    post-gather layout at input-build time would have every later step derive its
+    permutation from a layout the device never reached.
     """
-    batch = _input_batch_with_slot_remap([3, 2, 2, 0])
+    # "a" decodes at row 0 but its state still sits in slot 1.
+    runner = _state_slot_runner({"a": 1, "b": 0})
 
-    batch.add_request(_new_request("fresh"), req_index=1)
+    remap = runner._decode_state_slot_remap(["a", "b"])
 
-    # Only the reused slot is reset; the rest of the pending remap survives.
-    assert batch._slot_remap.tolist() == [3, 1, 2, 0]
+    assert remap is not None and remap.tolist()[:2] == [1, 0]
+    # Still pre-gather until something accepts the submission.
+    assert runner._req_state_slot == {"a": 1, "b": 0}
+
+    runner.discard_pending_state_slot_settle()
+    assert runner._req_state_slot == {"a": 1, "b": 0}
+
+    # Rebuild and accept: now the state is where the rows are.
+    runner._decode_state_slot_remap(["a", "b"])
+    runner.note_decode_state_slots_settled()
+    assert runner._req_state_slot == {"a": 0, "b": 1}
+
+
+def test_a_step_that_moves_nothing_leaves_the_ownership_map_alone():
+    """Identity and non-permutation both skip the gather, so neither may settle."""
+    runner = _state_slot_runner({"a": 0, "b": 1})
+
+    assert runner._decode_state_slot_remap(["a", "b"]) is None
+    assert runner._pending_state_slot_settle is None
+
+    # Two requests claiming one slot is not a permutation: the remap is withheld,
+    # so the map must not record a move either.
+    collided = _state_slot_runner({"a": 1, "b": 1})
+    assert collided._decode_state_slot_remap(["a", "b"]) is None
+    assert collided._pending_state_slot_settle is None
+    collided.note_decode_state_slots_settled()
+    assert collided._req_state_slot == {"a": 1, "b": 1}
