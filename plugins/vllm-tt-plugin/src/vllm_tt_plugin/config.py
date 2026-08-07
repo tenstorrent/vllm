@@ -38,6 +38,7 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
 # than user input. Written by store_tt_lane_count, read by
 # get_tt_data_parallel_size.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
+_OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -71,6 +72,33 @@ def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
         additional = {}
         vllm_config.additional_config = additional
     additional[_RESOLVED_LANE_COUNT_KEY] = lanes
+
+
+def get_tt_output_tokens_per_step(vllm_config: "VllmConfig") -> int:
+    """Return the normalized model output width, defaulting to AR behavior.
+
+    ``TTPlatform.check_and_update_config`` resolves and validates the model
+    capability once, then stores it in ``additional_config`` so EngineCore and
+    worker construction do not need to import the model implementation.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_OUTPUT_TOKENS_PER_STEP_KEY, 1))
+
+
+def store_tt_output_tokens_per_step(
+    vllm_config: "VllmConfig", output_tokens_per_step: int
+) -> None:
+    """Store the platform-normalized output width for scheduler/runner use."""
+    if output_tokens_per_step < 1:
+        raise ValueError(
+            "resolved TT output_tokens_per_step must be >= 1, got "
+            f"{output_tokens_per_step}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:

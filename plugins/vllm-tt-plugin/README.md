@@ -358,6 +358,8 @@ implementations. Current families:
 - Qwen 2.5-VL and Qwen 3-VL vision-language models
 - Mistral and Mistral 3 multimodal models
 - Gemma 3 multimodal models
+- DiffusionGemma 26B-A4B-it block-diffusion
+  (`TTDiffusionGemmaForBlockDiffusion`)
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 
@@ -397,6 +399,25 @@ clear error before anything reaches the device:
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
+- Models declaring `output_tokens_per_step > 1` use physical block-output
+  reservation and require `max_model_len >= output_tokens_per_step`.
+- Scheduler-level chunked prefill is force-disabled for block-output models;
+  this is independent of any model-internal TT prefill chunking.
+
+DiffusionGemma currently has additional serving constraints:
+
+- Each model step commits one 256-token canvas. Logical `max_tokens` output is
+  trimmed only after a complete physical canvas is returned, and prompt plus
+  physical output must fit `max_model_len`.
+- The current model-owned cache/state path supports one sequence
+  (`--max-num-seqs 1`). Automatic prefix caching and async decode are not
+  advertised by the model.
+- The denoise loop owns Gumbel sampling and an internal temperature schedule
+  from 0.8 to 0.4. HTTP sampling controls are not wired into that sampler.
+  Use the neutral transport values `temperature=1.0`, `top_p=1.0`,
+  `top_k=0` (or `-1`), `min_p=0.0`, no seed or penalties, and no logprobs or
+  structured-output controls. In particular, `temperature=0` is unsupported;
+  it does not select a greedy mode.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 

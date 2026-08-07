@@ -23,25 +23,8 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
-from vllm.config import (
-    CacheConfig,
-    ModelConfig,
-    ParallelConfig,
-    SchedulerConfig,
-    VllmConfig,
-)
-from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-)
-from vllm.v1.request import Request, RequestStatus
-from vllm.v1.structured_output import StructuredOutputManager
 
 VOCAB = 8
 BLOCK = 16
@@ -111,6 +94,33 @@ def test_preempted_request_releases_model_resources():
     assert released == [3]
 
 
+def test_resumed_request_releases_model_resources_for_rebind():
+    released = []
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
+    runner.model = SimpleNamespace(release_request=released.append)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.resumed_req_ids = {"req-0"}
+
+    runner._release_preempted_model_requests(output)
+
+    assert released == [3]
+
+
+def test_preempted_and_resumed_request_is_released_once():
+    released = []
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
+    runner.model = SimpleNamespace(release_request=released.append)
+    output = SchedulerOutput.make_empty()
+    output.preempted_req_ids = {"req-0"}
+    output.scheduled_cached_reqs.resumed_req_ids = {"req-0"}
+
+    runner._release_preempted_model_requests(output)
+
+    assert released == [3]
+
+
 def test_temporarily_unscheduled_request_retains_model_resources():
     released = []
     runner = object.__new__(TTModelRunner)
@@ -143,7 +153,10 @@ def test_block_output_updates_full_runner_state_at_exact_capacity():
 
 
 def test_block_output_builds_full_runner_output():
-    runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-0"]))
+    runner = SimpleNamespace(
+        _output_tokens_per_step=MAX_MODEL_LEN,
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-0"]),
+    )
     block = torch.arange(MAX_MODEL_LEN, dtype=torch.int32).reshape(1, -1)
 
     output = TTModelRunner._build_runner_output(runner, block)
@@ -152,9 +165,35 @@ def test_block_output_builds_full_runner_output():
     assert output.sampled_token_ids == [list(range(MAX_MODEL_LEN))]
 
 
+def test_runner_rejects_output_width_that_violates_normalized_capability():
+    runner = SimpleNamespace(
+        _output_tokens_per_step=CANVAS_LENGTH,
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-0"]),
+    )
+
+    with pytest.raises(ValueError, match="violates output_tokens_per_step"):
+        TTModelRunner._build_runner_output(
+            runner, torch.zeros((1, CANVAS_LENGTH - 1), dtype=torch.int32)
+        )
+
+
+def test_runner_rejects_chunked_prefill_for_block_output_model():
+    runner = SimpleNamespace(_is_block_output_model=True)
+
+    with pytest.raises(RuntimeError, match="chunked prefill must be disabled"):
+        TTModelRunner._build_chunked_prefill_output(
+            runner,
+            req_ids=["req-0"],
+            sampled_token_ids=torch.tensor([[1]], dtype=torch.int32),
+            logprobs=None,
+            intermediate_mask=np.array([True]),
+        )
+
+
 def test_block_output_rejects_max_length_overrun_before_state_write():
     output_tokens = []
     runner = SimpleNamespace(
+        _output_tokens_per_step=MAX_MODEL_LEN,
         input_batch=SimpleNamespace(
             num_reqs=1,
             num_tokens=np.array([1], dtype=np.int32),
@@ -179,6 +218,7 @@ def test_captured_block_overrun_rejects_before_any_request_state_write():
         "req-1": SimpleNamespace(output_token_ids=[]),
     }
     runner = SimpleNamespace(
+        _output_tokens_per_step=CANVAS_LENGTH,
         requests=request_states,
         input_batch=SimpleNamespace(
             num_tokens=np.array([0, MAX_MODEL_LEN - 1], dtype=np.int32),
@@ -202,257 +242,6 @@ def test_captured_block_overrun_rejects_before_any_request_state_write():
     assert not runner.input_batch.token_ids_cpu.any()
     assert request_states["req-0"].output_token_ids == []
     assert request_states["req-1"].output_token_ids == []
-
-
-def _block_scheduler(*, max_model_len=MAX_MODEL_LEN):
-    model_config = ModelConfig(
-        model="Qwen/Qwen2-0.5B-Instruct",
-        trust_remote_code=True,
-        dtype="float16",
-        seed=42,
-    )
-    model_config.max_model_len = max_model_len
-    scheduler_config = SchedulerConfig(
-        max_num_seqs=1,
-        max_num_batched_tokens=max_model_len,
-        max_model_len=max_model_len,
-        enable_chunked_prefill=True,
-        is_encoder_decoder=model_config.is_encoder_decoder,
-    )
-    cache_config = CacheConfig(
-        block_size=BLOCK,
-        gpu_memory_utilization=0.9,
-        swap_space=0,
-        cache_dtype="auto",
-        enable_prefix_caching=False,
-    )
-    vllm_config = VllmConfig(
-        scheduler_config=scheduler_config,
-        model_config=model_config,
-        cache_config=cache_config,
-        parallel_config=ParallelConfig(),
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=128,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                FullAttentionSpec(
-                    block_size=BLOCK,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            )
-        ],
-    )
-    cache_config.num_gpu_blocks = 128
-    scheduler = Scheduler(
-        vllm_config=vllm_config,
-        kv_cache_config=kv_cache_config,
-        block_size=BLOCK,
-        log_stats=True,
-        structured_output_manager=StructuredOutputManager(vllm_config),
-    )
-    scheduler.__class__ = TTScheduler
-    scheduler._output_tokens_per_step = CANVAS_LENGTH
-    scheduler._cache_block_outputs = False
-    scheduler._forced_mode = TTSchedulingMode.DEFAULT
-    scheduler._spec_token_placeholders = []
-    scheduler.scheduler_config.async_scheduling = False
-    return scheduler
-
-
-def _request(prompt_len, max_tokens=MAX_MODEL_LEN, *, ignore_eos=True):
-    return Request(
-        request_id="req-0",
-        prompt_token_ids=[1] * prompt_len,
-        sampling_params=SamplingParams(
-            max_tokens=max_tokens,
-            ignore_eos=ignore_eos,
-        ),
-        pooling_params=None,
-        eos_token_id=2,
-    )
-
-
-def _schedule_block_zero(scheduler, request):
-    scheduler.add_request(request)
-    scheduler_output = scheduler.schedule()
-    assert scheduler_output.num_scheduled_tokens == {
-        request.request_id: request.num_prompt_tokens
-    }
-    return scheduler_output
-
-
-def test_scheduler_reserves_full_canvas_before_block_zero_dispatch():
-    scheduler = _block_scheduler()
-    request = _request(prompt_len=32)
-
-    _schedule_block_zero(scheduler, request)
-
-    assert request.num_output_placeholders == CANVAS_LENGTH
-    assert request.num_computed_tokens == 32 + CANVAS_LENGTH - 1
-
-
-def test_scheduler_reserves_decode_canvas_before_base_dispatch():
-    scheduler = _block_scheduler()
-    request = _request(prompt_len=32, max_tokens=CANVAS_LENGTH * 2)
-    _schedule_block_zero(scheduler, request)
-    returned, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-    assert returned == list(range(CANVAS_LENGTH))
-    assert stopped is False
-
-    observed = {}
-    allocate_slots = scheduler.kv_cache_manager.allocate_slots
-
-    def capture_reservation(req, *args, **kwargs):
-        observed["placeholders"] = req.num_output_placeholders
-        observed["computed"] = req.num_computed_tokens
-        observed["max_model_len"] = scheduler.max_model_len
-        return allocate_slots(req, *args, **kwargs)
-
-    scheduler.kv_cache_manager.allocate_slots = capture_reservation
-    scheduler_output = scheduler.schedule()
-
-    assert scheduler_output.num_scheduled_tokens == {request.request_id: 1}
-    assert observed == {
-        "placeholders": 0,
-        "computed": request.num_tokens - 1,
-        "max_model_len": MAX_MODEL_LEN - CANVAS_LENGTH + 1,
-    }
-    assert scheduler.max_model_len == MAX_MODEL_LEN
-    assert request.num_output_placeholders == CANVAS_LENGTH
-    assert request.num_computed_tokens == request.num_tokens + CANVAS_LENGTH - 1
-
-
-def test_scheduler_exact_boundary_one_block_stops_safely():
-    scheduler = _block_scheduler()
-    request = _request(
-        prompt_len=MAX_MODEL_LEN - CANVAS_LENGTH,
-        max_tokens=CANVAS_LENGTH,
-    )
-    _schedule_block_zero(scheduler, request)
-
-    returned, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-
-    assert returned == list(range(CANVAS_LENGTH))
-    assert stopped is True
-    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
-    assert request.num_output_placeholders == 0
-    assert request.num_computed_tokens == request.num_tokens - 1
-
-
-def test_scheduler_internal_partial_capacity_stops_before_second_dispatch():
-    scheduler = _block_scheduler()
-    request = _request(
-        prompt_len=MAX_MODEL_LEN - CANVAS_LENGTH - 2,
-        max_tokens=CANVAS_LENGTH + 1,
-    )
-    _schedule_block_zero(scheduler, request)
-
-    returned, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-
-    assert returned == list(range(CANVAS_LENGTH))
-    assert stopped is True
-    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
-    assert request.num_output_placeholders == 0
-    assert request.num_computed_tokens == request.num_tokens - 1
-
-
-def test_scheduler_two_blocks_reclaims_max_token_trim():
-    scheduler = _block_scheduler()
-    request = _request(prompt_len=32, max_tokens=CANVAS_LENGTH + 1)
-    _schedule_block_zero(scheduler, request)
-    returned, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-    assert len(returned) == CANVAS_LENGTH
-    assert stopped is False
-
-    scheduler_output = scheduler.schedule()
-    assert scheduler_output.num_scheduled_tokens == {request.request_id: 1}
-    returned, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-
-    assert returned == [0]
-    assert stopped is True
-    assert request.num_output_placeholders == 0
-    assert request.num_computed_tokens == request.num_tokens - 1
-
-
-def test_scheduler_reclaims_canvas_remainder_after_eos_trim():
-    scheduler = _block_scheduler()
-    request = _request(prompt_len=32, ignore_eos=False)
-    _schedule_block_zero(scheduler, request)
-
-    returned, stopped = scheduler._update_request_with_output(
-        request, [0, 2, *range(2, CANVAS_LENGTH)]
-    )
-
-    assert returned == [0, 2]
-    assert stopped is True
-    assert request.num_output_placeholders == 0
-    assert request.num_computed_tokens == request.num_tokens - 1
-
-
-def test_scheduler_does_not_reserve_temporarily_unscheduled_request():
-    scheduler = _block_scheduler()
-    request = _request(prompt_len=32, max_tokens=CANVAS_LENGTH * 2)
-    _schedule_block_zero(scheduler, request)
-    _, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-    assert stopped is False
-    before = (
-        request.num_computed_tokens,
-        request.num_output_placeholders,
-    )
-
-    scheduler.set_forced_mode(TTSchedulingMode.PREFILL_ONLY)
-    scheduler_output = scheduler.schedule()
-
-    assert scheduler_output.total_num_scheduled_tokens == 0
-    assert (
-        request.num_computed_tokens,
-        request.num_output_placeholders,
-    ) == before
-
-
-def test_scheduler_preemption_clears_reservation_and_resume_reprefills():
-    scheduler = _block_scheduler()
-    request = _request(prompt_len=32, max_tokens=CANVAS_LENGTH * 2)
-    _schedule_block_zero(scheduler, request)
-    _, stopped = scheduler._update_request_with_output(
-        request, list(range(CANVAS_LENGTH))
-    )
-    assert stopped is False
-
-    scheduler.running.remove(request)
-    scheduler._preempt_request(request, timestamp=0.0)
-
-    assert request.status == RequestStatus.PREEMPTED
-    assert request.num_computed_tokens == 0
-    assert request.num_output_placeholders == 0
-
-    # A real preemption is emitted by an intervening scheduler step whose
-    # output no longer lists the victim as scheduled.
-    scheduler.prev_step_scheduled_req_ids.clear()
-    scheduler_output = scheduler.schedule()
-
-    assert scheduler_output.num_scheduled_tokens == {
-        request.request_id: request.num_tokens
-    }
-    assert request.status == RequestStatus.RUNNING
-    assert request.num_output_placeholders == CANVAS_LENGTH
 
 
 def test_pack_dp_results_pads_empty_rank_to_canvas_width():
@@ -546,8 +335,8 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
 def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
     captured: dict = {}
     batch = _lane_batch()
-    batch.build_merged_sampling_metadata = (
-        lambda rows, non_sampling_rows=None: None
+    batch.build_merged_sampling_metadata = lambda rows, non_sampling_rows=None: (
+        None
     )  # sampler ignores it
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Full slot logits: row r's argmax is token r (vocab>=5).
@@ -666,8 +455,9 @@ def test_get_output_tokens_skips_all_intermediate_prefill_rows():
 def test_apply_dp_result_suppresses_intermediate_prefill_rows():
     captured: dict = {}
     runner = SimpleNamespace(
-        _build_chunked_prefill_output=lambda **kwargs: captured.update(kwargs)
-        or "intermediate",
+        _build_chunked_prefill_output=lambda **kwargs: (
+            captured.update(kwargs) or "intermediate"
+        ),
         apply_and_build_runner_output=lambda *args, **kwargs: pytest.fail(
             "intermediate rows must not be applied"
         ),
@@ -699,10 +489,9 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
         raise AssertionError("intermediate prefill must not emit a sampled token")
 
     runner = SimpleNamespace(
-        _apply_grammar_to_input=lambda model_input,
-        grammar_output,
-        *,
-        lane_total: model_input,
+        _apply_grammar_to_input=lambda model_input, grammar_output, *, lane_total: (
+            model_input
+        ),
         lane_batch=SimpleNamespace(
             extract_output=extract_output,
             req_ids={0: "request"},

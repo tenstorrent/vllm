@@ -122,8 +122,13 @@ This does not mean the whole TT path is fully asynchronous.
 
 It means:
 
-- the scheduler can safely "reserve" the next decode token
-- the engine can submit the next decode step before the prior result is fully retired
+- the scheduler reserves the complete physical output declared by
+  `output_tokens_per_step` (one token for autoregressive models, one canvas for
+  block-output models)
+- the reservation includes every in-flight output before another step is
+  admitted, so an async step cannot overrun the model context
+- the engine can submit the next decode step before the prior result is fully
+  retired
 
 That mechanism matters most for steady-state decode.
 

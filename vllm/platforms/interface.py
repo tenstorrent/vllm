@@ -174,7 +174,15 @@ class Platform:
     def is_unspecified(self) -> bool:
         return self._enum == PlatformEnum.UNSPECIFIED
 
-    def get_max_output_tokens(self, prompt_len: int) -> int:
+    def get_max_output_tokens(
+        self, prompt_len: int, requested_max_tokens: int | None = None
+    ) -> int:
+        """Return a platform output cap for this prompt.
+
+        ``requested_max_tokens`` preserves whether the caller supplied an
+        explicit limit so platforms can clamp transport defaults without
+        silently weakening explicit admission checks.
+        """
         return sys.maxsize
 
     def is_cuda_alike(self) -> bool:

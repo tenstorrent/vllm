@@ -40,6 +40,7 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
+    get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.input_batch import (
@@ -134,6 +135,8 @@ class TTModelRunner:
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
+        self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+        self._is_block_output_model = self._output_tokens_per_step > 1
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -612,13 +615,18 @@ class TTModelRunner:
     def _release_preempted_model_requests(
         self, scheduler_output: SchedulerOutput
     ) -> None:
-        """Release model-owned state only for requests explicitly preempted.
+        """Release model state for explicit preemption and resumed re-prefill.
 
         A request absent from one scheduler step can be temporarily unscheduled
         and later resumed, so the general unscheduled path must retain its
-        model state. Preempted requests instead restart prefill from scratch.
+        model state. Explicitly preempted requests and requests resumed after a
+        prefix-cache reset both restart prefill from scratch. The union avoids
+        releasing twice if a request appears in both scheduler fields.
         """
-        for req_id in scheduler_output.preempted_req_ids or ():
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        req_ids = set(scheduler_output.preempted_req_ids or ())
+        req_ids.update(resumed_req_ids)
+        for req_id in req_ids:
             self._release_finished_model_request(req_id)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
@@ -2363,6 +2371,11 @@ class TTModelRunner:
         req_id_to_index: dict[str, int] | None = None,
     ) -> ModelRunnerOutput:
         """Builds output with ``[]`` for intermediate, ``[tokens]`` for final chunks."""
+        if getattr(self, "_is_block_output_model", False):
+            raise RuntimeError(
+                "vLLM scheduler chunked prefill must be disabled for block-output "
+                "models because intermediate prefill output is single-token shaped"
+            )
         final_idx_np = np.where(~intermediate_mask)[0]
         if final_idx_np.shape[0] > 0:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
@@ -2974,12 +2987,12 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
-                # #47488: keep the full [sz, num_out_tokens] TT sample. Prefill can
-                # return [sz] and autoregressive decode [sz, 1]; block-diffusion
-                # (DiffusionGemma) returns [sz, canvas_length] (a whole 256-token
-                # committed canvas per step). ``reshape(sz, -1)`` preserves all of
-                # them; the per-token logprobs path (below) still collapses to [sz]
-                # and is guarded to the 1-token case.
+                # tenstorrent/tt-metal#47488: keep the full
+                # [sz, num_out_tokens] TT sample. Prefill can return [sz] and
+                # autoregressive decode [sz, 1]; a block-output model returns
+                # [sz, output_tokens_per_step]. ``reshape(sz, -1)`` preserves
+                # the full physical output; per-token logprobs below remain
+                # guarded to the 1-token case.
                 next_token_ids = _take(tt_out).reshape(sz, -1)
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
@@ -3070,10 +3083,17 @@ class TTModelRunner:
             f"number of requests in input batch {num_reqs}"
         )
 
-        # #47488: [num_reqs, num_out_tokens] — 1 for autoregressive, canvas_length
-        # (e.g. 256) for block-diffusion. Emit all num_out_tokens per request as
-        # the per-request output list vLLM's engine core appends and detokenizes.
+        # tenstorrent/tt-metal#47488: emit all physical output tokens per
+        # request as the list EngineCore appends and detokenizes.
         num_out_tokens = sampled_token_ids.shape[1]
+        expected_output_tokens = getattr(
+            self, "_output_tokens_per_step", num_out_tokens
+        )
+        if num_out_tokens != expected_output_tokens:
+            raise ValueError(
+                "Model output width violates output_tokens_per_step: "
+                f"{num_out_tokens} != {expected_output_tokens}"
+            )
         sampled_token_ids_np = sampled_token_ids.reshape(
             num_reqs, num_out_tokens
         ).numpy()
@@ -3114,11 +3134,18 @@ class TTModelRunner:
             f"Number of request outputs {sampled_token_ids.shape[0]} != "
             f"number of requests in input batch {num_reqs}"
         )
-        # #47488: ``num_out_tokens`` is 1 for autoregressive models and
-        # ``canvas_length`` (e.g. 256) for block-diffusion (DiffusionGemma), which
-        # commits a whole canvas per step. Keep the [num_reqs, num_out_tokens]
-        # shape and write/advance by ``num_out_tokens`` instead of by 1.
+        # tenstorrent/tt-metal#47488: keep the
+        # [num_reqs, output_tokens_per_step] shape and advance runner state by
+        # the complete physical output rather than assuming one AR token.
         num_out_tokens = sampled_token_ids.shape[1]
+        expected_output_tokens = getattr(
+            self, "_output_tokens_per_step", num_out_tokens
+        )
+        if num_out_tokens != expected_output_tokens:
+            raise ValueError(
+                "Model output width violates output_tokens_per_step: "
+                f"{num_out_tokens} != {expected_output_tokens}"
+            )
 
         sampled_token_ids_np = sampled_token_ids.reshape(
             num_reqs, num_out_tokens

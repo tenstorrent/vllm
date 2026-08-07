@@ -179,7 +179,7 @@ def get_max_tokens(
     default_sampling_params: dict,
 ) -> int:
     default_max_tokens = max_model_len - input_length
-    max_output_tokens = current_platform.get_max_output_tokens(input_length)
+    max_output_tokens = current_platform.get_max_output_tokens(input_length, max_tokens)
 
     return min(
         val

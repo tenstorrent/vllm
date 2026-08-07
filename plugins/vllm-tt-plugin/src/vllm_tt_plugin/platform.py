@@ -13,6 +13,7 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     store_tt_lane_count,
+    store_tt_output_tokens_per_step,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
@@ -46,18 +47,29 @@ _GALAXY_GENERATOR_VERSIONS = {
 _CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
 
 
-def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
+def _apply_chunked_prefill_policy(
+    vllm_config: "VllmConfig", output_tokens_per_step: int
+) -> None:
     """Restricts token-chunked prefill to model types Metal has validated."""
     scheduler_config = vllm_config.scheduler_config
     model_config = vllm_config.model_config
     model_type = getattr(model_config.hf_config, "model_type", None)
+    is_block_output_model = output_tokens_per_step > 1
 
-    if model_type not in _CHUNKED_PREFILL_MODEL_TYPES:
+    if is_block_output_model or model_type not in _CHUNKED_PREFILL_MODEL_TYPES:
         if scheduler_config.enable_chunked_prefill:
-            logger.info(
-                "Chunked prefill is not validated for `model_type=%s`; disabling it.",
-                model_type,
-            )
+            if is_block_output_model:
+                logger.info(
+                    "vLLM scheduler chunked prefill is incompatible with "
+                    "output_tokens_per_step=%d; disabling it.",
+                    output_tokens_per_step,
+                )
+            else:
+                logger.info(
+                    "Chunked prefill is not validated for `model_type=%s`; "
+                    "disabling it.",
+                    model_type,
+                )
             scheduler_config.enable_chunked_prefill = False
 
             max_num_batched_tokens = scheduler_config.max_num_batched_tokens
@@ -480,10 +492,10 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
-    # DiffusionGemma 26B-A4B-it (block-diffusion; text backbone == Gemma-4 26B-A4B).
-    # Emits a 256-token block per decode step; the #47488 block-granular runner
-    # and scheduler below preserve the whole [num_reqs, 256] output and advance
-    # num_computed_tokens by the committed block length.
+    # DiffusionGemma 26B-A4B-it (block-diffusion; text backbone == Gemma-4
+    # 26B-A4B). It declares its committed output width through
+    # model_capabilities["output_tokens_per_step"]; the block reservation and
+    # reconciliation contract is tracked by tenstorrent/tt-metal#47488.
     _diffusion_gemma_target = (
         "models.experimental.diffusion_gemma.tt.generator_vllm:"
         "DiffusionGemmaForCausalLM"
@@ -546,7 +558,7 @@ class TTPlatform(Platform):
     device_name: str = "tt"
     device_type: str = "tt"
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
-    block_output_size: ClassVar[int | None] = None
+    output_tokens_per_step: ClassVar[int] = 1
     block_model_max_len: ClassVar[int | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
@@ -589,10 +601,8 @@ class TTPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
-    def _set_block_output_contract(
-        cls, model_class: type, model_config, is_diffusion_gemma: bool
-    ) -> None:
-        """Initialize API-process request validation from parsed capabilities."""
+    def _resolve_output_tokens_per_step(cls, model_class: type) -> int:
+        """Validate and return a model's committed output width capability."""
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
@@ -611,22 +621,11 @@ class TTPlatform(Platform):
                 f"{model_class.__module__}.{model_class.__name__}; "
                 "expected an integer >= 1"
             )
-        if is_diffusion_gemma:
-            if output_tokens_per_step == 1:
-                raise ValueError(
-                    "DiffusionGemma must declare output_tokens_per_step > 1 "
-                    "in model_capabilities"
-                )
-            cls.block_output_size = output_tokens_per_step
-            cls.block_model_max_len = model_config.max_model_len
-        else:
-            cls.block_output_size = None
-            cls.block_model_max_len = None
+        return output_tokens_per_step
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
-        _apply_chunked_prefill_policy(vllm_config)
 
         vllm_config.scheduler_config.disable_chunked_mm_input = True
 
@@ -684,11 +683,6 @@ class TTPlatform(Platform):
         # e.g. "TTLlamaForCausalLM"
         arch_names = vllm_config.model_config.hf_config.architectures
         is_diffusion_gemma = any("DiffusionGemma" in name for name in arch_names)
-        if is_diffusion_gemma and vllm_config.scheduler_config.max_num_seqs != 1:
-            raise ValueError(
-                "DiffusionGemma owns one model-side KV cache and requires "
-                "--max-num-seqs 1"
-            )
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
@@ -750,7 +744,30 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
-        cls._set_block_output_contract(model_class, model_config, is_diffusion_gemma)
+        output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
+        is_block_output_model = output_tokens_per_step > 1
+        if is_diffusion_gemma and not is_block_output_model:
+            raise ValueError(
+                "DiffusionGemma must declare output_tokens_per_step > 1 "
+                "in model_capabilities"
+            )
+        if is_block_output_model and vllm_config.scheduler_config.max_num_seqs != 1:
+            raise ValueError(
+                "Block-output models currently own one model-side request state "
+                "and require --max-num-seqs 1"
+            )
+        if model_config.max_model_len < output_tokens_per_step:
+            raise ValueError(
+                f"max_model_len={model_config.max_model_len} must be at least "
+                f"output_tokens_per_step={output_tokens_per_step}"
+            )
+
+        store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
+        cls.output_tokens_per_step = output_tokens_per_step
+        cls.block_model_max_len = (
+            model_config.max_model_len if is_block_output_model else None
+        )
+        _apply_chunked_prefill_policy(vllm_config, output_tokens_per_step)
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
@@ -852,6 +869,21 @@ class TTPlatform(Platform):
     def uses_host_device_handling(cls) -> bool:
         return True
 
+    def get_max_output_tokens(
+        self, prompt_len: int, requested_max_tokens: int | None = None
+    ) -> int:
+        """Clamp only omitted/default block output to complete canvases."""
+        output_size = type(self).output_tokens_per_step
+        max_model_len = type(self).block_model_max_len
+        if (
+            requested_max_tokens is None
+            and output_size > 1
+            and max_model_len is not None
+        ):
+            remaining = max(0, max_model_len - prompt_len)
+            return remaining // output_size * output_size
+        return super().get_max_output_tokens(prompt_len, requested_max_tokens)
+
     @classmethod
     def validate_request(
         cls,
@@ -867,8 +899,9 @@ class TTPlatform(Platform):
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
 
-        output_size = cls.block_output_size
-        if not isinstance(params, SamplingParams) or not output_size:
+        output_size = cls.output_tokens_per_step
+        is_block_output_model = output_size > 1
+        if not isinstance(params, SamplingParams) or not is_block_output_model:
             return
 
         prompt_token_ids = processed_inputs.get("prompt_token_ids")
@@ -877,57 +910,74 @@ class TTPlatform(Platform):
             prompt_len = len(prompt_token_ids)
             max_tokens = params.max_tokens
             if max_tokens is None:
-                # InputProcessor applies this same unbounded/default clamp after
-                # platform validation. Resolve it here so physical block
-                # capacity is checked before EngineCore dispatch.
-                max_tokens = max(0, max_model_len - prompt_len)
-            num_output_blocks = (max_tokens + output_size - 1) // output_size
-            physical_output_tokens = num_output_blocks * output_size
-            if prompt_len + physical_output_tokens > max_model_len:
-                raise ValueError(
-                    "DiffusionGemma output is committed in physical "
-                    f"{output_size}-token canvases: prompt length {prompt_len} "
-                    f"plus max_tokens={max_tokens} requires "
-                    f"{physical_output_tokens} physical output tokens, exceeding "
-                    f"max_model_len={max_model_len}"
-                )
+                remaining = max(0, max_model_len - prompt_len)
+                usable_default = remaining // output_size * output_size
+                if usable_default < output_size:
+                    raise ValueError(
+                        "The resolved default output capacity cannot fit one "
+                        f"physical {output_size}-token canvas after prompt length "
+                        f"{prompt_len} within max_model_len={max_model_len}. "
+                        "Use a shorter prompt or a larger max model length."
+                    )
+            else:
+                num_output_blocks = (max_tokens + output_size - 1) // output_size
+                physical_output_tokens = num_output_blocks * output_size
+                if prompt_len + physical_output_tokens > max_model_len:
+                    raise ValueError(
+                        "Block output is committed in physical "
+                        f"{output_size}-token canvases: prompt length {prompt_len} "
+                        f"plus user-specified max_tokens={max_tokens} requires "
+                        f"{physical_output_tokens} physical output tokens, "
+                        f"exceeding max_model_len={max_model_len}. Reduce "
+                        "max_tokens or use a shorter prompt."
+                    )
 
         unsupported = []
         if params.n != 1:
-            unsupported.append("n")
+            unsupported.append(f"n={params.n!r} (accepted: 1)")
         if params.logprobs is not None:
-            unsupported.append("logprobs")
+            unsupported.append(f"logprobs={params.logprobs!r} (accepted: omitted/None)")
         if params.temperature != 1.0:
-            unsupported.append("temperature")
+            unsupported.append(
+                f"temperature={params.temperature!r} (accepted transport value: "
+                "1.0; HTTP temperature is not wired to the model-owned Gumbel "
+                "sampler and its internal 0.8-to-0.4 schedule)"
+            )
         if params.top_p != 1.0:
-            unsupported.append("top_p")
+            unsupported.append(f"top_p={params.top_p!r} (accepted: 1.0)")
         if params.top_k not in (0, -1):
-            unsupported.append("top_k")
+            unsupported.append(f"top_k={params.top_k!r} (accepted: 0 or -1)")
         if params.min_p != 0.0:
-            unsupported.append("min_p")
+            unsupported.append(f"min_p={params.min_p!r} (accepted: 0.0)")
         if params.seed is not None:
-            unsupported.append("seed")
+            unsupported.append(f"seed={params.seed!r} (accepted: omitted/None)")
         if params.presence_penalty != 0.0:
-            unsupported.append("presence_penalty")
+            unsupported.append(
+                f"presence_penalty={params.presence_penalty!r} (accepted: 0.0)"
+            )
         if params.frequency_penalty != 0.0:
-            unsupported.append("frequency_penalty")
+            unsupported.append(
+                f"frequency_penalty={params.frequency_penalty!r} (accepted: 0.0)"
+            )
         if params.repetition_penalty != 1.0:
-            unsupported.append("repetition_penalty")
+            unsupported.append(
+                f"repetition_penalty={params.repetition_penalty!r} (accepted: 1.0)"
+            )
         if params.bad_words:
-            unsupported.append("bad_words")
+            unsupported.append("bad_words (accepted: empty)")
         if params.structured_outputs is not None:
-            unsupported.append("structured_outputs")
+            unsupported.append("structured_outputs (accepted: omitted/None)")
         if params.logit_bias is not None:
-            unsupported.append("logit_bias")
+            unsupported.append("logit_bias (accepted: omitted/None)")
         if params.allowed_token_ids is not None:
-            unsupported.append("allowed_token_ids")
+            unsupported.append("allowed_token_ids (accepted: omitted/None)")
         if params.min_tokens != 0:
-            unsupported.append("min_tokens")
+            unsupported.append(f"min_tokens={params.min_tokens!r} (accepted: 0)")
 
         if unsupported:
             raise ValueError(
-                "DiffusionGemma uses its model-owned block sampler and does not "
-                "support these request parameters: " + ", ".join(unsupported)
+                "This block-output model uses its model-owned sampler and does "
+                "not support these request parameters: " + "; ".join(unsupported)
             )
 
     @staticmethod
