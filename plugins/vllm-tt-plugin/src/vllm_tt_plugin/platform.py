@@ -769,6 +769,23 @@ class TTPlatform(Platform):
         )
         _apply_chunked_prefill_policy(vllm_config, output_tokens_per_step)
 
+        if is_block_output_model and model_config.generation_config == "auto":
+            # A block model owns its sampler, and request validation rejects
+            # non-neutral transport sampling values. Under the default
+            # ``--generation-config auto`` vLLM would inject the checkpoint's
+            # generation_config.json entries (DiffusionGemma ships
+            # ``max_new_tokens: 256``) as server-side defaults for every
+            # request that omits them — silently capping bare requests at one
+            # canvas or rejecting them outright. Neutralize the default;
+            # explicit --generation-config / --override-generation-config
+            # settings are respected.
+            logger.info(
+                "Block-output model owns its sampler; ignoring checkpoint "
+                "generation_config sampling defaults "
+                "(equivalent to --generation-config vllm)."
+            )
+            model_config.generation_config = "vllm"
+
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
         # `supports_sample_on_device` in their `model_capabilities` dict.
@@ -784,6 +801,24 @@ class TTPlatform(Platform):
                 f"({model_class.__module__}) does not support on-device sampling. "
                 "Unset sample_on_device_mode or use a model that supports it."
             )
+
+        if is_block_output_model:
+            # Fail at startup, not on the first request: the host sampling
+            # path is single-token shaped and cannot consume a block model's
+            # [num_reqs, output_tokens_per_step] device samples.
+            if sample_on_device_mode != "all":
+                raise ValueError(
+                    "Block-output models emit complete multi-token outputs "
+                    "from the model-owned sampler and require "
+                    f'sample_on_device_mode="all"; got '
+                    f"{sample_on_device_mode!r} in the TT config."
+                )
+            if model_config.logits_processors:
+                raise ValueError(
+                    "Block-output models do not support --logits-processors: "
+                    "logits processors force host sampling, which is "
+                    "incompatible with model-owned multi-token output."
+                )
 
         # Model-gated async scheduling. Async overlap requires generators that
         # support split decode submission via `decode_forward(...,
@@ -823,6 +858,19 @@ class TTPlatform(Platform):
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
+        if is_block_output_model and (
+            get_tt_data_parallel_size(vllm_config) > 1
+            or vllm_config.parallel_config.data_parallel_size > 1
+        ):
+            # The DP gather/pack paths synthesize single-token placeholder
+            # payloads on empty steps, which violates the block output-width
+            # contract; the single model-side request state also cannot be
+            # replicated yet.
+            raise ValueError(
+                "Block-output models do not yet support data parallelism "
+                "(TT lanes or gathered DP); use a single replica."
+            )
+
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
             supports_prefix_caching = (
@@ -849,6 +897,16 @@ class TTPlatform(Platform):
                         "Prefix caching is not supported in TT backend for "
                         "models with sliding window, disabling it"
                     )
+
+        if is_block_output_model and vllm_config.cache_config.enable_prefix_caching:
+            # The commit-time cache_blocks target can exceed the allocated
+            # block coverage for whole-canvas reservations, silently recording
+            # phantom cached blocks. Reject the combination until the paged
+            # bookkeeping is reconciled with block-granular reservation.
+            raise ValueError(
+                "Block-output models do not yet support vLLM automatic "
+                "prefix caching; launch with prefix caching disabled."
+            )
 
         logger.info(
             "Automatic prefix caching is %s",
@@ -881,7 +939,13 @@ class TTPlatform(Platform):
             and max_model_len is not None
         ):
             remaining = max(0, max_model_len - prompt_len)
-            return remaining // output_size * output_size
+            # Never collapse to 0: ``get_max_tokens`` would then build
+            # ``max_tokens=0``, which fails SamplingParams validation with a
+            # confusing message (or, on paths that skip it, reaches the
+            # scheduler). Returning at least one canvas lets
+            # ``max_model_len - prompt_len`` win the min() and
+            # ``validate_request`` produce the canonical capacity error.
+            return max(output_size, remaining // output_size * output_size)
         return super().get_max_output_tokens(prompt_len, requested_max_tokens)
 
     @classmethod
@@ -920,6 +984,18 @@ class TTPlatform(Platform):
                         "Use a shorter prompt or a larger max model length."
                     )
             else:
+                remaining = max_model_len - prompt_len
+                if remaining < output_size:
+                    # No admissible max_tokens exists, so do not advise
+                    # reducing it. This also covers transport defaults that
+                    # were clamped to the sub-canvas remainder.
+                    raise ValueError(
+                        "Block output is committed in physical "
+                        f"{output_size}-token canvases, but prompt length "
+                        f"{prompt_len} leaves only {max(0, remaining)} tokens "
+                        f"within max_model_len={max_model_len}. Use a shorter "
+                        "prompt or a larger max model length."
+                    )
                 num_output_blocks = (max_tokens + output_size - 1) // output_size
                 physical_output_tokens = num_output_blocks * output_size
                 if prompt_len + physical_output_tokens > max_model_len:
@@ -932,37 +1008,57 @@ class TTPlatform(Platform):
                         "max_tokens or use a shorter prompt."
                     )
 
+        # Sampling knobs are accepted but ignored: the model-owned denoise
+        # loop runs its own Gumbel sampler with an internal temperature
+        # schedule, and HTTP sampling values are not wired to it. Neutralize
+        # them in place (validate_request runs before the processor clones
+        # the params) so downstream host-sampling routing never engages, and
+        # warn instead of failing the request — OpenAI clients and checkpoint
+        # generation-config defaults routinely send these.
+        ignored = []
+        if params.temperature != 1.0:
+            ignored.append(f"temperature={params.temperature!r}")
+            params.temperature = 1.0
+        if params.top_p != 1.0:
+            ignored.append(f"top_p={params.top_p!r}")
+            params.top_p = 1.0
+        if params.top_k not in (0, -1):
+            ignored.append(f"top_k={params.top_k!r}")
+            params.top_k = 0
+        if params.min_p != 0.0:
+            ignored.append(f"min_p={params.min_p!r}")
+            params.min_p = 0.0
+        if params.seed is not None:
+            ignored.append(f"seed={params.seed!r}")
+            params.seed = None
+        if params.presence_penalty != 0.0:
+            ignored.append(f"presence_penalty={params.presence_penalty!r}")
+            params.presence_penalty = 0.0
+        if params.frequency_penalty != 0.0:
+            ignored.append(f"frequency_penalty={params.frequency_penalty!r}")
+            params.frequency_penalty = 0.0
+        if params.repetition_penalty != 1.0:
+            ignored.append(f"repetition_penalty={params.repetition_penalty!r}")
+            params.repetition_penalty = 1.0
+        if ignored:
+            logger.warning_once(
+                "This block-output model uses its model-owned sampler; HTTP "
+                "sampling controls are accepted but ignored. This warning is "
+                "logged once per distinct combination."
+            )
+            logger.debug(
+                "Ignoring unsupported sampling controls for block-output model: %s",
+                "; ".join(ignored),
+            )
+
+        # Parameters that change the response contract or force host-side
+        # logits processing cannot be silently ignored; reject them with a
+        # clear error.
         unsupported = []
         if params.n != 1:
             unsupported.append(f"n={params.n!r} (accepted: 1)")
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r} (accepted: omitted/None)")
-        if params.temperature != 1.0:
-            unsupported.append(
-                f"temperature={params.temperature!r} (accepted transport value: "
-                "1.0; HTTP temperature is not wired to the model-owned Gumbel "
-                "sampler and its internal 0.8-to-0.4 schedule)"
-            )
-        if params.top_p != 1.0:
-            unsupported.append(f"top_p={params.top_p!r} (accepted: 1.0)")
-        if params.top_k not in (0, -1):
-            unsupported.append(f"top_k={params.top_k!r} (accepted: 0 or -1)")
-        if params.min_p != 0.0:
-            unsupported.append(f"min_p={params.min_p!r} (accepted: 0.0)")
-        if params.seed is not None:
-            unsupported.append(f"seed={params.seed!r} (accepted: omitted/None)")
-        if params.presence_penalty != 0.0:
-            unsupported.append(
-                f"presence_penalty={params.presence_penalty!r} (accepted: 0.0)"
-            )
-        if params.frequency_penalty != 0.0:
-            unsupported.append(
-                f"frequency_penalty={params.frequency_penalty!r} (accepted: 0.0)"
-            )
-        if params.repetition_penalty != 1.0:
-            unsupported.append(
-                f"repetition_penalty={params.repetition_penalty!r} (accepted: 1.0)"
-            )
         if params.bad_words:
             unsupported.append("bad_words (accepted: empty)")
         if params.structured_outputs is not None:

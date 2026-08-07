@@ -359,7 +359,9 @@ implementations. Current families:
 - Mistral and Mistral 3 multimodal models
 - Gemma 3 multimodal models
 - DiffusionGemma 26B-A4B-it block-diffusion
-  (`TTDiffusionGemmaForBlockDiffusion`)
+  (`TTDiffusionGemmaForBlockDiffusion`) — bring-up: requires the tt-metal
+  DiffusionGemma adapter (tt-metal#52120) declaring
+  `model_capabilities["output_tokens_per_step"]`; not yet on tt-metal main
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 
@@ -395,7 +397,8 @@ clear error before anything reaches the device:
 - Tensor parallel and pipeline parallel execution are not supported.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
-- Chunked prefill is disabled.
+- Token-chunked prefill is enabled only for model types Metal has validated
+  (`gemma4`, `gemma4_unified`) and disabled elsewhere.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
@@ -409,15 +412,23 @@ DiffusionGemma currently has additional serving constraints:
 - Each model step commits one 256-token canvas. Logical `max_tokens` output is
   trimmed only after a complete physical canvas is returned, and prompt plus
   physical output must fit `max_model_len`.
+- When `max_tokens` is omitted, the server default is clamped down to a whole
+  number of canvases (e.g. 261,888 for a 32-token prompt on a 256K server)
+  instead of `max_model_len - prompt_len`.
+- The `--max-num-seqs 1` limit and the request-validation rules below apply to
+  every model declaring `output_tokens_per_step > 1`, not only DiffusionGemma.
 - The current model-owned cache/state path supports one sequence
   (`--max-num-seqs 1`). Automatic prefix caching and async decode are not
   advertised by the model.
 - The denoise loop owns Gumbel sampling and an internal temperature schedule
-  from 0.8 to 0.4. HTTP sampling controls are not wired into that sampler.
-  Use the neutral transport values `temperature=1.0`, `top_p=1.0`,
-  `top_k=0` (or `-1`), `min_p=0.0`, no seed or penalties, and no logprobs or
-  structured-output controls. In particular, `temperature=0` is unsupported;
-  it does not select a greedy mode.
+  from 0.8 to 0.4. HTTP sampling controls are not wired into that sampler:
+  `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and the penalty knobs are
+  accepted but ignored (neutralized with a warning) so stock OpenAI clients
+  keep working. In particular, `temperature=0` does not select a greedy mode.
+  Parameters that change the response contract or force host-side logits
+  processing — `n>1`, `logprobs`, `bad_words`, structured outputs,
+  `logit_bias`, `allowed_token_ids`, `min_tokens` — are still rejected at
+  request validation.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 

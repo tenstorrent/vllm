@@ -74,6 +74,7 @@ def test_finished_request_releases_model_resources_before_row_removal():
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_id_to_index={"req-0": 3}),
         model=SimpleNamespace(release_request=released.append),
+        _retained_model_rows={},
     )
 
     TTModelRunner._release_finished_model_request(runner, "req-0")
@@ -81,11 +82,38 @@ def test_finished_request_releases_model_resources_before_row_removal():
     assert released == [3]
 
 
+def test_off_batch_finish_releases_via_retained_row():
+    """A request that finished while out of the persistent batch still
+    releases the model row recorded at its eviction."""
+    released = []
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_id_to_index={}),
+        model=SimpleNamespace(release_request=released.append),
+        _retained_model_rows={"req-0": 3},
+    )
+
+    TTModelRunner._release_finished_model_request(runner, "req-0")
+
+    assert released == [3]
+    assert runner._retained_model_rows == {}
+
+
+def test_release_hook_survives_rank_that_never_loaded_a_model():
+    """Gathered-DP ranks other than local rank 0 have no ``model``
+    attribute; releasing there must be a no-op, not an AttributeError."""
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 0})
+    runner._retained_model_rows = {}
+
+    TTModelRunner._release_finished_model_request(runner, "req-0")
+
+
 def test_preempted_request_releases_model_resources():
     released = []
     runner = object.__new__(TTModelRunner)
     runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
     runner.model = SimpleNamespace(release_request=released.append)
+    runner._retained_model_rows = {}
     output = SchedulerOutput.make_empty()
     output.preempted_req_ids = {"req-0"}
 
@@ -99,6 +127,7 @@ def test_resumed_request_releases_model_resources_for_rebind():
     runner = object.__new__(TTModelRunner)
     runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
     runner.model = SimpleNamespace(release_request=released.append)
+    runner._retained_model_rows = {}
     output = SchedulerOutput.make_empty()
     output.scheduled_cached_reqs.resumed_req_ids = {"req-0"}
 
@@ -112,6 +141,7 @@ def test_preempted_and_resumed_request_is_released_once():
     runner = object.__new__(TTModelRunner)
     runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
     runner.model = SimpleNamespace(release_request=released.append)
+    runner._retained_model_rows = {}
     output = SchedulerOutput.make_empty()
     output.preempted_req_ids = {"req-0"}
     output.scheduled_cached_reqs.resumed_req_ids = {"req-0"}
@@ -126,6 +156,7 @@ def test_temporarily_unscheduled_request_retains_model_resources():
     runner = object.__new__(TTModelRunner)
     runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
     runner.model = SimpleNamespace(release_request=released.append)
+    runner._retained_model_rows = {}
 
     runner._release_preempted_model_requests(SchedulerOutput.make_empty())
 
@@ -135,6 +166,7 @@ def test_temporarily_unscheduled_request_retains_model_resources():
 def test_block_output_updates_full_runner_state_at_exact_capacity():
     output_tokens = []
     runner = SimpleNamespace(
+        _output_tokens_per_step=MAX_MODEL_LEN,
         input_batch=SimpleNamespace(
             num_reqs=1,
             num_tokens=np.array([0], dtype=np.int32),
@@ -498,6 +530,7 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
             num_tokens=[8],
         ),
         apply_and_build_runner_output=unexpected_final_output,
+        _is_block_output_model=False,
     )
 
     def build_chunked_prefill_output(**kwargs):

@@ -16,7 +16,8 @@ The current TT path is more specialized than upstream vLLM:
 
 - A TT step is treated as either all-prefill or all-decode.
 - TT does not support mixed prefill+decode batches.
-- TT does not support chunked prefill at the scheduling level.
+- Scheduler-level token-chunked prefill is limited to model types Metal has
+  validated (`gemma4`, `gemma4_unified`).
 - CPU-device work overlap is a decode optimization.
 - Gathered-DP is not just "the same thing on more ranks"; it adds a global mode negotiation and a gather/execute/scatter step around every DP execution.
 
@@ -56,7 +57,8 @@ The TT scheduler prefers to admit waiting work first, because TT wants to form a
 The current TT scheduler enforces two important rules:
 
 - no mixed prefill+decode batch
-- no chunked prefill
+- chunked prefill only for validated model types (`gemma4`, `gemma4_unified`),
+  never for block-output models
 
 So each TT scheduling step picks one of:
 
@@ -129,6 +131,20 @@ It means:
   admitted, so an async step cannot overrun the model context
 - the engine can submit the next decode step before the prior result is fully
   retired
+
+The physical reservation itself is not async-only: `_update_after_schedule`
+reserves the complete `output_tokens_per_step` output in both execution modes,
+and `_preempt_request` resets it in both. Async scheduling only adds the
+overlap (and the stale-output tracking that preemption needs).
+
+Two block-output scheduling policies follow from the reservation:
+
+- a running request is *held* (not scheduled, but keeping its
+  `max_num_seqs` slot) when another complete output cannot fit in the model
+  context or when its in-flight outputs already satisfy `max_tokens`
+- a waiting request that bypassed frontend validation and cannot fit a single
+  physical output is finished with `FINISHED_LENGTH_CAPPED`, and the scheduler
+  emits the terminal client output itself
 
 That mechanism matters most for steady-state decode.
 

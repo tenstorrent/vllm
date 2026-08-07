@@ -137,6 +137,11 @@ class TTModelRunner:
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = self._output_tokens_per_step > 1
+        # Rows evicted from the persistent batch while their request was
+        # merely unscheduled keep model-side state bound to the old row.
+        # Remember the binding so a finish that happens while the request is
+        # out of the batch can still release the model's row-owned resources.
+        self._retained_model_rows: dict[str, int] = {}
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -605,29 +610,39 @@ class TTModelRunner:
         Most autoregressive models have no per-request model state and therefore
         expose no callback. Block-diffusion models can own Metal traces and
         persistent buffers keyed by the current batch row; release them before
-        ``InputBatch.remove_request`` invalidates that row mapping.
+        ``InputBatch.remove_request`` invalidates that row mapping. A request
+        can also finish while out of the persistent batch (it stopped being
+        scheduled while its last outputs were still in flight), so fall back
+        to the row recorded at its eviction. Gathered-DP ranks other than
+        local rank 0 never load a model and have nothing to release.
         """
         req_index = self.input_batch.req_id_to_index.get(req_id)
-        release_request = getattr(self.model, "release_request", None)
+        if req_index is None:
+            req_index = self._retained_model_rows.get(req_id)
+        self._retained_model_rows.pop(req_id, None)
+        release_request = getattr(getattr(self, "model", None), "release_request", None)
         if req_index is not None and callable(release_request):
             release_request(req_index)
 
     def _release_preempted_model_requests(
         self, scheduler_output: SchedulerOutput
-    ) -> None:
+    ) -> set[str]:
         """Release model state for explicit preemption and resumed re-prefill.
 
         A request absent from one scheduler step can be temporarily unscheduled
         and later resumed, so the general unscheduled path must retain its
         model state. Explicitly preempted requests and requests resumed after a
         prefix-cache reset both restart prefill from scratch. The union avoids
-        releasing twice if a request appears in both scheduler fields.
+        releasing twice if a request appears in both scheduler fields. Returns
+        the released ids so eviction bookkeeping does not re-record rows whose
+        model state is already gone.
         """
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         req_ids = set(scheduler_output.preempted_req_ids or ())
         req_ids.update(resumed_req_ids)
         for req_id in req_ids:
             self._release_finished_model_request(req_id)
+        return req_ids
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
@@ -660,7 +675,7 @@ class TTModelRunner:
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
 
-        self._release_preempted_model_requests(scheduler_output)
+        released_req_ids = self._release_preempted_model_requests(scheduler_output)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -677,6 +692,11 @@ class TTModelRunner:
         for req_id in unscheduled_req_ids:
             req_index = self.input_batch.remove_request(req_id)
             assert req_index is not None
+            if req_id not in released_req_ids:
+                # Model state stays bound to this row while the request is
+                # out of the batch; remember it for a possible off-batch
+                # finish (see _release_finished_model_request).
+                self._retained_model_rows[req_id] = req_index
             removed_req_indices.append(req_index)
             persistent_batch_layout_changed = True
 
@@ -721,6 +741,8 @@ class TTModelRunner:
             # Fill the empty index, or append to the end.
             req_index = removed_req_indices.pop() if removed_req_indices else None
             self.input_batch.add_request(req_state, req_index)
+            # Back in the batch: the live row mapping is authoritative again.
+            self._retained_model_rows.pop(req_id, None)
             persistent_batch_layout_changed = True
 
         # Condense the batched states if there are empty indices.
@@ -2371,7 +2393,7 @@ class TTModelRunner:
         req_id_to_index: dict[str, int] | None = None,
     ) -> ModelRunnerOutput:
         """Builds output with ``[]`` for intermediate, ``[tokens]`` for final chunks."""
-        if getattr(self, "_is_block_output_model", False):
+        if self._is_block_output_model:
             raise RuntimeError(
                 "vLLM scheduler chunked prefill must be disabled for block-output "
                 "models because intermediate prefill output is single-token shaped"
@@ -3086,9 +3108,7 @@ class TTModelRunner:
         # tenstorrent/tt-metal#47488: emit all physical output tokens per
         # request as the list EngineCore appends and detokenizes.
         num_out_tokens = sampled_token_ids.shape[1]
-        expected_output_tokens = getattr(
-            self, "_output_tokens_per_step", num_out_tokens
-        )
+        expected_output_tokens = self._output_tokens_per_step
         if num_out_tokens != expected_output_tokens:
             raise ValueError(
                 "Model output width violates output_tokens_per_step: "
@@ -3138,9 +3158,7 @@ class TTModelRunner:
         # [num_reqs, output_tokens_per_step] shape and advance runner state by
         # the complete physical output rather than assuming one AR token.
         num_out_tokens = sampled_token_ids.shape[1]
-        expected_output_tokens = getattr(
-            self, "_output_tokens_per_step", num_out_tokens
-        )
+        expected_output_tokens = self._output_tokens_per_step
         if num_out_tokens != expected_output_tokens:
             raise ValueError(
                 "Model output width violates output_tokens_per_step: "

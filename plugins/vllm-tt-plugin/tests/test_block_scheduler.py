@@ -18,6 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -43,7 +44,6 @@ def _scheduler(
 ):
     model_config = ModelConfig(
         model="Qwen/Qwen2-0.5B-Instruct",
-        trust_remote_code=True,
         dtype="float16",
         seed=42,
     )
@@ -70,13 +70,17 @@ def _scheduler(
         parallel_config=ParallelConfig(),
         device_config=DeviceConfig(device="cpu"),
     )
-    # The host test environment may select CPUPlatform, whose config hook
-    # disables async scheduling. Restore the requested TT scheduler mode after
-    # generic VllmConfig construction.
+    # The host test environment's platform config hook (CPUPlatform, or
+    # TTPlatform itself when ttnn is importable) rewrites async scheduling and
+    # chunked-prefill settings for the probe model. Restore the requested
+    # values after generic VllmConfig construction so these tests exercise
+    # the intended scheduler configuration.
     vllm_config.scheduler_config.async_scheduling = async_scheduling
-    has_normalized_capability = hasattr(tt_config, "store_tt_output_tokens_per_step")
-    if has_normalized_capability:
-        tt_config.store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
+    vllm_config.scheduler_config.enable_chunked_prefill = enable_chunked_prefill
+    vllm_config.scheduler_config.max_num_batched_tokens = (
+        max_num_batched_tokens or max_model_len
+    )
+    tt_config.store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
 
     num_blocks = max_model_len // BLOCK_SIZE + 2
     kv_cache_config = KVCacheConfig(
@@ -102,21 +106,15 @@ def _scheduler(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
-    if not has_normalized_capability:
-        # Compatibility seam for proving these regressions against PR head
-        # 88c7b5845, before config normalization moved out of the scheduler.
-        scheduler._output_tokens_per_step = output_tokens_per_step
-        scheduler._is_block_output_model = output_tokens_per_step > 1
-        scheduler._cache_block_outputs = (
-            output_tokens_per_step == 1 or enable_prefix_caching
-        )
     return scheduler
 
 
-def _request(prompt_len, max_tokens=MAX_MODEL_LEN, *, ignore_eos=True):
+def _request(
+    prompt_len, max_tokens=MAX_MODEL_LEN, *, ignore_eos=True, request_id="req-0"
+):
     init_none_hash(sha256)
     return Request(
-        request_id="req-0",
+        request_id=request_id,
         prompt_token_ids=[1] * prompt_len,
         sampling_params=SamplingParams(
             max_tokens=max_tokens,
@@ -264,6 +262,25 @@ def test_scheduler_rejects_bypassed_waiting_request_without_canvas_capacity():
     assert scheduler_output.total_num_scheduled_tokens == 0
     assert scheduler_output.finished_req_ids == {request.request_id}
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+    # The request was never scheduled, so the base update loop builds no
+    # output for it; the scheduler must emit the terminal event itself or
+    # the client waits forever.
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    (terminal,) = outputs[0].outputs
+    assert terminal.request_id == request.request_id
+    assert terminal.finish_reason == FinishReason.LENGTH
+    assert terminal.new_token_ids == []
 
 
 def test_max_tokens_trims_final_canvas_and_reclaims_reservation():
@@ -419,3 +436,137 @@ def test_scheduler_does_not_reserve_temporarily_unscheduled_request():
         request.num_computed_tokens,
         request.num_output_placeholders,
     ) == before
+
+
+def test_async_final_canvas_in_flight_schedules_no_wasted_step():
+    """The in-flight canvas surely satisfies max_tokens; no extra dispatch."""
+    scheduler = _scheduler(async_scheduling=True)
+    request = _request(prompt_len=32, max_tokens=CANVAS_LENGTH // 2)
+    block_zero = _schedule_block_zero(scheduler, request)
+
+    held = scheduler.schedule()
+
+    assert held.total_num_scheduled_tokens == 0
+    assert request in scheduler.running
+    assert not request.is_finished()
+
+    outputs = scheduler.update_from_output(
+        block_zero,
+        _runner_output(block_zero, list(range(3, 3 + CANVAS_LENGTH))),
+    )
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert len(outputs[0].outputs[0].new_token_ids) == CANVAS_LENGTH // 2
+    assert request.num_output_placeholders == 0
+
+
+def test_held_request_keeps_max_num_seqs_slot():
+    """A held request still owns its slot; no replacement is admitted."""
+    scheduler = _scheduler(async_scheduling=True)
+    r1 = _request(prompt_len=32, max_tokens=CANVAS_LENGTH // 2)
+    block_zero = _schedule_block_zero(scheduler, r1)
+
+    r2 = _request(prompt_len=16, max_tokens=CANVAS_LENGTH, request_id="req-1")
+    scheduler.add_request(r2)
+
+    held = scheduler.schedule()
+    assert held.total_num_scheduled_tokens == 0
+    assert not r1.is_finished()
+    assert [r.request_id for r in scheduler.running] == ["req-0"]
+    assert len(scheduler.running) <= scheduler.max_num_running_reqs
+
+    scheduler.update_from_output(
+        block_zero,
+        _runner_output(block_zero, list(range(3, 3 + CANVAS_LENGTH))),
+    )
+    assert r1.is_finished()
+
+    admitted = scheduler.schedule()
+    assert admitted.num_scheduled_tokens == {"req-1": r2.num_prompt_tokens}
+
+
+def test_sync_forced_reset_commits_fresh_canvas_after_resume():
+    """pause/reset resume must not swallow the first regenerated canvas."""
+    scheduler = _scheduler(async_scheduling=False)
+    request = _request(prompt_len=32, max_tokens=3 * CANVAS_LENGTH)
+    step_a = _schedule_block_zero(scheduler, request)
+    canvas1 = list(range(3, 3 + CANVAS_LENGTH))
+    scheduler.update_from_output(step_a, _runner_output(step_a, canvas1))
+    assert request.num_output_tokens == CANVAS_LENGTH
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.discard_latest_async_tokens
+
+    scheduler.prev_step_scheduled_req_ids.clear()
+    step_b = scheduler.schedule()
+    assert step_b.num_scheduled_tokens == {request.request_id: request.num_tokens}
+
+    canvas2 = list(range(103, 103 + CANVAS_LENGTH))
+    outputs = scheduler.update_from_output(step_b, _runner_output(step_b, canvas2))
+
+    assert outputs[0].outputs[0].new_token_ids == canvas2
+    assert request.num_output_tokens == 2 * CANVAS_LENGTH
+    assert request.num_output_placeholders == 0
+    assert not request.discard_latest_async_tokens
+
+
+def test_async_forced_reset_with_running_block_request_is_refused():
+    """Async runner state has already applied in-flight canvases; refuse."""
+    scheduler = _scheduler(async_scheduling=True)
+    request = _request(prompt_len=32)
+    _schedule_block_zero(scheduler, request)
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True) is False
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_output_placeholders == CANVAS_LENGTH
+
+
+def test_default_mode_fallback_preserves_finished_req_ids():
+    """The discarded prefill-only output consumes ``finished_req_ids``; the
+    decode-only fallback must carry them so the model runner still releases
+    the finished requests' state."""
+    scheduler = _scheduler(async_scheduling=True)
+    r1 = _request(prompt_len=32, max_tokens=4 * CANVAS_LENGTH)
+    _schedule_block_zero(scheduler, r1)
+
+    r2 = _request(prompt_len=16, max_tokens=CANVAS_LENGTH, request_id="req-1")
+    r3 = _request(prompt_len=16, max_tokens=CANVAS_LENGTH, request_id="req-2")
+    scheduler.add_request(r2)
+    scheduler.add_request(r3)
+    scheduler.finish_requests(["req-1"], RequestStatus.FINISHED_ABORTED)
+
+    # r1 running decode + r3 waiting: prefill-only cannot admit (slot taken),
+    # so DEFAULT mode discards that output and reschedules decode-only.
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.num_scheduled_tokens == {"req-0": 1}
+    assert "req-1" in scheduler_output.finished_req_ids
+
+
+def test_ar_async_preemption_discards_stale_and_resumes():
+    """K=1 async keeps stock AsyncScheduler behavior through the TT preempt
+    override (stale outputs dropped, placeholders reset, clean resume)."""
+    scheduler = _scheduler(output_tokens_per_step=1, async_scheduling=True)
+    request = _request(prompt_len=32, max_tokens=8)
+    step_a = _schedule_block_zero(scheduler, request)
+    step_b = scheduler.schedule()
+    assert step_b.num_scheduled_tokens == {"req-0": 1}
+    assert request.num_output_placeholders == 2
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, timestamp=0.0)
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_output_placeholders == 0
+
+    for stale_step in (step_a, step_b):
+        outputs = scheduler.update_from_output(
+            stale_step, _runner_output(stale_step, [7])
+        )
+        assert all(not client_output.outputs for client_output in outputs.values())
+    assert request.num_output_tokens == 0
+
+    scheduler.prev_step_scheduled_req_ids.clear()
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens == {"req-0": request.num_prompt_tokens}
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_output_placeholders == 1

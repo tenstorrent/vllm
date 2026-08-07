@@ -96,6 +96,17 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         if result.reasoning is None:
             return result
 
+        # A multi-token first delta (e.g. a whole DiffusionGemma canvas) can
+        # carry the literal start marker plus reasoning text in one chunk;
+        # the base parser only strips the marker when it arrives as its own
+        # delta. Strip it here so streaming matches non-streaming extraction.
+        if (
+            not self._prefix_stripped
+            and not self._reasoning_text
+            and result.reasoning.startswith(self.start_token)
+        ):
+            result.reasoning = result.reasoning[len(self.start_token) :]
+
         self._reasoning_text += result.reasoning
 
         if self._prefix_stripped:

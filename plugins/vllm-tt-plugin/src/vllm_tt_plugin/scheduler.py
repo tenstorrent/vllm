@@ -9,6 +9,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.request import Request, RequestStatus
 from vllm_tt_plugin.config import get_tt_output_tokens_per_step
 from vllm_tt_plugin.logger import init_tt_logger
@@ -133,6 +134,10 @@ class TTScheduler(AsyncScheduler):
             not self._is_block_output_model
             or self.vllm_config.cache_config.enable_prefix_caching
         )
+        # Requests finished by the schedule-time capacity backstop; they were
+        # never scheduled, so update_from_output must emit their terminal
+        # client output explicitly.
+        self._bypassed_finished_requests: list[Request] = []
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -156,8 +161,39 @@ class TTScheduler(AsyncScheduler):
             <= self.max_model_len
         )
 
+    def _must_hold_output_step(self, request: Request) -> bool:
+        """Whether dispatching another physical output is impossible or wasted.
+
+        Holds a running block request when another complete output cannot fit
+        in the model context (capacity backstop for admissions that bypassed
+        frontend validation), or when the outputs already in flight are
+        guaranteed to satisfy ``max_tokens``: an unstopped canvas always
+        returns ``output_tokens_per_step`` tokens, so once committed plus
+        reserved output reaches ``max_tokens`` any further diffusion step
+        would only be discarded. This mirrors AsyncScheduler's max-tokens
+        skip, whose ``num_output_placeholders - 1`` draft-token correction
+        cancels the whole physical reservation for block models.
+        """
+        if not self._is_block_output_model:
+            return False
+        if not self._has_capacity_for_output_step(request):
+            return True
+        return (
+            request.num_output_placeholders > 0
+            and request.num_output_tokens + request.num_output_placeholders
+            >= request.max_tokens
+        )
+
     def _finish_impossible_waiting_requests(self) -> None:
-        """Reject bypassed admissions that cannot fit their first canvas."""
+        """Reject bypassed admissions that cannot fit their first canvas.
+
+        ``finish_requests`` alone only reaches the model runner via
+        ``finished_req_ids``; these requests were never scheduled, so the
+        base ``update_from_output`` loop would build no client-visible
+        output and the front end would wait forever. Stash them so
+        ``update_from_output`` can emit a terminal ``EngineCoreOutput``
+        (mirroring the base scheduler's failed-KV-load handling).
+        """
         if not self._is_block_output_model:
             return
         impossible_req_ids = [
@@ -171,35 +207,67 @@ class TTScheduler(AsyncScheduler):
                 "capacity validation and cannot fit a physical output: %s",
                 impossible_req_ids,
             )
+            requests = [self.requests[req_id] for req_id in impossible_req_ids]
             self.finish_requests(
                 impossible_req_ids, RequestStatus.FINISHED_LENGTH_CAPPED
             )
+            self._bypassed_finished_requests.extend(requests)
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output,
+    ) -> dict[int, EngineCoreOutputs]:
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        if self._bypassed_finished_requests:
+            for request in self._bypassed_finished_requests:
+                client_outputs = outputs.get(request.client_index)
+                if client_outputs is None:
+                    client_outputs = EngineCoreOutputs(outputs=[])
+                    outputs[request.client_index] = client_outputs
+                client_outputs.outputs.append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                        num_cached_tokens=request.num_cached_tokens,
+                    )
+                )
+            self._bypassed_finished_requests.clear()
+        return outputs
 
     def schedule(self) -> SchedulerOutput:
         self._finish_impossible_waiting_requests()
 
         # Async scheduling can have one or more complete physical outputs
         # reserved in ``num_output_placeholders``. Hide a running request when
-        # another complete output would exceed capacity; its oldest in-flight
-        # output is still dispatched and reconciled normally.
-        deferred_running = [
-            request
-            for request in self.running
-            if not self._has_capacity_for_output_step(request)
+        # another complete output would exceed capacity or is provably wasted;
+        # its in-flight outputs are still dispatched and reconciled normally.
+        held_running = [
+            request for request in self.running if self._must_hold_output_step(request)
         ]
-        if deferred_running:
-            deferred_req_ids = {request.request_id for request in deferred_running}
-            self.running = [
-                request
-                for request in self.running
-                if request.request_id not in deferred_req_ids
-            ]
-
-        has_pending_prefill = self._has_pending_prefill()
-        has_running = any(not r.is_prefill_chunk for r in self.running)
-        mode = self._forced_mode
-        result = None
+        saved_max_num_running_reqs = self.max_num_running_reqs
         try:
+            if held_running:
+                held_req_ids = {request.request_id for request in held_running}
+                self.running = [
+                    request
+                    for request in self.running
+                    if request.request_id not in held_req_ids
+                ]
+                # A held request still owns its scheduling slot. Without this,
+                # hiding it from ``running`` would free the slot and the base
+                # waiting loop could admit a replacement while the held request
+                # is unfinished and its model-side state is still bound.
+                self.max_num_running_reqs = max(
+                    0, saved_max_num_running_reqs - len(held_running)
+                )
+
+            has_pending_prefill = self._has_pending_prefill()
+            has_running = any(not r.is_prefill_chunk for r in self.running)
+            mode = self._forced_mode
             if mode == TTSchedulingMode.PREFILL_ONLY:
                 result = self._schedule_prefill_only()
             elif mode == TTSchedulingMode.DECODE_ONLY:
@@ -215,17 +283,25 @@ class TTScheduler(AsyncScheduler):
                 # make progress.
                 result = self._schedule_prefill_only()
                 if result.total_num_scheduled_tokens == 0 and has_running:
+                    # The discarded prefill-only output already consumed
+                    # ``self.finished_req_ids``; carry them over so the model
+                    # runner still sees the finish (and releases model-owned
+                    # row state).
+                    discarded_finished = result.finished_req_ids
                     result = self._schedule_decode_only()
+                    if discarded_finished:
+                        result.finished_req_ids |= discarded_finished
             else:
                 # No pending prefill work: run decode-only naturally.
                 result = super().schedule()
             return self._finalize_scheduler_output(result)
         finally:
-            if deferred_running:
+            self.max_num_running_reqs = saved_max_num_running_reqs
+            if held_running:
                 active_req_ids = {request.request_id for request in self.running}
                 self.running.extend(
                     request
-                    for request in deferred_running
+                    for request in held_running
                     if request.request_id in self.requests
                     and not request.is_finished()
                     and request.request_id not in active_req_ids
@@ -281,6 +357,32 @@ class TTScheduler(AsyncScheduler):
                 self.running.extend(partial_prefills)
 
         return result
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Refuse the forced-preempt reset for async block-output serving.
+
+        Under async scheduling the model runner has already applied in-flight
+        canvases that this reset discards scheduler-side; resuming from that
+        divergent state is unrecoverable. Synchronous block serving resumes
+        correctly (``_update_request_with_output`` commits the fresh
+        post-resume canvas), so only the unsafe combination is refused.
+        """
+        if (
+            reset_running_requests
+            and self._is_block_output_model
+            and self.scheduler_config.async_scheduling
+            and self.running
+        ):
+            logger.error(
+                "reset_prefix_cache(reset_running_requests=True) is not "
+                "supported for block-output models under async scheduling; "
+                "refusing while %d request(s) are running.",
+                len(self.running),
+            )
+            return False
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and drop any outputs still in the pipeline.
@@ -358,8 +460,14 @@ class TTScheduler(AsyncScheduler):
             )
 
         if request.discard_latest_async_tokens:
+            # ``reset_prefix_cache``'s forced preemption sets this to drop one
+            # raced 1-token AR output. Block models already drop raced outputs
+            # through ``_PendingOutputs`` staleness (handled above, which also
+            # clears this flag), so a canvas reaching this point is fresh
+            # post-resume work: commit it. Returning early here would silently
+            # lose a whole canvas and permanently leak its physical
+            # reservation.
             request.discard_latest_async_tokens = False
-            return [], False
 
         status_before_update = request.status
         # The base scheduler appends tokens and applies EOS/max-token trimming.

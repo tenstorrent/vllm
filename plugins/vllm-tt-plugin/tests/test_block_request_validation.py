@@ -13,7 +13,6 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 @pytest.fixture(autouse=True)
 def block_model_contract(monkeypatch):
     monkeypatch.setattr(TTPlatform, "output_tokens_per_step", 256, raising=False)
-    monkeypatch.setattr(TTPlatform, "block_output_size", 256, raising=False)
     monkeypatch.setattr(TTPlatform, "block_model_max_len", 262144)
 
 
@@ -73,8 +72,15 @@ def test_block_model_clamps_transport_default_to_whole_canvas_capacity(monkeypat
     assert platform.get_max_output_tokens(1000) == 261120
     assert platform.get_max_output_tokens(261887) == 256
     assert platform.get_max_output_tokens(261888) == 256
+    # Past the last whole-canvas boundary the clamp must not collapse to 0:
+    # max_tokens=0 would fail SamplingParams validation with a confusing
+    # message. The min() then lands on max_model_len - prompt_len and
+    # validate_request produces the canonical capacity error.
+    assert platform.get_max_output_tokens(261889) == 256
+    assert platform.get_max_output_tokens(262000) == 256
     assert entrypoint_utils.get_max_tokens(262144, None, 32, {}) == 261888
     assert entrypoint_utils.get_max_tokens(262144, 257, 261887, {}) == 257
+    assert entrypoint_utils.get_max_tokens(262144, None, 262000, {}) == 144
 
 
 def test_block_model_rejects_omitted_max_tokens_when_no_canvas_fits():
@@ -97,16 +103,53 @@ def test_block_model_accepts_neutral_temperature():
     _validate(SamplingParams(max_tokens=256, temperature=1.0))
 
 
-def test_block_model_rejects_zero_temperature_as_unwired_transport_control():
-    with pytest.raises(ValueError) as exc_info:
-        _validate(SamplingParams(max_tokens=256, temperature=0.0))
+_NEUTRAL_SAMPLING_VALUES = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "seed": None,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+}
 
-    message = str(exc_info.value)
-    assert "temperature=0.0" in message
-    assert "accepted transport value: 1.0" in message
-    assert "model-owned Gumbel sampler" in message
-    assert "0.8-to-0.4" in message
-    assert "greedy" not in message.lower()
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", 0.0),
+        ("temperature", 0.5),
+        ("top_p", 0.9),
+        ("top_k", 10),
+        ("min_p", 0.1),
+        ("seed", 42),
+        ("presence_penalty", 0.5),
+        ("frequency_penalty", 0.5),
+        ("repetition_penalty", 1.1),
+    ],
+)
+def test_block_model_accepts_and_ignores_sampling_knobs(field, value):
+    """Sampling knobs must not fail the request; the model-owned sampler
+    ignores them, so they are neutralized in place instead."""
+    params = SamplingParams(max_tokens=256, **{field: value})
+
+    _validate(params)
+
+    assert getattr(params, field) == _NEUTRAL_SAMPLING_VALUES[field]
+
+
+def test_block_model_ignores_typical_client_default_sampling_bundle():
+    """A stock OpenAI-client request (or checkpoint generation-config
+    injection) sends several non-neutral knobs at once; the request must
+    succeed and every knob must be neutralized."""
+    params = SamplingParams(max_tokens=256, temperature=0.7, top_p=0.95, top_k=64)
+
+    _validate(params)
+
+    assert params.temperature == 1.0
+    assert params.top_p == 1.0
+    assert params.top_k == 0
 
 
 @pytest.mark.parametrize(
@@ -114,15 +157,6 @@ def test_block_model_rejects_zero_temperature_as_unwired_transport_control():
     [
         ({"n": 2}, "n"),
         ({"logprobs": 0}, "logprobs"),
-        ({"temperature": 0.0}, "temperature"),
-        ({"temperature": 0.5}, "temperature"),
-        ({"top_p": 0.9}, "top_p"),
-        ({"top_k": 10}, "top_k"),
-        ({"min_p": 0.1}, "min_p"),
-        ({"seed": 42}, "seed"),
-        ({"presence_penalty": 0.5}, "presence_penalty"),
-        ({"frequency_penalty": 0.5}, "frequency_penalty"),
-        ({"repetition_penalty": 1.1}, "repetition_penalty"),
         ({"bad_words": ["forbidden"]}, "bad_words"),
         (
             {"structured_outputs": StructuredOutputsParams(json_object=True)},
@@ -133,7 +167,9 @@ def test_block_model_rejects_zero_temperature_as_unwired_transport_control():
         ({"min_tokens": 1}, "min_tokens"),
     ],
 )
-def test_block_model_rejects_unsupported_request_sampling(kwargs, parameter):
+def test_block_model_rejects_response_contract_parameters(kwargs, parameter):
+    """Parameters that change the response contract or force host-side
+    logits processing are still rejected with a clear error."""
     with pytest.raises(ValueError, match=parameter):
         _validate(SamplingParams(**kwargs))
 
@@ -143,6 +179,10 @@ def _public_config(
     max_model_len=262144,
     max_num_seqs=1,
     enable_chunked_prefill=True,
+    sample_on_device_mode=None,
+    enable_prefix_caching=False,
+    data_parallel_size=1,
+    logits_processors=None,
 ):
     scheduler_config = SimpleNamespace(
         max_num_seqs=max_num_seqs,
@@ -163,21 +203,35 @@ def _public_config(
             model_type="gemma4",
         ),
         get_sliding_window=lambda: None,
+        generation_config="auto",
+        logits_processors=logits_processors,
+    )
+    additional_config = (
+        {"tt": {"sample_on_device_mode": sample_on_device_mode}}
+        if sample_on_device_mode
+        else {}
     )
     return SimpleNamespace(
         scheduler_config=scheduler_config,
         model_config=model_config,
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             worker_cls="auto",
-            data_parallel_size=1,
+            data_parallel_size=data_parallel_size,
         ),
         speculative_config=None,
         lora_config=None,
-        additional_config={},
+        additional_config=additional_config,
     )
+
+
+class _DeviceSamplingBlockModel:
+    model_capabilities = {
+        "output_tokens_per_step": 256,
+        "supports_sample_on_device": True,
+    }
 
 
 def _patch_public_config_dependencies(monkeypatch, model_class):
@@ -205,11 +259,8 @@ def _patch_public_config_dependencies(monkeypatch, model_class):
 def test_public_config_normalizes_generic_block_capability_and_disables_chunking(
     monkeypatch,
 ):
-    class BlockModel:
-        model_capabilities = {"output_tokens_per_step": 256}
-
-    config = _public_config()
-    _patch_public_config_dependencies(monkeypatch, BlockModel)
+    config = _public_config(sample_on_device_mode="all")
+    _patch_public_config_dependencies(monkeypatch, _DeviceSamplingBlockModel)
 
     TTPlatform.check_and_update_config(config)
 
@@ -219,6 +270,52 @@ def test_public_config_normalizes_generic_block_capability_and_disables_chunking
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.scheduler_config.max_num_batched_tokens == 262144
+    # The model-owned sampler contract also neutralizes checkpoint
+    # generation_config defaults that would otherwise be injected into
+    # bare requests (DiffusionGemma ships max_new_tokens=256).
+    assert config.model_config.generation_config == "vllm"
+
+
+def test_public_config_requires_device_sampling_for_block_model(monkeypatch):
+    config = _public_config(sample_on_device_mode=None)
+    _patch_public_config_dependencies(monkeypatch, _DeviceSamplingBlockModel)
+
+    with pytest.raises(ValueError, match=r'require.*sample_on_device_mode="all"'):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_public_config_rejects_logits_processors_for_block_model(monkeypatch):
+    config = _public_config(
+        sample_on_device_mode="all", logits_processors=["custom.Processor"]
+    )
+    _patch_public_config_dependencies(monkeypatch, _DeviceSamplingBlockModel)
+
+    with pytest.raises(ValueError, match=r"logits-processors"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_public_config_rejects_data_parallel_block_model(monkeypatch):
+    config = _public_config(sample_on_device_mode="all", data_parallel_size=2)
+    config.scheduler_config.max_num_seqs = 1
+    _patch_public_config_dependencies(monkeypatch, _DeviceSamplingBlockModel)
+
+    with pytest.raises(ValueError, match=r"do not yet support data parallelism"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_public_config_rejects_prefix_caching_block_model(monkeypatch):
+    class PrefixCachingBlockModel:
+        model_capabilities = {
+            "output_tokens_per_step": 256,
+            "supports_sample_on_device": True,
+            "supports_prefix_caching": True,
+        }
+
+    config = _public_config(sample_on_device_mode="all", enable_prefix_caching=True)
+    _patch_public_config_dependencies(monkeypatch, PrefixCachingBlockModel)
+
+    with pytest.raises(ValueError, match=r"prefix caching"):
+        TTPlatform.check_and_update_config(config)
 
 
 def test_public_config_rejects_block_width_larger_than_model_context(monkeypatch):
@@ -261,6 +358,8 @@ def test_public_config_defaults_autoregressive_model_to_one_token(monkeypatch):
     assert TTPlatform.output_tokens_per_step == 1
     assert TTPlatform.block_model_max_len is None
     assert config.scheduler_config.enable_chunked_prefill is True
+    # Autoregressive models keep vLLM's default generation-config handling.
+    assert config.model_config.generation_config == "auto"
 
 
 def test_public_config_requires_diffusion_gemma_to_declare_block_width(monkeypatch):
@@ -276,3 +375,16 @@ def test_public_config_requires_diffusion_gemma_to_declare_block_width(monkeypat
         match=r"DiffusionGemma must declare output_tokens_per_step > 1",
     ):
         TTPlatform.check_and_update_config(config)
+
+
+def test_block_model_clamped_transport_default_gets_canonical_error():
+    """A prompt past the last whole-canvas boundary resolves to a small
+    positive default max_tokens; validation must produce the capacity error
+    (not a max_tokens=0 crash, not advice to reduce max_tokens)."""
+    with pytest.raises(ValueError) as exc_info:
+        _validate(SamplingParams(max_tokens=144), prompt_len=262000)
+
+    message = str(exc_info.value)
+    assert "physical 256-token canvases" in message
+    assert "shorter prompt" in message
+    assert "Reduce max_tokens" not in message
