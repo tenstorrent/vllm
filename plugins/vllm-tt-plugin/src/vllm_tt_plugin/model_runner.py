@@ -1264,9 +1264,9 @@ class TTModelRunner:
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
-        # State follows the request, not the row (``self._req_state_slot``). That
-        # subsumes the batch's condense-move remap, so pop and discard it.
-        input_batch.pop_slot_remap()
+        # State follows the request, not the row (``self._req_state_slot``), which
+        # subsumes the batch's condense-move remap.
+        input_batch.reset_slot_remap()
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
         if is_prompt:
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)

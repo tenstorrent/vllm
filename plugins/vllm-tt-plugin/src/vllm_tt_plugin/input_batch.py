@@ -249,12 +249,17 @@ class InputBatch:
 
         # Slot remap for seed manager: remap[i] = j means slot i's data came
         # from slot j after condense.  Identity when nothing moved.
+        # Only the lane decode builder reads it; _prepare_model_inputs discards it.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
+
+    def reset_slot_remap(self) -> None:
+        """Drop any pending slot remap; the identity from here."""
+        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
     def pop_slot_remap(self) -> torch.Tensor:
         """Return pending slot remap and reset to identity."""
         remap = self._slot_remap
-        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
+        self.reset_slot_remap()
         return remap
 
     @property
@@ -480,7 +485,7 @@ class InputBatch:
             self.sampling.batch_update_builder.moved.append(
                 (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
             )
-            # Track for on-device seed manager slot reindexing.
+            # Condense-move tracking; only _prepare_model_inputs pops it, to discard.
             self._slot_remap[empty_index] = self._slot_remap[last_req_index]
 
             # Swap the states.
