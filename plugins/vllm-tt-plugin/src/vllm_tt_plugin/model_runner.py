@@ -613,8 +613,10 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            # Only a FINISHED request releases its slot; an unscheduled one still
-            # owns its state even though the lines below drop it from the batch.
+            self._req_state_slot.pop(req_id, None)
+
+        # Preempted requests re-prefill from scratch: their state is already dead.
+        for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
@@ -817,25 +819,38 @@ class TTModelRunner:
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing."""
+        steady state moves nothing. Evicts a holder rather than raising if full."""
         n_slots = self.tt_per_lane_max_num_seqs
         prefilling = set(row_req_ids)
-        held = {
-            slot
+        # Slot -> holder, so exhaustion can name a victim.
+        holder = {
+            slot: req_id
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        held = set(holder)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
             if row < n_slots and row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
-                assert free, (
-                    f"no free device state slot for {len(row_req_ids)} prefill(s): "
-                    f"held={sorted(held)}, capacity={n_slots}"
-                )
-                slot = free[0]
+                if free:
+                    slot = free[0]
+                else:
+                    # Evicting a holder costs one response; asserting kills the engine.
+                    slot = max(holder) if holder else row % n_slots
+                    evicted = holder.pop(slot, None)
+                    self._req_state_slot.pop(evicted, None)
+                    logger.warning(
+                        "TT device state slots exhausted for %d prefill(s) "
+                        "(capacity %d); taking slot %d from %s -- that response "
+                        "may be incoherent.",
+                        len(row_req_ids),
+                        n_slots,
+                        slot,
+                        evicted,
+                    )
             held.add(slot)
             self._req_state_slot[req_id] = slot
             slots.append(slot)

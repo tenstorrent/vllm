@@ -14,7 +14,6 @@ against a fake runner.
 
 from types import SimpleNamespace
 
-import pytest
 from vllm_tt_plugin import model_runner as model_runner_module
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -41,6 +40,18 @@ def _decode(runner, row_req_ids):
 
 def _merge(runner, inputs):
     return TTModelRunner._merge_dp_prefill_slots(runner, inputs)
+
+
+def _scheduler_output(*, preempted=None, scheduled=("KEEP",)):
+    """Just the SchedulerOutput fields ``_update_states`` reads on a quiet step."""
+    return SimpleNamespace(
+        finished_req_ids=[],
+        preempted_req_ids=preempted,
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens=dict.fromkeys(scheduled, 1),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+    )
 
 
 def _gather(state, remap):
@@ -138,13 +149,50 @@ def test_gathered_dp_prefill_slots_match_the_decode_offsets():
     assert _merge(r, [SimpleNamespace(prefill_empty_slots=None)]) is None
 
 
-def test_capacity_and_slot_width_are_enforced():
-    """More prefills than slots is a caller bug; rows past capacity are dropped."""
+def test_preemption_releases_its_state_slot():
+    """A preempted request re-prefills from scratch, so its slot must be released."""
+    r = _runner()
+    r.encoder_cache = {}
+    r._decode_layout_changed_since_last_decode = False
+    r.input_batch = SimpleNamespace(
+        req_id_to_index={"KEEP": 0}, refresh_logitsprocs=lambda: None
+    )
+    r._req_state_slot.update({"P": 0, "KEEP": 1})
+    r.requests.update(dict.fromkeys(["P", "KEEP"]))
+
+    TTModelRunner._update_states(r, _scheduler_output(preempted={"P"}))
+
+    assert r._req_state_slot == {"KEEP": 1}, "only the preempted request releases"
+    assert "P" in r.requests, "the request is still live, it just re-prefills"
+
+    # Which is the point: the freed slot is available to the incoming prefill.
+    assert _prefill(r, ["NEW"]) == [0]
+
+
+def test_slot_exhaustion_evicts_instead_of_killing_the_engine(monkeypatch):
+    """Full slots plus a prefill is legitimate: it must not assert in the hot path."""
+    warned: list[str] = []
+    monkeypatch.setattr(
+        model_runner_module.logger,
+        "warning",
+        lambda msg, *a, **k: warned.append(str(msg)),
+    )
+
     r = _runner(slots=2)
-    _prefill(r, ["A"])
-    _decode(r, ["A"])
-    with pytest.raises(AssertionError, match="no free device state slot"):
-        _prefill(r, ["B", "C"])
+    _prefill(r, ["A", "B"])  # both slots held by live requests
+    slots = _prefill(r, ["C"])
+
+    assert slots == [1], f"a slot must still be allocated, got {slots}"
+    assert any("slots exhausted" in w for w in warned), warned
+    # The victim's entry goes with its slot, so the map stays a bijection.
+    assert r._req_state_slot == {"A": 0, "C": 1}
+
+
+def test_capacity_and_slot_width_are_enforced():
+    """Over-capacity prefills stay in range; rows past the slot width are dropped."""
+    r = _runner(slots=2)
+    slots = _prefill(r, ["A", "B", "C"])
+    assert all(0 <= s < 2 for s in slots), f"slots must stay in range: {slots}"
 
     # Rows beyond the slot width are truncated, so an over-long batch still yields a
     # permutation of the real slots instead of an out-of-range source index.
