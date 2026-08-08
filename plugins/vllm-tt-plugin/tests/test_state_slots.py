@@ -39,6 +39,10 @@ def _decode(runner, row_req_ids):
     return None if remap is None else remap.tolist()
 
 
+def _merge(runner, inputs):
+    return TTModelRunner._merge_dp_prefill_slots(runner, inputs)
+
+
 def _gather(state, remap):
     """What the device does with a remap: row ``i`` reads slot ``remap[i]``."""
     return list(state) if remap is None else [state[s] for s in remap]
@@ -112,6 +116,26 @@ def test_remap_carries_off_batch_state():
     state = _gather(state, remap)
     _assert_state_found(r, state)
     assert state[:2] == ["B", "A"], f"state must sit at each request's row: {state}"
+
+
+def test_gathered_dp_prefill_slots_match_the_decode_offsets():
+    """Gathered DP decode offsets each rank's remap by ``rank * stride``; prefill has
+    to place state in that same global space or the two disagree about where it is."""
+    r = _runner()
+    ranks = [
+        SimpleNamespace(prefill_empty_slots=[3]),  # rank 0 kept a live slot free
+        None,  # nothing scheduled
+        SimpleNamespace(prefill_empty_slots=[0, 2]),
+    ]
+    assert _merge(r, ranks) == [3, 2 * SLOTS + 0, 2 * SLOTS + 2]
+
+    # Scheduling order is what #454 removed: rank 2's rows are not slots 0 and 1.
+    assert _merge(r, ranks) != [0, 2 * SLOTS + 0, 2 * SLOTS + 1]
+
+    # No rank allocated any (stateless model): stay None so submit_prefill keeps its
+    # scheduling-order fallback rather than sending an empty list.
+    assert _merge(r, [None, None]) is None
+    assert _merge(r, [SimpleNamespace(prefill_empty_slots=None)]) is None
 
 
 def test_capacity_and_slot_width_are_enforced():

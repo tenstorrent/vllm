@@ -841,6 +841,24 @@ class TTModelRunner:
             slots.append(slot)
         return slots
 
+    def _merge_dp_prefill_slots(
+        self, inputs: list[TTModelInput | None]
+    ) -> list[int] | None:
+        """Lift each gathered-DP rank's prefill slots from its local ``[0, stride)``
+        space into the global one decode gathers from (``rank * stride``, matching
+        the offsets applied to ``slot_remap``). Rank order, so the slots line up
+        with the merged rows. None when no rank supplied any, leaving
+        ``submit_prefill``'s scheduling-order fallback in place for stateless
+        models."""
+        stride = self.tt_per_lane_max_num_seqs
+        merged = [
+            rank * stride + slot
+            for rank, mi in enumerate(inputs)
+            if mi is not None and mi.prefill_empty_slots
+            for slot in mi.prefill_empty_slots
+        ]
+        return merged or None
+
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
@@ -1659,6 +1677,7 @@ class TTModelRunner:
         generators_list: list[dict[int, torch.Generator]] = []
         slot_remap = None
         intermediate_prefill_mask = None
+        prefill_empty_slots: list[int] | None = None
 
         if is_decode and isinstance(inputs, dict):
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -1848,6 +1867,8 @@ class TTModelRunner:
             perform_device_sampling = all(
                 mi.perform_device_sampling for mi in active_inputs
             )
+
+            prefill_empty_slots = self._merge_dp_prefill_slots(inputs)
 
             # Determine max token width across slots.
             max_tok_width = 0
@@ -2072,7 +2093,7 @@ class TTModelRunner:
             max_num_logprobs=max_num_logprobs,
             logitsprocs_list=logitsprocs_list,
             generators_list=generators_list,
-            prefill_empty_slots=None,
+            prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
         return merged
