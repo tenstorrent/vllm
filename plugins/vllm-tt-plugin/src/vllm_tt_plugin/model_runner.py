@@ -844,25 +844,33 @@ class TTModelRunner:
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
-        means identity, so skip it."""
+        means identity, so skip it. Commits the move to ``self._req_state_slot`` for
+        every request the permutation touches, off-batch holders included."""
         n_slots = self.tt_per_lane_max_num_seqs
         row_req_ids = row_req_ids[:n_slots]
         want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
-        # post-gather: state sits at its row
-        settled = {r: row for row, r in enumerate(row_req_ids)}
         if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
             # Never hand a non-permutation to a gather: one incoherent response beats
             # an out-of-bounds device read.
+            # Nothing moves, so leave the map alone: it still locates everyone else.
             logger.warning(
                 "TT decode state slots are not a permutation (%s); skipping the state "
                 "remap for this step -- one response may be incoherent.",
                 want,
             )
-            self._req_state_slot.update(settled)
             return None
         taken = set(want)
         remap = want + [s for s in range(n_slots) if s not in taken]
-        self._req_state_slot.update(settled)
+        # The gather moves every slot, not just the batch rows: ownership must follow.
+        by_slot: dict[int, list[str]] = {}
+        for req_id, slot in self._req_state_slot.items():
+            by_slot.setdefault(slot, []).append(req_id)
+        # A request with no source slot: ``want`` assumed it already sits at its row.
+        for row, req_id in enumerate(row_req_ids):
+            self._req_state_slot[req_id] = row
+        for row, slot in enumerate(remap):
+            for req_id in by_slot.get(slot, ()):
+                self._req_state_slot[req_id] = row
         if all(remap[i] == i for i in range(n_slots)):
             return None
         return torch.tensor(remap, dtype=torch.int32)

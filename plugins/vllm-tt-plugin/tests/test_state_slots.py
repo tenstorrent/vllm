@@ -39,6 +39,21 @@ def _decode(runner, row_req_ids):
     return None if remap is None else remap.tolist()
 
 
+def _gather(state, remap):
+    """What the device does with a remap: row ``i`` reads slot ``remap[i]``."""
+    return list(state) if remap is None else [state[s] for s in remap]
+
+
+def _assert_state_found(runner, state):
+    """The invariant: a request's recorded slot is where its state actually sits."""
+    for req_id in runner.requests:
+        slot = runner._req_state_slot[req_id]
+        assert state[slot] == req_id, (
+            f"{req_id} thinks its state is in slot {slot}, which holds "
+            f"{state[slot]!r} (device state: {state})"
+        )
+
+
 def test_state_follows_the_request_across_row_moves():
     """The full lifecycle: fresh prefill, eviction, return at a new row, re-prefill."""
     r = _runner()
@@ -76,6 +91,29 @@ def test_state_follows_the_request_across_row_moves():
     )
 
 
+def test_remap_carries_off_batch_state():
+    """A non-identity remap permutes ALL slots, live off-batch holders' included."""
+    r = _runner()
+    state: list[str | None] = [None] * SLOTS
+    for row, slot in enumerate(_prefill(r, ["A", "B"])):
+        state[slot] = ["A", "B"][row]
+    assert r._req_state_slot == {"A": 0, "B": 1}
+
+    # Only B decodes; pulling it to row 0 pushes live off-batch A out of slot 0.
+    remap = _decode(r, ["B"])
+    assert remap is not None and remap[0] == 1, f"row 0 must read B's slot 1: {remap}"
+    state = _gather(state, remap)
+    assert state[0] == "B"
+    assert state[1] == "A", "A's state was displaced by the gather"
+    _assert_state_found(r, state)
+
+    # A is rescheduled: its recorded slot must be the one it landed in.
+    remap = _decode(r, ["B", "A"])
+    state = _gather(state, remap)
+    _assert_state_found(r, state)
+    assert state[:2] == ["B", "A"], f"state must sit at each request's row: {state}"
+
+
 def test_capacity_and_slot_width_are_enforced():
     """More prefills than slots is a caller bug; rows past capacity are dropped."""
     r = _runner(slots=2)
@@ -111,8 +149,8 @@ def test_non_permutation_is_refused_and_a_clean_map_is_silent(monkeypatch):
     assert not warned, f"the clean path must not warn: {warned}"
 
     # Skip the move -- one incoherent response beats an OOB device read -- and say so.
-    r._req_state_slot.update({"X": 3, "Y": 3})
+    r._req_state_slot.update({"X": 3, "Y": 3, "Z": 5})
     assert _decode(r, ["X", "Y"]) is None
     assert any("not a permutation" in w for w in warned), warned
-    # The map is still repaired to the rows, so the next step is consistent.
-    assert r._req_state_slot == {"X": 0, "Y": 1}
+    # Nothing moved, so nothing is rewritten -- rewriting the rows would strand Z.
+    assert r._req_state_slot == {"X": 3, "Y": 3, "Z": 5}
