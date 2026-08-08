@@ -904,7 +904,6 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
-        capture_slot_remap: bool = True,
     ) -> TTModelInput:
         """Build a ``TTModelInput`` for one prefill or decode step.
 
@@ -922,8 +921,6 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether to pop and attach the input batch's
-                pending slot remap.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling
@@ -1244,8 +1241,6 @@ class TTModelRunner:
         else:
             prefill_empty_slots = None
             slot_remap = self._decode_state_slot_remap(row_req_ids)
-        if not capture_slot_remap:
-            slot_remap = None
 
         return TTModelInput(
             input_tokens=input_tokens,

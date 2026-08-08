@@ -21,6 +21,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
+from vllm_tt_plugin.model_input import TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -364,6 +365,61 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
     TTModelRunner.submit_prefill(runner, model_input, [2, 2])
 
     assert captured["empty_slots"] == [4]
+
+
+def _sampling_params(rows=2):
+    """Every field a per-row tensor, as ``submit_decode``'s ``.tolist()`` expects."""
+    return TTSamplingParams(
+        temperature=torch.ones(rows),
+        top_k=torch.zeros(rows, dtype=torch.int32),
+        top_p=torch.ones(rows),
+        presence_penalty=torch.zeros(rows),
+        frequency_penalty=torch.zeros(rows),
+        repetition_penalty=torch.ones(rows),
+        seed=torch.zeros(rows, dtype=torch.int64),
+        num_logprobs=torch.full((rows,), -1, dtype=torch.int32),
+        enable_log_probs=torch.zeros(rows, dtype=torch.bool),
+    )
+
+
+@pytest.mark.parametrize("perform_device_sampling", [True, False])
+def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
+    """``slot_remap`` moves per-slot state (GDN recurrent/conv), so it is not a
+    sampling parameter: one client's ``logprobs=5`` flips the whole step to host
+    sampling, and the gather still has to run for every co-batched request."""
+    captured: dict = {}
+
+    class FakeModel:
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros((1, 1), dtype=torch.float32)
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+    )
+    remap = torch.tensor([1, 0], dtype=torch.int32)
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        input_positions=torch.zeros((2,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=2,
+        tt_sampling_params=_sampling_params(),
+        perform_device_sampling=perform_device_sampling,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=remap,
+    )
+
+    controller = TTAsyncDecodeController(runner)
+    controller.submit_decode(model_input, read_from_device=True)
+
+    assert torch.equal(captured["slot_remap"], remap)
+    assert ("sampling_params" in captured) is perform_device_sampling
 
 
 def test_async_lane_decode_uses_batch_extraction():
