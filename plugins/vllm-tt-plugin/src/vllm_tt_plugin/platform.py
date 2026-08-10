@@ -42,6 +42,53 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
+_TTTV2_LLAMA_GENERATOR_PATHS = {
+    "meta-llama/Llama-3.1-8B-Instruct": (
+        "models.common.models.llama3_8b.generator:Llama3Generator"
+    ),
+    "meta-llama/Llama-3.2-1B-Instruct": (
+        "models.common.models.llama32_1b.generator:Llama32_1BGenerator"
+    ),
+    "meta-llama/Llama-3.2-3B-Instruct": (
+        "models.common.models.llama32_3b.generator:Llama32_3BGenerator"
+    ),
+    "meta-llama/Llama-3.3-70B-Instruct": (
+        "models.common.models.llama33_70b.generator:Llama33_70BGenerator"
+    ),
+}
+
+_TTTV2_QWEN2_GENERATOR_PATHS = {
+    "Qwen/Qwen2-7B-Instruct": (
+        "models.common.models.qwen2_7b.generator:Qwen2Generator"
+    ),
+    "Qwen/Qwen2.5-7B-Instruct": (
+        "models.common.models.qwen25_7b.generator:Qwen25Generator"
+    ),
+    "Qwen/Qwen2.5-72B-Instruct": (
+        "models.common.models.qwen25_72b.generator:Qwen25_72BGenerator"
+    ),
+    "Qwen/Qwen2.5-Coder-32B-Instruct": (
+        "models.common.models.qwen25_coder_32b.generator:Qwen25Coder32BGenerator"
+    ),
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": (
+        "models.common.models.deepseek_r1_distill_qwen_14b.generator:DeepSeekR1Qwen14BGenerator"
+    ),
+}
+
+_TTTV2_QWEN3_GENERATOR_PATHS = {
+    "Qwen/Qwen3-32B": "models.common.models.qwen3_32b.generator:Qwen3_32BGenerator",
+}
+
+_TTTV2_MISTRAL_GENERATOR_PATHS = {
+    "mistralai/Mistral-7B-Instruct-v0.3": (
+        "models.common.models.mistral_7b.generator:Mistral7BGenerator"
+    ),
+}
+
+_TTTV2_PHI_GENERATOR_PATHS = {
+    "microsoft/phi-4": "models.common.models.phi4.generator:Phi4Generator",
+}
+
 
 def _galaxy_generator_version() -> str | None:
     """Return the active Galaxy-generator model version, or None.
@@ -229,10 +276,13 @@ def register_tt_models(register_test_models=False) -> None:
         path_llama_text = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
     elif llama_text_version == "tt_transformers_v2":
         model = os.getenv("HF_MODEL")
-        if model == "meta-llama/Llama-3.1-8B-Instruct":
-            path_llama_text = "models.common.models.llama3_8b.generator:Llama3Generator"
-        else:
-            raise ValueError(f"Unsupported tt_transformers_v2 model: {model}")
+        path_llama_text = _TTTV2_LLAMA_GENERATOR_PATHS.get(model)
+        if path_llama_text is None:
+            supported_models = ", ".join(_TTTV2_LLAMA_GENERATOR_PATHS)
+            raise ValueError(
+                f"Unsupported tt_transformers_v2 model: {model}; "
+                f"supported models: {supported_models}"
+            )
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:LlamaForCausalLM"
@@ -258,14 +308,40 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:MllamaForConditionalGeneration",
     )
 
-    # Qwen2.5 - Text
-    path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
+    # Qwen2/2.5 - Text
+    qwen2_text_version = os.getenv("TT_QWEN2_TEXT_VER", "tt_transformers")
+    if qwen2_text_version == "tt_transformers":
+        path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
+    elif qwen2_text_version == "tt_transformers_v2":
+        model = os.getenv("HF_MODEL")
+        path_qwen_text = _TTTV2_QWEN2_GENERATOR_PATHS.get(model)
+        if path_qwen_text is None:
+            supported = ", ".join(sorted(_TTTV2_QWEN2_GENERATOR_PATHS))
+            raise ValueError(
+                f"Unsupported tt_transformers_v2 model: {model}; "
+                f"supported models: [{supported}]"
+            )
+    else:
+        raise ValueError(
+            f"Unsupported TT Qwen2 version: {qwen2_text_version}, "
+            "pick one of [tt_transformers, tt_transformers_v2]"
+        )
+
     _register_model_if_missing(ModelRegistry, "TTQwen2ForCausalLM", path_qwen_text)
 
     # Qwen3 - Text
     qwen3_text_version = os.getenv("TT_QWEN3_TEXT_VER", "tt_transformers")
     if qwen3_text_version == "tt_transformers":
         path_qwen3_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
+    elif qwen3_text_version == "tt_transformers_v2":
+        model = os.getenv("HF_MODEL")
+        path_qwen3_text = _TTTV2_QWEN3_GENERATOR_PATHS.get(model)
+        if path_qwen3_text is None:
+            supported = ", ".join(sorted(_TTTV2_QWEN3_GENERATOR_PATHS))
+            raise ValueError(
+                f"Unsupported tt_transformers_v2 model: {model}; "
+                f"supported models: [{supported}]"
+            )
     elif qwen3_text_version == "qwen3_32b_galaxy":
         path_qwen3_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:QwenForCausalLM"
@@ -273,7 +349,7 @@ def register_tt_models(register_test_models=False) -> None:
     else:
         raise ValueError(
             f"Unsupported TT Qwen3 version: {qwen3_text_version}, "
-            "pick one of [tt_transformers, qwen3_32b_galaxy]"
+            "pick one of [tt_transformers, tt_transformers_v2, qwen3_32b_galaxy]"
         )
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
@@ -309,11 +385,46 @@ def register_tt_models(register_test_models=False) -> None:
     )
 
     # Mistral - Text only
-    _register_model_if_missing(
-        ModelRegistry,
-        "TTMistralForCausalLM",
-        "models.tt_transformers.tt.generator_vllm:MistralForCausalLM",
-    )
+    mistral_text_version = os.getenv("TT_MISTRAL_TEXT_VER", "tt_transformers")
+    if mistral_text_version == "tt_transformers":
+        path_mistral_text = (
+            "models.tt_transformers.tt.generator_vllm:MistralForCausalLM"
+        )
+    elif mistral_text_version == "tt_transformers_v2":
+        model = os.getenv("HF_MODEL")
+        path_mistral_text = _TTTV2_MISTRAL_GENERATOR_PATHS.get(model)
+        if path_mistral_text is None:
+            supported = ", ".join(sorted(_TTTV2_MISTRAL_GENERATOR_PATHS))
+            raise ValueError(
+                f"Unsupported tt_transformers_v2 model: {model}; "
+                f"supported models: [{supported}]"
+            )
+    else:
+        raise ValueError(
+            f"Unsupported TT Mistral version: {mistral_text_version}, "
+            "pick one of [tt_transformers, tt_transformers_v2]"
+        )
+
+    _register_model_if_missing(ModelRegistry, "TTMistralForCausalLM", path_mistral_text)
+
+    # Phi - Text only. There is no legacy TT Phi path, so an unset selector
+    # intentionally leaves the architecture unregistered.
+    phi_text_version = os.getenv("TT_PHI_TEXT_VER")
+    if phi_text_version == "tt_transformers_v2":
+        model = os.getenv("HF_MODEL")
+        path_phi_text = _TTTV2_PHI_GENERATOR_PATHS.get(model)
+        if path_phi_text is None:
+            supported = ", ".join(sorted(_TTTV2_PHI_GENERATOR_PATHS))
+            raise ValueError(
+                f"Unsupported tt_transformers_v2 model: {model}; "
+                f"supported models: [{supported}]"
+            )
+        _register_model_if_missing(ModelRegistry, "TTPhi3ForCausalLM", path_phi_text)
+    elif phi_text_version is not None:
+        raise ValueError(
+            f"Unsupported TT Phi version: {phi_text_version}, "
+            "pick one of [tt_transformers_v2]"
+        )
 
     # Mistral 3 - Multimodal (Vision + Text)
     _register_model_if_missing(
