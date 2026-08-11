@@ -8,7 +8,8 @@ at whatever row is free, and ``condense`` moves rows down when a request finishe
 Device state indexed by slot (Qwen3.6 GDN recurrent+conv, the per-slot seed RNG, the
 decode trace's token/position buffers) does not follow, so
 ``_alloc_prefill_state_slots`` and ``_decode_state_slot_remap`` say where each
-request's state is. No device execution: both are pure index bookkeeping, run here
+request's state is, and ``_release_dead_state_slots`` says when a request stops
+owning one. No device execution: all three are pure index bookkeeping, run here
 against a fake runner.
 """
 
@@ -37,6 +38,15 @@ def _prefill(runner, row_req_ids):
 def _decode(runner, row_req_ids):
     remap = TTModelRunner._decode_state_slot_remap(runner, list(row_req_ids))
     return None if remap is None else remap.tolist()
+
+
+def _release(runner, finished=(), preempted=None):
+    """One release pass. ``preempted`` defaults to None, the value a scheduler that
+    preempted nothing reports."""
+    TTModelRunner._release_dead_state_slots(
+        runner,
+        SimpleNamespace(finished_req_ids=set(finished), preempted_req_ids=preempted),
+    )
 
 
 def test_state_follows_the_request_across_row_moves():
@@ -74,6 +84,66 @@ def test_state_follows_the_request_across_row_moves():
     assert _prefill(r, ["B0"]) == [0], (
         "a re-prefilled live request must keep its own slot"
     )
+
+
+def test_release_keeps_a_merely_unscheduled_request():
+    """Every prefill step leaves the whole decode batch unscheduled, and that state is
+    still live. The release predicate must not read "unscheduled" as "dead"."""
+    r = _runner()
+    assert _prefill(r, ["A"]) == [0]
+
+    _release(r)
+    assert r._req_state_slot == {"A": 0}
+    assert _prefill(r, ["B"]) == [1], "a live request's slot must not be reused"
+
+    _release(r, finished={"A"})
+    assert r._req_state_slot == {"B": 1}
+
+
+def test_preemption_frees_the_slot_a_later_prefill_needs():
+    """A preempted request's state is dead: ``_preempt_request`` freed its KV and reset
+    ``num_computed_tokens``, so the resume re-prefills from zero and rewrites the slot.
+    Holding it only shrinks capacity, and the shortfall is a hard assert."""
+    r = _runner()
+    rows = [f"r{i}" for i in range(SLOTS)]
+    assert _prefill(r, rows) == list(range(SLOTS))
+    assert _decode(r, rows) is None
+
+    _release(r, preempted={"r7"})
+    assert "r7" not in r._req_state_slot
+    # The cached request state stays: the resume needs it, and it is what keeps the
+    # stale slot inside ``held``.
+    assert "r7" in r.requests
+
+    # Under ``--scheduling-policy priority`` the preempted request is re-queued by
+    # priority, not to the front, so a higher-priority arrival prefills ahead of it.
+    # Its slot must be free or the prefill has nowhere to go.
+    assert _prefill(r, ["r8"]) == [7]
+
+
+def test_a_resumed_preempted_request_gets_a_slot_and_a_valid_remap():
+    """The resume is an ordinary prefill: it takes whatever slot is free and the next
+    decode step gathers its state to its row."""
+    r = _runner()
+    rows = [f"r{i}" for i in range(SLOTS)]
+    _prefill(r, rows)
+    _decode(r, rows)
+    _release(r, preempted={"r7"})
+    _prefill(r, ["r8"])
+
+    # r7 can resume only once the batch has room: the scheduler caps running at the
+    # slot count and a preempted request does not count against it.
+    _release(r, finished={"r0"})
+    r.requests.pop("r0")
+    assert _prefill(r, ["r7"]) == [0], "the resume takes the slot the finish freed"
+
+    # vLLM re-adds both newcomers at the free rows, so the decode rows no longer match
+    # the slots.
+    decode_rows = [f"r{i}" for i in range(1, 7)] + ["r8", "r7"]
+    remap = _decode(r, decode_rows)
+    assert remap == [1, 2, 3, 4, 5, 6, 7, 0]
+    assert sorted(remap) == list(range(SLOTS)), "must be a permutation"
+    assert _decode(r, decode_rows) is None
 
 
 def test_capacity_and_slot_width_are_enforced():
