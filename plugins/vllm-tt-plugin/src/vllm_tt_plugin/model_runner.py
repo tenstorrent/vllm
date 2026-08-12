@@ -819,38 +819,36 @@ class TTModelRunner:
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing. Evicts a holder rather than raising if full."""
+        steady state moves nothing.
+
+        Exhaustion is unreachable: holders and prefills are disjoint and both count
+        against ``max_num_seqs``, which is ``n_slots``. Reaching an assert means the
+        map has stopped describing the device, and nothing on the host can recover
+        it, so fail rather than guess and return plausible, wrong text.
+        """
         n_slots = self.tt_per_lane_max_num_seqs
+        assert len(row_req_ids) <= n_slots, (
+            f"{len(row_req_ids)} prefill(s) exceed the {n_slots} device state "
+            "slots; admission is the scheduler's job, not this function's"
+        )
         prefilling = set(row_req_ids)
-        # Slot -> holder, so exhaustion can name a victim.
-        holder = {
-            slot: req_id
+        held = {
+            slot
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
-        held = set(holder)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row < n_slots and row not in held:
+            if row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
-                if free:
-                    slot = free[0]
-                else:
-                    # Evicting a holder costs one response; asserting kills the engine.
-                    slot = max(holder) if holder else row % n_slots
-                    evicted = holder.pop(slot, None)
-                    self._req_state_slot.pop(evicted, None)
-                    logger.warning(
-                        "TT device state slots exhausted for %d prefill(s) "
-                        "(capacity %d); taking slot %d from %s -- that response "
-                        "may be incoherent.",
-                        len(row_req_ids),
-                        n_slots,
-                        slot,
-                        evicted,
-                    )
+                assert free, (
+                    f"no free device state slot for {len(row_req_ids)} prefill(s): "
+                    f"held={sorted(held)}, capacity={n_slots}, "
+                    f"map={self._req_state_slot}"
+                )
+                slot = free[0]
             held.add(slot)
             self._req_state_slot[req_id] = slot
             slots.append(slot)
@@ -866,13 +864,22 @@ class TTModelRunner:
         ``submit_prefill``'s scheduling-order fallback in place for stateless
         models."""
         stride = self.tt_per_lane_max_num_seqs
-        merged = [
-            rank * stride + slot
-            for rank, mi in enumerate(inputs)
-            if mi is not None and mi.prefill_empty_slots
-            for slot in mi.prefill_empty_slots
-        ]
-        return merged or None
+        active = [mi for mi in inputs if mi is not None]
+        if not any(mi.prefill_empty_slots for mi in active):
+            return None
+        merged: list[int] = []
+        for rank, mi in enumerate(inputs):
+            if mi is None:
+                continue
+            slots = mi.prefill_empty_slots
+            # The row concat below takes every ``mi is not None``, so the slots must
+            # match it one for one, in order. Nothing else enforces that.
+            assert slots is not None and len(slots) == mi.input_tokens.shape[0], (
+                f"gathered-DP prefill: rank {rank} contributes "
+                f"{mi.input_tokens.shape[0]} row(s) but {slots} state slot(s)"
+            )
+            merged.extend(rank * stride + slot for slot in slots)
+        return merged
 
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
@@ -881,29 +888,37 @@ class TTModelRunner:
         every request the permutation touches, off-batch holders included."""
         n_slots = self.tt_per_lane_max_num_seqs
         row_req_ids = row_req_ids[:n_slots]
-        want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
-        if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
-            # Never hand a non-permutation to a gather: one incoherent response beats
-            # an out-of-bounds device read.
-            # Nothing moves, so leave the map alone: it still locates everyone else.
-            logger.warning(
-                "TT decode state slots are not a permutation (%s); skipping the state "
-                "remap for this step -- one response may be incoherent.",
-                want,
+        want: list[int] = []
+        for req_id in row_req_ids:
+            slot = self._req_state_slot.get(req_id)
+            # Every decoding request got a slot at prefill. Inventing one here is
+            # how a second request ends up recorded at an owned slot.
+            assert slot is not None, (
+                f"decoding request {req_id!r} has no device state slot: "
+                f"map={self._req_state_slot}"
             )
-            return None
+            want.append(slot)
+        if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
+            # Refusing the remap is not the safe option: no gather goes out for the
+            # WHOLE batch, so every off-row request reads another's state.
+            duplicates = sorted({s for s in want if want.count(s) > 1})
+            raise AssertionError(
+                f"TT decode state slots are not a permutation: want={want}, "
+                f"duplicated={duplicates}, capacity={n_slots}, "
+                f"map={self._req_state_slot}"
+            )
         taken = set(want)
         remap = want + [s for s in range(n_slots) if s not in taken]
         # The gather moves every slot, not just the batch rows: ownership must follow.
+        # Build the new map whole and swap it in, so no read sees it half-written.
         by_slot: dict[int, list[str]] = {}
         for req_id, slot in self._req_state_slot.items():
             by_slot.setdefault(slot, []).append(req_id)
-        # A request with no source slot: ``want`` assumed it already sits at its row.
-        for row, req_id in enumerate(row_req_ids):
-            self._req_state_slot[req_id] = row
+        moved = dict(self._req_state_slot)
         for row, slot in enumerate(remap):
             for req_id in by_slot.get(slot, ()):
-                self._req_state_slot[req_id] = row
+                moved[req_id] = row
+        self._req_state_slot = moved
         if all(remap[i] == i for i in range(n_slots)):
             return None
         return torch.tensor(remap, dtype=torch.int32)
@@ -1543,9 +1558,9 @@ class TTModelRunner:
                 if model_input.max_num_logprobs[0] is not None
                 else LOGPROBS_NONE_SENTINEL
             )
-        # Slot remap for seed manager reindexing after condense. The merged
-        # input batch uses global max_num_seqs, but the decode gather wire
-        # format is per-lane/per-rank.
+        # State slot remap: it moves per-slot GDN state and, under device sampling,
+        # reindexes the seed manager. The merged input batch uses global
+        # max_num_seqs, but the decode gather wire format is per-lane/per-rank.
         slot_remap = self._decode_gather_slot_remap(model_input, max_batch)
         # Pack into flattened tensors to reduce number of collectives.
         # B = max batch size, W = max_num_blocks_per_req, G = num kv_cache_groups.
@@ -1779,8 +1794,8 @@ class TTModelRunner:
             ]
             off += 1
 
-            # Slot remap for seed manager: per-rank values are in [0,B), but
-            # the row-sharded SeedManager uses global indices [0, total_B).
+            # State slot remap: per-rank values are in [0,B), but the merged batch
+            # (and the row-sharded SeedManager) uses global indices [0, total_B).
             # Offset each rank's remap values by rank * B.
             raw_remap = stacked_int[:, off : off + B]  # [world, B]
             offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * B

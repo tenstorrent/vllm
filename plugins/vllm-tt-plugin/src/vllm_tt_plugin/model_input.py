@@ -118,13 +118,13 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
-    # Per-rank slot remap from condense - remap[i]=j means slot i's data came
-    # from slot j. Identity when nothing moved. Shape: [total_B] (concat of
-    # per-rank [B] tensors for DP).
+    # Decode-only: device state slot remap - row i reads slot remap[i]. From
+    # ``_req_state_slot`` (lane mode: the condense-move remap). ``None`` means
+    # identity. Shape: [total_B] (concat of per-rank [B] tensors for DP).
     slot_remap: torch.Tensor | None = None
 
-    # Single-process DP prefill only: global stable slots supplied by the
-    # scheduler-owned step plan. ``None`` for non-DP, gathered-DP, and decode.
+    # Prefill-only: the device state slot each prefilling row writes to. Global for
+    # DP (step plan for lane mode, rank-offset for gathered), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
     # Prefill-only: rows whose forward contributes KV state but must not
