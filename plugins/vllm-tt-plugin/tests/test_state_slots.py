@@ -269,12 +269,14 @@ def test_slot_exhaustion_fails_instead_of_guessing():
         _prefill(_runner(slots=2), ["A", "B", "C"])
 
 
-def test_decode_rows_past_the_slot_width_are_dropped():
-    """An over-long batch still yields a permutation of the real slots, never an
-    out-of-range source index."""
+def test_more_decode_rows_than_slots_raises():
+    """Truncating to the slot width would silently drop C's state instead of saying
+    the batch cannot be described."""
     r = _runner(slots=2)
     r._req_state_slot.update({"A": 1, "B": 0})
-    assert _decode(r, ["A", "B", "C"]) == [1, 0]
+    assert _decode(r, ["A", "B"]) == [1, 0], "at capacity is still fine"
+    with pytest.raises(AssertionError, match="3 decode row"):
+        _decode(r, ["A", "B", "C"])
 
 
 def test_a_clean_map_is_silent_and_a_broken_one_raises():

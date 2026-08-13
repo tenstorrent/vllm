@@ -887,7 +887,11 @@ class TTModelRunner:
         means identity, so skip it. Commits the move to ``self._req_state_slot`` for
         every request the permutation touches, off-batch holders included."""
         n_slots = self.tt_per_lane_max_num_seqs
-        row_req_ids = row_req_ids[:n_slots]
+        # More decode rows than slots means the batch cannot be described at all, so
+        # truncating would just drop a request's state silently.
+        assert len(row_req_ids) <= n_slots, (
+            f"{len(row_req_ids)} decode row(s) exceed the {n_slots} device state slots"
+        )
         want: list[int] = []
         for req_id in row_req_ids:
             slot = self._req_state_slot.get(req_id)
