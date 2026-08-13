@@ -613,9 +613,7 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            # Only a FINISHED request releases its slot; an unscheduled one still
-            # owns its state even though the lines below drop it from the batch.
-            self._req_state_slot.pop(req_id, None)
+        self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -813,6 +811,30 @@ class TTModelRunner:
         )
 
     # --- Per-request device state slots (see ``self._req_state_slot``) ---
+
+    def _release_dead_state_slots(self, scheduler_output: SchedulerOutput) -> None:
+        """Drop the slot claims of requests whose device state is no longer
+        authoritative.
+
+        The predicate is not "did the step schedule it": a RUNNING request the step
+        left out (what every prefill step does to the whole decode batch) still owns
+        live state and must keep its slot. Only two states release:
+
+        - FINISHED: the request is gone.
+        - PREEMPTED: ``Scheduler._preempt_request`` freed the KV blocks and reset
+          ``num_computed_tokens``, so a resume re-prefills the prompt plus every
+          generated token and writes the slot's final state itself. Nothing reads the
+          old contents, and holding the slot only inflates ``held`` in
+          ``_alloc_prefill_state_slots``, where a shortfall is a hard assert. The
+          per-slot seed RNG does not need the hold either: the device seed is derived
+          from the absolute decode position, not from slot residency.
+
+        ``preempted_req_ids`` is typed optional, hence the ``or ()``.
+        """
+        for req_id in scheduler_output.finished_req_ids:
+            self._req_state_slot.pop(req_id, None)
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._req_state_slot.pop(req_id, None)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
