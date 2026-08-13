@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -444,8 +445,15 @@ def run_inference(
         print("Using async engine")
         engine_args = AsyncEngineArgs(**engine_kw_args)
 
-        # For DP > 1, send prompts round-robin to DP ranks
-        if data_parallel_size > 1:
+        # On TT Galaxy, --data_parallel_size is collapsed into internal TT
+        # lanes by the plugin (TTLaneCoordinator). The engine's effective vLLM
+        # data_parallel_size is therefore 1 and request distribution is handled
+        # by the lane scheduler, so a per-request data_parallel_rank would be
+        # out of range. Only round-robin across DP ranks when the plugin is not
+        # converting DP into lanes.
+        mesh_device = os.environ.get("MESH_DEVICE")
+        galaxy_lane_dp = mesh_device in ("TG", "BH-Galaxy") and data_parallel_size > 1
+        if data_parallel_size > 1 and not galaxy_lane_dp:
             print("Will send prompts round-robin to DP ranks")
             dp_ranks = [i % data_parallel_size for i in range(len(prompts))]
         else:
