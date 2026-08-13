@@ -621,3 +621,50 @@ def test_runner_is_lane_mode_property():
     assert not _runner_with(data_parallel_size=1, tt_data_parallel_size=1)._is_lane_mode
     # Gathered multi-process DP: each rank is its own engine -> plain InputBatch.
     assert not _runner_with(data_parallel_size=4, tt_data_parallel_size=4)._is_lane_mode
+
+
+# --------------------------------------------------------------------------
+# Overlap prediction (row stability, answered before the batch is mutated)
+# --------------------------------------------------------------------------
+
+
+def _scheduler_output(scheduled, *, new_reqs=(), resumed=(), finished=()):
+    return SimpleNamespace(
+        num_scheduled_tokens={req_id: 1 for req_id in scheduled},
+        scheduled_new_reqs=list(new_reqs),
+        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set(resumed)),
+        finished_req_ids=set(finished),
+    )
+
+
+def test_unscheduled_lane_row_does_not_count_as_a_layout_change():
+    """A running decode may go unscheduled and keep its stable slot.
+
+    The front-packed batch evicts and condenses in that case, so membership
+    equality is its test; applying that rule here would give up decode overlap
+    on every step that skips a lane.
+    """
+    b = _lane_batch(num_lanes=2, per_lane=2)
+    _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), lane=0)
+    _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0)), lane=1)
+
+    assert b.scheduling_preserves_rows(_scheduler_output(("a", "b")))
+    assert b.scheduling_preserves_rows(_scheduler_output(("a",)))
+
+
+def test_lane_row_release_and_placement_are_layout_changes():
+    """The three ``apply_step_plan`` causes must all be predicted."""
+    b = _lane_batch(num_lanes=2, per_lane=2)
+    _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), lane=0)
+
+    assert not b.scheduling_preserves_rows(
+        _scheduler_output(("a",), finished=("a",)),
+    )
+    assert not b.scheduling_preserves_rows(
+        _scheduler_output(("a", "c"), new_reqs=(SimpleNamespace(req_id="c"),)),
+    )
+    assert not b.scheduling_preserves_rows(
+        _scheduler_output(("a",), resumed=("a",)),
+    )
+    # A request finishing that this batch never held frees no row here.
+    assert b.scheduling_preserves_rows(_scheduler_output(("a",), finished=("gone",)))

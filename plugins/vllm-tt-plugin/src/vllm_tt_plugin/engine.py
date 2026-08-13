@@ -6,7 +6,7 @@ import os
 import pickle
 import queue
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar, cast
 
 import torch
@@ -78,6 +78,10 @@ class DPGatherHandle:
     intermediate_prefill_mask: torch.Tensor | None
     req_ids: list[str]
     req_id_to_index: dict[str, int]
+    # Requests a scheduler output processed after this submission invalidated,
+    # filled in by the later ``dp_gather_submit`` that observes them. Rows for
+    # these ids are dropped when this handle's result is applied.
+    invalidated_req_ids: set[str] = field(default_factory=set)
 
 
 class TTDPEngineCoreProc(DPEngineCoreProc):
@@ -99,6 +103,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         self.dlog = dlog_logger
         super().__init__(vllm_config, *args, **kwargs)
         self._dp_in_flight: DPGatherHandle | None = None
+        self._dp_local_contract_version: int | None = None
         if self.batch_queue is not None:
             self.step_fn = self.step_dp_with_batch_queue
 
@@ -412,21 +417,27 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             model_output = self.dp_gather_finalize(handle)
             if handle.scheduler_output is None:
                 return {}
+            # Match the synchronous/upstream engine ordering: aborts that
+            # arrived while the device step was in flight must update
+            # scheduler membership before its old output is applied.
+            self._process_aborts_queue()
             return self.scheduler.update_from_output(
                 handle.scheduler_output, model_output
             )
 
-        # Always finalize the previous step before submitting the next one.
-        #
-        # The submit reads ``input_batch.token_ids_cpu`` to build the decode
-        # input for the next step; that table is only updated once
-        # ``apply_dp_execution_result`` runs inside ``_finalize_previous``. The
-        # original overlap path (submit-next then finalize-prev) therefore
-        # built the next step's input from stale token state, so the device
-        # re-sampled the previous step's near-deterministic position — most
-        # visibly as doubled ``<|end|>`` and ``<|start|>assistant`` tokens,
-        # which break harmony parsing and silently null out chat responses.
-        finalize_before_submit = prev_handle is not None
+        # A contract-v1 steady device decode deliberately builds the next step
+        # while host token/position state is one step behind: its explicit
+        # update plan preserves device-resident token/position buffers (and may
+        # refresh only page tables). Every transition requiring host inputs or
+        # sampling-state changes reports ``current_overlap_ok=False`` and
+        # drains first, re-establishing host authority before submission.
+        # Version-0 adapters never report True (see
+        # ``resident_decode_overlap_permitted``) because their model-local reload
+        # heuristics would copy the stale host tensors: getting this wrong
+        # presents as doubled end-of-turn tokens (``<|end|>`` then
+        # ``<|start|>assistant``), which break harmony parsing and silently null
+        # out chat responses.
+        finalize_before_submit = prev_handle is not None and not current_overlap_ok
 
         engine_core_outputs: dict[int, EngineCoreOutputs] | None = {}
         if finalize_before_submit:
@@ -443,10 +454,14 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         next_handle: DPGatherHandle | None = None
         if global_has_requests:
+            # ``prev_handle`` is None exactly when it was already finalized
+            # above, which is what tells the submit whether an outstanding
+            # result still needs this step's invalidations.
             next_handle = self.dp_gather_submit(
                 scheduler_output,
                 grammar_output,
                 overlap_ok=current_overlap_ok,
+                outstanding=prev_handle,
             )
 
         if not finalize_before_submit and prev_handle is not None:
@@ -482,7 +497,18 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         grammar_output: GrammarOutput | None,
         *,
         overlap_ok: bool = False,
+        outstanding: DPGatherHandle | None = None,
     ) -> DPGatherHandle:
+        """Submit one merged DP step and return its handle.
+
+        ``outstanding`` is the still-unapplied handle this step overlaps, if
+        any. Building the local input processes this step's scheduler output,
+        which is what invalidates requests for that earlier submission, so the
+        ids go to ``outstanding`` and never to the handle returned here. When
+        the caller already applied the previous result they pass ``None`` and
+        the ids are dropped: the results were applied in scheduler order, so
+        there is nothing left to reject.
+        """
         parallel_config = self.vllm_config.parallel_config
         group = self.dp_group
         rank = self.dp_rank
@@ -507,37 +533,68 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             local_max_blocks,
             local_has_structured,
             local_has_penalties,
-            local_reset_batch,
+            local_decode_layout_changed,
             local_can_sample_device,
             local_needs_logprobs,
             intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
+            invalidated_req_ids,
         ) = all_local_inputs
+        if outstanding is not None:
+            outstanding.invalidated_req_ids |= invalidated_req_ids
         max_blocks_decode = None
         any_structured_inputs = False
         any_needs_logprobs = False
 
         gathered_inputs: Any = None
         if is_decode:
+            # Only ``data_parallel_rank_local == 0`` loads a model, so ranks
+            # without one report -1 and the MAX reduction below yields the
+            # device ranks' agreed version. Static for the process lifetime.
+            if self._dp_local_contract_version is None:
+                self._dp_local_contract_version = self.model_executor.collective_rpc(
+                    "decode_input_update_contract_version"
+                )[0]
             input_info_t = torch.tensor(
                 [
                     local_max_blocks,
                     local_has_structured,
                     local_has_penalties,
-                    local_reset_batch,
+                    local_decode_layout_changed,
                     1 - local_can_sample_device,
                     local_needs_logprobs,
+                    self._dp_local_contract_version,
+                    int(local_input is not None),
                 ],
                 dtype=torch.int32,
             )
+            # MIN alongside MAX for the version alone. Every device rank loads the
+            # same model, so their versions agree and MAX simply skips the
+            # abstaining -1s. If that ever stops holding, MAX would hand a
+            # version-0 rank the v1 consumption rule and it would retire a remap
+            # its adapter was never sent, so disagreement has to be fatal rather
+            # than resolved in the permissive direction.
+            version_floor_t = torch.tensor(
+                [self._dp_local_contract_version], dtype=torch.int32
+            )
             dist.all_reduce(input_info_t, op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(version_floor_t, op=dist.ReduceOp.MIN, group=group)
             max_blocks_decode = int(input_info_t[0].item())
             any_structured_inputs = input_info_t[1].item() > 0
             any_penalties_inputs = input_info_t[2].item() > 0
-            any_reset_batch = input_info_t[3].item() > 0
+            any_decode_layout_changed = input_info_t[3].item() > 0
             all_sample_device = input_info_t[4].item() == 0
             any_needs_logprobs = input_info_t[5].item() > 0
+            contract_version = int(input_info_t[6].item())
+            any_local_input = input_info_t[7].item() > 0
+            version_floor = int(version_floor_t.item())
+            if version_floor >= 0 and version_floor != contract_version:
+                raise RuntimeError(
+                    "gathered DP ranks disagree on the decode input-update "
+                    f"contract version ({version_floor} vs {contract_version}); "
+                    "every device rank must load the same model"
+                )
 
             decode_inputs: dict[str, Any] = self.model_executor.collective_rpc(
                 "build_dp_decode_gather_input",
@@ -584,7 +641,9 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     dist.recv(stacked_float, src=0, group=group)
 
             gathered_tokens_inputs = None
-            if any_penalties_inputs and (not all_sample_device or any_reset_batch):
+            if any_penalties_inputs and (
+                not all_sample_device or any_decode_layout_changed
+            ):
                 if rank == 0:
                     gathered_tokens_inputs = [None for _ in range(world)]
                 local_tokens_inputs = decode_inputs["sampling_tokens_inputs"]
@@ -660,7 +719,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     "float_inputs": stacked_float,
                     "sampling_tokens_inputs": gathered_tokens_inputs,
                     "host_only_sample_params": gathered_host_only_sample_params,
-                    "reset_batch": any_reset_batch,
+                    "decode_layout_changed": any_decode_layout_changed,
                     "all_sample_device": all_sample_device,
                 }
 
@@ -712,6 +771,27 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                 ),
             )
             future = _unwrap_single_worker_future(collective_future)
+            if is_decode:
+                # With no rank contributing work the merged submit short-circuits
+                # without a forward, so nothing became device-resident and the
+                # residency flags must not advance.
+                if any_local_input:
+                    self.model_executor.collective_rpc(
+                        "note_dp_decode_submitted",
+                        args=(all_sample_device,),
+                    )
+            else:
+                self.model_executor.collective_rpc("note_dp_prefill_submitted")
+            if is_decode and local_input is not None:
+                # Each participating DP rank built its own remap and layout
+                # signal from local persistent state, and only the driver runs
+                # the merged forward, so every rank retires its pair here. The
+                # worker preserves v0's historical device-sampling-only
+                # consumption rule.
+                self.model_executor.collective_rpc(
+                    "commit_dp_slot_updates",
+                    args=(all_sample_device, contract_version),
+                )
         else:
             future = self._completed_dp_gather_future()
 
@@ -764,6 +844,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
                     handle.req_ids,
                     handle.req_id_to_index,
                     handle.intermediate_prefill_mask,
+                    handle.invalidated_req_ids,
                 ),
             )[0]
             return output
@@ -774,8 +855,10 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         scheduler_output: SchedulerOutput | None,
         grammar_output: GrammarOutput | None,
     ) -> ModelRunnerOutput:
+        # Submit and finalize the same step, so no earlier result is
+        # outstanding and this step's own invalidations apply to nothing.
         handle = self.dp_gather_submit(
-            scheduler_output, grammar_output, overlap_ok=False
+            scheduler_output, grammar_output, overlap_ok=False, outstanding=None
         )
         return self.dp_gather_finalize(handle)
 

@@ -347,6 +347,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         trace_mode="none",
         request_specific_rope=False,
         model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
     )
     model_input = SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
@@ -394,7 +395,6 @@ def test_async_lane_decode_uses_batch_extraction():
     context = SubmittedStepContext(
         req_ids=["req-4"],
         req_id_to_index={"req-4": 0},
-        request_states=(),
         submit_time_ns=123,
     )
     model_input = object()

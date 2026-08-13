@@ -36,6 +36,9 @@ plugins/vllm-tt-plugin/
 +-- tests/tt/                # Server-facing TT plugin tests
 ```
 
+The async input-ownership rules and generator API are documented in
+[docs/decode-reload-contract.md](docs/decode-reload-contract.md).
+
 ## Requirements
 
 If testing a specific model, check the

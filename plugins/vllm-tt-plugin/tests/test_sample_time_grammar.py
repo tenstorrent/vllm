@@ -231,12 +231,12 @@ def test_finish_nondp_sync_applies_grammar_before_sampling():
     def apply_grammar(model_input, grammar_output, *, lane_total):
         order.append("grammar")
         assert lane_total is None
-        return replace(model_input, reset_batch=True)  # mark it was applied
+        return replace(model_input, decode_layout_changed=True)  # mark it was applied
 
     def sample_sync(fwd):
         order.append("sample")
         # Grammar must already be on the input the sampler runs against.
-        assert fwd.model_input.reset_batch is True
+        assert fwd.model_input.decode_layout_changed is True
         return [torch.tensor([[42]], dtype=torch.int32)], []
 
     def build_output(sampled, logprobs, **kwargs):

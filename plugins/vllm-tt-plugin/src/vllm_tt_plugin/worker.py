@@ -377,15 +377,16 @@ class TTWorker(WorkerBase):
         torch.Tensor | None,
         list[str],
         dict[str, int],
+        set[str],
     ]:
         """Build the local DP payload consumed by gathered-DP orchestration.
 
         Returns `(local_input, max_blocks, has_structured_input,
-        has_penalties, reset_batch, can_sample_device, needs_logprobs,
-        intermediate_prefill_mask, req_ids, req_id_to_index)`, where
-        `local_input` is this rank's
-        TT model input (or `None`) and the remaining fields are the
-        per-rank metadata consumed by gathered-DP orchestration.
+        has_penalties, decode_layout_changed, can_sample_device, needs_logprobs,
+        intermediate_prefill_mask, req_ids, req_id_to_index,
+        invalidated_req_ids)`, where `local_input` is this rank's TT model input
+        (or `None`) and the remaining fields are the per-rank metadata consumed
+        by gathered-DP orchestration.
         """
         return self.model_runner.prepare_dp_model_input(
             scheduler_output, grammar_output
@@ -414,6 +415,47 @@ class TTWorker(WorkerBase):
         return self.model_runner.can_attempt_steady_decode_from_scheduler(
             scheduler_output, grammar_output
         )
+
+    def decode_input_update_contract_version(self) -> int:
+        """This rank's view of the adapter contract version, or -1 if unknown.
+
+        Only the device rank loads a model; the engine reduces these into one
+        globally agreed version.
+        """
+        version = self.model_runner.async_decode.decode_input_update_contract_version()
+        return -1 if version is None else version
+
+    def commit_dp_slot_updates(
+        self, device_sampling: bool, contract_version: int
+    ) -> None:
+        """Retire the layout signals the gathered decode submit carried.
+
+        ``contract_version`` is the globally agreed value because a rank that
+        holds no model cannot read it. Contract-v1 adapters consume layout
+        remaps in both sampling modes; version-0 adapters retain their
+        historical device-sampling-only call shape, so a host-sampling step must
+        leave their state-slot layout where it is.
+
+        Retired at submission rather than completion: only the driver rank runs
+        the merged forward, and a raised forward surfaces through the gather
+        future, which is fatal to the engine rather than retried.
+        """
+        controller = self.model_runner.async_decode
+        self.model_runner.note_decode_layout_consumed()
+        if device_sampling or controller.slot_remap_delivered_on_host_sampling(
+            contract_version
+        ):
+            self.model_runner.note_decode_state_slots_settled()
+        else:
+            self.model_runner.discard_pending_state_slot_settle()
+
+    def note_dp_decode_submitted(self, device_sampling: bool) -> None:
+        """Mirror merged decode residency on this rank's overlap controller."""
+        self.model_runner.async_decode.note_dp_decode_submitted(device_sampling)
+
+    def note_dp_prefill_submitted(self) -> None:
+        """Invalidate this rank's decode residency after merged prefill."""
+        self.model_runner.async_decode.note_prefill_submitted()
 
     def build_dp_decode_gather_input(
         self,
@@ -479,11 +521,13 @@ class TTWorker(WorkerBase):
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
         intermediate_prefill_mask: torch.Tensor | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result through the worker facade.
 
         Applies the local DP rank result and returns the corresponding
-        `ModelRunnerOutput`.
+        `ModelRunnerOutput`. ``skip_req_ids`` travels with the submission whose
+        result this is, so it cannot filter a different step's rows.
         """
         return self.model_runner.apply_dp_execution_result(
             sampled_token_ids,
@@ -491,6 +535,7 @@ class TTWorker(WorkerBase):
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            skip_req_ids=skip_req_ids,
         )
 
     # ---- Destructor (used to close devices) ----

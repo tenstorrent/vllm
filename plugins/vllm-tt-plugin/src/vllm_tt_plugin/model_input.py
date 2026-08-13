@@ -21,6 +21,56 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
 @dataclass(frozen=True)
+class TTDecodeReloadPlan:
+    """Explicit host-to-device updates for one decode submission.
+
+    The TT runner is the sole owner of these decisions because it knows whether
+    the host token/position tensors are authoritative or intentionally one step
+    behind an overlapped device-sampling decode. Contract-aware generators must
+    execute these flags as commands and must not infer additional reloads from
+    tensor equality, sampling mode, or their own previous-call state.
+
+    ``reload_inputs`` is a full forward-input copy (tokens, positions, RoPE
+    inputs and page tables). ``reload_page_table`` is the cheaper page-table-only
+    copy and is only meaningful when ``reload_inputs`` is false. Sampling
+    parameters and mutable sampling state are separate so forward and sampling
+    can be split without coupling either update to the batch-layout hint.
+    """
+
+    reload_inputs: bool
+    reload_page_table: bool
+    reload_sampling_params: bool
+    reset_sampling_state: bool
+
+    def __post_init__(self) -> None:
+        # Requirement 7, host input authority: an adapter aligns its RNG counters
+        # from the host positions on a state reset, which is only sound when the
+        # same step also restages them. Without this the alignment would silently
+        # bind a seeded stream to positions that lag the device by one step, so
+        # the implication is checked here rather than left to hold by accident of
+        # how the two flags happen to be computed.
+        assert not (self.reset_sampling_state and not self.reload_inputs), (
+            "reset_sampling_state requires reload_inputs: an adapter derives its "
+            "seed counters from host positions on a state reset"
+        )
+        # ``reload_inputs`` subsumes the page-table copy, so asking for both is a
+        # contradiction rather than a stronger request.
+        assert not (self.reload_page_table and self.reload_inputs), (
+            "reload_page_table is the page-table-only copy and is meaningless "
+            "when reload_inputs already copies it"
+        )
+
+    @property
+    def overlap_safe(self) -> bool:
+        """Whether a device-resident decode may be submitted host-stale."""
+        return not (
+            self.reload_inputs
+            or self.reload_sampling_params
+            or self.reset_sampling_state
+        )
+
+
+@dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
 
@@ -116,11 +166,12 @@ class TTModelInput:
 
     # Decode-only: indicates the padded decode-batch layout changed since the
     # previous step (used by on-device sampling).
-    reset_batch: bool = False
+    decode_layout_changed: bool = False
 
-    # Per-rank slot remap from condense - remap[i]=j means slot i's data came
-    # from slot j. Identity when nothing moved. Shape: [total_B] (concat of
-    # per-rank [B] tensors for DP).
+    # Per-rank persistent-state remap from condense - remap[i]=j means slot i's
+    # data came from slot j. Applies to model-owned decode state as well as
+    # sampler state, including during host sampling. Identity when nothing
+    # moved. Shape: [total_B] (concat of per-rank [B] tensors for DP).
     slot_remap: torch.Tensor | None = None
 
     # Single-process DP prefill only: global stable slots supplied by the

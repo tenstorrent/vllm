@@ -257,6 +257,16 @@ class InputBatch:
         self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
         return remap
 
+    def scheduling_preserves_rows(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether applying this scheduler output leaves every row where it is.
+
+        Answered before the batch is mutated, so it has to be derived from the
+        scheduler output alone. This batch front-packs: an occupied row absent
+        from the step is evicted and ``condense`` moves the rows behind it, so
+        membership equality is exactly the question.
+        """
+        return set(self.req_id_to_index) == set(scheduler_output.num_scheduled_tokens)
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -291,7 +301,6 @@ class InputBatch:
         assert req_index < self.max_num_reqs, (
             f"req_index={req_index} >= max_num_reqs={self.max_num_reqs}"
         )
-
         req_id = request.req_id
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
@@ -362,8 +371,8 @@ class InputBatch:
         )
 
         # Update fast-path bookkeeping sets.
-        # NOTE: Use `discard()` because `req_id` can be reused (abort+resubmit)
-        # and slots can be overwritten.
+        # Use `discard()` because slots can be overwritten and the request may
+        # not currently be present in a particular fast-path set.
         if sampling_params.temperature == 0.0:
             self.random_reqs.discard(req_id)
         else:
@@ -660,6 +669,22 @@ class InputBatch:
             out.append(bt_cpu)
         return out
 
+    def allocated_blocks_for_rows(self, rows: torch.Tensor | list[int]) -> int:
+        """Widest per-group block count the scheduler has allocated to ``rows``.
+
+        Truncating a block table narrower than this drops a block the device
+        will address. Derived from the allocation rather than from a token count
+        because host token state is intentionally one step behind an overlapped
+        device-sampling decode.
+        """
+        return max(
+            (
+                int(bt.num_blocks_per_row[rows].max())
+                for bt in self.block_table.block_tables
+            ),
+            default=0,
+        )
+
     def advance_generators(self, req_indices: list[int] | None = None) -> None:
         # This relies on the fact, that for a torch all_gather_object,
         # the local object is also copied,
@@ -828,6 +853,23 @@ class TTLaneInputBatch(InputBatch):
         manager's ``slot_remap`` stays the identity.
         """
         return
+
+    def scheduling_preserves_rows(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Lane rows are stable, so only a release or a placement moves state.
+
+        Mirrors ``apply_step_plan``'s three ``layout_changed`` causes. Merely
+        being unscheduled keeps a request's slot here, so the front-packed
+        membership-equality test would report a change on every step that leaves
+        a running decode unscheduled and give up overlap for nothing.
+        """
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+            return False
+        return not any(
+            req_id in self.req_id_to_index
+            for req_id in scheduler_output.finished_req_ids
+        )
 
     # ------------------------------------------------------------------
     # State update (lane step plan -> batch + request map)
@@ -1152,8 +1194,10 @@ class TTLaneInputBatch(InputBatch):
         if perform_device_sampling and not lane_batch.no_penalties:
             prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
-        reset_batch = runner._decode_layout_changed_since_last_decode
-        runner._decode_layout_changed_since_last_decode = False
+        # Lane rows are stable, so this batch never moves per-slot state and its
+        # remap is always the identity. The layout signal is read but not retired:
+        # ``submit_decode`` does that once a contract-aware decode has accepted it.
+        decode_layout_changed = runner._decode_layout_changed_since_last_decode
         slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
 
         return TTModelInput(
@@ -1173,7 +1217,7 @@ class TTLaneInputBatch(InputBatch):
             grammar_bitmask=[bitmask],
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host sampling reads the merged batch directly (see
             # ``extract_output``); the per-rank sidecars are unused here.
@@ -1266,7 +1310,7 @@ class TTLaneInputBatch(InputBatch):
             grammar_bitmask=[bitmask],
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=False,
+            decode_layout_changed=False,
             slot_remap=None,
             allowed_token_ids_mask_list=[None],
             bad_words_token_ids_list=[{}],

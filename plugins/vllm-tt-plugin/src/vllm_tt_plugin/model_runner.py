@@ -207,6 +207,11 @@ class TTModelRunner:
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
+        # Requests whose state an in-flight decode result may no longer touch:
+        # finished, or resumed from preemption and therefore re-prefilling.
+        # Accumulated as the scheduler reveals them and consumed by whichever
+        # path applies the outstanding result.
+        self._invalidated_req_ids: set[str] = set()
         self.async_decode = TTAsyncDecodeController(self)
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
@@ -216,6 +221,9 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # Where the remap built this step will leave that state, held until the
+        # submission carrying it is accepted.
+        self._pending_state_slot_settle: dict[str, int] | None = None
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -616,11 +624,11 @@ class TTModelRunner:
         self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
+        # ``finished_req_ids`` can overlap the scheduled ids: a request id is the
+        # client-supplied one, so an abort followed by a resubmit under the same
+        # id arrives as two distinct requests in one step. The first is cleared
+        # here and the second is added below; the invalidated set keeps the old
+        # request's in-flight result from reaching the new one.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             req_index = self.input_batch.remove_request(req_id)
@@ -704,6 +712,56 @@ class TTModelRunner:
 
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
+
+    def _note_invalidated_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Record requests an outstanding decode result may no longer update.
+
+        A finished request must not receive a speculative token, and a request
+        resumed from preemption re-prefills from freed KV, so the token computed
+        against that KV is void.
+
+        These ids reject only results submitted *before* this scheduler output
+        was processed. A request resumed here is a member of this step's own
+        batch, so its own result is legitimate; the set must therefore reach the
+        outstanding submission and no later one.
+        """
+        self._invalidated_req_ids.update(scheduler_output.finished_req_ids)
+        self._invalidated_req_ids.update(
+            scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+
+    def _consume_invalidated_req_ids(self) -> set[str]:
+        invalidated = self._invalidated_req_ids
+        self._invalidated_req_ids = set()
+        return invalidated
+
+    def note_decode_layout_consumed(self) -> None:
+        """Retire the layout signal an accepted decode submission carried.
+
+        Paired with ``note_decode_state_slots_settled`` at the same boundary. Both
+        describe what the accepted submission did to device state, so retiring one
+        without the other leaves the pair describing different steps: the signal
+        says the layout was rebuilt while the ownership map still points at the
+        pre-gather slots, or the reverse. Retiring either at input-build time drops
+        it on a raised decode.
+        """
+        self._decode_layout_changed_since_last_decode = False
+
+    def _dp_block_table_width(
+        self, req_indices: list[int], *, target_width: int
+    ) -> int:
+        """Width the gathered page table is trimmed to for this batch.
+
+        Derived from the scheduler's allocation rather than a token count: an
+        overlapped device-sampling decode builds its input while host token
+        state is one step behind, and a token-derived width would drop the block
+        the device is about to write at every block boundary. The DP concat then
+        zero-pads that column back to block id 0, i.e. into another request's
+        page.
+        """
+        return min(
+            self.input_batch.allocated_blocks_for_rows(req_indices), target_width
+        )
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
@@ -866,28 +924,55 @@ class TTModelRunner:
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
-        means identity, so skip it."""
+        means identity, so skip it.
+
+        Records where the gather *will* leave each request's state as pending rather
+        than applying it here. Building an input does not prove the model accepted
+        it: on a raised ``decode_forward`` the gather never runs, and an ownership
+        map already advanced to the post-gather layout would compute every later
+        remap from a layout the device never reached.
+        ``note_decode_state_slots_settled`` promotes it once the submission is
+        accepted.
+        """
         n_slots = self.tt_per_lane_max_num_seqs
         row_req_ids = row_req_ids[:n_slots]
         want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
         # post-gather: state sits at its row
-        settled = {r: row for row, r in enumerate(row_req_ids)}
+        self._pending_state_slot_settle = {r: row for row, r in enumerate(row_req_ids)}
         if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
             # Never hand a non-permutation to a gather: one incoherent response beats
-            # an out-of-bounds device read.
+            # an out-of-bounds device read. No gather runs, so the state stays where
+            # it is and the map must not move either.
             logger.warning(
                 "TT decode state slots are not a permutation (%s); skipping the state "
                 "remap for this step -- one response may be incoherent.",
                 want,
             )
-            self._req_state_slot.update(settled)
+            self._pending_state_slot_settle = None
             return None
         taken = set(want)
         remap = want + [s for s in range(n_slots) if s not in taken]
-        self._req_state_slot.update(settled)
         if all(remap[i] == i for i in range(n_slots)):
+            # Identity: nothing to gather, so nothing moves and the map already
+            # describes the layout.
+            self._pending_state_slot_settle = None
             return None
         return torch.tensor(remap, dtype=torch.int32)
+
+    def note_decode_state_slots_settled(self) -> None:
+        """Promote the pending state-slot layout after an accepted decode submit.
+
+        Paired with ``note_decode_layout_consumed`` at the same boundary: the remap
+        and the ownership record it implies have to advance together, or a later step
+        derives its gather from a layout the device never reached.
+        """
+        if self._pending_state_slot_settle is not None:
+            self._req_state_slot.update(self._pending_state_slot_settle)
+            self._pending_state_slot_settle = None
+
+    def discard_pending_state_slot_settle(self) -> None:
+        """Drop the pending layout for a submission that was never made."""
+        self._pending_state_slot_settle = None
 
     @staticmethod
     def _build_host_generators(
@@ -936,8 +1021,9 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether to pop and attach the input batch's
-                pending slot remap.
+            capture_slot_remap: Whether to attach the per-request state-slot
+                remap. The ownership map it implies advances only after a decode
+                accepts the submission.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling
@@ -978,9 +1064,8 @@ class TTModelRunner:
         # overhead from gathering inputs to rank 0 and rely on DP concat
         # function to pad to global max blocks.
         if self.tt_data_parallel_size > 1:
-            max_tokens_in_batch = max(input_batch.num_tokens[i] for i in req_indices)
-            max_blocks_in_batch = cdiv(
-                max_tokens_in_batch, self.cache_config.block_size
+            max_blocks_in_batch = self._dp_block_table_width(
+                req_indices, target_width=target_width
             )
             block_tables_per_group = [
                 bt[:, :max_blocks_in_batch] for bt in block_tables_per_group
@@ -1066,7 +1151,7 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
-            reset_batch = False
+            decode_layout_changed = False
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1075,9 +1160,11 @@ class TTModelRunner:
             ].view(-1, 1)
             prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
-            # decode batch layout changed since the previous step.
-            reset_batch = self._decode_layout_changed_since_last_decode
-            self._decode_layout_changed_since_last_decode = False
+            # decode batch layout changed since the previous step. Read but not
+            # cleared here: building an input does not prove the model accepted
+            # it, and this signal has to survive or die with the pending slot
+            # remap it travels beside (see ``note_decode_layout_consumed``).
+            decode_layout_changed = self._decode_layout_changed_since_last_decode
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -1275,7 +1362,7 @@ class TTModelRunner:
             grammar_bitmask=[bitmask],  # wrap to match DP case
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
@@ -1303,23 +1390,25 @@ class TTModelRunner:
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """
-        # Update cached state
+        # Update scheduler-owned membership before applying a drained async
+        # output. Finished/resumed requests must reject the speculative token;
+        # continuing requests need the accepted token appended before current
+        # host tensors are built. A request may remain live while unscheduled,
+        # so its captured request state must still receive the accepted token.
         self._update_states(scheduler_output)
+        self._note_invalidated_requests(scheduler_output)
+        # The drain below applies the step submitted before this scheduler
+        # output was processed, so it is the submission these ids reject.
+        # Gathered DP applies its outstanding result from the engine's handle
+        # instead, and ``prepare_dp_model_input`` drains the set into it.
+        skipped = (
+            self._consume_invalidated_req_ids()
+            if self.parallel_config.data_parallel_size == 1
+            else None
+        )
+        self.async_decode.apply_ready_completed_decode_steps(skip_req_ids=skipped)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
-
-        # ``_update_states`` may have just discovered a layout change that the
-        # scheduler-output prediction could not see: it predicts the resets caused by
-        # new or resumed requests, but removals, unscheduled requests and batch
-        # condensation only surface here, after the drain decision was already made.
-        # ``_decode_layout_changed_since_last_decode = True`` implies
-        # ``reset_batch=True``: ``_prepare_model_inputs`` below reloads inputs from host
-        # state, which a pending async decode step has not been applied to yet. This
-        # step is therefore not steady-decode eligible, so drain pending decodes to
-        # ensure updated host inputs. No-op when the flag was already set before the
-        # step (the caller's drain decision covered it) or when nothing is pending.
-        if self._decode_layout_changed_since_last_decode:
-            self.async_decode.wait_for_all_pending_async_steps()
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
@@ -1390,6 +1479,24 @@ class TTModelRunner:
             return flat[:max_batch]
         tail = torch.arange(n, max_batch, dtype=torch.int32, device=flat.device)
         return torch.cat([flat, tail])
+
+    @staticmethod
+    def _globalize_dp_slot_remap(raw_remap: torch.Tensor) -> torch.Tensor:
+        """Convert rank-local seed slots into the merged DP slot namespace."""
+        if raw_remap.dim() != 2:
+            raise ValueError(
+                "DP slot remap must have shape [world_size, per_rank_batch]"
+            )
+        per_rank_batch = raw_remap.shape[1]
+        offsets = (
+            torch.arange(
+                raw_remap.shape[0],
+                dtype=raw_remap.dtype,
+                device=raw_remap.device,
+            ).unsqueeze(1)
+            * per_rank_batch
+        )
+        return (raw_remap + offsets).reshape(-1)
 
     def build_dp_decode_gather_input(
         self,
@@ -1650,7 +1757,7 @@ class TTModelRunner:
             Only provided when there are requests with penalties.
             One dict per DP rank, each with keys "prompt_tokens" and
             "output_tokens" (tensors padded with -1).
-          - "reset_batch": bool for if the batch layout changed
+          - "decode_layout_changed": bool for if the batch layout changed
             since the previous step.
           - "all_sample_device": bool for if all ranks can sample on device.
         """
@@ -1693,7 +1800,7 @@ class TTModelRunner:
             )
             B = self.tt_per_lane_max_num_seqs
             W = max_blocks_decode_batch
-            reset_batch = inputs["reset_batch"]
+            decode_layout_changed = inputs["decode_layout_changed"]
             perform_device_sampling = inputs["all_sample_device"]
             stacked_int: torch.Tensor = inputs["int_inputs"]
             stacked_float: torch.Tensor = inputs["float_inputs"]
@@ -1768,8 +1875,7 @@ class TTModelRunner:
             # the row-sharded SeedManager uses global indices [0, total_B).
             # Offset each rank's remap values by rank * B.
             raw_remap = stacked_int[:, off : off + B]  # [world, B]
-            offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * B
-            slot_remap = (raw_remap + offsets).reshape(total_B)
+            slot_remap = self._globalize_dp_slot_remap(raw_remap)
             off += B
 
             # Optional structured inputs: keep as list[Optional[tensor]]
@@ -1857,7 +1963,7 @@ class TTModelRunner:
             num_logprobs_list: list[torch.Tensor] = []
             enable_log_probs_list: list[torch.Tensor] = []
             intermediate_prefill_masks: list[torch.Tensor] = []
-            reset_batch = False
+            decode_layout_changed = False
 
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
@@ -2083,7 +2189,7 @@ class TTModelRunner:
             grammar_bitmask=grammar_bitmask_list,
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host-only sampling params (per-rank lists)
             allowed_token_ids_mask_list=allowed_token_ids_mask_list,
@@ -2132,25 +2238,23 @@ class TTModelRunner:
             )
 
         lane_batch = self.lane_batch
-        self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_dp_decode_from_scheduler(
                 scheduler_output, None
             )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
-            self.async_decode.wait_for_all_pending_async_steps()
+            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
 
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
         )
+        self._note_invalidated_requests(scheduler_output)
+        self.async_decode.apply_ready_completed_decode_steps(
+            skip_req_ids=self._consume_invalidated_req_ids()
+        )
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
-            # ``_decode_layout_changed_since_last_decode = True`` implies
-            # ``reset_batch=True``: the model will reload inputs. This step is not
-            # steady-decode eligible, so drain pending decodes to ensure updated
-            # host inputs.
-            self.async_decode.wait_for_all_pending_async_steps()
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2289,14 +2393,13 @@ class TTModelRunner:
         # thread. In steady decode mode we intentionally allow one step of
         # lag between host application and device submission, but we never let
         # completed work pile up unbounded.
-        self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(
                 scheduler_output, None
             )
         )
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
-            self.async_decode.wait_for_all_pending_async_steps()
+            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
@@ -2433,6 +2536,7 @@ class TTModelRunner:
         logprobs: list | None,
         intermediate_mask: np.ndarray,
         req_id_to_index: dict[str, int] | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> ModelRunnerOutput:
         """Builds output with ``[]`` for intermediate, ``[tokens]`` for final chunks."""
         final_idx_np = np.where(~intermediate_mask)[0]
@@ -2440,14 +2544,18 @@ class TTModelRunner:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
             final_tokens = sampled_token_ids[final_idx_tensor]
             final_req_ids = [req_ids[int(i)] for i in final_idx_np]
-            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+            self._apply_sampled_tokens_to_state(
+                final_tokens, req_ids=final_req_ids, skip_req_ids=skip_req_ids
+            )
 
         num_reqs = len(req_ids)
         sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
         sampled_token_id_lists = [
-            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            []
+            if intermediate_mask[i] or (skip_req_ids and req_ids[i] in skip_req_ids)
+            else [int(sampled_token_ids_np[i])]
             for i in range(num_reqs)
         ]
 
@@ -2632,8 +2740,11 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
+            self.async_decode.note_prefill_submitted()
             return tt_out
-        return self.model.prefill_forward(**kwargs)
+        tt_out = self.model.prefill_forward(**kwargs)
+        self.async_decode.note_prefill_submitted()
+        return tt_out
 
     def _forward_with_model_input(
         self,
@@ -2748,15 +2859,17 @@ class TTModelRunner:
         torch.Tensor | None,
         list[str],
         dict[str, int],
+        set[str],
     ]:
         """Build the per-rank DP payload consumed by gather orchestration.
 
         Returns the local TT model input plus the per-rank metadata needed by
-        gathered-DP negotiation and input gathering.
+        gathered-DP negotiation and input gathering, ending with the requests
+        this step invalidated for the outstanding submission.
         """
         model_input = None
         has_penalties = 0
-        reset_batch = 0
+        decode_layout_changed = 0
         can_sample_device = 1
         needs_logprobs = 0
         intermediate_prefill_mask = None
@@ -2766,7 +2879,7 @@ class TTModelRunner:
             model_input = self.build_model_input(scheduler_output, grammar_output)
             if model_input is not None:
                 has_penalties = int(not self.input_batch.no_penalties)
-                reset_batch = int(model_input.reset_batch)
+                decode_layout_changed = int(model_input.decode_layout_changed)
                 can_sample_device = int(model_input.perform_device_sampling)
                 max_num_logprobs = model_input.max_num_logprobs[0]
                 # max_num_logprobs=0 still requests the sampled token's logprob.
@@ -2779,17 +2892,23 @@ class TTModelRunner:
         has_structured_input = (
             int(model_input.grammar_bitmask[0] is not None) if model_input else 0
         )
+        # Drained unconditionally, including when this rank scheduled nothing:
+        # the ids belong to the submission that was outstanding when
+        # ``build_model_input`` noted them, and carrying them into a later step
+        # would reject a token that step legitimately produced.
+        invalidated_req_ids = self._consume_invalidated_req_ids()
         return (
             model_input,
             max_blocks,
             has_structured_input,
             has_penalties,
-            reset_batch,
+            decode_layout_changed,
             can_sample_device,
             needs_logprobs,
             intermediate_prefill_mask,
             req_ids,
             req_id_to_index,
+            invalidated_req_ids,
         )
 
     def submit_dp_execution(
@@ -2830,34 +2949,40 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
         intermediate_prefill_mask: torch.Tensor | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> ModelRunnerOutput:
         """Apply the local DP rank result to runner state and build output.
 
         Converts the local gathered-DP result into the same state update and
-        `ModelRunnerOutput` used by non-DP execution.
+        `ModelRunnerOutput` used by non-DP execution. ``skip_req_ids`` comes
+        from the engine handle for this submission and names the requests a
+        later scheduler output invalidated while it was in flight; the caller
+        owns that set precisely so this result cannot be filtered by ids
+        belonging to a different step.
         """
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = sampled_token_ids[:num_reqs]
         if intermediate_prefill_mask is not None:
             intermediate_mask = intermediate_prefill_mask[:num_reqs]
             if intermediate_mask.any():
-                output_req_ids = (
-                    list(req_ids)
-                    if req_ids is not None
-                    else list(self.input_batch.req_ids[:num_reqs])
-                )
                 return self._build_chunked_prefill_output(
-                    req_ids=output_req_ids,
+                    req_ids=(
+                        list(req_ids)
+                        if req_ids is not None
+                        else list(self.input_batch.req_ids[:num_reqs])
+                    ),
                     sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs_lists,
                     intermediate_mask=intermediate_mask.cpu().numpy(),
                     req_id_to_index=req_id_to_index,
+                    skip_req_ids=skip_req_ids,
                 )
         return self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs_lists,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            skip_req_ids=skip_req_ids,
         )
 
     def _get_output_tokens(
@@ -3146,14 +3271,14 @@ class TTModelRunner:
         self,
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
-        request_states: tuple[CachedRequestState, ...] | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime
-        # and the ``request_states`` identity check guards slot reuse, so the
-        # live row equals the captured one. ``req_id_to_index`` is therefore the
-        # single source of truth for the target row.
+        # time, because the batch may have condensed in between. Request ids are
+        # client-supplied and can therefore be reused after an abort; the caller
+        # excludes such ids via ``skip_req_ids`` so a stale result cannot reach
+        # the request that took the id over.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         assert sampled_token_ids.shape[0] == num_reqs, (
@@ -3190,10 +3315,10 @@ class TTModelRunner:
         assert req_ids is not None
         captured_req_ids = req_ids
         for req_idx, req_id in enumerate(captured_req_ids):
+            if skip_req_ids is not None and req_id in skip_req_ids:
+                continue
             req_state = self.requests.get(req_id)
             if req_state is None:
-                continue
-            if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
             current_row = self.input_batch.req_id_to_index.get(req_id)
@@ -3218,22 +3343,34 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        skip_req_ids: set[str] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
         Updates persistent runner state from sampled tokens and returns the
-        `ModelRunnerOutput` consumed by the rest of vLLM.
+        `ModelRunnerOutput` consumed by the rest of vLLM. ``skip_req_ids`` names
+        requests whose state this result may no longer touch; their rows are
+        emptied so the scheduler does not append the token either.
         """
+        assert not skip_req_ids or req_ids is not None, (
+            "skip_req_ids resolves rows by request id, so req_ids is required"
+        )
         self._apply_sampled_tokens_to_state(
             sampled_token_ids=sampled_token_ids,
             req_ids=req_ids,
+            skip_req_ids=skip_req_ids,
         )
-        return self._build_runner_output(
+        output = self._build_runner_output(
             sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
+        for req_id in skip_req_ids or ():
+            req_idx = output.req_id_to_index.get(req_id)
+            if req_idx is not None:
+                output.sampled_token_ids[req_idx] = []
+        return output
 
     def warmup_model(self) -> None:
         # Two-phase warmup: compile first, then capture traces.
