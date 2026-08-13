@@ -247,14 +247,20 @@ class InputBatch:
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
 
-        # Slot remap for seed manager: remap[i] = j means slot i's data came
-        # from slot j after condense.  Identity when nothing moved.
+        # Condense-move remap: remap[i] = j means slot i's data came from slot j.
+        # ``condense`` is the only writer and ``TTLaneInputBatch`` overrides it to a
+        # no-op, so ``pop_slot_remap``'s one caller always reads the identity; the
+        # non-lane path resets it and uses ``_req_state_slot``, which subsumes it.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
+
+    def reset_slot_remap(self) -> None:
+        """Drop any pending slot remap; the identity from here."""
+        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
     def pop_slot_remap(self) -> torch.Tensor:
         """Return pending slot remap and reset to identity."""
         remap = self._slot_remap
-        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
+        self.reset_slot_remap()
         return remap
 
     @property
@@ -480,7 +486,7 @@ class InputBatch:
             self.sampling.batch_update_builder.moved.append(
                 (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
             )
-            # Track for on-device seed manager slot reindexing.
+            # Condense-move tracking (see ``self._slot_remap``): the only write.
             self._slot_remap[empty_index] = self._slot_remap[last_req_index]
 
             # Swap the states.

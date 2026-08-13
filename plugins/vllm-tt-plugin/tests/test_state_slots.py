@@ -15,8 +15,10 @@ against a fake runner.
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
-from vllm_tt_plugin import model_runner as model_runner_module
+import torch
+from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 SLOTS = 8
@@ -38,6 +40,37 @@ def _prefill(runner, row_req_ids):
 def _decode(runner, row_req_ids):
     remap = TTModelRunner._decode_state_slot_remap(runner, list(row_req_ids))
     return None if remap is None else remap.tolist()
+
+
+def _merge(runner, inputs):
+    return TTModelRunner._merge_dp_prefill_slots(runner, inputs)
+
+
+def _scheduler_output(*, preempted=None, scheduled=("KEEP",)):
+    """Just the SchedulerOutput fields ``_update_states`` reads on a quiet step."""
+    return SimpleNamespace(
+        finished_req_ids=[],
+        preempted_req_ids=preempted,
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens=dict.fromkeys(scheduled, 1),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+    )
+
+
+def _gather(state, remap):
+    """What the device does with a remap: row ``i`` reads slot ``remap[i]``."""
+    return list(state) if remap is None else [state[s] for s in remap]
+
+
+def _assert_state_found(runner, state):
+    """The invariant: a request's recorded slot is where its state actually sits."""
+    for req_id in runner.requests:
+        slot = runner._req_state_slot[req_id]
+        assert state[slot] == req_id, (
+            f"{req_id} thinks its state is in slot {slot}, which holds "
+            f"{state[slot]!r} (device state: {state})"
+        )
 
 
 def _release(runner, finished=(), preempted=None):
@@ -146,43 +179,202 @@ def test_a_resumed_preempted_request_gets_a_slot_and_a_valid_remap():
     assert _decode(r, decode_rows) is None
 
 
-def test_capacity_and_slot_width_are_enforced():
-    """More prefills than slots is a caller bug; rows past capacity are dropped."""
-    r = _runner(slots=2)
-    _prefill(r, ["A"])
-    _decode(r, ["A"])
-    with pytest.raises(AssertionError, match="no free device state slot"):
-        _prefill(r, ["B", "C"])
+def test_remap_carries_off_batch_state():
+    """A non-identity remap permutes ALL slots, live off-batch holders' included."""
+    r = _runner()
+    state: list[str | None] = [None] * SLOTS
+    for row, slot in enumerate(_prefill(r, ["A", "B"])):
+        state[slot] = ["A", "B"][row]
+    assert r._req_state_slot == {"A": 0, "B": 1}
 
-    # Rows beyond the slot width are truncated, so an over-long batch still yields a
-    # permutation of the real slots instead of an out-of-range source index.
-    r = _runner(slots=2)
-    r._req_state_slot.update({"A": 1, "B": 0})
-    assert _decode(r, ["A", "B", "C"]) == [1, 0]
+    # Only B decodes; pulling it to row 0 pushes live off-batch A out of slot 0.
+    remap = _decode(r, ["B"])
+    assert remap is not None and remap[0] == 1, f"row 0 must read B's slot 1: {remap}"
+    state = _gather(state, remap)
+    assert state[0] == "B"
+    assert state[1] == "A", "A's state was displaced by the gather"
+    _assert_state_found(r, state)
+
+    # A is rescheduled: its recorded slot must be the one it landed in.
+    remap = _decode(r, ["B", "A"])
+    state = _gather(state, remap)
+    _assert_state_found(r, state)
+    assert state[:2] == ["B", "A"], f"state must sit at each request's row: {state}"
 
 
-def test_non_permutation_is_refused_and_a_clean_map_is_silent(monkeypatch):
-    """A duplicated source slot would make a device gather read one slot twice.
+def _decode_global_slots(local_slots_per_rank, stride=SLOTS):
+    """The global slot space, computed the way gathered-DP DECODE computes it
+    (``raw_remap + arange(world) * B``). Prefill has to agree with this side."""
+    world = len(local_slots_per_rank)
+    raw = torch.zeros((world, stride), dtype=torch.int32)
+    for rank, slots in enumerate(local_slots_per_rank):
+        raw[rank, : len(slots)] = torch.tensor(slots, dtype=torch.int32)
+    offsets = torch.arange(world, dtype=torch.int32).unsqueeze(1) * stride
+    globalised = raw + offsets
+    return [
+        int(globalised[rank, i])
+        for rank, slots in enumerate(local_slots_per_rank)
+        for i in range(len(slots))
+    ]
 
-    The warning is captured by replacing the module logger; the plugin's logger does not
-    propagate to pytest's root handler.
-    """
-    warned: list[str] = []
-    monkeypatch.setattr(
-        model_runner_module.logger,
-        "warning",
-        lambda msg, *a, **k: warned.append(str(msg)),
+
+def _sampling_params(rows):
+    """Neutral per-row sampling tensors, the shape ``concat_dp_model_inputs`` cats."""
+    return TTSamplingParams(
+        temperature=torch.ones(rows),
+        top_k=torch.zeros(rows, dtype=torch.int32),
+        top_p=torch.ones(rows),
+        presence_penalty=torch.zeros(rows),
+        frequency_penalty=torch.zeros(rows),
+        repetition_penalty=torch.ones(rows),
+        seed=torch.zeros(rows, dtype=torch.int64),
+        num_logprobs=torch.full((rows,), -1, dtype=torch.int32),
+        enable_log_probs=torch.zeros(rows, dtype=torch.bool),
     )
 
-    # A request the allocator never saw is assumed to sit at its own row, which keeps
-    # the remap the identity instead of guessing. Nothing wrong, so nothing logged.
-    r = _runner()
-    assert _decode(r, ["X", "Y"]) is None
-    assert not warned, f"the clean path must not warn: {warned}"
 
-    # Skip the move -- one incoherent response beats an OOB device read -- and say so.
-    r._req_state_slot.update({"X": 3, "Y": 3})
+def _rank_input(slots, rows=None):
+    """One DP rank's prefill input: ``rows`` rows placed at ``slots``."""
+    rows = len(slots) if rows is None else rows
+    return TTModelInput(
+        input_tokens=torch.zeros((rows, 4), dtype=torch.int32),
+        input_positions=np.zeros(rows, dtype=np.int32),
+        prompt_lens=np.full(rows, 4, dtype=np.int32),
+        block_tables=torch.zeros((rows, 1), dtype=torch.int32),
+        block_tables_per_group=[torch.zeros((rows, 1), dtype=torch.int32)],
+        block_tables_per_layer=None,
+        unpadded_batch_size=rows,
+        tt_sampling_params=_sampling_params(rows),
+        multi_modal_kwargs={},
+        perform_device_sampling=True,
+        grammar_bitmask=[None],
+        logitsprocs_list=[None],
+        bad_words_token_ids_list=[{}],
+        allowed_token_ids_mask_list=[None],
+        generators_list=[{}],
+        max_num_logprobs=[None],
+        prefill_empty_slots=slots,
+    )
+
+
+def _concat_runner(slots=SLOTS):
+    r = _runner(slots)
+    r.max_num_blocks_per_req = 1
+    r._num_kv_cache_groups = 1
+    r.model_config = SimpleNamespace(is_multimodal_model=False)
+    r._block_tables_per_layer = lambda per_group: None
+    r._merge_dp_prefill_slots = lambda inputs: _merge(r, inputs)
+    return r
+
+
+def test_gathered_dp_prefill_slots_match_the_decode_offsets():
+    """The merge helper lifts each rank's local slots into the decode global space."""
+    per_rank = [[3], [], [0, 2]]  # rank 0 kept a live slot free; rank 1 idle
+    inputs = [_rank_input([3]), None, _rank_input([0, 2])]
+    assert _merge(_runner(), inputs) == _decode_global_slots(per_rank)
+
+    # No rank allocated any (stateless model): stay None so submit_prefill keeps its
+    # scheduling-order fallback rather than sending an empty list.
+    assert _merge(_runner(), [None, None]) is None
+    assert _merge(_runner(), [_rank_input(None, rows=1)]) is None
+
+
+def test_merged_slots_must_line_up_with_the_merged_rows():
+    """A rank contributing rows but no slots would silently shift every later rank's
+    state into the wrong place."""
+    with pytest.raises(AssertionError, match="rank 1 contributes 2 row"):
+        _merge(_runner(), [_rank_input([0]), _rank_input(None, rows=2)])
+    with pytest.raises(AssertionError, match="rank 0 contributes 3 row"):
+        _merge(_runner(), [_rank_input([0, 1], rows=3)])
+
+
+def test_concat_dp_prefill_carries_the_global_slots():
+    """#462 was in the caller: it dropped the merged slots, so every rank but rank 0
+    prefilled into rank 0's slots. Test where the bug was."""
+    per_rank = [[3], [0, 2]]
+    merged = TTModelRunner.concat_dp_model_inputs(
+        _concat_runner(),
+        [_rank_input(per_rank[0]), _rank_input(per_rank[1])],
+        is_decode=False,
+        max_blocks_decode_batch=None,
+        any_structured_inputs=False,
+    )
+
+    assert merged.prefill_empty_slots == _decode_global_slots(per_rank)
+    assert len(merged.prefill_empty_slots) == merged.input_tokens.shape[0], (
+        "one slot per merged row, in row order"
+    )
+
+
+def test_preemption_releases_its_state_slot():
+    """The wiring: ``_update_states`` must actually call the release pass. The tests
+    above drive ``_release_dead_state_slots`` directly and would not notice its loss."""
+    r = _runner()
+    r.encoder_cache = {}
+    r._decode_layout_changed_since_last_decode = False
+    r.input_batch = SimpleNamespace(
+        req_id_to_index={"KEEP": 0}, refresh_logitsprocs=lambda: None
+    )
+    r._release_dead_state_slots = lambda so: _release(
+        r, finished=so.finished_req_ids, preempted=so.preempted_req_ids
+    )
+    r._req_state_slot.update({"P": 0, "KEEP": 1})
+    r.requests.update(dict.fromkeys(["P", "KEEP"]))
+
+    TTModelRunner._update_states(r, _scheduler_output(preempted={"P"}))
+
+    assert r._req_state_slot == {"KEEP": 1}, "only the preempted request releases"
+    assert "P" in r.requests, "the request is still live, it just re-prefills"
+
+    # Which is the point: the freed slot is available to the incoming prefill.
+    assert _prefill(r, ["NEW"]) == [0]
+
+
+def test_slot_exhaustion_fails_instead_of_guessing():
+    """Exhaustion means the map has stopped describing the device, and it is the only
+    record of slot ownership. Guessing returns plausible, wrong text."""
+    r = _runner(slots=2)
+    _prefill(r, ["A", "B"])  # both slots held by live requests
+    with pytest.raises(AssertionError, match="no free device state slot"):
+        _prefill(r, ["C"])
+
+    # Over-capacity is the scheduler's decision to make, not this function's.
+    with pytest.raises(AssertionError, match="exceed the 2 device state slots"):
+        _prefill(_runner(slots=2), ["A", "B", "C"])
+
+
+def test_more_decode_rows_than_slots_raises():
+    """Truncating to the slot width would silently drop C's state instead of saying
+    the batch cannot be described."""
+    r = _runner(slots=2)
+    r._req_state_slot.update({"A": 1, "B": 0})
+    assert _decode(r, ["A", "B"]) == [1, 0], "at capacity is still fine"
+    with pytest.raises(AssertionError, match="3 decode row"):
+        _decode(r, ["A", "B", "C"])
+
+
+def test_a_clean_map_is_silent_and_a_broken_one_raises():
+    """A duplicated source slot would make a device gather read one slot twice.
+    Refusing sends no gather at all, which corrupts every off-row request instead."""
+    # Steady state: everyone already sits at their own row, so nothing moves.
+    r = _runner()
+    _prefill(r, ["X", "Y"])
     assert _decode(r, ["X", "Y"]) is None
-    assert any("not a permutation" in w for w in warned), warned
-    # The map is still repaired to the rows, so the next step is consistent.
-    assert r._req_state_slot == {"X": 0, "Y": 1}
+
+    # A duplicate is an impossible state, and Z's entry says who else is affected.
+    r._req_state_slot.update({"X": 3, "Y": 3, "Z": 5})
+    with pytest.raises(AssertionError, match="not a permutation") as exc:
+        _decode(r, ["X", "Y"])
+    assert "duplicated=[3]" in str(exc.value)
+    assert "'Z': 5" in str(exc.value), "the whole map is the diagnostic"
+    # It fails before writing, so off-batch entries like Z are left alone.
+    assert r._req_state_slot == {"X": 3, "Y": 3, "Z": 5}
+
+
+def test_a_decoding_request_without_a_slot_raises():
+    """Inventing ownership records a second request at a slot a live one owns. It is
+    the hole both corruptions travel through."""
+    r = _runner()
+    _prefill(r, ["A"])
+    with pytest.raises(AssertionError, match="'GHOST' has no device state slot"):
+        _decode(r, ["A", "GHOST"])

@@ -600,8 +600,10 @@ class TTAsyncDecodeController:
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
             kwargs["reset_batch"] = model_input.reset_batch
-            if model_input.slot_remap is not None:
-                kwargs["slot_remap"] = model_input.slot_remap
+        # Two consumers, gated differently: ``decode_forward`` moves per-slot GDN
+        # state with it always, the seed manager reindexes only on device sampling.
+        if model_input.slot_remap is not None:
+            kwargs["slot_remap"] = model_input.slot_remap
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
