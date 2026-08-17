@@ -628,10 +628,6 @@ def get_dispatch_core_config(tt_config):
     return ttnn.DispatchCoreConfig(axis=dispatch_core_axis)
 
 
-def _fabric_config_names():
-    return [name for name in dir(ttnn.FabricConfig) if name[0].isupper()]
-
-
 def get_fabric_config(tt_config, num_devices):
     if num_devices == 1:
         # No fabric config for single device
@@ -652,10 +648,10 @@ def get_fabric_config(tt_config, num_devices):
     # work without a plugin allow-list update.
     if tt_config is not None and "fabric_config" in tt_config:
         fabric_config_str = tt_config["fabric_config"]
-        fabric_config = getattr(ttnn.FabricConfig, fabric_config_str, None)
+        fabric_config = ttnn.FabricConfig.__members__.get(fabric_config_str)
         assert fabric_config is not None, (
             f"Invalid fabric_config: {fabric_config_str}. "
-            f"Expected one of {_fabric_config_names()}."
+            f"Expected one of {list(ttnn.FabricConfig.__members__)}."
         )
     return fabric_config
 
