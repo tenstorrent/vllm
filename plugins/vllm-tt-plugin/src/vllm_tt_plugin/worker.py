@@ -628,31 +628,34 @@ def get_dispatch_core_config(tt_config):
     return ttnn.DispatchCoreConfig(axis=dispatch_core_axis)
 
 
+def _fabric_config_names():
+    return [name for name in dir(ttnn.FabricConfig) if name[0].isupper()]
+
+
 def get_fabric_config(tt_config, num_devices):
     if num_devices == 1:
         # No fabric config for single device
         fabric_config = None
     else:
-        # Set the most common value as default
-        is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
-        fabric_config = (
-            ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
-        )
+        # Wormhole Galaxy (6U) uses a 1D ring. Blackhole Galaxy needs a 2D torus:
+        # column-axis collectives have no wraparound path on 1D fabrics.
+        cluster_type = ttnn.cluster.get_cluster_type()
+        if cluster_type == ttnn.cluster.ClusterType.BLACKHOLE_GALAXY:
+            fabric_config = ttnn.FabricConfig.FABRIC_2D_TORUS_XY
+        elif cluster_type == ttnn.cluster.ClusterType.GALAXY:
+            fabric_config = ttnn.FabricConfig.FABRIC_1D_RING
+        else:
+            fabric_config = ttnn.FabricConfig.FABRIC_1D
 
-    # Override fabric_config if specified in TT plugin config.
+    # Override fabric_config if specified in TT plugin config. Resolve the name
+    # from ttnn.FabricConfig so newly added fabrics (e.g. FABRIC_2D_TORUS_XY)
+    # work without a plugin allow-list update.
     if tt_config is not None and "fabric_config" in tt_config:
         fabric_config_str = tt_config["fabric_config"]
-        fabric_config_map = {
-            "DISABLED": ttnn.FabricConfig.DISABLED,
-            "FABRIC_1D": ttnn.FabricConfig.FABRIC_1D,
-            "FABRIC_1D_RING": ttnn.FabricConfig.FABRIC_1D_RING,
-            "FABRIC_2D": ttnn.FabricConfig.FABRIC_2D,
-            "CUSTOM": ttnn.FabricConfig.CUSTOM,
-        }
-        fabric_config = fabric_config_map.get(fabric_config_str)
+        fabric_config = getattr(ttnn.FabricConfig, fabric_config_str, None)
         assert fabric_config is not None, (
             f"Invalid fabric_config: {fabric_config_str}. "
-            f"Expected one of {list(fabric_config_map.keys())}."
+            f"Expected one of {_fabric_config_names()}."
         )
     return fabric_config
 
