@@ -158,6 +158,53 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         # Everything generated so far is reasoning.
         return model_output, None
 
+    def _split_reasoning_content(self, text: str) -> tuple[str, str]:
+        """Split accumulated model output into ``(reasoning, content)``.
+
+        Pure function of TEXT. Deliberately ignores token ids: the id stream
+        runs ahead of the detokenizer, so using ids to place the boundary
+        emits still-buffered reasoning as content.
+
+        Reasoning ends at whichever marker comes first:
+          * ``</think>``    -- consumed, never emitted
+          * ``<tool_call>`` -- retained, it belongs to content
+
+        Until a marker is complete, a trailing PREFIX of one is withheld, so a
+        marker split across deltas (``'\\n</think'`` + ``'>'``) is never
+        emitted piecemeal.
+        """
+        # Old template / edge case: the model emits <think> itself.
+        if self.start_token in text:
+            text = text.split(self.start_token, 1)[1]
+
+        markers = [self.end_token]
+        if self._tool_call_token_id is not None:
+            markers.append(self._tool_call_tag)
+
+        end_index = text.find(self.end_token)
+        tool_index = (
+            text.find(self._tool_call_tag)
+            if self._tool_call_token_id is not None
+            else -1
+        )
+
+        if end_index >= 0 and (tool_index < 0 or end_index < tool_index):
+            # </think> is consumed: it is neither reasoning nor content.
+            return text[:end_index], text[end_index + len(self.end_token) :]
+        if tool_index >= 0:
+            # <tool_call> stays in content for the tool parser to pick up.
+            return text[:tool_index], text[tool_index:]
+
+        # No complete marker yet. Withhold any trailing partial marker so it is
+        # not emitted as reasoning and then again as part of the marker.
+        hold = 0
+        for marker in markers:
+            for k in range(min(len(marker) - 1, len(text)), 0, -1):
+                if text.endswith(marker[:k]):
+                    hold = max(hold, k)
+                    break
+        return (text[: len(text) - hold] if hold else text), ""
+
     def extract_reasoning_streaming(
         self,
         previous_text: str,
@@ -179,60 +226,34 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         prompt_is_reasoning_end and routes deltas as content without
         calling this method.
         """
-        # Strip <think> from delta if present (old template / edge case
-        # where the model generates <think> itself).
-        if self.start_token_id in delta_token_ids:
-            start_idx = delta_text.find(self.start_token)
-            if start_idx >= 0:
-                delta_text = delta_text[start_idx + len(self.start_token) :]
-
-        # Cherrypick of https://github.com/vllm-project/vllm/pull/38864
-        # Stop-string buffering can delay the visible text for </think> until a
-        # later chunk, so detect the end marker from text first rather than
-        # relying solely on the token ids from the current delta.
-        end_index = delta_text.find(self.end_token)
-        if end_index >= 0:
-            reasoning = delta_text[:end_index]
-            content = delta_text[end_index + len(self.end_token) :]
-            if not reasoning and not content:
-                return None
-            return DeltaMessage(
-                reasoning=reasoning if reasoning else None,
-                content=content if content else None,
-            )
-
         if self.end_token_id in delta_token_ids and not delta_text:
             # End token in IDs but not in visible text yet. Wait for the
             # detokenizer to flush the buffered text in a later chunk.
             return None
 
-        # Implicit reasoning end via <tool_call>.
-        if (
-            self._tool_call_token_id is not None
-            and self._tool_call_token_id in delta_token_ids
-        ):
-            tool_index = delta_text.find(self._tool_call_tag)
-            if tool_index >= 0:
-                reasoning = delta_text[:tool_index]
-                content = delta_text[tool_index:]
-                return DeltaMessage(
-                    reasoning=reasoning if reasoning else None,
-                    content=content if content else None,
-                )
+        # Place the boundary from TEXT ONLY.
+        #
+        # The previous implementation keyed off
+        #   `self.end_token_id in previous_token_ids`
+        # but the id stream runs AHEAD of the detokenized text, so that flips to
+        # content mode while the reasoning tail and the marker itself are still
+        # buffered -- emitting both as content and breaking
+        # response_format=json_object, whose content must parse as JSON.
+        #
+        # _split_reasoning_content() is a pure function of the accumulated text,
+        # so emitting the difference between the split of previous_text and the
+        # split of previous_text + delta_text is monotonic by construction and
+        # can never emit marker text, however the marker is chunked.
+        prev_reasoning, prev_content = self._split_reasoning_content(previous_text)
+        cur_reasoning, cur_content = self._split_reasoning_content(
+            previous_text + delta_text
+        )
+        reasoning = cur_reasoning[len(prev_reasoning) :]
+        content = cur_content[len(prev_content) :]
 
-        # No end token in this delta.
-        if not delta_text:
-            # Nothing left after stripping start token.
+        if not reasoning and not content:
             return None
-        # Cherrypick of https://github.com/vllm-project/vllm/pull/38864
-        elif self.end_token_id in previous_token_ids or self.end_token in previous_text:
-            # End token already passed: everything is content now.
-            return DeltaMessage(content=delta_text)
-        elif (
-            self._tool_call_token_id is not None
-            and self._tool_call_token_id in previous_token_ids
-        ):
-            return DeltaMessage(content=delta_text)
-        else:
-            # No end token yet: still in reasoning phase.
-            return DeltaMessage(reasoning=delta_text)
+        return DeltaMessage(
+            reasoning=reasoning if reasoning else None,
+            content=content if content else None,
+        )
