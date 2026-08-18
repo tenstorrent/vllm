@@ -171,7 +171,7 @@ or a mesh shape such as `"(4,8)"`, then pass `--model`:
 For Llama 3.1 8B on N150, set `--max_model_len 32768`; see the tt-metal model
 demo for context-length details.
 
-To run Llama 70B on Galaxy:
+To run Llama 70B on Wormhole Galaxy:
 
 ```bash
 MESH_DEVICE=TG \
@@ -179,18 +179,30 @@ LLAMA_DIR=<path-to-weights> \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
   --model "meta-llama/Llama-3.1-70B-Instruct" \
-  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
 ```
 
-To run GPT-OSS 20B on Galaxy:
+To run GPT-OSS 20B on Wormhole Galaxy:
 
 ```bash
 MESH_DEVICE="(4,8)" \
 python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
   --model "openai/gpt-oss-20b" \
-  --max_seqs_in_batch 1 \
-  --additional-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'
+  --max_seqs_in_batch 1
 ```
+
+To run Qwen3-32B on Blackhole Galaxy:
+
+```bash
+MESH_DEVICE=TG \
+TT_QWEN3_TEXT_VER=qwen3_32b_galaxy \
+python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+  --model "Qwen/Qwen3-32B" \
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1345000, "trace_region_size": 184915840}}'
+```
+
+Wormhole Galaxy defaults to `FABRIC_1D_RING` and Blackhole Galaxy defaults to
+`FABRIC_2D_TORUS_XY`, so those recipes do not need an explicit `fabric_config`.
 
 Run Llama 3.2 Vision on N300:
 
@@ -269,7 +281,7 @@ Common options:
 | `trace_region_size` | Trace region size for TT runtime tracing. |
 | `worker_l1_size` | Worker L1 size override. |
 | `l1_small_size` | Small L1 size override. |
-| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. |
+| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Defaults: Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
@@ -325,7 +337,7 @@ lanes.
 
 Serve them with the familiar `--data_parallel_size N --max_num_seqs M` flags;
 the TT backend transparently maps them to `N` in-process lanes. No config
-changes are needed:
+changes are needed. Wormhole Galaxy example (fabric defaults to `FABRIC_1D_RING`):
 
 ```bash
 MESH_DEVICE=TG \
@@ -336,7 +348,7 @@ python plugins/vllm-tt-plugin/examples/server_example_tt.py \
   --data_parallel_size 4 \
   --max_num_seqs 8 \
   --async-scheduling \
-  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
 `--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
