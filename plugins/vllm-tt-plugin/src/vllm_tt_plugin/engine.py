@@ -350,6 +350,43 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
         if callable(set_mode):
             set_mode(forced_mode)
 
+    def _dp_schedule_with_zero_prefill_fallback(
+        self,
+        forced_mode: TTSchedulingMode,
+        scheduler_output: SchedulerOutput | None,
+    ) -> SchedulerOutput | None:
+        if forced_mode != TTSchedulingMode.PREFILL_ONLY:
+            return scheduler_output
+
+        local_tokens = (
+            scheduler_output.total_num_scheduled_tokens if scheduler_output else 0
+        )
+        local_has_decode = any(
+            not request.is_prefill_chunk
+            for request in getattr(self.scheduler, "running", [])
+        )
+        progress_t = torch.tensor([local_tokens], dtype=torch.int32)
+        dist.all_reduce(progress_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+        decode_t = torch.tensor([int(local_has_decode)], dtype=torch.int32)
+        dist.all_reduce(decode_t, op=dist.ReduceOp.MAX, group=self.dp_group)
+
+        if progress_t.item() != 0 or decode_t.item() == 0:
+            return scheduler_output
+
+        self._dp_gather_forced_mode = TTSchedulingMode.DECODE_ONLY
+        self._dp_apply_forced_mode(TTSchedulingMode.DECODE_ONLY)
+        decode_output = (
+            self.scheduler.schedule() if self.scheduler.has_requests() else None
+        )
+        if scheduler_output is not None and decode_output is not None:
+            decode_output.finished_req_ids |= scheduler_output.finished_req_ids
+            decode_output.free_encoder_mm_hashes = (
+                scheduler_output.free_encoder_mm_hashes
+                + decode_output.free_encoder_mm_hashes
+            )
+
+        return decode_output
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         if self._scheduler_paused:
             return {}, False
@@ -358,13 +395,16 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             return {}, False
 
         forced_mode = self._dp_negotiate_forced_mode()
-        if not self.scheduler.has_requests():
+        has_local_requests = self.scheduler.has_requests()
+        self._dp_apply_forced_mode(forced_mode)
+        scheduler_output = self.scheduler.schedule() if has_local_requests else None
+        scheduler_output = self._dp_schedule_with_zero_prefill_fallback(
+            forced_mode, scheduler_output
+        )
+        self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
+        if not has_local_requests:
             _ = self._execute_model_dp_gather(None, None)
             return {}, False
-
-        self._dp_apply_forced_mode(forced_mode)
-        scheduler_output = self.scheduler.schedule()
-        self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
 
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         model_output = self._execute_model_dp_gather(scheduler_output, grammar_output)
@@ -394,7 +434,12 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             if self.scheduler.has_requests():
                 self._dp_apply_forced_mode(forced_mode)
                 scheduler_output = self.scheduler.schedule()
-                self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
+            scheduler_output = self._dp_schedule_with_zero_prefill_fallback(
+                forced_mode, scheduler_output
+            )
+            forced_mode = self._dp_gather_forced_mode
+            self._dp_apply_forced_mode(TTSchedulingMode.DEFAULT)
+            if scheduler_output is not None:
                 if not self.is_ec_producer:
                     model_executed = scheduler_output.total_num_scheduled_tokens > 0
                 if not scheduler_output.pending_structured_output_tokens:
