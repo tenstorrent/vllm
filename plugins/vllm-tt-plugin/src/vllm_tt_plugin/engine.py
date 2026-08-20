@@ -365,12 +365,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             not request.is_prefill_chunk
             for request in getattr(self.scheduler, "running", [])
         )
-        progress_t = torch.tensor([local_tokens], dtype=torch.int32)
-        dist.all_reduce(progress_t, op=dist.ReduceOp.SUM, group=self.dp_group)
-        decode_t = torch.tensor([int(local_has_decode)], dtype=torch.int32)
-        dist.all_reduce(decode_t, op=dist.ReduceOp.MAX, group=self.dp_group)
+        # Both quantities are non-negative, so a single SUM answers both:
+        # zero total tokens, and zero iff no rank has a running decode.
+        probe_t = torch.tensor([local_tokens, int(local_has_decode)], dtype=torch.int32)
+        dist.all_reduce(probe_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+        global_tokens, ranks_with_decode = (int(v) for v in probe_t.tolist())
 
-        if progress_t.item() != 0 or decode_t.item() == 0:
+        if global_tokens != 0 or ranks_with_decode == 0:
             return scheduler_output
 
         self._dp_gather_forced_mode = TTSchedulingMode.DECODE_ONLY

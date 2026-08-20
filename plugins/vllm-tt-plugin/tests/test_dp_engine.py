@@ -54,10 +54,11 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
         set_forced_mode=lambda mode: None,
     )
     core = _core_with_scheduler(scheduler)
-    reductions = iter(([0], [1]))
+    all_reduce_calls = []
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor(next(reductions)))
+        all_reduce_calls.append(op)
+        tensor.copy_(engine_module.torch.tensor([0, 1]))
         assert group is core.dp_group
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
@@ -70,6 +71,7 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
     assert result.finished_req_ids == {"finished-prefill"}
     assert result.free_encoder_mm_hashes == ["encoder-prefill"]
     assert core._dp_gather_forced_mode == TTSchedulingMode.DECODE_ONLY
+    assert all_reduce_calls == [engine_module.dist.ReduceOp.SUM]
 
 
 def test_dp_zero_prefill_fallback_keeps_output_when_rank_has_drained(monkeypatch):
@@ -83,10 +85,9 @@ def test_dp_zero_prefill_fallback_keeps_output_when_rank_has_drained(monkeypatch
         schedule=lambda: (_ for _ in ()).throw(AssertionError("unexpected reschedule")),
     )
     core = _core_with_scheduler(scheduler)
-    reductions = iter(([0], [1]))
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor(next(reductions)))
+        tensor.copy_(engine_module.torch.tensor([0, 1]))
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
 
@@ -101,17 +102,17 @@ def test_dp_zero_prefill_fallback_keeps_output_when_rank_has_drained(monkeypatch
 
 
 @pytest.mark.parametrize(
-    ("running", "reductions"),
+    ("running", "probe"),
     [
         pytest.param(
             [SimpleNamespace(is_prefill_chunk=False)],
-            ([1], [1]),
+            [1, 1],
             id="prefill-progress-on-any-rank",
         ),
-        pytest.param([], ([0], [0]), id="no-running-decode"),
+        pytest.param([], [0, 0], id="no-running-decode"),
     ],
 )
-def test_dp_zero_prefill_no_fallback(monkeypatch, running, reductions):
+def test_dp_zero_prefill_no_fallback(monkeypatch, running, probe):
     """Prefill remains selected when fallback conditions are incomplete."""
     prefill_output = SchedulerOutput.make_empty()
     scheduler = SimpleNamespace(
@@ -121,10 +122,9 @@ def test_dp_zero_prefill_no_fallback(monkeypatch, running, reductions):
     )
     core = _core_with_scheduler(scheduler)
     core._dp_gather_forced_mode = TTSchedulingMode.PREFILL_ONLY
-    reductions = iter(reductions)
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor(next(reductions)))
+        tensor.copy_(engine_module.torch.tensor(probe))
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
 
@@ -161,11 +161,10 @@ def test_dp_step_uses_decode_fallback_output(monkeypatch):
     )
     core = _core_with_scheduler(scheduler)
     core._scheduler_paused = False
-    reductions = iter(([0], [1]))
     executed = []
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor(next(reductions)))
+        tensor.copy_(engine_module.torch.tensor([0, 1]))
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
     monkeypatch.setattr(core, "_dp_any_rank_has_scheduler_requests", lambda: True)
@@ -219,11 +218,10 @@ def test_dp_async_step_submits_decode_after_prefill_fallback(monkeypatch):
     core.batch_queue = object()
     core._dp_in_flight = None
     core.is_ec_producer = False
-    reductions = iter(([0], [1]))
     submitted = []
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor(next(reductions)))
+        tensor.copy_(engine_module.torch.tensor([0, 1]))
 
     def submit(output, grammar, *, overlap_ok):
         submitted.append((output, core._dp_gather_forced_mode, overlap_ok))
