@@ -21,6 +21,11 @@ deterministic budget source:
   yields a fixed per-model budget, isolating this function from the
   per-SKU tables that live on the model class.
 
+``num_devices`` is now an explicit parameter (added by #425, "forward-compat
+prep for newer vLLM", which did not update these tests). Each call below passes
+``cfg.device_config.num_devices`` so a test's device count stays expressed in one
+place -- the fixture default of 1, or the explicit override a test sets.
+
 Sliding-window headroom is gated per model class by the
 ``_HYBRID_KV_CACHE_GROUPS_ENABLED`` attribute, read off the resolved model
 class. ``_model_budget`` sets it explicitly on the stub class (defaulting
@@ -89,7 +94,7 @@ def test_default_branch_no_sliding(cfg):
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
         _fallback_arch(),
     ):
-        n = get_num_available_blocks_tt(cfg)
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
 
     # Default branch: max_tokens_all_users = 131072, plus block_size*batch
     # padding (64*32 = 2048). num_blocks = ceil(133120 / 64) = 2080.
@@ -116,7 +121,7 @@ def test_lane_mode_kv_shape_matches_per_lane_gathered_dp(cfg):
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
         _fallback_arch(),
     ):
-        n = get_num_available_blocks_tt(cfg)
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
 
     # Per-lane batch is 32 // 4 = 8.
     # Default tokens (131072) + batch padding (64 * 8 = 512) = 131584 tokens
@@ -137,7 +142,7 @@ def test_sliding_window_adds_headroom(cfg):
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
         _model_budget(131_072, hybrid_enabled=True),
     ):
-        n = get_num_available_blocks_tt(cfg)
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
 
     # Model budget (131072) + batch padding (64*32=2048) +
     # sliding overhead (1024 * 32 * 8 = 262144) = 395264 tokens ->
@@ -157,7 +162,7 @@ def test_n150_branch_unchanged_for_uniform_model(cfg):
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
         _model_budget(32768),
     ):
-        n = get_num_available_blocks_tt(cfg)
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
 
     # Llama8B-N150 branch: 32768 + 64*32 padding = 34816 -> ceil/64 = 544.
     assert n == 544
@@ -176,7 +181,7 @@ def test_per_model_branch_with_sliding_window(cfg):
         patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
         _model_budget(65_536, hybrid_enabled=True),
     ):
-        n = get_num_available_blocks_tt(cfg)
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
 
     # gemma-3-4b N300 branch: 65536 base + 64*32 padding + 1024*32*8 sliding
     # = 65536 + 2048 + 262144 = 329728 -> ceil/64 = 5152
