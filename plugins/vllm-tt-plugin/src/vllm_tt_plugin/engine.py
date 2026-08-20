@@ -375,10 +375,16 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
         self._dp_gather_forced_mode = TTSchedulingMode.DECODE_ONLY
         self._dp_apply_forced_mode(TTSchedulingMode.DECODE_ONLY)
+
         decode_output = (
-            self.scheduler.schedule() if self.scheduler.has_requests() else None
+            self.scheduler.schedule()
+            if self.scheduler.has_unfinished_requests()
+            else None
         )
-        if scheduler_output is not None and decode_output is not None:
+        if decode_output is None:
+            return scheduler_output
+
+        if scheduler_output is not None:
             decode_output.finished_req_ids |= scheduler_output.finished_req_ids
             decode_output.free_encoder_mm_hashes = (
                 scheduler_output.free_encoder_mm_hashes

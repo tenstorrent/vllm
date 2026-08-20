@@ -49,7 +49,7 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
     decode_output.total_num_scheduled_tokens = 2
     scheduler = SimpleNamespace(
         running=[SimpleNamespace(is_prefill_chunk=False)],
-        has_requests=lambda: True,
+        has_unfinished_requests=lambda: True,
         schedule=lambda: decode_output,
         set_forced_mode=lambda mode: None,
     )
@@ -67,6 +67,34 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
     )
 
     assert result is decode_output
+    assert result.finished_req_ids == {"finished-prefill"}
+    assert result.free_encoder_mm_hashes == ["encoder-prefill"]
+    assert core._dp_gather_forced_mode == TTSchedulingMode.DECODE_ONLY
+
+
+def test_dp_zero_prefill_fallback_keeps_output_when_rank_has_drained(monkeypatch):
+    """A rank with nothing left to schedule keeps its output instead of None."""
+    prefill_output = SchedulerOutput.make_empty()
+    prefill_output.finished_req_ids.add("finished-prefill")
+    prefill_output.free_encoder_mm_hashes.append("encoder-prefill")
+    scheduler = SimpleNamespace(
+        running=[],
+        has_unfinished_requests=lambda: False,
+        schedule=lambda: (_ for _ in ()).throw(AssertionError("unexpected reschedule")),
+    )
+    core = _core_with_scheduler(scheduler)
+    reductions = iter(([0], [1]))
+
+    def all_reduce(tensor, *, op, group):
+        tensor.copy_(engine_module.torch.tensor(next(reductions)))
+
+    monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
+
+    result = core._dp_schedule_with_zero_prefill_fallback(
+        TTSchedulingMode.PREFILL_ONLY, prefill_output
+    )
+
+    assert result is prefill_output
     assert result.finished_req_ids == {"finished-prefill"}
     assert result.free_encoder_mm_hashes == ["encoder-prefill"]
     assert core._dp_gather_forced_mode == TTSchedulingMode.DECODE_ONLY
@@ -125,6 +153,7 @@ def test_dp_step_uses_decode_fallback_output(monkeypatch):
     scheduler = SimpleNamespace(
         running=[SimpleNamespace(is_prefill_chunk=False)],
         has_requests=lambda: True,
+        has_unfinished_requests=lambda: True,
         schedule=schedule,
         set_forced_mode=modes.append,
         get_grammar_bitmask=lambda output: None,
@@ -181,6 +210,7 @@ def test_dp_async_step_submits_decode_after_prefill_fallback(monkeypatch):
     scheduler = SimpleNamespace(
         running=[SimpleNamespace(is_prefill_chunk=False)],
         has_requests=lambda: True,
+        has_unfinished_requests=lambda: True,
         schedule=schedule,
         set_forced_mode=modes.append,
         get_grammar_bitmask=lambda output: None,
