@@ -86,6 +86,33 @@ def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
     scheduler_config.long_prefill_token_threshold = 0
 
 
+def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
+    """Re-apply core's no-prefix-caching Mamba sizing after we turn it off.
+
+    ``MambaModelConfig.verify_and_update_config`` runs as the first statement of
+    ``VllmConfig.__post_init__``, far ahead of this platform hook, and sizes
+    ``mamba_block_size`` and ``mamba_cache_mode`` against prefix caching being
+    enabled. Disabling the flag afterwards leaves a pair that
+    ``VllmConfig.validate_mamba_block_size`` rejects outright, so mirror the
+    branch core takes when prefix caching is off: that validator reads
+    ``mamba_block_size == max_model_len`` as "unset".
+
+    ``block_size`` is deliberately left alone. TT reads it when it builds the KV
+    spec, and it already holds the value core's disabled branch computes.
+    """
+    cache_config = vllm_config.cache_config
+    if getattr(cache_config, "mamba_block_size", None) is None:
+        return
+
+    cache_config.mamba_cache_mode = "none"
+    cache_config.mamba_block_size = vllm_config.model_config.max_model_len
+    logger.info(
+        "Prefix caching is disabled, so mamba_block_size is reset to "
+        "max_model_len=%d and mamba_cache_mode to 'none'.",
+        cache_config.mamba_block_size,
+    )
+
+
 def _galaxy_generator_version() -> str | None:
     """Return the active Galaxy-generator model version, or None.
 
@@ -766,6 +793,7 @@ class TTPlatform(Platform):
                     "disabling it",
                     model_class.__module__,
                 )
+                _renormalize_mamba_cache_config(vllm_config)
             else:
                 # Check if the model architecture uses sliding window
                 uses_sliding_window = (
@@ -777,6 +805,7 @@ class TTPlatform(Platform):
                         "Prefix caching is not supported in TT backend for "
                         "models with sliding window, disabling it"
                     )
+                    _renormalize_mamba_cache_config(vllm_config)
 
         logger.info(
             "Automatic prefix caching is %s",
