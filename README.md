@@ -1,7 +1,22 @@
 <!-- markdownlint-disable MD001 MD041 -->
-**⚠️ Running on Tenstorrent hardware**: To use vLLM with Tenstorrent hardware, please follow the instructions in the [TT vLLM plugin README](https://github.com/tenstorrent/vllm/tree/dev/plugins/vllm-tt-plugin) (Note: `dev` is the main development branch).
+
+> [!CAUTION]
+>
+> # This repository is deprecated. Do not use it
+>
+> Tenstorrent support for vLLM now lives in a standalone plugin that runs on
+> **upstream vLLM**, not in this fork:
+>
+> ## ➡️ [github.com/tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin)
+>
+> This fork receives no further fixes, model enablement, or upstream merges,
+> and it will be archived. Start there instead, and migrate any existing setup:
+> install upstream vLLM plus `vllm-tt-plugin` by following that repo's README.
+> Open issues and pull requests against
+> [tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin/issues).
 
 ---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
