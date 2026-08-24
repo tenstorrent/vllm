@@ -1,0 +1,15 @@
+.buildkite/scripts/run-multi-node-test.sh:SC2086
+.buildkite/scripts/run-multi-node-test.sh:SC2089
+.buildkite/scripts/run-multi-node-test.sh:SC2090
+.buildkite/scripts/tool_call/run-bfcl-eval.sh:SC2317
+.buildkite/scripts/tool_call/run-bfcl-eval.sh:SC2329
+tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh:SC2086
+tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh:SC2089
+tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh:SC2090
+tests/v1/kv_connector/nixl_integration/spec_decode_acceptance_test.sh:SC2046
+tests/v1/kv_connector/nixl_integration/spec_decode_acceptance_test.sh:SC2048
+tests/v1/kv_connector/nixl_integration/spec_decode_acceptance_test.sh:SC2086
+tests/v1/kv_connector/nixl_integration/spec_decode_acceptance_test.sh:SC2206
+tools/pre_commit/shellcheck.sh:SC2016
+vllm/utils/numa_wrapper.sh:SC1001
+vllm/utils/numa_wrapper.sh:SC2086
