@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import sys
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -183,6 +184,46 @@ builtin_platform_plugins = {
 }
 
 
+TT_PLATFORM_PLUGIN_NAME = "tt"
+
+_TT_DEPRECATION_BANNER = r"""
+################################################################################
+#                                                                              #
+#        **************************************************************        #
+#                                                                              #
+#                             D E P R E C A T E D                              #
+#                                                                              #
+#        **************************************************************        #
+#                                                                              #
+#          This vLLM fork (tenstorrent/vllm) is no longer maintained.          #
+#         Tenstorrent support now ships as a plugin for UPSTREAM vLLM:         #
+#                                                                              #
+#          >>>   https://github.com/tenstorrent/vllm-tt-plugin   <<<           #
+#                                                                              #
+#      No further fixes, model enablement, or upstream merges land here,       #
+#     and this repository will be archived. Migrate now: install upstream      #
+#        vLLM plus vllm-tt-plugin, following that repository's README.         #
+#                File issues and pull requests there, not here.                #
+#                                                                              #
+################################################################################
+"""
+
+_tt_deprecation_warned = False
+
+
+def _warn_tt_fork_deprecated() -> None:
+    """Shout the fork deprecation once per process when TT is the platform.
+
+    Written straight to stderr rather than through logging: it has to survive
+    VLLM_CONFIGURE_LOGGING=0 and any log level the caller picked.
+    """
+    global _tt_deprecation_warned
+    if _tt_deprecation_warned:
+        return
+    _tt_deprecation_warned = True
+    print(_TT_DEPRECATION_BANNER, file=sys.stderr, flush=True)
+
+
 def resolve_current_platform_cls_qualname() -> str:
     platform_plugins = load_plugins_by_group(PLATFORM_PLUGINS_GROUP)
 
@@ -210,6 +251,8 @@ def resolve_current_platform_cls_qualname() -> str:
     elif len(activated_oot_plugins) == 1:
         platform_cls_qualname = platform_plugins[activated_oot_plugins[0]]()
         logger.info("Platform plugin %s is activated", activated_oot_plugins[0])
+        if activated_oot_plugins[0] == TT_PLATFORM_PLUGIN_NAME:
+            _warn_tt_fork_deprecated()
     elif len(activated_builtin_plugins) >= 2:
         raise RuntimeError(
             "Only one platform plugin can be activated, but got: "

@@ -1,5 +1,15 @@
 # vLLM TT Plugin
 
+> [!CAUTION]
+>
+> ## This in-tree copy of the plugin is deprecated
+>
+> The plugin is developed and released from its own repository, against
+> **upstream vLLM**:
+> [github.com/tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin).
+> The copy here is frozen and will be archived with the rest of this fork. Use
+> the standalone repository for installation, issues and pull requests.
+
 Tenstorrent backend plugin for vLLM.
 
 `vllm-tt-plugin` integrates Tenstorrent hardware into vLLM using the standard
