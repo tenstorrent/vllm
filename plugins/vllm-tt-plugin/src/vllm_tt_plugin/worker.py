@@ -493,20 +493,53 @@ class TTWorker(WorkerBase):
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
-    # ---- Destructor (used to close devices) ----
+    def shutdown(self) -> None:
+        """Synchronously release model resources, the mesh, and fabric state."""
+        model_runner = getattr(self, "model_runner", None)
+        mesh_device = getattr(self, "mesh_device", None)
+        did_work = model_runner is not None or mesh_device is not None
 
+        # Relinquish ownership before invoking cleanup. A second shutdown (or
+        # __del__ after an exception) must never close the same mesh twice.
+        self.model_runner = None
+        self.mesh_device = None
+        device_config = getattr(self, "device_config", None)
+        if (
+            device_config is not None
+            and getattr(device_config, "device", None) is mesh_device
+        ):
+            device_config.device = None
+
+        errors = []
+        if model_runner is not None:
+            try:
+                model_runner.shutdown()
+            except Exception as exc:
+                errors.append(exc)
+        if mesh_device is not None:
+            try:
+                close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            super().shutdown()
+        except Exception as exc:
+            errors.append(exc)
+
+        if errors:
+            raise errors[0]
+        if did_work:
+            logger.info("TTWorker shutdown complete")
+
+    # Destructor is a best-effort fallback. Normal EngineCore teardown calls
+    # shutdown() explicitly and observes any failure.
     def __del__(self):
-        # Delete model runner first in case there are model artifacts
-        with suppress(AttributeError):
-            # attributes may be already torn down when destructor is called
-            del self.model_runner
-
-            if self.mesh_device:
-                close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
-                del self.mesh_device
+        with suppress(Exception):
+            self.shutdown()
 
         if hasattr(super(), "__del__"):
-            super().__del__()  # type: ignore
+            with suppress(Exception):
+                super().__del__()  # type: ignore
 
 
 def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int) -> int:
@@ -796,14 +829,28 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
 
 def close_mesh_device(mesh_device, tt_config):
-    # Read device profiler (no-op if not profiling with tracy)
-    ttnn.ReadDeviceProfiler(mesh_device)
+    """Close every mesh layer and reset fabric, attempting every cleanup step."""
+    errors = []
+    try:
+        # No-op unless profiling with Tracy; profiler failure must not strand
+        # an otherwise closeable device.
+        ttnn.ReadDeviceProfiler(mesh_device)
+    except Exception as exc:
+        errors.append(exc)
 
-    # Close devices
     num_devices = mesh_device.get_num_devices()
     for submesh in mesh_device.get_submeshes():
-        ttnn.close_mesh_device(submesh)
-    ttnn.close_mesh_device(mesh_device)
-
-    # Reset fabric
-    reset_fabric(tt_config, num_devices)
+        try:
+            ttnn.close_mesh_device(submesh)
+        except Exception as exc:
+            errors.append(exc)
+    try:
+        ttnn.close_mesh_device(mesh_device)
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        reset_fabric(tt_config, num_devices)
+    except Exception as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[0]
