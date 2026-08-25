@@ -268,6 +268,20 @@ class TTModelRunner:
             vllm_config=self.vllm_config, model_config=self.model_config
         )
 
+    def shutdown(self) -> None:
+        """Release model-owned resources before the worker closes its mesh.
+
+        Taking the model reference first makes shutdown idempotent even when a
+        model-specific close hook raises. Models without a close hook retain
+        the historical drop-reference behaviour.
+        """
+        model = getattr(self, "model", None)
+        self.model = None
+        self.mesh_device = None
+        close = getattr(model, "close", None)
+        if callable(close):
+            close()
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         # TT backend currently supports text generation only.
         # (No transcription support yet.)
