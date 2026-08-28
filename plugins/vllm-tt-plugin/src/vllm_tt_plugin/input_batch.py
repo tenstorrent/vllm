@@ -340,21 +340,28 @@ class InputBatch:
         self.sampling.temperature[req_index] = sampling_params.temperature
         top_p = sampling_params.top_p
         top_k = sampling_params.top_k
-        if not (0 < top_k < self.vocab_size):
-            # Normalize top_k <= 0 or >= vocab_size to vocab_size
-            # (consider all tokens)
-            top_k = self.vocab_size
-        # Workaround for https://github.com/tenstorrent/tt-metal/issues/46827
-        # top_k == 1 means greedy/argmax for this request. The on-device sampler
-        # always builds a fixed top-32 candidate set and its per-user top_k does
-        # NOT collapse that set to a single token before the RNG draw, so with
-        # any top_p < 1.0 a multi-token nucleus survives and the random seed makes
-        # top_k=1 non-deterministic (e.g. Qwen3's generation_config defaults
-        # top_p=0.95). Force top_p to 0 so the nucleus keeps exactly the single
-        # most-probable token (cum_prob > 0 keeps one), i.e. exact argmax and
-        # RNG-independent. Per-request, so mixed-k batches are unaffected.
-        if top_k == 1:
+        # vLLM encodes greedy as temperature≈0 and top_k=0 (disabled). The
+        # on-device sampler treats k<=0 as full vocab (then caps to 32), so
+        # collapse greedy rows to k=1/p=0 explicitly.
+        if sampling_params.temperature < 1e-5:
+            top_k = 1
             top_p = 0.0
+        else:
+            if not (0 < top_k < self.vocab_size):
+                # Normalize top_k <= 0 or >= vocab_size to vocab_size
+                # (consider all tokens)
+                top_k = self.vocab_size
+            # Workaround for https://github.com/tenstorrent/tt-metal/issues/46827
+            # top_k == 1 means greedy/argmax for this request. The on-device sampler
+            # always builds a fixed top-32 candidate set and its per-user top_k does
+            # NOT collapse that set to a single token before the RNG draw, so with
+            # any top_p < 1.0 a multi-token nucleus survives and the random seed makes
+            # top_k=1 non-deterministic (e.g. Qwen3's generation_config defaults
+            # top_p=0.95). Force top_p to 0 so the nucleus keeps exactly the single
+            # most-probable token (cum_prob > 0 keeps one), i.e. exact argmax and
+            # RNG-independent. Per-request, so mixed-k batches are unaffected.
+            if top_k == 1:
+                top_p = 0.0
         self.sampling.top_p[req_index] = top_p
         self.sampling.top_k[req_index] = top_k
         self.sampling.presence_penalty[req_index] = sampling_params.presence_penalty
@@ -870,6 +877,12 @@ class TTLaneInputBatch(InputBatch):
             if self.remove_request(req_id) is not None:
                 layout_changed = True
 
+        # Preempted requests release their row in the same step as the
+        # coordinator returns it to the lane free list.
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
         # Free cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             encoder_cache.pop(mm_hash, None)
@@ -1069,6 +1082,19 @@ class TTLaneInputBatch(InputBatch):
             self.sampling, torch.as_tensor(rows, dtype=torch.long)
         )
 
+    def slot_penalty_token_tensors(
+        self, rows: list[int], capacity: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scatter packed prompt/output history onto the device slot grid."""
+        packed_prompt = self.make_prompt_token_ids_tensor(rows)
+        packed_output = self.make_output_token_ids_tensor(rows)
+        prompt = packed_prompt.new_full((capacity, packed_prompt.shape[1]), -1)
+        output = packed_output.new_full((capacity, packed_output.shape[1]), -1)
+        slot_idx = torch.as_tensor(rows, dtype=torch.long)
+        prompt[slot_idx] = packed_prompt
+        output[slot_idx] = packed_output
+        return prompt, output
+
     def slot_grammar_bitmask(
         self, grammar_output: "GrammarOutput | None", batch_length: int
     ) -> torch.Tensor | None:
@@ -1247,8 +1273,9 @@ class TTLaneInputBatch(InputBatch):
         # building them here on the host path would be dead work.
         prompt_tokens = output_tokens = None
         if perform_device_sampling and not lane_batch.no_penalties:
-            prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows)
-            output_tokens = lane_batch.make_output_token_ids_tensor(rows)
+            prompt_tokens, output_tokens = lane_batch.slot_penalty_token_tensors(
+                rows, lane_batch.max_num_reqs
+            )
 
         multi_modal_kwargs = (
             runner._gather_multi_modal_inputs(req_indices=list(rows))
