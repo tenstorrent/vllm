@@ -391,6 +391,12 @@ def register_tt_models(register_test_models=False) -> None:
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
         path_llama_text = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
+    elif llama_text_version == "tt_transformers_v2":
+        model = os.getenv("HF_MODEL")
+        if model == "meta-llama/Llama-3.1-8B-Instruct":
+            path_llama_text = "models.common.models.llama3_8b.generator:Llama3Generator"
+        else:
+            raise ValueError(f"Unsupported tt_transformers_v2 model: {model}")
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:LlamaForCausalLM"
@@ -402,7 +408,8 @@ def register_tt_models(register_test_models=False) -> None:
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]"
+            "pick one of [tt_transformers, tt_transformers_v2, "
+            "llama3_70b_galaxy, llama2_70b]"
         )
 
     # Llama3.1/3.2 - Text
