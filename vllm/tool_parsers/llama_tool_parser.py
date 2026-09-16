@@ -74,6 +74,28 @@ class Llama3JsonToolParser(ToolParser):
                 f"'{self.bot_token}' in the tokenizer."
             )
 
+    @staticmethod
+    def _normalize_tool_call(
+        tool_call: dict, request: ChatCompletionRequest | None
+    ) -> dict:
+        if (
+            "name" not in tool_call
+            and tool_call.get("type") == "function"
+            and isinstance(tool_call.get("function"), str)
+        ):
+            tool_call["name"] = tool_call["function"]
+
+        name = tool_call.get("name")
+        if name is not None and request is not None:
+            declared_names = {tool.function.name for tool in (request.tools or [])}
+            if name not in declared_names:
+                raise ValueError(
+                    f"Model called undeclared tool {name!r}; "
+                    f"declared tools are {sorted(declared_names)!r}"
+                )
+
+        return tool_call
+
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest
     ) -> ExtractedToolCallInformation:
@@ -107,6 +129,7 @@ class Llama3JsonToolParser(ToolParser):
                         model_output[start_index:]
                     )
                     end_index = start_index + json_end_index
+                    obj = self._normalize_tool_call(obj, request)
 
                     # raise KeyError if missing
                     name = obj["name"]
@@ -204,6 +227,7 @@ class Llama3JsonToolParser(ToolParser):
                         is_complete_json(current_text[start_idx : start_idx + end_idx])
                     )
                     start_idx += end_idx + len("; ")
+                    obj = self._normalize_tool_call(obj, request)
                     # depending on the prompt Llama can use
                     # either arguments or parameters
                     if "parameters" in obj:

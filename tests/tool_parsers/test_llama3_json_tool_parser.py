@@ -6,6 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from transformers import AutoTokenizer
 
+from tests.tool_parsers.utils import run_tool_extraction
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+    FunctionDefinition,
+)
 from vllm.entrypoints.openai.engine.protocol import ExtractedToolCallInformation
 from vllm.tool_parsers.llama_tool_parser import Llama3JsonToolParser
 
@@ -20,6 +26,26 @@ def llama_tokenizer():
 @pytest.fixture
 def parser(llama_tokenizer):
     return Llama3JsonToolParser(llama_tokenizer)
+
+
+@pytest.fixture
+def weather_request():
+    return ChatCompletionRequest(
+        model=LLAMA_MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                )
+            )
+        ],
+        tool_choice="auto",
+    )
 
 
 def test_extract_tool_calls_simple(parser):
@@ -51,6 +77,42 @@ def test_extract_tool_calls_with_arguments(parser):
     assert result.tool_calls[0].function.name == "searchTool"
     assert '"query": "test query"' in result.tool_calls[0].function.arguments
     assert '"limit": 10' in result.tool_calls[0].function.arguments
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_extract_llama32_function_shape(parser, weather_request, streaming):
+    model_output = (
+        '{"type":"function","function":"get_weather","parameters":{"city":"Toronto"}}'
+    )
+
+    content, tool_calls = run_tool_extraction(
+        parser, model_output, weather_request, streaming=streaming
+    )
+
+    assert content is None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "get_weather"
+    assert tool_calls[0].function.arguments == '{"city": "Toronto"}'
+
+
+def test_extract_undeclared_llama32_function_shape(parser, weather_request):
+    model_output = '{"type":"function","function":"delete_everything","parameters":{}}'
+
+    result = parser.extract_tool_calls(model_output, weather_request)
+
+    assert result.tools_called is False
+    assert result.tool_calls == []
+    assert result.content == model_output
+
+
+def test_streaming_rejects_undeclared_llama32_function_shape(parser, weather_request):
+    model_output = '{"type":"function","function":"delete_everything","parameters":{}}'
+
+    _, tool_calls = run_tool_extraction(
+        parser, model_output, weather_request, streaming=True
+    )
+
+    assert tool_calls == []
 
 
 def test_extract_tool_calls_no_json(parser):
