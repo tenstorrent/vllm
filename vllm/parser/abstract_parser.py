@@ -610,15 +610,32 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            # Hand off remaining content to tool parser
-            if self._tool_parser and self.is_reasoning_end(delta_token_ids):
+            # Hand off remaining content to tool parser. Also treat
+            # reasoning as ended if the model never began a reasoning
+            # block at all: hybrid-thinking models (e.g. Qwen3) can skip
+            # the <think>...</think> phase entirely for requests that
+            # don't need it. is_reasoning_end() only detects the *end*
+            # token, so it never becomes True in that case, and all
+            # output -- including tool call markup -- would otherwise be
+            # routed through extract_reasoning_streaming() as plain
+            # content forever.
+            start_token = getattr(self._reasoning_parser, "start_token", None)
+            reasoning_skipped = (
+                start_token is not None
+                and len(current_text) >= len(start_token)
+                and not current_text.startswith(start_token)
+            )
+            if self._tool_parser and (
+                self.is_reasoning_end(delta_token_ids) or reasoning_skipped
+            ):
                 state.reasoning_ended = True
-                current_token_ids = self.extract_content_ids(delta_token_ids)
-                if delta_message and delta_message.content:
-                    current_text = delta_message.content
-                    delta_message.content = None
-                else:
-                    current_text = ""
+                if not reasoning_skipped:
+                    current_token_ids = self.extract_content_ids(delta_token_ids)
+                    if delta_message and delta_message.content:
+                        current_text = delta_message.content
+                        delta_message.content = None
+                    else:
+                        current_text = ""
 
         # Tool call extraction
         if self._in_tool_call_phase(state):
